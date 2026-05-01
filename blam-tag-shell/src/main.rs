@@ -389,6 +389,21 @@ enum Commands {
         output: Option<String>,
     },
 
+    /// Decompress and write out the source files baked into a tag's
+    /// `info` (import-info) stream. Each `files[i]` carries the
+    /// original on-disk path + zlib-compressed bytes of a source asset
+    /// the importer consumed (JMS, JMA, TIFF, etc.).
+    ExtractImportInfo {
+        /// Path to a tag file with an `info` stream
+        file: String,
+        /// Output directory. Default: `./<tag_stem>/import_info/`.
+        #[arg(long)]
+        output: Option<String>,
+        /// Print the manifest only — don't decompress or write.
+        #[arg(long)]
+        list: bool,
+    },
+
     /// List the animations in a `model_animation_graph` tag (header
     /// metadata only — no codec decode)
     ListAnimations {
@@ -619,6 +634,11 @@ pub(crate) fn dispatch(ctx: &mut CliContext, cmd: Commands, reload_tag: bool) ->
         Commands::ExtractData { file, path, output } => {
             ensure_loaded(ctx, &file, reload_tag)?;
             commands::extract_data::run(ctx, &path, output.as_deref())
+        }
+
+        Commands::ExtractImportInfo { file, output, list } => {
+            ensure_loaded(ctx, &file, reload_tag)?;
+            commands::extract_import_info::run(ctx, output.as_deref(), list)
         }
 
         Commands::ListAnimations { file, json } => {

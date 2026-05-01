@@ -14,6 +14,7 @@ pub mod export;
 pub mod extract_animation;
 pub mod extract_bitmap;
 pub mod extract_data;
+pub mod extract_import_info;
 pub mod extract_jms;
 pub mod extract_ass;
 pub mod find;

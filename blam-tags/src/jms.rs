@@ -242,11 +242,21 @@ impl JmsFile {
         let local_nodes = read_nodes(&root)?;
         let world_nodes = chain_local_to_world(&local_nodes);
         let bounds = read_compression_bounds(&root);
-        let (materials, part_material_map, mesh_emit_order) = build_materials(&root)?;
+        let (mut materials, part_material_map, mesh_emit_order) = build_materials(&root)?;
         let markers = read_markers(&root)?;
-        let (vertices, triangles) = build_geometry(
+        let (mut vertices, mut triangles) = build_geometry(
             &root, &part_material_map, &mesh_emit_order, &bounds,
         )?;
+        // Append per-instance-placement geometry. Mirrors Foundry's
+        // `render_model.py` instance walk: each `instance placements[i]`
+        // pairs with `meshes[instance_mesh_index].subparts[i]`, gets its
+        // own (forward,left,up,position+scale) transform, and binds to a
+        // single bone via `node_index`. Without this, characters whose
+        // modular armor (gauntlets, helmets, etc.) lives in the instance
+        // mesh — like the brute — extract with all attachments missing.
+        // TagTool extracts this only for `VertexType.Decorator`; we
+        // run it for every render_model that has placements.
+        append_instance_geometry(&root, &mut materials, &mut vertices, &mut triangles, &bounds)?;
         Ok(Self { nodes: world_nodes, materials, markers, vertices, triangles, ..Default::default() })
     }
 
@@ -1277,6 +1287,161 @@ fn build_geometry(
         }
     }
     Ok((vertices, triangles))
+}
+
+/// Walk `instance placements[]` and bake each as additional triangles
+/// referencing `meshes[instance_mesh_index].subparts[i]`. No-op when
+/// `instance mesh index < 0` or there are no placements.
+///
+/// Per-placement transform mirrors Foundry's `InstancePlacement.matrix`:
+/// the 3×3 rotation has `(forward, left, up)` as columns and `position`
+/// as the translation column. `scale` is applied to the vertex before
+/// rotation. Vertex weights are overridden to a single bone — the
+/// placement's `node_index` — since the runtime engine attaches the
+/// instance to that bone rather than the original mesh's skin weights.
+///
+/// Material naming: each placement gets a unique JMS material slot whose
+/// `material_name` is `(slot) <placement_name>`, so they appear as
+/// distinct named pieces in Blender. Shader name is inherited from the
+/// subpart's referenced `parts[].render method index`.
+fn append_instance_geometry(
+    root: &TagStruct<'_>,
+    materials: &mut Vec<JmsMaterial>,
+    vertices: &mut Vec<JmsVertex>,
+    triangles: &mut Vec<JmsTriangle>,
+    bounds: &CompressionBounds,
+) -> Result<(), JmsError> {
+    let instance_mesh_index = root.read_int_any("instance mesh index").unwrap_or(-1);
+    if instance_mesh_index < 0 { return Ok(()); }
+    let instance_mesh_index = instance_mesh_index as usize;
+
+    let placements = match root.field("instance placements").and_then(|f| f.as_block()) {
+        Some(b) if !b.is_empty() => b,
+        _ => return Ok(()),
+    };
+
+    let mats_block = root.field_path("materials").and_then(|f| f.as_block())
+        .ok_or(JmsError::MissingField("materials"))?;
+    let meshes_block = root.field_path("render geometry/meshes")
+        .and_then(|f| f.as_block())
+        .ok_or(JmsError::MissingField("render geometry/meshes"))?;
+    let pmt_block = root.field_path("render geometry/per mesh temporary")
+        .and_then(|f| f.as_block())
+        .ok_or(JmsError::MissingField("render geometry/per mesh temporary"))?;
+
+    if instance_mesh_index >= meshes_block.len() || instance_mesh_index >= pmt_block.len() {
+        return Ok(());
+    }
+    let mesh = meshes_block.element(instance_mesh_index).unwrap();
+    let pmt = pmt_block.element(instance_mesh_index).unwrap();
+
+    let raw_v = pmt.field("raw vertices").and_then(|f| f.as_block())
+        .ok_or(JmsError::MissingField("per mesh temporary[i]/raw vertices"))?;
+    let raw_i = pmt.field("raw indices").and_then(|f| f.as_block())
+        .ok_or(JmsError::MissingField("per mesh temporary[i]/raw indices"))?;
+    let indices: Vec<u16> = (0..raw_i.len())
+        .filter_map(|k| raw_i.element(k))
+        .map(|e| e.read_int_any("word").unwrap_or(0) as u16)
+        .collect();
+    let is_strip = mesh.field("index buffer type")
+        .and_then(|f| f.value())
+        .map(|v| matches!(v, TagFieldData::CharEnum { name: Some(n), .. } if n == "triangle strip"))
+        .unwrap_or(true);
+
+    let parts = mesh.field("parts").and_then(|f| f.as_block())
+        .ok_or(JmsError::MissingField("meshes[i]/parts"))?;
+    let subparts = mesh.field("subparts").and_then(|f| f.as_block())
+        .ok_or(JmsError::MissingField("meshes[i]/subparts"))?;
+
+    for ii in 0..placements.len() {
+        let placement = placements.element(ii).unwrap();
+        let name = placement.read_string_id("name").unwrap_or_else(|| format!("instance_{ii}"));
+        let node_index = placement.read_int_any("node_index").map(|v| v as i16).unwrap_or(-1);
+        let scale = placement.read_real("scale").unwrap_or(1.0);
+        let forward = placement.read_vec3("forward");
+        let left = placement.read_vec3("left");
+        let up = placement.read_vec3("up");
+        let position = placement.read_point3d("position") * SCALE;
+
+        // Pair instance i with subpart i. Skip silently if the runtime
+        // tag has fewer subparts than placements (defensive — should
+        // never happen in practice).
+        let subpart = match subparts.element(ii) { Some(s) => s, None => continue };
+        let part_index = subpart.read_int_any("part index").unwrap_or(-1);
+        let start_i = subpart.read_int_any("index start").unwrap_or(0);
+        let count_i = subpart.read_int_any("index count").unwrap_or(0);
+        if count_i <= 0 { continue; }
+        let start = (start_i as i16 as u16) as usize;
+        let count = count_i as usize;
+        if start >= indices.len() { continue; }
+        let end = (start + count).min(indices.len());
+        let part_indices = &indices[start..end];
+
+        // Resolve the shader name via parts[part_index].render method
+        // index. Falls back to "default" so we never lose triangles
+        // even on malformed tags.
+        let shader_name = if part_index >= 0 && (part_index as usize) < parts.len() {
+            let part = parts.element(part_index as usize).unwrap();
+            let shader_idx = part.read_int_any("render method index").unwrap_or(0);
+            if shader_idx >= 0 && (shader_idx as usize) < mats_block.len() {
+                let m = mats_block.element(shader_idx as usize).unwrap();
+                let path = m.read_tag_ref_path("render method").unwrap_or_default();
+                Path::new(&path.replace('\\', "/"))
+                    .file_stem().and_then(|s| s.to_str()).unwrap_or("default").to_owned()
+            } else { "default".to_owned() }
+        } else { "default".to_owned() };
+
+        let slot = materials.len() + 1;
+        let material_index = materials.len() as i32;
+        materials.push(JmsMaterial {
+            name: shader_name,
+            material_name: format!("({}) {}", slot, name),
+        });
+
+        let tris: Vec<(u16, u16, u16)> = if is_strip {
+            strip_to_list(part_indices)
+        } else {
+            part_indices.chunks_exact(3).map(|c| (c[0], c[1], c[2])).collect()
+        };
+
+        for (a, b, c) in tris {
+            let base = vertices.len() as u32;
+            for vi in [a, b, c] {
+                let Some(v) = raw_v.element(vi as usize) else { continue; };
+                let mut jv = read_vertex(&v, bounds);
+                // Transform vertex by placement basis. Foundry packs
+                // `(forward, left, up)` as columns of the 3×3 rotation,
+                // i.e. `new = forward*x + left*y + up*z + position`,
+                // with the vertex pre-scaled.
+                let p = jv.position;
+                let sx = p.x * scale; let sy = p.y * scale; let sz = p.z * scale;
+                jv.position = crate::math::RealPoint3d {
+                    x: forward.i * sx + left.i * sy + up.i * sz + position.x,
+                    y: forward.j * sx + left.j * sy + up.j * sz + position.y,
+                    z: forward.k * sx + left.k * sy + up.k * sz + position.z,
+                };
+                let n = jv.normal;
+                jv.normal = crate::math::RealVector3d {
+                    i: forward.i * n.i + left.i * n.j + up.i * n.k,
+                    j: forward.j * n.i + left.j * n.j + up.j * n.k,
+                    k: forward.k * n.i + left.k * n.j + up.k * n.k,
+                };
+                // Override skin weights — instance is rigidly attached
+                // to its placement bone, regardless of mesh-N's original
+                // multi-bone weights.
+                jv.node_sets.clear();
+                if node_index >= 0 {
+                    jv.node_sets.push((node_index, 1.0));
+                }
+                vertices.push(jv);
+            }
+            triangles.push(JmsTriangle {
+                material: material_index,
+                v: [base, base + 1, base + 2],
+            });
+        }
+    }
+    Ok(())
 }
 
 //================================================================================

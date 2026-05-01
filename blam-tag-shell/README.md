@@ -61,6 +61,7 @@ The example commands below elide `--game` for readability — add it to every in
 | [`extract-jms`](#extract-jms--model-to-source-tree-jms-files) | Extract a `.model` tag's render / collision / physics children as JMS files in the H3EK source-tree layout |
 | [`extract-ass`](#extract-ass--scenario-to-ass) | Extract a `.scenario` tag's structure BSPs as ASS files (one per BSP, with paired lighting baked in) |
 | [`extract-data`](#extract-data--dump-a-tag_data-field) | Write the bytes of a single `tag_data` field to a file |
+| [`extract-import-info`](#extract-import-info--unzip-source-files-from-the-info-stream) | Decompress and write out the source files baked into a tag's `info` stream (zlib-compressed JMS / JMA / TIFF / ASS that the importer consumed) |
 | [`list-animations`](#list-animations--enumerate-jmad-animations) | List the animations in a `model_animation_graph` tag |
 | [`extract-animation`](#extract-animation--decode-and-export-an-animation) | Decode one or every jmad animation; write JMA-family text or JSON |
 | [`add-dependency-list`](#optional-stream-commands) | Attach an empty dependency-list stream |
@@ -681,7 +682,7 @@ extracted/masterchief.render.jms: [render] 51 nodes, …
 extracted/masterchief.collision.jms: [collision] 51 nodes, …
 ```
 
-Render-side pipeline: walks `regions × permutations × meshes × parts`, decompresses bounds-quantized positions/UVs against `compression info[0]`, converts triangle strips to lists with restart-aware parity + degenerate filtering, and emits one JMS material per `(shader, perm, region)` cell. Collision-side pipeline: walks each BSP's `surfaces[]` via the edge-ring algorithm, fan-triangulates each ring, and emits world-space vertices through the render_model-derived skeleton. Physics-side pipeline: emits Havok shape primitives (sphere/box/pill/polyhedron) plus ragdoll/hinge constraints in world-space. Validated across the H3 MCC corpus: 4354/4354 reconstructions; 89.7% bbox match against embedded source JMS, 86.8% with ≥99% position coverage at 10cm precision.
+Render-side pipeline: walks `regions × permutations × meshes × parts`, decompresses bounds-quantized positions/UVs against `compression info[0]`, converts triangle strips to lists with restart-aware parity + degenerate filtering, and emits one JMS material per `(shader, perm, region)` cell. **Plus `instance placements[]`**: when a render_model has `instance mesh index >= 0` (the brute and other modular characters), each `instance placements[i]` is paired with `meshes[N].subparts[i]`, transformed by the placement's `(forward, left, up, position)` basis × `scale`, weighted to the placement's `node_index`, and emitted as additional triangles with a unique `(slot) <placement_name>` material. This mirrors Foundry's `render_model.py` behaviour. TagTool's render_model export silently skips these for non-decorator types, so blam-tags is the only available pipeline that recovers brute gauntlets, helmet variants, jumppack braces, etc., from the runtime tag. Collision-side pipeline: walks each BSP's `surfaces[]` via the edge-ring algorithm, fan-triangulates each ring, and emits world-space vertices through the render_model-derived skeleton. Physics-side pipeline: emits Havok shape primitives (sphere/box/pill/polyhedron) plus ragdoll/hinge constraints in world-space. Validated across the H3 MCC corpus: 4354/4354 reconstructions; 89.7% bbox match against embedded source JMS, 86.8% with ≥99% position coverage at 10cm precision.
 
 Notes:
 
@@ -752,6 +753,53 @@ $ blam-tag-shell extract-data elite.model_animation_graph \
 $ blam-tag-shell extract-data elite.model_animation_graph "definitions/animations"
 Error: field 'definitions/animations' is block (not a `tag_data` field)
 ```
+
+---
+
+### `extract-import-info` — Unzip source files from the `info` stream
+
+| Argument | Description |
+|-|-|
+| `<FILE>` | Path to a tag file with an `info` (tag_import_information) stream. |
+
+| Long | Description |
+|-|-|
+| `--output <DIR>` | Output directory. Default: `./<tag_stem>/import_info/`. |
+| `--list` | Print the manifest only — don't decompress or write. |
+
+The `info` stream's `files[]` block carries one entry per source file Bungie's importer consumed when the tag was built — original on-disk path, modification date, CRC32, byte size, plus the source file's bytes zlib-compressed (`tag_import_file_zipped_data_definition`, capped at 160 MiB / file). This command walks `files[]` and writes each entry's decompressed payload to disk under a sanitized form of its original path (drive letter stripped, backslashes normalized).
+
+Useful for verifying which artist source actually fed a runtime tag, recovering source-of-truth fidelity that runtime-tag extractors can't reach (e.g. comparing `extract-jms` output to the original `.ass` the render_model was built from), or pulling the importer log out of `events[]`.
+
+What carries an `info` stream in the H3 corpus:
+
+| Tag group | Source files |
+|---|---|
+| `render_model` | typically 1 `.ass` (full Max scene). E.g. `brute.render_model` → `brute.ass` (~5 MB). |
+| `collision_model` | 1 `.jms`. |
+| `physics_model` | 1 `.jms` (e.g. `brute_ragdoll.jms`). |
+| `bitmap` | source TIFF/DDS — but MCC ships `source data: 0 bytes`, so usually empty. |
+| `model_animation_graph` / `biped` / `model` / `weapon` / etc. | none — composite tags built from refs to other tags. |
+
+Rule of thumb: leaf-asset tags (mesh / coll / phys / bitmap) carry their source files; composite tags don't.
+
+```sh
+# List manifest only
+$ blam-tag-shell --game halo3_mcc extract-import-info /path/to/brute.render_model --list
+tag built tool  test pc 11138.07.07.06.0905.main  Jul  6 2007 09:14:12 by shikaiw (build=Some(11138))
+  [  0] data\objects\characters\brute\render\brute.ass (862380/4850221 bytes, crc32=c478cbe6)
+1 files: 0 written, 0 failed; 862380 bytes compressed → 0 bytes decompressed
+
+# Default — decompress + write to ./<tag_stem>/import_info/<sanitized path>
+$ blam-tag-shell --game halo3_mcc extract-import-info /path/to/brute.render_model
+  brute.render_model/import_info/data/objects/characters/brute/render/brute.ass (862380 → 4850221 bytes)
+1 files: 1 written, 0 failed; 862380 bytes compressed → 4850221 bytes decompressed
+
+# Pick output dir — drops the brute.ass into /tmp directly
+$ blam-tag-shell --game halo3_mcc extract-import-info /path/to/brute.render_model --output /tmp/brute_src
+```
+
+Errors out cleanly when the tag has no `info` stream (most composite tags). Use `add-import-info` to attach an empty one if you're authoring a tag from scratch and intend to populate the manifest.
 
 ---
 

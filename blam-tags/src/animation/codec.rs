@@ -300,7 +300,11 @@ impl<'a> AnimationGroup<'a> {
         });
 
         // Movement offset+size: Reach has it at positional index 4;
-        // H3 sits at the trailing end of the blob (just before pill).
+        // H3 places it sequentially right after the animated node flags
+        // (static codec → animated codec → static flags → animated flags → movement),
+        // matching TagTool's `AnimationResourceData.Read` and Foundry's
+        // `_read_movement_data`. The `pill_offset_data` field tracks pill data
+        // elsewhere in the blob and isn't a `blob.len() - pill - movement` anchor.
         let movement = self.data_sizes.as_ref().map(|d| {
             let (off, size) = match layout {
                 SizeLayout::Reach => (
@@ -309,8 +313,12 @@ impl<'a> AnimationGroup<'a> {
                 ),
                 SizeLayout::H3 => {
                     let m = d.get("movement_data") as usize;
-                    let p = d.get("pill_offset_data") as usize;
-                    let off = self.blob.len().saturating_sub(p).saturating_sub(m);
+                    let static_total = d.get("static_node_flags") as usize;
+                    let animated_total = d.get("animated_node_flags") as usize;
+                    let off = static_size
+                        + animated_codec_size.unwrap_or(0)
+                        + static_total
+                        + animated_total;
                     (off, m)
                 }
             };
