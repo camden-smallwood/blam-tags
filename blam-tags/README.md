@@ -347,9 +347,11 @@ cargo run --release -p blam-tags --example jmad_export_sweep -- \
     /path/to/halo3_mcc/tags /path/to/haloreach_mcc/tags
 ```
 
-### JMS (render / collision / physics → JMS)
+### JMS / ASS (render / collision / physics → JMS, with ASS for instance-bearing render_models)
 
 `JmsFile` reconstructs a Bungie Joint Model Skeleton (`.JMS`, version 8213) from a parsed `render_model`, `collision_model`, or `physics_model` tag. The three constructors emit per-purpose JMS files — render geometry only, collision BSP only, or physics primitives + constraints — so callers can split them across the H3EK source-tree layout (`render/`, `collision/`, `physics/`).
+
+For render_models with **instance geometry** (`instance mesh index >= 0` + `instance placements[]` populated — the brute, decorators, level objects), [`AssFile::from_render_model`](src/ass.rs) is the structurally-faithful path: it emits an ASS file whose `INSTANCES` section carries one entry per placement, which Tool re-extracts back into `instance placements[]` on recompile. The shell's `extract-geometry` command auto-dispatches between the two based on tag content; library callers pick directly.
 
 ```rust
 use blam_tags::{JmsFile, TagFile};

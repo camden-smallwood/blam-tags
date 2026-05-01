@@ -331,50 +331,43 @@ enum Commands {
         format: String,
     },
 
-    /// Extract a `.model` (hlmt) tag's referenced render / collision /
-    /// physics children as JMS files matching the H3 source-tree
-    /// authoring layout (`render/`, `collision/`, `physics/`).
-    ExtractJms {
-        /// Path to a `.model` tag file (hlmt). Other tag groups are
-        /// rejected — extract through the .model so the skeleton is
-        /// available to coll/phmo for world-space placement.
+    /// Extract geometry source files from a tag. Accepts:
+    ///
+    /// - `.model` (hlmt): render/collision/physics children. Render
+    ///   side auto-dispatches JMS or ASS based on
+    ///   `instance mesh index >= 0` + non-empty `instance placements[]`
+    ///   (the brute, decorators, level objects emit ASS; everything
+    ///   else emits JMS). Coll/phys always JMS. `--force jms|ass`
+    ///   overrides the render-side decision.
+    /// - `.scenario` (scnr): one ASS per `structure_bsps[]` entry,
+    ///   with paired `.stli` lighting baked in. Always ASS.
+    /// - `.scenario_structure_bsp` (sbsp): a single ASS for that BSP.
+    ///   No paired stli (lighting is unreachable without scenario
+    ///   context). Always ASS.
+    ///
+    /// `[KINDS...]` and `--force` are `.model`-only. Passing them with
+    /// scenario/sbsp inputs is rejected with an explanatory error.
+    ExtractGeometry {
+        /// Path to a `.model`, `.scenario`, or `.scenario_structure_bsp` tag.
         file: String,
-        /// Which sub-models to extract. Multi-select, in any order.
-        /// Accepted: `render`, `collision`, `physics`, `all`.
-        /// Default if omitted: `all`.
+        /// `.model`-only. Which sub-models to extract: `render`,
+        /// `collision`, `physics`, or `all`. Default `all`. Rejected
+        /// for scenario / sbsp inputs.
         #[arg(value_parser = ["render", "collision", "physics", "all"])]
         kinds: Vec<String>,
-        /// Output directory (default: current directory). The
-        /// command writes `<DIR>/<stem>/{render,collision,physics}/<stem>.JMS`
-        /// — re-importable by H3EK / Tool.exe.
+        /// Output directory (default: current directory).
         #[arg(long)]
         output: Option<String>,
-        /// Flatten the layout: emit `<DIR>/<stem>.<kind>.jms` instead
-        /// of nested subdirs. Useful for ad-hoc inspection.
+        /// Flatten the layout. For `.model`: `<DIR>/<stem>.<kind>.<ext>`.
+        /// For `.scenario`: `<DIR>/<scenario>.<bsp>.ass`. No effect on
+        /// `.sbsp` (always a single file).
         #[arg(long)]
         flat: bool,
-    },
-
-    /// Extract a `.scenario` (scnr) tag's structure BSPs as ASS
-    /// files (Bungie Amalgam, version 7 for H3) — one ASS per
-    /// `scenario.structure_bsps[]` entry, each pairing the
-    /// referenced `scenario_structure_bsp` with its
-    /// `scenario_structure_lighting_info`. ASS is the static-scene
-    /// counterpart to JMS.
-    ExtractAss {
-        /// Path to a `.scenario` tag file. sbsp-direct extraction
-        /// is available via the library function
-        /// `AssFile::from_scenario_structure_bsp`.
-        file: String,
-        /// Output root directory (default: current directory). The
-        /// command writes one `<DIR>/<scenario_stem>/structure/<bsp_stem>.ASS`
-        /// per BSP to match the H3EK source-tree convention.
-        #[arg(long)]
-        output: Option<String>,
-        /// Flatten: emit `<DIR>/<scenario_stem>.<bsp_stem>.ass` per
-        /// BSP in a single dir instead of the nested layout.
-        #[arg(long)]
-        flat: bool,
+        /// `.model`-only. Force render-side format (`jms` or `ass`),
+        /// overriding content-based dispatch. Rejected for scenario /
+        /// sbsp inputs (those always emit ASS).
+        #[arg(long, value_enum)]
+        force: Option<commands::extract_geometry::Force>,
     },
 
     /// Write the bytes of a single `tag_data` field to a file
@@ -439,7 +432,7 @@ enum Commands {
         output: Option<String>,
         /// Flatten the layout: emit `<root>/<tag_stem>.<anim_name>.<EXT>`
         /// instead of nested `<root>/<tag_stem>/animations/...` subdirs.
-        /// Useful for ad-hoc inspection. Mirrors `extract-jms --flat`.
+        /// Useful for ad-hoc inspection. Mirrors `extract-geometry --flat`.
         /// Ignored when `--output` is an exact filename.
         #[arg(long)]
         flat: bool,
@@ -621,14 +614,9 @@ pub(crate) fn dispatch(ctx: &mut CliContext, cmd: Commands, reload_tag: bool) ->
             commands::extract_bitmap::run(ctx, output.as_deref(), &format)
         }
 
-        Commands::ExtractJms { file, kinds, output, flat } => {
+        Commands::ExtractGeometry { file, kinds, output, flat, force } => {
             ensure_loaded(ctx, &file, reload_tag)?;
-            commands::extract_jms::run(ctx, &kinds, output.as_deref(), flat)
-        }
-
-        Commands::ExtractAss { file, output, flat } => {
-            ensure_loaded(ctx, &file, reload_tag)?;
-            commands::extract_ass::run(ctx, output.as_deref(), flat)
+            commands::extract_geometry::run(ctx, &kinds, output.as_deref(), flat, force)
         }
 
         Commands::ExtractData { file, path, output } => {

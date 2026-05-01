@@ -722,6 +722,298 @@ impl AssFile {
         })
     }
 
+    /// Walk a parsed `render_model` tag and reconstruct an ASS scene
+    /// suitable for re-import via Tool. Counterpart to
+    /// [`crate::JmsFile::from_render_model`] for the same input —
+    /// ASS is the format Bungie's pipeline used for any render_model
+    /// that needs **instance geometry** (modular characters like the
+    /// brute, decorators, level objects).
+    ///
+    /// Empirically across halo3_mcc: every render_model with
+    /// `instance mesh index >= 0` was sourced from a `.ass` file (141
+    /// of them); every `.jms`-sourced render_model has no instance
+    /// geometry. JMS literally has no `INSTANCES` section to carry
+    /// the per-placement transforms, so going round-trip-through-Tool
+    /// for these requires emitting ASS.
+    ///
+    /// OBJECTs emitted:
+    /// - one MESH per `(region, permutation, mesh_index_off)` cell
+    ///   — same content-grouping the JMS path uses, but each cell is
+    ///   its own OBJECT here (vs JMS where everything lives in a
+    ///   global vertex/triangle pool keyed by material).
+    /// - one MESH for the instance mesh (`meshes[instance mesh index]`)
+    ///   when `instance mesh index >= 0` — geometry is the union of
+    ///   all subparts, vertices in mesh-local space.
+    /// - one SPHERE per `marker_groups[].markers[]` entry. SPHERE
+    ///   class with `# <group>` instance name parented to the marker's
+    ///   `node_index` bone. Mirrors the H3 source-tree convention.
+    ///
+    /// INSTANCEs emitted:
+    /// - INSTANCE 0 is "Scene Root" (object_index = -1).
+    /// - one frame INSTANCE per render_model node (bones), parented
+    ///   through the node hierarchy. These carry no mesh — they're
+    ///   the armature scaffolding Tool uses to round-trip the
+    ///   skeleton on re-compile.
+    /// - one INSTANCE per region-permutation MESH parented to its
+    ///   rigid-fallback bone (or Scene Root if none).
+    /// - one INSTANCE per `instance placements[]` entry — each
+    ///   placement spawns the instance-mesh OBJECT at the placement's
+    ///   `(forward, left, up, position) × scale` matrix, parented to
+    ///   `node_index`. **This is the round-trip-critical bit Tool
+    ///   re-extracts back into `instance placements[]` on recompile.**
+    ///
+    /// Materials carry `(slot) <perm> <region>` labels (same convention
+    /// as the JMS path / H3 Blender exporter); the slot is a 1-based
+    /// counter. The instance-mesh material gets `(slot) <placement_name>`
+    /// per-placement so each piece is independently identifiable in
+    /// the artist scene.
+    pub fn from_render_model(tag: &TagFile) -> Result<Self, AssError> {
+        let root = tag.root();
+
+        let mut materials: Vec<AssMaterial> = Vec::new();
+        let mut objects: Vec<AssObject> = Vec::new();
+        let mut instances: Vec<AssInstance> = Vec::new();
+
+        // INSTANCE 0: Scene Root.
+        instances.push(AssInstance {
+            object_index: -1,
+            name: "Scene Root".to_owned(),
+            unique_id: 0,
+            parent_id: -1,
+            inheritance_flag: 0,
+            ..Default::default()
+        });
+
+        // Bones: emit one frame INSTANCE per render_model node, with
+        // parent_id chained through the node hierarchy. Indices into
+        // `instances` for each node are recorded in `node_to_instance`
+        // so later mesh placements (regions/permutations + instance
+        // placements + markers) can parent themselves to the right bone.
+        let nodes = read_rm_nodes_local(&root)?;
+        let mut node_to_instance: Vec<i32> = vec![-1; nodes.len()];
+        for (i, n) in nodes.iter().enumerate() {
+            // Parent INSTANCE: Scene Root (0) for root nodes; otherwise
+            // the bone's parent's INSTANCE. The render_model nodes block
+            // stores parent-before-child, so node_to_instance[parent]
+            // is always populated when we get here.
+            let parent_inst = if n.parent < 0 {
+                0
+            } else {
+                node_to_instance.get(n.parent as usize).copied().unwrap_or(0)
+            };
+            let inst_idx = instances.len() as i32;
+            instances.push(AssInstance {
+                object_index: -1,
+                name: n.name.clone(),
+                unique_id: inst_idx,
+                parent_id: parent_inst,
+                inheritance_flag: 0,
+                local_rotation: n.rotation,
+                local_translation: n.translation * SCALE,
+                local_scale: 1.0,
+                pivot_rotation: RealQuaternion::IDENTITY,
+                pivot_translation: RealPoint3d::ZERO,
+                pivot_scale: 1.0,
+                bone_groups: Vec::new(),
+            });
+            node_to_instance[i] = inst_idx;
+        }
+
+        // Cache geometry blocks once.
+        let bounds = crate::geometry::read_compression_bounds(&root);
+        let meshes = root.field_path("render geometry/meshes").and_then(|f| f.as_block())
+            .ok_or(AssError::MissingField("render geometry/meshes"))?;
+        let pmt = root.field_path("render geometry/per mesh temporary").and_then(|f| f.as_block())
+            .ok_or(AssError::MissingField("render geometry/per mesh temporary"))?;
+        let mats_block = root.field_path("materials").and_then(|f| f.as_block())
+            .ok_or(AssError::MissingField("materials"))?;
+        let regions_block = root.field_path("regions").and_then(|f| f.as_block())
+            .ok_or(AssError::MissingField("regions"))?;
+
+        // Walk regions × permutations and emit one MESH OBJECT per
+        // mesh referenced by a permutation, plus one INSTANCE per
+        // (region, permutation) cell parented to the rigid-fallback
+        // bone where applicable.
+        for ri in 0..regions_block.len() {
+            let region = regions_block.element(ri).unwrap();
+            let region_name = region.read_string_id("name").unwrap_or_default();
+            let perms = match region.field("permutations").and_then(|f| f.as_block()) {
+                Some(b) => b,
+                None => continue,
+            };
+            for pi in 0..perms.len() {
+                let perm = perms.element(pi).unwrap();
+                let perm_name = perm.read_string_id("name").unwrap_or_default();
+                let mesh_idx = perm.read_int_any("mesh index").unwrap_or(-1);
+                let mesh_count = perm.read_int_any("mesh count").unwrap_or(0);
+                if mesh_idx < 0 || mesh_count <= 0 { continue; }
+
+                for mi_off in 0..mesh_count as usize {
+                    let mi = mesh_idx as usize + mi_off;
+                    if mi >= meshes.len() || mi >= pmt.len() { continue; }
+                    let mesh = meshes.element(mi).unwrap();
+                    let mesh_pmt = pmt.element(mi).unwrap();
+                    let cell_label = format!("{} {}", perm_name, region_name);
+                    let object = build_render_model_object(
+                        &mesh, &mesh_pmt, &mats_block, &bounds, &mut materials, &cell_label,
+                    )?;
+                    if object.vertices_len() == 0 { continue; }
+                    let object_index = objects.len() as i32;
+                    objects.push(object);
+
+                    // Rigid-fallback parenting: if the mesh has a
+                    // `rigid node index >= 0`, parent the INSTANCE
+                    // there; otherwise hang it off Scene Root.
+                    let rigid_node = mesh.read_int_any("rigid node index")
+                        .map(|v| v as i32).filter(|&v| v >= 0);
+                    let parent_inst = rigid_node
+                        .and_then(|n| node_to_instance.get(n as usize).copied())
+                        .filter(|&v| v >= 0)
+                        .unwrap_or(0);
+                    instances.push(AssInstance {
+                        object_index,
+                        name: format!("{}:{}", region_name, perm_name),
+                        unique_id: instances.len() as i32,
+                        parent_id: parent_inst,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        // Instance placements — the round-trip-critical bit.
+        // `instance mesh index` points at one mesh whose subparts hold
+        // the modular geometry; each `instance placements[i]` is paired
+        // with `subparts[i]` and spawns the whole instance mesh at its
+        // placement matrix, parented to `node_index`.
+        let instance_mesh_index = root.read_int_any("instance mesh index").unwrap_or(-1);
+        if instance_mesh_index >= 0 {
+            let imi = instance_mesh_index as usize;
+            if imi < meshes.len() && imi < pmt.len() {
+                let placements = root.field("instance placements").and_then(|f| f.as_block());
+                if let Some(placements) = placements {
+                    if !placements.is_empty() {
+                        // One MESH OBJECT for the whole instance mesh,
+                        // covering all subparts. Per-placement subpart
+                        // selection lives on the INSTANCE side (we can't
+                        // express subpart filtering in ASS directly —
+                        // Tool's compiler will re-derive subparts on
+                        // recompile by walking placements).
+                        let mesh = meshes.element(imi).unwrap();
+                        let mesh_pmt = pmt.element(imi).unwrap();
+                        let object = build_render_model_object(
+                            &mesh, &mesh_pmt, &mats_block, &bounds, &mut materials,
+                            "instance_mesh",
+                        )?;
+                        let imi_object_index = if object.vertices_len() > 0 {
+                            let idx = objects.len() as i32;
+                            objects.push(object);
+                            Some(idx)
+                        } else {
+                            None
+                        };
+
+                        if let Some(object_index) = imi_object_index {
+                            for ii in 0..placements.len() {
+                                let placement = placements.element(ii).unwrap();
+                                let name = placement.read_string_id("name")
+                                    .unwrap_or_else(|| format!("instance_{ii}"));
+                                let node_idx = placement.read_int_any("node_index")
+                                    .map(|v| v as i32).unwrap_or(-1);
+                                let scale = placement.read_real("scale").unwrap_or(1.0);
+                                let f = placement.read_vec3("forward");
+                                let l = placement.read_vec3("left");
+                                let u = placement.read_vec3("up");
+                                let p = placement.read_point3d("position");
+                                let rot = RealQuaternion::from_basis_columns(f, l, u);
+                                let parent_inst = if node_idx >= 0 {
+                                    node_to_instance.get(node_idx as usize).copied()
+                                        .filter(|&v| v >= 0).unwrap_or(0)
+                                } else {
+                                    0
+                                };
+                                instances.push(AssInstance {
+                                    object_index,
+                                    name,
+                                    unique_id: instances.len() as i32,
+                                    parent_id: parent_inst,
+                                    inheritance_flag: 0,
+                                    local_rotation: rot,
+                                    local_translation: p * SCALE,
+                                    local_scale: scale,
+                                    pivot_rotation: RealQuaternion::IDENTITY,
+                                    pivot_translation: RealPoint3d::ZERO,
+                                    pivot_scale: 1.0,
+                                    bone_groups: Vec::new(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Markers — render_model markers live in `marker groups[].markers[]`.
+        // Emit each as a SPHERE primitive parented to its bone, with
+        // the `#<group>` source-tree name convention.
+        if let Some(groups) = root.field("marker groups").and_then(|f| f.as_block()) {
+            for gi in 0..groups.len() {
+                let group = groups.element(gi).unwrap();
+                let group_name = group.read_string_id("name").unwrap_or_default();
+                let markers = match group.field("markers").and_then(|f| f.as_block()) {
+                    Some(b) => b, None => continue,
+                };
+                for mi in 0..markers.len() {
+                    let m = markers.element(mi).unwrap();
+                    let node_idx = m.read_int_any("node index")
+                        .map(|v| v as i32).unwrap_or(-1);
+                    let translation = m.read_point3d("translation");
+                    let rotation = m.read_quat("rotation");
+                    let radius = m.read_real("scale").unwrap_or(0.01);
+                    let object_index = objects.len() as i32;
+                    objects.push(AssObject {
+                        xref_filepath: String::new(),
+                        xref_objectname: String::new(),
+                        payload: AssObjectPayload::Sphere {
+                            material: -1,
+                            radius: radius * SCALE,
+                        },
+                    });
+                    let parent_inst = if node_idx >= 0 {
+                        node_to_instance.get(node_idx as usize).copied()
+                            .filter(|&v| v >= 0).unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    instances.push(AssInstance {
+                        object_index,
+                        name: format!("#{}", group_name),
+                        unique_id: instances.len() as i32,
+                        parent_id: parent_inst,
+                        inheritance_flag: 0,
+                        local_rotation: rotation,
+                        local_translation: translation * SCALE,
+                        local_scale: 1.0,
+                        pivot_rotation: RealQuaternion::IDENTITY,
+                        pivot_translation: RealPoint3d::ZERO,
+                        pivot_scale: 1.0,
+                        bone_groups: Vec::new(),
+                    });
+                }
+            }
+        }
+
+        Ok(Self {
+            header_tool: "MAX".to_owned(),
+            header_tool_version: "8.0".to_owned(),
+            header_user: "blam-tags".to_owned(),
+            header_machine: String::new(),
+            materials,
+            objects,
+            instances,
+        })
+    }
+
     /// Write the ASS as version 7 (H3) text format.
     pub fn write<W: Write>(&self, w: &mut W) -> Result<(), AssError> {
         writeln!(w, ";### HEADER ###")?;
@@ -1351,4 +1643,163 @@ fn write_floats<W: Write>(w: &mut W, values: &[f32]) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// One render_model node in the parent-relative form the tag stores.
+/// Used by [`AssFile::from_render_model`] to emit one bone INSTANCE
+/// per node, parented through the node hierarchy. Same shape as
+/// [`crate::JmsNode`] but kept private here so the ass module
+/// doesn't have to depend on the jms module.
+#[derive(Debug, Clone)]
+struct RmNode {
+    name: String,
+    parent: i32,
+    rotation: RealQuaternion,
+    translation: RealPoint3d,
+}
+
+fn read_rm_nodes_local(root: &TagStruct<'_>) -> Result<Vec<RmNode>, AssError> {
+    let block = root.field_path("nodes").and_then(|f| f.as_block())
+        .ok_or(AssError::MissingField("nodes"))?;
+    let mut out = Vec::with_capacity(block.len());
+    for i in 0..block.len() {
+        let n = block.element(i).unwrap();
+        let name = n.read_string_id("name").unwrap_or_default();
+        let parent = n.read_block_index("parent node") as i32;
+        let default = n.field("default").and_then(|f| f.as_struct());
+        let (rotation, translation) = if let Some(d) = default {
+            (d.read_quat("rotation"), d.read_point3d("translation"))
+        } else {
+            (RealQuaternion::IDENTITY, RealPoint3d::ZERO)
+        };
+        out.push(RmNode { name, parent, rotation, translation });
+    }
+    Ok(out)
+}
+
+/// Build one MESH OBJECT for a render_model mesh, walking
+/// `parts × subparts` and converting strips → lists. Mirrors
+/// [`crate::JmsFile::from_render_model`]'s `build_geometry` but
+/// emits ASS vertices/triangles into a single object instead of a
+/// global pool.
+///
+/// `cell_label` becomes the "(slot) <label>" material_name suffix —
+/// for region/permutation cells we pass `"<perm> <region>"`; for the
+/// instance mesh we pass a placement-derived label.
+fn build_render_model_object(
+    mesh: &TagStruct<'_>,
+    mesh_pmt: &TagStruct<'_>,
+    mats_block: &crate::api::TagBlock<'_>,
+    bounds: &CompressionBounds,
+    materials: &mut Vec<AssMaterial>,
+    cell_label: &str,
+) -> Result<AssObject, AssError> {
+    let raw_v = mesh_pmt.field("raw vertices").and_then(|f| f.as_block());
+    let raw_i = mesh_pmt.field("raw indices").and_then(|f| f.as_block());
+    let parts = mesh.field("parts").and_then(|f| f.as_block());
+    let (raw_v, raw_i, parts) = match (raw_v, raw_i, parts) {
+        (Some(v), Some(i), Some(p)) => (v, i, p),
+        _ => return Ok(empty_mesh()),
+    };
+
+    let indices: Vec<u16> = (0..raw_i.len())
+        .filter_map(|k| raw_i.element(k))
+        .map(|e| e.read_int_any("word").unwrap_or(0) as u16)
+        .collect();
+
+    // render_model meshes are TRIANGLE STRIPS (default for H3 MCC),
+    // unlike sbsp which is always lists. The schema enum is
+    // `index buffer type` — value 5 = strip.
+    let is_strip = mesh.field("index buffer type")
+        .and_then(|f| f.value())
+        .map(|v| matches!(v, crate::TagFieldData::CharEnum { name: Some(n), .. } if n == "triangle strip"))
+        .unwrap_or(true);
+
+    let mut vertex_remap: HashMap<u16, u32> = HashMap::new();
+    let mut vertices: Vec<AssVertex> = Vec::new();
+    let mut triangles: Vec<AssTriangle> = Vec::new();
+
+    for pi in 0..parts.len() {
+        let part = parts.element(pi).unwrap();
+        let shader_idx = part.read_int_any("render method index").unwrap_or(0);
+        let shader_name = if shader_idx >= 0 && (shader_idx as usize) < mats_block.len() {
+            let m = mats_block.element(shader_idx as usize).unwrap();
+            let path = m.read_tag_ref_path("render method").unwrap_or_default();
+            Path::new(&path.replace('\\', "/"))
+                .file_stem().and_then(|s| s.to_str()).unwrap_or("default").to_owned()
+        } else {
+            "default".to_owned()
+        };
+
+        // Material lookup / append: same dedup rule as the JMS path —
+        // `(shader_name, cell_label)` cells share a material slot.
+        let material_index = match materials.iter().position(|m|
+            m.name == shader_name && m.lightmap_variant == cell_label
+        ) {
+            Some(idx) => idx as i32,
+            None => {
+                let _slot = materials.len() + 1;
+                materials.push(AssMaterial {
+                    name: shader_name,
+                    lightmap_variant: cell_label.to_owned(),
+                    bm_strings: Vec::new(),
+                });
+                (materials.len() - 1) as i32
+            }
+        };
+
+        // Subparts → index ranges (LOD-grouped). Falls back to the
+        // part's own (start, count) when subparts is missing or the
+        // part has no subpart range.
+        let part_start_i = part.read_int_any("index start").unwrap_or(0);
+        let part_count_i = part.read_int_any("index count").unwrap_or(0);
+        let sub_start = part.read_int_any("subpart start").unwrap_or(0);
+        let sub_count = part.read_int_any("subpart count").unwrap_or(0);
+        let subparts = mesh.field("subparts").and_then(|f| f.as_block());
+
+        let emit_range = |start_i: i64, count_i: i64,
+                           vertices: &mut Vec<AssVertex>,
+                           triangles: &mut Vec<AssTriangle>,
+                           vertex_remap: &mut HashMap<u16, u32>| {
+            if count_i <= 0 { return; }
+            // `index start` is signed-i16 but functionally u16 — wrap.
+            let start = (start_i as i16 as u16) as usize;
+            let count = count_i as usize;
+            if start >= indices.len() { return; }
+            let end = (start + count).min(indices.len());
+            let slice = &indices[start..end];
+            let tris: Vec<(u16, u16, u16)> = if is_strip {
+                crate::geometry::strip_to_list(slice)
+            } else {
+                slice.chunks_exact(3).map(|c| (c[0], c[1], c[2])).collect()
+            };
+            for (a, b, c) in tris {
+                let va = remap_vertex(vertex_remap, vertices, &raw_v, a, bounds);
+                let vb = remap_vertex(vertex_remap, vertices, &raw_v, b, bounds);
+                let vc = remap_vertex(vertex_remap, vertices, &raw_v, c, bounds);
+                triangles.push(AssTriangle { material: material_index, v: [va, vb, vc] });
+            }
+        };
+
+        if let Some(sps) = subparts.as_ref() {
+            if sub_count > 0 {
+                for sub_off in 0..sub_count as usize {
+                    let si = sub_start as usize + sub_off;
+                    if si >= sps.len() { break; }
+                    let sp = sps.element(si).unwrap();
+                    let s = sp.read_int_any("index start").unwrap_or(0);
+                    let c = sp.read_int_any("index count").unwrap_or(0);
+                    emit_range(s, c, &mut vertices, &mut triangles, &mut vertex_remap);
+                }
+                continue;
+            }
+        }
+        emit_range(part_start_i, part_count_i, &mut vertices, &mut triangles, &mut vertex_remap);
+    }
+
+    Ok(AssObject {
+        xref_filepath: String::new(),
+        xref_objectname: String::new(),
+        payload: AssObjectPayload::Mesh { vertices, triangles },
+    })
 }

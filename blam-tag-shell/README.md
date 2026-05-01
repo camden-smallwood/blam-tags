@@ -58,8 +58,7 @@ The example commands below elide `--game` for readability — add it to every in
 | [`data-diff`](#data-diff--compare-two-tag-values) | Diff the **values** of two tag files |
 | [`export`](#export--dump-tag-state-as-replay-commands) | Dump a tag's state as replayable `set` commands |
 | [`extract-bitmap`](#extract-bitmap--bitmap-to-tiff--dds) | Extract a `.bitmap` tag's images as TIFF (default, Tool-importable) or DDS files (one per image) |
-| [`extract-jms`](#extract-jms--model-to-source-tree-jms-files) | Extract a `.model` tag's render / collision / physics children as JMS files in the H3EK source-tree layout |
-| [`extract-ass`](#extract-ass--scenario-to-ass) | Extract a `.scenario` tag's structure BSPs as ASS files (one per BSP, with paired lighting baked in) |
+| [`extract-geometry`](#extract-geometry--tag-to-source-tree-jms--ass-files) | Extract geometry source files. Accepts `.model` (render/coll/phys, render auto JMS-or-ASS), `.scenario` (one ASS per structure BSP, lighting baked in), or `.scenario_structure_bsp` (single ASS). |
 | [`extract-data`](#extract-data--dump-a-tag_data-field) | Write the bytes of a single `tag_data` field to a file |
 | [`extract-import-info`](#extract-import-info--unzip-source-files-from-the-info-stream) | Decompress and write out the source files baked into a tag's `info` stream (zlib-compressed JMS / JMA / TIFF / ASS that the importer consumed) |
 | [`list-animations`](#list-animations--enumerate-jmad-animations) | List the animations in a `model_animation_graph` tag |
@@ -634,94 +633,111 @@ extracted/weapon_atlas/1.tif: 256×256 dxt5 (2D texture, 9 mips)
 
 ---
 
-### `extract-jms` — model to source-tree JMS files
+### `extract-geometry` — tag to source-tree JMS / ASS files
 
 | Argument | Description |
 |-|-|
-| `<FILE>` | Path to a `.model` (hlmt) tag file. Other tag groups are rejected — extraction must route through `.model` so the world-space skeleton is available to coll/phmo. |
-| `[KINDS...]` | Optional positional filters: `render`, `collision`, `physics`, or `all`. Default: all three. |
+| `<FILE>` | Path to a `.model` (hlmt), `.scenario` (scnr), or `.scenario_structure_bsp` (sbsp) tag. Other groups rejected. |
+| `[KINDS...]` | **`.model`-only.** Filters: `render`, `collision`, `physics`, or `all`. Default `all`. Rejected for scenario / sbsp inputs. |
 
 | Long | Description |
 |-|-|
 | `--output <DIR>` | Output root directory (default: current directory). |
-| `--flat` | Emit `<DIR>/<stem>.<kind>.jms` in a single dir instead of the nested `<DIR>/<stem>/<kind>/<stem>.JMS` source-tree layout. |
+| `--flat` | Flatten the layout. `.model` → `<DIR>/<stem>.<kind>.<ext>`. `.scenario` → `<DIR>/<scenario>.<bsp>.ass`. No effect on direct sbsp (single file). |
+| `--force <FORMAT>` | **`.model`-only.** Force render-side output to `jms` or `ass`. Defaults to content-based dispatch. Rejected for scenario / sbsp inputs (those always emit ASS). No effect on collision / physics — both always emit JMS. |
 
-Reconstructs JMS files (Bungie static-geometry text format, version 8213) for the model's referenced render / collision / physics children. Output mirrors the H3EK / Tool.exe source-tree convention so the result is re-importable as artist source.
+Single verb for "extract geometry source files from a tag", dispatched on input group. Replaces both the old `extract-jms` (`.model` → JMS only) and `extract-ass` (`.scenario` → ASS) verbs.
+
+#### Inputs
+
+**`.model` (hlmt)** — render / collision / physics children in the H3EK source-tree layout. **Render side auto-dispatches**: emits ASS when the render_model carries `instance mesh index >= 0` + populated `instance placements[]` (modular characters like the brute, decorators, level objects); JMS otherwise. Empirically across halo3_mcc: 141 / 1869 render_models trigger the ASS path under auto-dispatch.
+
+Why two formats: ASS carries the `INSTANCES` section that round-trips back through Tool to recreate `instance mesh index` + `instance placements[]` on recompile. JMS has no `INSTANCES` section — choosing JMS for an instance-bearing render_model bakes each placement inline as N copies of the geometry, which still imports but loses the per-placement structure. ASS is structurally faithful; JMS is universally supported.
 
 Default layout:
 
 ```
-<DIR>/<stem>/render/<stem>.JMS         ← render geometry + skeleton + markers
-<DIR>/<stem>/collision/<stem>.JMS      ← collision geometry (BSP triangles, world-space)
-<DIR>/<stem>/physics/<stem>.JMS        ← Havok primitives + constraints
+<DIR>/<stem>/render/<stem>.{JMS|ASS}      ← format auto-picked or forced
+<DIR>/<stem>/collision/<stem>.JMS         ← collision BSP triangles, world-space
+<DIR>/<stem>/physics/<stem>.JMS           ← Havok primitives + constraints
 ```
 
-Each JMS is per-purpose (matches what Tool.exe expects in each subdir):
+Per-format contents:
 
-- **render**: NODES + MATERIALS + MARKERS + VERTICES + TRIANGLES (no collision/physics sections)
-- **collision**: NODES + MATERIALS + VERTICES + TRIANGLES (collision geometry only, world-space via skeleton)
-- **physics**: NODES + collision primitives (CAPSULES / BOXES / CONVEX / RAGDOLLS / HINGES — no triangle mesh)
+- **render JMS**: NODES + MATERIALS + MARKERS + VERTICES + TRIANGLES. Walks `regions × permutations × meshes × parts`; emits one material per `(shader, perm, region)` cell. When `instance placements[]` is populated and JMS is forced, each placement's slice of the instance mesh is baked inline as additional triangles weighted to the placement's bone (lossy round-trip vs ASS).
+- **render ASS**: HEADER + MATERIALS + OBJECTS + INSTANCES (version 7). One MESH OBJECT per region/permutation cell, one MESH for the instance mesh, one SPHERE per marker, one frame INSTANCE per render_model node (bones), one INSTANCE per region/permutation MESH, **one INSTANCE per placement** (the round-trip-critical bit), one INSTANCE per marker.
+- **collision JMS**: NODES + MATERIALS + VERTICES + TRIANGLES (world-space via skeleton).
+- **physics JMS**: NODES + CAPSULES / BOXES / CONVEX / RAGDOLLS / HINGES (no triangle mesh).
 
-The skeleton is built once from the model's render_model and shared across all three. Coll and phmo place their data in world space using bone-name-keyed lookups against that skeleton — see `JmsFile::from_collision_model_with_skeleton` / `from_physics_model_with_skeleton` in the library for direct callers.
+The skeleton is built once from the model's render_model and shared across all three children. Coll and phmo place their data in world space via bone-name lookups against that skeleton.
 
-Missing references in the .model are silently skipped with a status note (e.g. a model with no physics_model emits only render + collision).
+Missing references in the .model are silently skipped with a status note.
 
 ```sh
-# Default — all three kinds, source-tree layout
-$ blam-tag-shell extract-jms masterchief.model --output extracted/
-extracted/masterchief/render/masterchief.JMS: [render] 51 nodes, 20 mats, 37 markers, 18702 verts, 6234 tris
-extracted/masterchief/collision/masterchief.JMS: [collision] 51 nodes, 4 mats, 660 verts, 220 tris
-extracted/masterchief/physics/masterchief.JMS: [physics] 51 nodes, 1 mats, 9 capsules, 1 convex, 5 ragdolls, 4 hinges
+# Auto-dispatch — brute has instance geometry → ASS render, JMS coll/phys
+$ blam-tag-shell extract-geometry brute.model --output extracted/
+extracted/brute/render/brute.ASS: [render: ASS]  37 mats, 96 objects, 184 instances
+extracted/brute/collision/brute.JMS: [collision] 50 nodes, 7 mats, 2478 verts, 826 tris
+extracted/brute/physics/brute.JMS: [physics]   50 nodes, 1 mats, 7 capsules, 3 convex, 5 ragdolls, 4 hinges
 
-# Just physics
-$ blam-tag-shell extract-jms masterchief.model physics --output extracted/
+# Auto-dispatch — masterchief has no instances → JMS everywhere
+$ blam-tag-shell extract-geometry masterchief.model --output extracted/
+extracted/masterchief/render/masterchief.JMS: [render: JMS]  51 nodes, 20 mats, 37 markers, 18702 verts, 6234 tris
+…
 
-# Render + collision, flat layout
-$ blam-tag-shell extract-jms masterchief.model render collision --output extracted/ --flat
-extracted/masterchief.render.jms: [render] 51 nodes, …
-extracted/masterchief.collision.jms: [collision] 51 nodes, …
+# Force JMS on the brute (lossy: instance pieces baked as triangles)
+$ blam-tag-shell extract-geometry brute.model --force jms --output extracted/
+extracted/brute/render/brute.JMS: [render: JMS]  50 nodes, 71 mats, 79 markers, 51960 verts, 17320 tris
+
+# Force ASS on a non-instance model (valid but trivial INSTANCES section)
+$ blam-tag-shell extract-geometry masterchief.model --force ass --output extracted/
+
+# Just physics, flat layout
+$ blam-tag-shell extract-geometry brute.model physics --flat --output extracted/
+extracted/brute.physics.jms: [physics] 50 nodes, 1 mats, …
 ```
 
-Render-side pipeline: walks `regions × permutations × meshes × parts`, decompresses bounds-quantized positions/UVs against `compression info[0]`, converts triangle strips to lists with restart-aware parity + degenerate filtering, and emits one JMS material per `(shader, perm, region)` cell. **Plus `instance placements[]`**: when a render_model has `instance mesh index >= 0` (the brute and other modular characters), each `instance placements[i]` is paired with `meshes[N].subparts[i]`, transformed by the placement's `(forward, left, up, position)` basis × `scale`, weighted to the placement's `node_index`, and emitted as additional triangles with a unique `(slot) <placement_name>` material. This mirrors Foundry's `render_model.py` behaviour. TagTool's render_model export silently skips these for non-decorator types, so blam-tags is the only available pipeline that recovers brute gauntlets, helmet variants, jumppack braces, etc., from the runtime tag. Collision-side pipeline: walks each BSP's `surfaces[]` via the edge-ring algorithm, fan-triangulates each ring, and emits world-space vertices through the render_model-derived skeleton. Physics-side pipeline: emits Havok shape primitives (sphere/box/pill/polyhedron) plus ragdoll/hinge constraints in world-space. Validated across the H3 MCC corpus: 4354/4354 reconstructions; 89.7% bbox match against embedded source JMS, 86.8% with ≥99% position coverage at 10cm precision.
+Render-side pipeline (JMS path): walks `regions × permutations × meshes × parts`, decompresses bounds-quantized positions/UVs against `compression info[0]`, converts triangle strips to lists with restart-aware parity + degenerate filtering. **Plus `instance placements[]`**: when a render_model has `instance mesh index >= 0`, each `instance placements[i]` is paired with `meshes[N].subparts[i]`, transformed by the placement's `(forward, left, up, position) × scale` basis, weighted to the placement's `node_index`, and emitted as additional triangles with a unique `(slot) <placement_name>` material. Foundry mirrors this; TagTool drops it for non-decorator types.
+
+Render-side pipeline (ASS path): same regions/permutations walk emits one MESH OBJECT per cell. One frame INSTANCE per render_model node provides the bone armature scaffolding (parent_id chains through the node hierarchy). The instance mesh becomes a single MESH OBJECT and each placement spawns an INSTANCE of it with the placement's basis matrix, parented to the placement's bone — preserving the round-trip back through Tool. Markers emit as SPHERE OBJECTs with `#<group>` instance names parented to their bone.
+
+Collision-side pipeline: walks each BSP's `surfaces[]` via the edge-ring algorithm, fan-triangulates each ring, emits world-space vertices through the render_model skeleton. Physics-side pipeline: emits Havok shape primitives (sphere / box / pill / polyhedron) plus ragdoll / hinge constraints in world-space.
+
+Validated across the H3 MCC corpus: 4354 / 4354 JMS reconstructions; 89.7% bbox match against embedded source JMS, 86.8% with ≥99% position coverage at 10 cm precision.
 
 Notes:
 
+- ASS render-side output is structurally compile-time-equivalent to the runtime tag, not the artist source. The original `.ass` source files have many more named MESH OBJECTs because each artist piece kept its own name; Tool consolidates these into the runtime tag's region/permutation grouping. We can reconstruct the consolidated form, not the artist-level granularity.
 - Material `material_name` follows the `(slot) <perm> <region>` H3 Blender exporter convention. The `(N)` slot value is a deterministic 1-based counter — the original artist counter from `bpy.data.materials` is round-trip metadata only and unrecoverable from the tag.
-- Transparent parts (`part_type=4`) are emitted with both face windings, matching what MCC's importer baked from the artist's `%` two-sided directive. Same behavior as TagTool.
-- Marker `node_index` references the tag's node table (which differs from the artist's depth-first JMS node ordering).
-- For tag-direct extraction (skip the .model wrapper), call the library functions `JmsFile::from_render_model` / `from_collision_model_with_skeleton` / `from_physics_model_with_skeleton` directly.
+- Transparent parts (`part_type=4`) on the JMS path emit both face windings, matching what MCC's importer baked from the artist's `%` two-sided directive. Same as TagTool.
+- For tag-direct extraction (skip the .model wrapper), call the library functions `JmsFile::from_render_model` / `AssFile::from_render_model` / `JmsFile::from_collision_model_with_skeleton` / `from_physics_model_with_skeleton` directly.
 
----
+#### `.scenario` (scnr) input
 
-### `extract-ass` — scenario to ASS
+Walks `scenario.structure_bsps[]` and emits one ASS per entry, pairing each `scenario_structure_bsp` with its `scenario_structure_lighting_info`. Always ASS — JMS has no representation for level/BSP geometry. `[KINDS...]` and `--force` are rejected.
 
-| Argument | Description |
-|-|-|
-| `<FILE>` | Path to a `.scenario` (scnr) tag file. Other tag groups are rejected — extraction routes through the scenario so each BSP can be paired with its `scenario_structure_lighting_info`. |
+Default layout: `<DIR>/<scenario_stem>/structure/<bsp_stem>.ASS` (re-importable as artist source).
 
-| Long | Description |
-|-|-|
-| `--output <DIR>` | Output root directory (default: current directory). |
-| `--flat` | Emit `<DIR>/<scenario_stem>.<bsp_stem>.ass` per BSP in a single dir instead of the nested `<DIR>/<scenario_stem>/structure/<bsp_stem>.ASS` source-tree layout. |
-
-Walks `scenario.structure_bsps[]` and reconstructs one ASS file (Bungie Amalgam, version 7 — H3's static-scene authoring format, the level-geometry counterpart to JMS) per entry, pairing each `scenario_structure_bsp` with its `scenario_structure_lighting_info`.
-
-Default layout (re-importable as artist source):
-```
-<DIR>/<scenario_stem>/structure/<bsp_stem>.ASS
-```
-
-Sections emitted (per BSP):
+Sections emitted per BSP:
 - **HEADER** — version 7 + tool/user/machine placeholders
 - **MATERIALS** — one per `materials[]` entry on the sbsp, with `BM_FLAGS` / `BM_LMRES` (real lightmap-resolution from the material `properties[type=0]`) plus `BM_LIGHTING_BASIC` / `_ATTEN` / `_FRUS` strings layered in for emissive materials from the paired `.stli`. Auto-appended `+portal` / `+weather` / `@collision_only` marker materials so Tool.exe re-extracts the recompile-only categories back into their proper tag blocks.
-- **OBJECTS** — cluster MESHes (one per `clusters[]`), per-IGD-def MESHes (one per `instanced geometries definitions[]`, content-deduped, each in its own per-definition compression bounds), `+portal_N` MESHes (one per cluster portal, fan-triangulated), `+weather_N` MESHes (convex hull recovered from the polyhedron plane set), `@CollideOnly` MESH (merged structure collision BSP via the same edge-ring walker as `extract-jms`), SPHERE primitives for sbsp markers (matching the H3 source-tree `frame construct` convention), GENERIC_LIGHT (SPOT/DIRECT/OMNI/AMBIENT) entries from the `.stli` definitions, and xref-only OBJECTs for `environment_objects[]` palette entries.
+- **OBJECTS** — cluster MESHes (one per `clusters[]`), per-IGD-def MESHes (one per `instanced geometries definitions[]`, content-deduped, each in its own per-definition compression bounds), `+portal_N` MESHes (one per cluster portal, fan-triangulated), `+weather_N` MESHes (convex hull recovered from the polyhedron plane set), `@CollideOnly` MESH (merged structure collision BSP via the same edge-ring walker as the model path), SPHERE primitives for sbsp markers (matching the H3 source-tree `frame construct` convention), GENERIC_LIGHT (SPOT/DIRECT/OMNI/AMBIENT) entries from the `.stli` definitions, and xref-only OBJECTs for `environment_objects[]` palette entries.
 - **INSTANCES** — Scene Root parent (object_index = -1), one identity-transform instance per cluster, one instance per `instanced geometry instances[]` placement (3-vec3 rotation matrix → quaternion, position × 100 cm, uniform scale), one instance per portal / weather polyhedron / marker / collision BSP / environment_object placement, and one instance per stli `generic_light_instances[]` entry (forward+up → quat, position × 100 cm).
 
-Validated across 147 / 147 BSPs across 49 H3 scenarios — every BSP produces a clean ASS file. Source ASS files have a different mesh granularity (artist-named meshes vs our cluster aggregates); that's compile-time information the tag doesn't carry.
+Validated across 147 / 147 BSPs across 49 H3 scenarios — every BSP produces a clean ASS file. Source ASS files have a different mesh granularity (artist-named meshes vs cluster aggregates); that's compile-time information the tag doesn't carry.
 
 ```sh
-$ blam-tag-shell extract-ass levels/multi/construct/construct.scenario --output extracted/
+$ blam-tag-shell extract-geometry levels/multi/construct/construct.scenario --output extracted/
 extracted/construct/structure/construct.ASS: [bsp0] 97 mats, 203 objects (14 lights), 687 instances, 111617 verts, 67625 tris
+```
+
+#### `.scenario_structure_bsp` (sbsp) input
+
+Direct sbsp input emits a single ASS for that BSP. **No paired stli** — lighting is unreachable without scenario context, so `GENERIC_LIGHT` objects and `BM_LIGHTING_*` material metadata are absent. Use `.scenario` input if you need lights. Output: `<DIR>/<sbsp_stem>.ASS` (no nesting, single file). `--flat` is a no-op.
+
+```sh
+$ blam-tag-shell extract-geometry levels/multi/construct/construct.scenario_structure_bsp --output /tmp/
+/tmp/construct.ASS: [sbsp] 97 mats, 189 objects, 673 instances, 111617 verts, 67625 tris (no lighting — pass scenario for lights)
 ```
 
 ---
@@ -769,7 +785,7 @@ Error: field 'definitions/animations' is block (not a `tag_data` field)
 
 The `info` stream's `files[]` block carries one entry per source file Bungie's importer consumed when the tag was built — original on-disk path, modification date, CRC32, byte size, plus the source file's bytes zlib-compressed (`tag_import_file_zipped_data_definition`, capped at 160 MiB / file). This command walks `files[]` and writes each entry's decompressed payload to disk under a sanitized form of its original path (drive letter stripped, backslashes normalized).
 
-Useful for verifying which artist source actually fed a runtime tag, recovering source-of-truth fidelity that runtime-tag extractors can't reach (e.g. comparing `extract-jms` output to the original `.ass` the render_model was built from), or pulling the importer log out of `events[]`.
+Useful for verifying which artist source actually fed a runtime tag, recovering source-of-truth fidelity that runtime-tag extractors can't reach (e.g. comparing `extract-geometry` output to the original `.ass` the render_model was built from), or pulling the importer log out of `events[]`.
 
 What carries an `info` stream in the H3 corpus:
 
@@ -841,18 +857,18 @@ $ blam-tag-shell list-animations objects/.../foo.model_animation_graph
 | Long | Description |
 |-|-|
 | `--output <PATH>` | Source-tree root. Files land at `<root>/<tag_stem>/animations/<anim_name>.<EXT>`. Default root is `.`. See semantics below. |
-| `--flat` | Flatten the layout: emit `<root>/<tag_stem>.<anim_name>.<EXT>` instead of nested subdirs. Mirrors [`extract-jms --flat`](#extract-jms--model-to-source-tree-jms-files). Ignored when `--output` is an exact filename. |
+| `--flat` | Flatten the layout: emit `<root>/<tag_stem>.<anim_name>.<EXT>` instead of nested subdirs. Mirrors [`extract-geometry --flat`](#extract-geometry--model-to-source-tree-jms--ass-files). Ignored when `--output` is an exact filename. |
 | `--format <FMT>` | `jma` (default) or `json`. |
 
 Decodes one or every animation's static + animated codec streams + per-bone flag bitarrays + per-frame movement, composes them against the tag's skeleton, and writes the result.
 
-The output layout matches what [Tool's `model-animations` command](https://c20.reclaimers.net/h3/h3-ek/h3-tool/#model-animations) consumes — `<source-directory>/animations/*.JM*` — so the result drops straight into an H3EK source tree alongside [`extract-jms`](#extract-jms--model-to-source-tree-jms-files)'s `render/` output. Pointing both verbs at the same `--output <root>` produces a Tool-importable tree at `<root>/<tag_stem>/`:
+The output layout matches what [Tool's `model-animations` command](https://c20.reclaimers.net/h3/h3-ek/h3-tool/#model-animations) consumes — `<source-directory>/animations/*.JM*` — so the result drops straight into an H3EK source tree alongside [`extract-geometry`](#extract-geometry--model-to-source-tree-jms--ass-files)'s `render/` output. Pointing both verbs at the same `--output <root>` produces a Tool-importable tree at `<root>/<tag_stem>/`:
 
 ```text
 <root>/<tag_stem>/
-  render/<tag_stem>.JMS         # extract-jms
-  collision/<tag_stem>.JMS      # extract-jms
-  physics/<tag_stem>.JMS        # extract-jms
+  render/<tag_stem>.{JMS|ASS}   # extract-geometry
+  collision/<tag_stem>.JMS      # extract-geometry
+  physics/<tag_stem>.JMS        # extract-geometry
   animations/<anim_name>.<EXT>  # extract-animation, one file per anim
 ```
 
@@ -916,7 +932,7 @@ build/brute/animations/melee.JMT: 38 frames (37+1) × 50 bones [JMT]  movement=D
 ...
 
 # Tool round-trip: extract render + animations into the same source tree, import.
-$ blam-tag-shell extract-jms       brute.model            --output data/
+$ blam-tag-shell extract-geometry  brute.model            --output data/
 $ blam-tag-shell extract-animation brute.model_animation_graph --output data/
 $ tool model-animations brute    # consumes data/brute/render/ + data/brute/animations/
 
