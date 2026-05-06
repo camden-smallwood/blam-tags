@@ -430,16 +430,26 @@ impl TagBlockIndex {
 
 /// Per-pass routing entry — maps a constant-table source into a
 /// destination D3D register. Mirrors `s_render_method_routing_info`
-/// (4 bytes).
+/// (4 bytes). On-disk layout: `[dest:u16, overlay:u8, source:u8]`.
+///
+/// The schema field names are misleading (the file calls byte 2
+/// "source index" and byte 3 "type specific"), but the engine reads
+/// byte 2 as the overlay/animated-parameter index (into
+/// `overlays[]`) and byte 3 as the source slot (into
+/// `real_constants[]`). Verified against `update_constants @
+/// 0x180685300` and `submit_static_ps_parameters @ 0x180685860`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RenderMethodRoutingInfo {
     /// D3D constant index (or sampler index for textures).
+    /// Byte offset 0..1 in the routing entry.
     pub destination_index: u16,
-    /// Index into the corresponding constant table — or, for an extern
-    /// pass entry, the [`RenderMethodExtern`] discriminant.
+    /// Index into `overlays[]` — used by `update_constants` to
+    /// evaluate animated_parameter curves and overlay them onto the
+    /// real_constants slot. Byte offset 2.
+    pub overlay_index: u8,
+    /// Index into `real_constants[]` — the source vec4 slot from the
+    /// cache-builder bake. Byte offset 3.
     pub source_index: u8,
-    /// Bitmap flags or shader component mask, depending on usage.
-    pub bitmap_flags: u8,
 }
 
 // =============================================================================
@@ -1037,10 +1047,11 @@ impl RenderMethodTemplatePass {
 
 impl RenderMethodRoutingInfo {
     fn from_struct(s: &TagStruct<'_>) -> Self {
+        // Schema field names lie — see struct doc.
         Self {
             destination_index: s.read_int_any("destination index").unwrap_or(0) as u16,
-            source_index:      s.read_int_any("source index").unwrap_or(0) as u8,
-            bitmap_flags:      s.read_int_any("type specific").unwrap_or(0) as u8,
+            overlay_index:     s.read_int_any("source index").unwrap_or(0) as u8,
+            source_index:      s.read_int_any("type specific").unwrap_or(0) as u8,
         }
     }
 }
@@ -1186,7 +1197,12 @@ impl RenderMethodAnimatedParameter {
                 .and_then(RenderMethodAnimatedParameterType::from_index),
             input_name: s.read_string_id("input name").unwrap_or_default(),
             range_name: s.read_string_id("range name").unwrap_or_default(),
-            time_period_in_seconds: s.read_real("time period:seconds").unwrap_or(0.0),
+            // Schema field name is `"time period"` (no suffix). The
+            // ":seconds" hint in some Halo schemas indicates the unit
+            // but isn't part of the field's actual identifier.
+            time_period_in_seconds: s.read_real("time period")
+                .or_else(|| s.read_real("time period:seconds"))
+                .unwrap_or(0.0),
             function: s.field("function")
                 .and_then(|f| f.as_struct())
                 .and_then(|inner| inner.field("data"))
