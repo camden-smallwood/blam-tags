@@ -40,15 +40,31 @@
 //!
 //! ## Coverage status
 //!
-//! All 11 function types parse + evaluate. Direct-formula types (Linear,
-//! Spline, Spline2, Exponent) port from the engine's pseudocode-
-//! commented `c_*_function_compact::evaluate` methods (Ares
+//! All 11 function types parse + evaluate scalar. Direct-formula types
+//! (Linear, Spline, Spline2, Exponent) port from the engine's
+//! pseudocode-commented `c_*_function_compact::evaluate` methods (Ares
 //! `function_definitions.cpp` 800-1180). Compound types (LinearKey,
 //! MultiPart) walk their compact-data graphs. Cyclic helpers
 //! (`periodic_function_evaluate`, `transition_function_evaluate`)
 //! reproduce the engine's analytic curve definitions directly rather
 //! than via the engine's pre-baked 1024-byte lookup tables — same
 //! curves, no precision loss.
+//!
+//! ## Known gaps
+//!
+//! - **Color-graph evaluation** (gradient interpolation when
+//!   `color_graph_type != Scalar`) — `evaluate_color` is still a stub.
+//!   Static-color params work via the render_method walker reading
+//!   `header.colors[0]` directly (already wired); animated color
+//!   gradients aren't.
+//! - **Periodic random/noise types** (`noise`, `jitter`, `wander`,
+//!   `spark`) need a per-instance PRNG seed. Currently stub to 0.5.
+//!   Riverworld water doesn't use these; particle effects do.
+//! - **Exclusion** (`EXCLUSION` flag bit + exclusion_min/max range
+//!   remap) isn't applied. Engine `c_function_definition::exclude_value`
+//!   body isn't decompiled; most shipped tags don't set the flag.
+//! - **v2 functions** (`function_definitions_v2.{h,cpp}`) — Reach-era
+//!   successor, irrelevant for H3 MCC tags.
 
 use crate::math::RealRgbColor;
 
