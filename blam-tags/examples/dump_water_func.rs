@@ -16,11 +16,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if p.animated_parameters.is_empty() { continue; }
         for (i, a) in p.animated_parameters.iter().enumerate() {
             let ft = a.function.as_ref().map(|f| f.function_type());
-            let val = a.function.as_ref().map(|f| f.evaluate(0.0, 0.0));
+            let samples: Vec<f32> = if let Some(f) = a.function.as_ref() {
+                [0.0, 0.25, 0.5, 0.75, 1.0].iter()
+                    .map(|&x| f.evaluate(x, 0.0)).collect()
+            } else { vec![] };
             println!(
-                "  '{}' anim[{i}] inner_type={:?} func_type={:?} eval(0,0)={:?} time_period_s={}",
-                p.parameter_name, a.parameter_type, ft, val, a.time_period_in_seconds,
+                "  '{}' anim[{i}] inner_type={:?} func_type={:?} time_period_s={}",
+                p.parameter_name, a.parameter_type, ft, a.time_period_in_seconds,
             );
+            if !samples.is_empty() {
+                println!("    samples @ x=[0, .25, .5, .75, 1]: {samples:?}");
+            }
         }
     }
     let mut types: Vec<_> = rm.parameters.iter()

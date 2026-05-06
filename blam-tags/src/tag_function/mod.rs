@@ -452,6 +452,164 @@ impl PeriodicCompact {
     }
 }
 
+/// `c_linear_key_function` — 80 bytes piecewise linear over 4 control
+/// points. Layout per `function_definitions.cpp:454-457`:
+/// ```text
+/// real_point2d m_graph_points[4];   // 0x00 (32 bytes — x,y pairs)
+/// float        m_times_vector[4];   // 0x20 (16 bytes — postprocess cache)
+/// float        m_increment_vector[4]; // 0x30 (16 bytes — 1/(x[i+1]-x[i]))
+/// float        m_y_delta_vector[4];   // 0x40 (16 bytes — y[i+1]-y[i])
+/// ```
+/// Body of `c_linear_key_function::evaluate` isn't decompiled, but the
+/// stored vectors are clear: the engine pre-computes per-segment slope
+/// reciprocals + y deltas at postprocess time so runtime evaluate is
+/// `y[i] + (input - x[i]) * increment[i] * y_delta[i]` with a segment
+/// search. We replicate that.
+#[derive(Debug, Clone, Copy)]
+pub struct LinearKeyCompact {
+    pub graph_points: [(f32, f32); 4],
+    pub times_vector: [f32; 4],
+    pub increment_vector: [f32; 4],
+    pub y_delta_vector: [f32; 4],
+}
+
+impl LinearKeyCompact {
+    fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() < 80 { return None; }
+        let mut graph_points = [(0.0f32, 0.0f32); 4];
+        for i in 0..4 {
+            let off = i * 8;
+            graph_points[i] = (
+                f32::from_le_bytes(data[off..off + 4].try_into().unwrap()),
+                f32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap()),
+            );
+        }
+        let mut times_vector = [0.0f32; 4];
+        let mut increment_vector = [0.0f32; 4];
+        let mut y_delta_vector = [0.0f32; 4];
+        for i in 0..4 {
+            times_vector[i]     = f32::from_le_bytes(data[32 + i*4..32 + i*4 + 4].try_into().unwrap());
+            increment_vector[i] = f32::from_le_bytes(data[48 + i*4..48 + i*4 + 4].try_into().unwrap());
+            y_delta_vector[i]   = f32::from_le_bytes(data[64 + i*4..64 + i*4 + 4].try_into().unwrap());
+        }
+        Some(Self { graph_points, times_vector, increment_vector, y_delta_vector })
+    }
+    fn evaluate(&self, input: f32) -> f32 {
+        // Clamp before first point / after last point.
+        if input <= self.graph_points[0].0 { return self.graph_points[0].1; }
+        if input >= self.graph_points[3].0 { return self.graph_points[3].1; }
+        // Find the segment [i, i+1] containing input.
+        for i in 0..3 {
+            let (x_a, y_a) = self.graph_points[i];
+            let (x_b, _)   = self.graph_points[i + 1];
+            if input <= x_b {
+                // Use precomputed reciprocal slope when valid; fall
+                // back to direct compute. The engine's
+                // increment_vector[i] = 1.0 / (x_b - x_a).
+                let dx = x_b - x_a;
+                let inv = if dx > 0.0 { 1.0 / dx } else { 0.0 };
+                let t = (input - x_a) * inv;
+                return y_a + t * self.y_delta_vector[i];
+            }
+        }
+        self.graph_points[3].1
+    }
+}
+
+/// `c_multi_part_function_compact` — variable-size. Layout:
+/// ```text
+/// long              m_function_count;   // 0x0
+/// s_function_part   m_function_part[m_function_count];
+/// ```
+/// Each `s_function_part` is `(header: 8 bytes, function: variable)`.
+/// `header.type` is a `e_function_type` (only Linear=4, Spline=7,
+/// Spline2=10 are valid for parts) and `header.ending_x` is where this
+/// segment ends. Walk parts, find the one whose `ending_x ≥ input`
+/// (or the last), evaluate its compact function at input.
+///
+/// Per `function_definitions.cpp:1216-1228` (`get_size_of_part`):
+/// linear part = 16B (8 hdr + 8 body), spline = 24B, spline2 = 36B.
+#[derive(Debug, Clone)]
+pub struct MultiPartCompact {
+    pub parts: Vec<MultiPartSegment>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MultiPartSegment {
+    pub ending_x: f32,
+    pub function: MultiPartSubFunction,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum MultiPartSubFunction {
+    Linear(LinearCompact),
+    Spline(SplineCompact),
+    Spline2(Spline2Compact),
+}
+
+impl MultiPartCompact {
+    fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() < 4 { return None; }
+        let function_count = i32::from_le_bytes(data[0..4].try_into().unwrap());
+        if function_count <= 0 || function_count > 16 {
+            // sanity bound — engine has 4-segment max but we allow
+            // some headroom for malformed/forward-compat tags.
+            return None;
+        }
+        let mut parts = Vec::with_capacity(function_count as usize);
+        let mut off = 4usize;
+        for _ in 0..function_count {
+            if off + 8 > data.len() { return None; }
+            let part_type = data[off];
+            // bytes [off+1..off+4] unused
+            let ending_x = f32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap());
+            let body_off = off + 8;
+            let function = match part_type {
+                4 /* Linear */ => {
+                    let c = LinearCompact::parse(data.get(body_off..)?)?;
+                    off = body_off + 8;
+                    MultiPartSubFunction::Linear(c)
+                }
+                7 /* Spline */ => {
+                    let c = SplineCompact::parse(data.get(body_off..)?)?;
+                    off = body_off + 16;
+                    MultiPartSubFunction::Spline(c)
+                }
+                10 /* Spline2 */ => {
+                    let c = Spline2Compact::parse(data.get(body_off..)?)?;
+                    off = body_off + 28;
+                    MultiPartSubFunction::Spline2(c)
+                }
+                _ => return None,
+            };
+            parts.push(MultiPartSegment { ending_x, function });
+        }
+        Some(Self { parts })
+    }
+    fn evaluate(&self, input: f32) -> f32 {
+        if self.parts.is_empty() { return 0.0; }
+        // Find the first part whose ending_x ≥ input. The engine's
+        // pseudocode iterates `function_part` and breaks when found.
+        for part in &self.parts {
+            if input <= part.ending_x {
+                return match &part.function {
+                    MultiPartSubFunction::Linear(c)  => c.evaluate(input),
+                    MultiPartSubFunction::Spline(c)  => c.evaluate(input),
+                    MultiPartSubFunction::Spline2(c) => c.evaluate(input),
+                };
+            }
+        }
+        // Past the last ending_x — evaluate the last part at its own
+        // domain. This matches the engine fallback when `found = false`.
+        let last = &self.parts[self.parts.len() - 1];
+        match &last.function {
+            MultiPartSubFunction::Linear(c)  => c.evaluate(input),
+            MultiPartSubFunction::Spline(c)  => c.evaluate(input),
+            MultiPartSubFunction::Spline2(c) => c.evaluate(input),
+        }
+    }
+}
+
 /// `c_exponent_function_compact` — 12 bytes. Per
 /// `function_definitions.cpp:976-1003`:
 /// ```text
@@ -501,8 +659,18 @@ pub enum TagFunction {
     Transition { header: TagFunctionHeader, compact: TransitionCompact },
     Periodic { header: TagFunctionHeader, compact: PeriodicCompact },
     Linear   { header: TagFunctionHeader, compact: LinearCompact },
+    LinearKey { header: TagFunctionHeader, compact: LinearKeyCompact },
+    /// `MultiLinearKey` — multi-graph LinearKey. The runtime treats it
+    /// the same shape as LinearKey (one graph per
+    /// `color_graph_type`-derived count); for scalar use we read the
+    /// first graph identically.
+    MultiLinearKey { header: TagFunctionHeader, compact: LinearKeyCompact },
     Spline   { header: TagFunctionHeader, compact: SplineCompact },
     Spline2  { header: TagFunctionHeader, compact: Spline2Compact },
+    /// `MultiSpline` (a.k.a. `_function_type_multi_part`, enum value 8).
+    /// Variable-size sequence of (Linear | Spline | Spline2) parts each
+    /// covering an `[ending_x[i-1], ending_x[i]]` sub-domain.
+    MultiSpline { header: TagFunctionHeader, compact: MultiPartCompact },
     Exponent { header: TagFunctionHeader, compact: ExponentCompact },
     /// Function type recognized but not yet implemented. `evaluate`
     /// returns 0.0; `as_constant()` returns None.
@@ -566,9 +734,17 @@ impl TagFunction {
                 Some(c) => Self::Exponent { header, compact: c },
                 None => Self::Unsupported { header, raw: data.to_vec() },
             },
-            _ => Self::Unsupported {
-                header,
-                raw: data.to_vec(),
+            FunctionType::LinearKey => match LinearKeyCompact::parse(compact) {
+                Some(c) => Self::LinearKey { header, compact: c },
+                None => Self::Unsupported { header, raw: data.to_vec() },
+            },
+            FunctionType::MultiLinearKey => match LinearKeyCompact::parse(compact) {
+                Some(c) => Self::MultiLinearKey { header, compact: c },
+                None => Self::Unsupported { header, raw: data.to_vec() },
+            },
+            FunctionType::MultiSpline => match MultiPartCompact::parse(compact) {
+                Some(c) => Self::MultiSpline { header, compact: c },
+                None => Self::Unsupported { header, raw: data.to_vec() },
             },
         })
     }
@@ -580,8 +756,11 @@ impl TagFunction {
             | Self::Transition { header, .. }
             | Self::Periodic { header, .. }
             | Self::Linear { header, .. }
+            | Self::LinearKey { header, .. }
+            | Self::MultiLinearKey { header, .. }
             | Self::Spline { header, .. }
             | Self::Spline2 { header, .. }
+            | Self::MultiSpline { header, .. }
             | Self::Exponent { header, .. }
             | Self::Unsupported { header, .. } => header,
         }
@@ -621,12 +800,15 @@ impl TagFunction {
             // clamp_range = (0, 1). For Linear / Spline / Spline2,
             // the engine applies clamp_range as the [out_min, out_max]
             // interpretation per `map_to_output_range_legacy`.
-            Self::Transition { compact, .. } => compact.evaluate(input),
-            Self::Periodic   { compact, .. } => compact.evaluate(input),
-            Self::Linear     { compact, .. } => compact.evaluate(input),
-            Self::Spline     { compact, .. } => compact.evaluate(input),
-            Self::Spline2    { compact, .. } => compact.evaluate(input),
-            Self::Exponent   { compact, .. } => compact.evaluate(input),
+            Self::Transition     { compact, .. } => compact.evaluate(input),
+            Self::Periodic       { compact, .. } => compact.evaluate(input),
+            Self::Linear         { compact, .. } => compact.evaluate(input),
+            Self::LinearKey      { compact, .. } => compact.evaluate(input),
+            Self::MultiLinearKey { compact, .. } => compact.evaluate(input),
+            Self::Spline         { compact, .. } => compact.evaluate(input),
+            Self::Spline2        { compact, .. } => compact.evaluate(input),
+            Self::MultiSpline    { compact, .. } => compact.evaluate(input),
+            Self::Exponent       { compact, .. } => compact.evaluate(input),
             Self::Unsupported { .. } => 0.0,
         }
     }
@@ -979,6 +1161,70 @@ mod tests {
         // zeros at t=0 and t=1
         assert!((f.evaluate(0.0, 0.0) - 0.0).abs() < 1e-5);
         assert!((f.evaluate(1.0, 0.0) - 0.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn linear_key_4_points() {
+        // Type 5 (LinearKey). 4 control points: (0, 0), (0.25, 1.0),
+        // (0.75, 1.0), (1.0, 0.0) — a trapezoid pulse.
+        let mut blob = header_with(5, 0.0, 1.0).to_vec();
+        // graph_points
+        for &(x, y) in &[(0.0_f32, 0.0_f32), (0.25, 1.0), (0.75, 1.0), (1.0, 0.0)] {
+            blob.extend_from_slice(&x.to_le_bytes());
+            blob.extend_from_slice(&y.to_le_bytes());
+        }
+        // times_vector (unused by our evaluator — compute fresh)
+        for _ in 0..4 { blob.extend_from_slice(&0.0_f32.to_le_bytes()); }
+        // increment_vector — engine pre-computes 1/(x[i+1]-x[i])
+        // — our evaluator falls back to live compute, so values here
+        // don't matter.
+        for _ in 0..4 { blob.extend_from_slice(&0.0_f32.to_le_bytes()); }
+        // y_delta_vector — y[i+1] - y[i] for i=0..2; sentinel at [3].
+        for &v in &[1.0_f32, 0.0, -1.0, 0.0] {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        let f = TagFunction::parse(&blob).unwrap();
+        assert_eq!(f.function_type(), FunctionType::LinearKey);
+        // Ramp up: at t=0.125 → halfway between (0,0) and (0.25,1) = 0.5
+        assert!((f.evaluate(0.125, 0.0) - 0.5).abs() < 1e-5);
+        // Plateau: at t=0.5 → between (0.25,1) and (0.75,1) = 1
+        assert!((f.evaluate(0.5, 0.0) - 1.0).abs() < 1e-5);
+        // Ramp down: at t=0.875 → halfway from 1 to 0 = 0.5
+        assert!((f.evaluate(0.875, 0.0) - 0.5).abs() < 1e-5);
+        // Clamp before / after
+        assert_eq!(f.evaluate(-1.0, 0.0), 0.0);
+        assert_eq!(f.evaluate(2.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn multi_part_linear_segments() {
+        // Type 8 (MultiSpline / multi_part). 2 linear parts:
+        // Part 1: x ∈ [0, 0.5], f(x) = 2x.        slope=2, offset=0
+        // Part 2: x ∈ [0.5, 1.0], f(x) = -2x+2.   slope=-2, offset=2
+        // Triangle peaking at (0.5, 1).
+        let mut blob = header_with(8, 0.0, 1.0).to_vec();
+        // function_count = 2
+        blob.extend_from_slice(&2i32.to_le_bytes());
+        // Part 1: header (type=4 linear, ending_x=0.5) + linear body
+        blob.push(4); blob.extend_from_slice(&[0, 0, 0]);
+        blob.extend_from_slice(&0.5_f32.to_le_bytes()); // ending_x
+        blob.extend_from_slice(&2.0_f32.to_le_bytes()); // slope
+        blob.extend_from_slice(&0.0_f32.to_le_bytes()); // offset
+        // Part 2: header (type=4 linear, ending_x=1.0) + linear body
+        blob.push(4); blob.extend_from_slice(&[0, 0, 0]);
+        blob.extend_from_slice(&1.0_f32.to_le_bytes()); // ending_x
+        blob.extend_from_slice(&(-2.0_f32).to_le_bytes()); // slope
+        blob.extend_from_slice(&2.0_f32.to_le_bytes()); // offset
+        let f = TagFunction::parse(&blob).unwrap();
+        assert_eq!(f.function_type(), FunctionType::MultiSpline);
+        // Part 1 at x=0.25 → 0.5
+        assert!((f.evaluate(0.25, 0.0) - 0.5).abs() < 1e-5);
+        // Part 1 at x=0.5 → 1.0
+        assert!((f.evaluate(0.5, 0.0) - 1.0).abs() < 1e-5);
+        // Part 2 at x=0.75 → -1.5 + 2 = 0.5
+        assert!((f.evaluate(0.75, 0.0) - 0.5).abs() < 1e-5);
+        // Past end: still uses last part
+        assert!((f.evaluate(1.5, 0.0) - (-1.0)).abs() < 1e-5);
     }
 
     #[test]
