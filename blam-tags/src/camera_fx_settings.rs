@@ -17,8 +17,10 @@
 //! (bloom, bling, tone curve) lands when those passes go in.
 
 use crate::api::TagStruct;
+use crate::fields::TagFieldType;
 use crate::file::TagFile;
 use crate::math::RealRgbColor;
+use crate::tag_function::TagFunction;
 
 const CFXS_GROUP: [u8; 4] = *b"cfxs";
 
@@ -62,6 +64,238 @@ pub struct CameraFxSettings {
     pub bloom_large_color: RealRgbColor,
     pub bloom_medium_color: RealRgbColor,
     pub bloom_small_color: RealRgbColor,
+    /// `ssao` sub-struct. Older tags (riverworld) have it absent — `None`.
+    pub ssao: Option<SsaoBlock>,
+    /// `lightshafts` sub-struct. Same shape — older tags omit it.
+    pub lightshafts: Option<LightshaftsBlock>,
+    /// `color grading` sub-struct. `None` if the cfxs tag predates the
+    /// color-grading addition (early H3 maps including riverworld) or
+    /// the field walker can't find it. Older shorter tags fall back to
+    /// identity LUT (engine `update_color_grading` does the same when
+    /// `(m_flags & 2) == 0`).
+    pub color_grading: Option<ColorGradingBlock>,
+}
+
+/// `s_ssao_parameter` (cfxs sub-struct, schema size 16B).
+/// Engine: `c_screen_postprocess::render_ssao @ 0x1806b50e0` reads
+/// these per frame. `flags & 2 == 0` → SSAO disabled (return early).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SsaoBlock {
+    /// Bit 1 (`& 2`) = enable.
+    pub flags: u32,
+    /// AO darkening multiplier. Tuned per-cfxs.
+    pub intensity: f32,
+    /// World-space sample radius. Larger = wider AO falloff.
+    pub radius: f32,
+    /// Z-threshold for sample acceptance — samples beyond this depth
+    /// delta are treated as "different surface" and rejected. Engine
+    /// passes `1/sample_z_threshold` to the SSAO shader.
+    pub sample_z_threshold: f32,
+}
+
+impl SsaoBlock {
+    pub fn is_enabled(&self) -> bool {
+        (self.flags & 2) != 0
+    }
+}
+
+/// `s_lightshafts` (cfxs sub-struct, schema size 44B).
+/// Engine: `c_screen_postprocess::render_lightshafts @ 0x1806b55c0`.
+/// `flags & 2 == 0` → disabled.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LightshaftsBlock {
+    /// Bit 1 (`& 2`) = enable.
+    pub flags: u32,
+    /// Light source pitch in degrees `[0, 90]` (vertical angle).
+    pub pitch: f32,
+    /// Light source heading in degrees `[0, 360]` (horizontal angle).
+    pub heading: f32,
+    /// God-ray tint color.
+    pub tint: RealRgbColor,
+    /// World-space depth clamp — samples beyond this are excluded.
+    pub depth_clamp: f32,
+    /// Intensity clamp `[0, 1]`.
+    pub intensity_clamp: f32,
+    /// Falloff radius `[0, 2]` (relative to screen space).
+    pub falloff_radius: f32,
+    /// Overall ray intensity `[0, 50]`.
+    pub intensity: f32,
+    /// Blur radius `[0, 20]` (post-pass blur to soften the rays).
+    pub blur_radius: f32,
+}
+
+impl LightshaftsBlock {
+    pub fn is_enabled(&self) -> bool {
+        (self.flags & 2) != 0
+    }
+}
+
+/// `s_color_grading_parameter` (cfxs sub-struct, schema size 80B).
+///
+/// Mirrors the `color_grading_*_block`s nested inside the `color
+/// grading` field. Riverworld's tag predates this struct so it lands
+/// as `None`; campaign maps and `s3d_*` Forge tags carry it. Engine
+/// reads in `c_screen_postprocess::update_color_grading` (per-texel
+/// bake of the 16³ LUT).
+#[derive(Debug, Clone, Default)]
+pub struct ColorGradingBlock {
+    /// Bit 1 (`& 2`) = enable. `c_screen_postprocess::update_color_grading
+    /// @ dllcache:146` checks `(pColorGrading->m_flags & 2) == 0` and
+    /// falls through to the identity-LUT fast path when unset.
+    pub flags: u32,
+    /// Authored cross-fade duration (in seconds) when transitioning
+    /// between color-grading settings. Engine: `g_fColorGradingBlendFactor`.
+    pub blend_time: f32,
+    /// `Curves editor` block (max_count=1). 4 TagFunctions —
+    /// brightness + per-RGB curves. Mode picks which to apply.
+    pub curves_editor: Option<CurvesEditorBlock>,
+    /// `Brightness, contrast` block (max_count=1). `None` if absent.
+    pub brightness_contrast: Option<BrightnessContrast>,
+    /// `Hue, saturation, lightness, vibrance` block. NOTE: the schema
+    /// labels offset 12 as "lightness" and offset 16 as "vibrance" but
+    /// the engine reads them as saturation-multiplier (vibrance) and
+    /// lightness-add respectively — schema labels are swapped vs
+    /// `update_color_grading`'s actual math. Field names below follow
+    /// the *engine* semantics.
+    pub hslv: Option<HslvBlock>,
+    /// `Colorize effect` block. NOTE: same swap as HSLV — schema's
+    /// "saturation" slider is at the offset the engine reads as the
+    /// L-target, and vice versa. Field names follow engine semantics.
+    pub colorize: Option<ColorizeBlock>,
+    /// `Selective color` block — per-color-zone CMYK adjust, applied
+    /// post-HSL→RGB via `ProcessSelectiveColor`.
+    pub selective_color: Option<SelectiveColorBlock>,
+    /// `Color balance` block — shadows/midtones/highlights CMY adjust,
+    /// applied as a per-channel pow remap built from `Tones[3][3]`.
+    pub color_balance: Option<ColorBalanceBlock>,
+}
+
+impl ColorGradingBlock {
+    /// `(m_flags & 2) != 0` — engine's gate before applying any of the
+    /// per-effect blocks.
+    pub fn is_enabled(&self) -> bool {
+        (self.flags & 2) != 0
+    }
+}
+
+/// `Curves editor` block (88B). 4 mapping curves + a mode enum.
+/// Engine: `update_color_grading:226-269` — when mode == 1 (Brightness)
+/// applies `brightness` to all 3 channels; otherwise applies `red`,
+/// `green`, `blue` per channel. Each curve is evaluated with
+/// `range = 1.0`.
+#[derive(Debug, Clone, Default)]
+pub struct CurvesEditorBlock {
+    /// Bit 0 = enable.
+    pub flags: u32,
+    /// 0 = RGB (per-channel curves), 1 = Brightness (single curve).
+    pub mode: u32,
+    pub brightness: Option<TagFunction>,
+    pub red: Option<TagFunction>,
+    pub green: Option<TagFunction>,
+    pub blue: Option<TagFunction>,
+}
+
+/// `Brightness, contrast` block (12B).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BrightnessContrast {
+    /// Bit 0 = enable.
+    pub flags: u32,
+    /// Authored slider in [-1, 1]. Engine formula:
+    /// `b≥0: c = c + (1-c)*b ; b<0: c = c * (b+1)` per channel, then
+    /// `c = (contrast+1) * (c - 0.5) + 0.5`.
+    pub brightness: f32,
+    /// Authored slider in [-1, 1]. See `brightness` formula.
+    pub contrast: f32,
+}
+
+/// `Hue, saturation, lightness, vibrance` block (20B). Field names
+/// follow *engine* semantics — the schema's slider labels for offsets
+/// 12 and 16 are swapped vs how the runtime reads them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HslvBlock {
+    /// Bit 0 = enable.
+    pub flags: u32,
+    /// Hue offset in degrees, `[-180, 180]`. Added directly to `hsl.H`.
+    pub hue_offset_deg: f32,
+    /// Saturation additive offset, `[-1, 1]`.
+    pub saturation_offset: f32,
+    /// Saturation multiplier (engine's "vibrance" — schema slider is
+    /// labeled "lightness" but the math at offset 12 multiplies S).
+    /// Effective scale = `(±0.48 or ±0.10) * vibrance + 1`, with the
+    /// branch picked from current H (skin-tone protect) and current S.
+    pub vibrance: f32,
+    /// Lightness additive offset (schema slider is labeled "vibrance"
+    /// but offset 16 adds to L).
+    pub lightness_offset: f32,
+}
+
+/// `Selective color` block (148B = 4 + 9 × 16). One CMYB per
+/// color-zone band. Engine `ProcessSelectiveColor` accumulates a CMYK
+/// adjustment by weighting each band by the input pixel's hue / tonal
+/// distance to that zone.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SelectiveColorBlock {
+    /// Bit 0 = enable.
+    pub flags: u32,
+    /// Order matters — `ProcessSelectiveColor` walks them in declaration
+    /// order: `dFactors[0..5]` map to reds..magentas (hue zones via
+    /// 6-bin RGB ordering); `dFactors[6..8]` map to whites/neutrals/
+    /// blacks (tonal zones via luminance distance).
+    pub bands: [CmybBand; 9],
+}
+
+/// `Color grading CMYB` (16B). Per-zone CMYK adjust slider in `[-1, 1]`.
+/// Negative `black` values are weighted 2× during accumulation
+/// (asymmetric K) per `ProcessSelectiveColor:139-180`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CmybBand {
+    pub cyan: f32,
+    pub magenta: f32,
+    pub yellow: f32,
+    pub black: f32,
+}
+
+/// `Color balance` block (40B = 4 + 3 × 12). Cyan-red, magenta-green,
+/// yellow-blue sliders in shadows/midtones/highlights. Engine
+/// `SetColorBalanceParams` builds a `Tones[3][3]` (per-channel lo,
+/// gamma, hi) which the per-texel loop applies as
+/// `out = pow(remap(in, lo, hi), 1/gamma)` per RGB channel.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ColorBalanceBlock {
+    /// Bit 0 = enable.
+    pub flags: u32,
+    pub shadows: CmyBand,
+    pub midtones: CmyBand,
+    pub highlights: CmyBand,
+}
+
+/// `Color grading CMY` (12B). Cyan-red, magenta-green, yellow-blue
+/// sliders in `[-1, 1]`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CmyBand {
+    pub cyan_red: f32,
+    pub magenta_green: f32,
+    pub yellow_blue: f32,
+}
+
+/// `Colorize effect` block (20B). Field names follow *engine*
+/// semantics; schema's "saturation" / "lightness" slider labels are
+/// swapped vs the read offsets.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ColorizeBlock {
+    /// Bit 0 = enable.
+    pub flags: u32,
+    /// Lerp factor in `[0, 1]`. 0 = no colorize (preserve original
+    /// H/S/L), 1 = pure target. Engine: `out = target*blend + in*(1-blend)`.
+    pub blendfactor: f32,
+    /// Target hue in degrees, `[-180, 180]`.
+    pub target_hue_deg: f32,
+    /// Lightness target bias in `[-1, 1]`. The L target is the texel's
+    /// luminance (R+G+B)/3 nudged toward 1 (when positive) or 0 (when
+    /// negative); this slider is the nudge amount.
+    pub target_lightness: f32,
+    /// Saturation target in `[-1, 1]`.
+    pub target_saturation: f32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -147,6 +381,25 @@ impl CameraFxSettings {
                 .unwrap_or_default()
         };
 
+        let color_grading = parse_color_grading(s);
+        let ssao = s.field("ssao").and_then(|f| f.as_struct()).map(|sub| SsaoBlock {
+            flags: sub.read_int_any("flags").unwrap_or(0) as u32,
+            intensity: sub.read_real("intensity").unwrap_or(0.0),
+            radius: sub.read_real("radius").unwrap_or(0.0),
+            sample_z_threshold: sub.read_real("sample z threshold").unwrap_or(0.0),
+        });
+        let lightshafts = s.field("lightshafts").and_then(|f| f.as_struct()).map(|sub| LightshaftsBlock {
+            flags: sub.read_int_any("flags").unwrap_or(0) as u32,
+            pitch: sub.read_real("pitch").unwrap_or(0.0),
+            heading: sub.read_real("heading").unwrap_or(0.0),
+            tint: sub.read_rgb("tint"),
+            depth_clamp: sub.read_real("depth clamp").unwrap_or(0.0),
+            intensity_clamp: sub.read_real("intensity clamp").unwrap_or(0.0),
+            falloff_radius: sub.read_real("falloff radius").unwrap_or(0.0),
+            intensity: sub.read_real("intensity").unwrap_or(0.0),
+            blur_radius: sub.read_real("blur radius").unwrap_or(0.0),
+        });
+
         Self {
             exposure,
             bloom_point: read_struct_real("bloom_point", "bloom point"),
@@ -163,6 +416,136 @@ impl CameraFxSettings {
             bloom_large_color: read_struct_color("bloom_large_color", "large color"),
             bloom_medium_color: read_struct_color("bloom_medium_color", "medium color"),
             bloom_small_color: read_struct_color("bloom_small_color", "small color"),
+            ssao,
+            lightshafts,
+            color_grading,
         }
     }
+}
+
+/// Walk the `color grading` struct (if present) and pull out the
+/// sub-blocks the LUT bake consumes. Returns `None` for tags that
+/// predate the struct (e.g. riverworld) so callers can fall through
+/// to the engine's identity-LUT path.
+fn parse_color_grading(s: &TagStruct<'_>) -> Option<ColorGradingBlock> {
+    let cg = s.field("color grading").and_then(|f| f.as_struct())?;
+
+    let block_first = |name: &str| -> Option<TagStruct<'_>> {
+        cg.field(name)
+            .and_then(|f| f.as_block())
+            .and_then(|b| b.element(0))
+    };
+
+    let curves_editor = block_first("Curves editor").map(|sub| {
+        let parse_curve = |name: &str| -> Option<TagFunction> {
+            let curve = sub.field(name).and_then(|f| f.as_struct())?;
+            // The schema defines two same-named "Mapping" fields — a
+            // `custom` marker (group_tag fned) followed by the actual
+            // `mapping_function` struct. `field("Mapping")` would
+            // return the marker first; instead pick the field by type.
+            let mapping = curve
+                .fields()
+                .find(|f| f.field_type() == TagFieldType::Struct)?
+                .as_struct()?;
+            mapping.field("data").and_then(|f| f.as_function())
+        };
+        CurvesEditorBlock {
+            flags: sub.read_int_any("flags").unwrap_or(0) as u32,
+            mode: sub.read_int_any("mode").unwrap_or(0) as u32,
+            brightness: parse_curve("brightness curve"),
+            red: parse_curve("red curve"),
+            green: parse_curve("green curve"),
+            blue: parse_curve("blue curve"),
+        }
+    });
+
+    let brightness_contrast = block_first("Brightness, contrast").map(|sub| BrightnessContrast {
+        flags: sub.read_int_any("flags").unwrap_or(0) as u32,
+        brightness: sub.read_real("brightness").unwrap_or(0.0),
+        contrast: sub.read_real("contrast").unwrap_or(0.0),
+    });
+
+    let hslv = block_first("Hue, saturation, lightness, vibrance").map(|sub| HslvBlock {
+        flags: sub.read_int_any("flags").unwrap_or(0) as u32,
+        hue_offset_deg: sub.read_real("hue").unwrap_or(0.0),
+        saturation_offset: sub.read_real("saturation").unwrap_or(0.0),
+        // Schema label "lightness" — engine reads as saturation
+        // multiplier (vibrance) at offset 12.
+        vibrance: sub.read_real("lightness").unwrap_or(0.0),
+        // Schema label "vibrance" — engine reads as lightness offset
+        // at offset 16.
+        lightness_offset: sub.read_real("vibrance").unwrap_or(0.0),
+    });
+
+    let colorize = block_first("Colorize effect").map(|sub| ColorizeBlock {
+        flags: sub.read_int_any("flags").unwrap_or(0) as u32,
+        blendfactor: sub.read_real("blendfactor").unwrap_or(0.0),
+        target_hue_deg: sub.read_real("hue").unwrap_or(0.0),
+        // Schema label "saturation" — engine reads as L-target bias
+        // at offset 12 (luminance lerp control).
+        target_lightness: sub.read_real("saturation").unwrap_or(0.0),
+        // Schema label "lightness" — engine reads as S-target at offset 16.
+        target_saturation: sub.read_real("lightness").unwrap_or(0.0),
+    });
+
+    let selective_color = block_first("Selective color").map(|sub| {
+        let read_band = |name: &str| -> CmybBand {
+            sub.field(name)
+                .and_then(|f| f.as_struct())
+                .map(|b| CmybBand {
+                    cyan: b.read_real("cyan").unwrap_or(0.0),
+                    magenta: b.read_real("magenta").unwrap_or(0.0),
+                    yellow: b.read_real("yellow").unwrap_or(0.0),
+                    black: b.read_real("black").unwrap_or(0.0),
+                })
+                .unwrap_or_default()
+        };
+        SelectiveColorBlock {
+            flags: sub.read_int_any("flags").unwrap_or(0) as u32,
+            // Order MUST match `ProcessSelectiveColor`'s walk:
+            // reds → yellows → greens → cyans → blues → magentas →
+            // whites → neutrals → blacks.
+            bands: [
+                read_band("reds"),
+                read_band("yellows"),
+                read_band("greens"),
+                read_band("cyans"),
+                read_band("blues"),
+                read_band("magentas"),
+                read_band("whites"),
+                read_band("neutrals"),
+                read_band("blacks"),
+            ],
+        }
+    });
+
+    let color_balance = block_first("Color balance").map(|sub| {
+        let read_cmy = |name: &str| -> CmyBand {
+            sub.field(name)
+                .and_then(|f| f.as_struct())
+                .map(|b| CmyBand {
+                    cyan_red: b.read_real("cyan - red").unwrap_or(0.0),
+                    magenta_green: b.read_real("magenta - green").unwrap_or(0.0),
+                    yellow_blue: b.read_real("yellow - blue").unwrap_or(0.0),
+                })
+                .unwrap_or_default()
+        };
+        ColorBalanceBlock {
+            flags: sub.read_int_any("flags").unwrap_or(0) as u32,
+            shadows: read_cmy("shadows"),
+            midtones: read_cmy("midtones"),
+            highlights: read_cmy("highlights"),
+        }
+    });
+
+    Some(ColorGradingBlock {
+        flags: cg.read_int_any("flags").unwrap_or(0) as u32,
+        blend_time: cg.read_real("blend time").unwrap_or(0.0),
+        curves_editor,
+        brightness_contrast,
+        hslv,
+        colorize,
+        selective_color,
+        color_balance,
+    })
 }

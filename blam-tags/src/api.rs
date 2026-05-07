@@ -293,11 +293,13 @@ impl<'a> TagStruct<'a> {
     }
 
     /// Read a real-shaped field as `f32`. Accepts `Real`,
-    /// `RealFraction`, and `Angle`.
+    /// `RealFraction`, `RealSlider`, and `Angle` — every shape that
+    /// stores a single 32-bit float.
     pub fn read_real(&self, name: &str) -> Option<f32> {
         match self.field(name)?.value()? {
             TagFieldData::Real(r) => Some(r),
             TagFieldData::RealFraction(r) => Some(r),
+            TagFieldData::RealSlider(r) => Some(r),
             TagFieldData::Angle(r) => Some(r),
             _ => None,
         }
