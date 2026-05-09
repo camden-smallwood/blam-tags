@@ -143,7 +143,7 @@ pub fn read_compression_bounds_at(root: &TagStruct<'_>, index: usize) -> Compres
 /// winding parity per local position and drops degenerate windows
 /// (any two indices equal — these are splice triangles used to stitch
 /// strip pieces together).
-pub(crate) fn strip_to_list(strip: &[u16]) -> Vec<(u16, u16, u16)> {
+pub fn strip_to_list(strip: &[u16]) -> Vec<(u16, u16, u16)> {
     let mut out = Vec::with_capacity(strip.len().saturating_sub(2));
     for segment in strip.split(|&x| x == 0xFFFF) {
         for i in 0..segment.len().saturating_sub(2) {

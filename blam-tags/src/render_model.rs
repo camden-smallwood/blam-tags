@@ -253,6 +253,59 @@ pub struct RenderMeshPart {
     pub part_type: i8,
 }
 
+/// One entry in a `render_model`'s `instance placements` block — a
+/// named transform that the engine resolves by string-id from the
+/// owning content (e.g., `s_decorator_set::render_model_instance_names`
+/// → match name → instance_placement → node_index + per-subpart
+/// transform). Decorator render_models use this to map per-type
+/// `decorator_types[k].mesh` (block index into the decorator_set's
+/// names list) to which subpart of the single concatenated mesh to
+/// draw for that type.
+///
+/// Index in the parent `instance_placements` vec aligns with subpart
+/// index in `meshes[0].parts[0].subparts[]` — i.e.,
+/// `instance_placements[i]` describes subpart `i`'s transform.
+#[derive(Debug, Clone)]
+pub struct RenderInstancePlacement {
+    pub name: String,
+    pub node_index: i16,
+    pub scale: f32,
+    pub forward: RealVector3d,
+    pub left: RealVector3d,
+    pub up: RealVector3d,
+    pub position: RealPoint3d,
+}
+
+/// One sub-strip within a `render_model.meshes[i].parts[j]`. The engine
+/// uses these for decorator multi-type rendering: each subpart is a
+/// triangle-strip slice of the part's index pool, drawn for one
+/// decorator type. Slice = `raw_indices[index_start..index_start +
+/// index_count]`. `budget_vertex_count` is the number of unique
+/// vertices the strip references — diagnostic only at runtime.
+#[derive(Debug, Clone, Copy)]
+pub struct RenderMeshSubpart {
+    pub index_start: u32,
+    pub index_count: u32,
+    pub budget_vertex_count: u16,
+}
+
+/// Per-mesh raw-strip + per-subpart slices, as read straight from the
+/// tag without the per-part `strip_to_list` decoding that
+/// `extract_render_geometry_meshes` applies. Used by decorator loaders
+/// that need per-subpart triangle-list slices (each subpart = one
+/// decorator type's geometry). The vertex pool is shared across all
+/// subparts; `subpart_indices[k]` is a triangle-list decoded from
+/// the strip slice for subpart `k`.
+///
+/// Returned by [`extract_decorator_subparts`].
+#[derive(Debug, Clone, Default)]
+pub struct DecoratorSubpartGeometry {
+    pub vertices: Vec<RenderVertex>,
+    /// Per-subpart triangle-list (each tuple is 3 vertex indices into
+    /// `vertices`). Length = number of subparts = `instance_placements.len()`.
+    pub subpart_indices: Vec<Vec<u32>>,
+}
+
 /// One marker (attachment point). `region_index`/`permutation_index`
 /// are `-1` when the marker is unconstrained. Transform is in
 /// node-local space (relative to [`Self::node_index`]).
@@ -277,6 +330,14 @@ pub struct RenderModel {
     pub regions: Vec<RenderRegion>,
     pub meshes: Vec<RenderMesh>,
     pub markers: Vec<RenderMarker>,
+    /// `instance placements` block — named transforms that decorator
+    /// render_models use as the resolution target for their per-type
+    /// `decorator_types[k].mesh` block index (which goes through
+    /// `s_decorator_set::render_model_instance_names` → string_id →
+    /// match on `instance_placements[i].name`). Empty for non-decorator
+    /// render_models. Index aligns 1:1 with the subparts of
+    /// `meshes[0].parts[0]`.
+    pub instance_placements: Vec<RenderInstancePlacement>,
     /// `sky lights` block — area-light samples used by sky-tag
     /// render_models. The LAST entry is conventionally the dominant
     /// sun (`get_sun_constants_from_sky @ 0x1803adcb0` reads
@@ -329,10 +390,127 @@ impl RenderModel {
             regions: read_regions(&root)?,
             meshes: read_meshes(&root, &bounds)?,
             markers: read_markers(&root)?,
+            instance_placements: read_instance_placements(&root),
             sky_lights: read_sky_lights(&root),
             default_lightprobe: read_default_lightprobe(&root),
         })
     }
+}
+
+/// Walk `instance placements` block. Empty for non-decorator
+/// render_models. Each entry's `name` matches a `string_id` in the
+/// owning decorator_set's `render_model_instance_names` block — that's
+/// the resolution chain `decorator_types[k].mesh → name → instance_placements`.
+fn read_instance_placements(root: &TagStruct<'_>) -> Vec<RenderInstancePlacement> {
+    let Some(block) = root.field_path("instance placements").and_then(|f| f.as_block()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(block.len());
+    for i in 0..block.len() {
+        let Some(elem) = block.element(i) else { continue };
+        out.push(RenderInstancePlacement {
+            name: elem.read_string_id("name").unwrap_or_default(),
+            node_index: elem.read_block_index("node_index"),
+            scale: elem.read_real("scale").unwrap_or(1.0),
+            forward: read_real_vector3d(&elem, "forward").unwrap_or(RealVector3d { i: 1.0, j: 0.0, k: 0.0 }),
+            left: read_real_vector3d(&elem, "left").unwrap_or(RealVector3d { i: 0.0, j: 1.0, k: 0.0 }),
+            up: read_real_vector3d(&elem, "up").unwrap_or(RealVector3d { i: 0.0, j: 0.0, k: 1.0 }),
+            position: elem.read_point3d("position"),
+        });
+    }
+    out
+}
+
+/// Decorator-specific extractor: walk `render geometry/meshes[0]/parts[0]/subparts[]`
+/// and produce per-subpart triangle-lists (each strip-decoded
+/// independently of the others, so degenerate-stitching triangles
+/// between subparts don't pollute any one subpart's list). Each
+/// triangle is 3 indices into the shared vertex pool.
+///
+/// Engine equivalent: `c_structure_renderer::render_decorators @
+/// 0x1806901A0`'s per-subpart draw loop. The engine actually does an
+/// unindexed strip draw against a cache-built expanded vertex buffer
+/// (`start_vertex = s × subpart[0].index_count`), but for an indexed
+/// pipeline we slice the index pool by subpart and let the
+/// rasterizer fetch the full vertex buffer through normal indexing.
+///
+/// Returns `None` if the tag isn't shaped like a decorator
+/// render_model (no per-mesh-temporary, no parts, no subparts, etc).
+pub fn extract_decorator_subparts(
+    tag: &TagFile,
+) -> Option<DecoratorSubpartGeometry> {
+    let root = tag.root();
+    let bounds = read_compression_bounds(&root);
+
+    let pmt = root.field_path("render geometry/per mesh temporary").and_then(|f| f.as_block())?;
+    let meshes = root.field_path("render geometry/meshes").and_then(|f| f.as_block())?;
+    if meshes.is_empty() || pmt.is_empty() {
+        return None;
+    }
+
+    // Decorator render_models conventionally have one mesh + one part.
+    // We only walk meshes[0]/parts[0]; other shapes are caller error.
+    let mesh = meshes.element(0)?;
+    let pmt0 = pmt.element(0)?;
+
+    let raw_v = pmt0.field("raw vertices").and_then(|f| f.as_block())?;
+    let raw_i = pmt0.field("raw indices").and_then(|f| f.as_block())?;
+
+    // Decode every raw vertex once (same path as `read_meshes_per_mesh`).
+    let mut vertices: Vec<RenderVertex> = Vec::with_capacity(raw_v.len());
+    for k in 0..raw_v.len() {
+        let v = raw_v.element(k)?;
+        // Decorators are unskinned (single-bone via instance_placements
+        // node_index); per-vertex node_indices are zero — pass None.
+        vertices.push(read_vertex(&v, &bounds, None));
+    }
+    // Flatten raw indices into a u16 pool.
+    let raw_index_list: Vec<u16> = (0..raw_i.len())
+        .filter_map(|k| raw_i.element(k))
+        .map(|e| e.read_int_any("word").unwrap_or(0) as u16)
+        .collect();
+
+    // Walk the mesh's `subparts` block. NOTE: in `render geometry/
+    // meshes[i]`, `subparts` is a SIBLING of `parts` (not nested under
+    // `parts[0]`) — the per-part `subpart_start` / `subpart_count`
+    // fields slice into this mesh-level block. For decorators (one
+    // part per mesh) the whole `subparts` block belongs to that part.
+    // Falls back to one synthetic subpart spanning the whole index
+    // pool when the field is absent (e.g., non-decorator render_models).
+    let mut subpart_indices: Vec<Vec<u32>> = Vec::new();
+    if let Some(subparts) = mesh.field("subparts").and_then(|f| f.as_block()) {
+        for k in 0..subparts.len() {
+            let Some(sp) = subparts.element(k) else { continue };
+            let start = sp.read_int_any("index start").unwrap_or(0) as i32;
+            let count = sp.read_int_any("index count").unwrap_or(0) as i32;
+            let start = (start as i16 as u16) as usize;
+            let count = count.max(0) as usize;
+            if count == 0 {
+                subpart_indices.push(Vec::new());
+                continue;
+            }
+            let end = (start + count).min(raw_index_list.len());
+            let strip = &raw_index_list[start..end];
+            let tris = crate::geometry::strip_to_list(strip);
+            let mut flat = Vec::with_capacity(tris.len() * 3);
+            for (a, b, c) in tris {
+                flat.push(a as u32);
+                flat.push(b as u32);
+                flat.push(c as u32);
+            }
+            subpart_indices.push(flat);
+        }
+    } else {
+        // Single synthetic subpart spanning all indices.
+        let tris = crate::geometry::strip_to_list(&raw_index_list);
+        let mut flat = Vec::with_capacity(tris.len() * 3);
+        for (a, b, c) in tris {
+            flat.push(a as u32); flat.push(b as u32); flat.push(c as u32);
+        }
+        subpart_indices.push(flat);
+    }
+
+    Some(DecoratorSubpartGeometry { vertices, subpart_indices })
 }
 
 /// Walk the `sky lights` block. Field name has a space in the tag
