@@ -92,6 +92,7 @@ pub mod camera_fx_settings;
 pub mod chocolate_mountain;
 pub mod rasterizer_globals;
 pub mod structure_bsp;
+pub mod wind;
 pub mod paths;
 
 // Facade re-exports — the recommended surface for editing tags.
