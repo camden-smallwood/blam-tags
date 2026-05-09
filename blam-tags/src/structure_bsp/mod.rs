@@ -11,6 +11,7 @@
 mod types;
 
 pub use types::{
-    BspCluster, BspClusterPortal, BspCollisionMaterial, BspInstance, BspInstanceDefinition,
-    BspMarker, BspMaterial, BspMeshMetadata, BspMeshPart, StructureBsp, StructureBspError,
+    BspAtmospherePaletteEntry, BspCluster, BspClusterPortal, BspCollisionMaterial, BspInstance,
+    BspInstanceDefinition, BspMarker, BspMaterial, BspMeshMetadata, BspMeshPart,
+    BspWeatherPaletteEntry, StructureBsp, StructureBspError,
 };

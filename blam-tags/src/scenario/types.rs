@@ -137,6 +137,13 @@ pub struct Scenario {
     /// `c_camera_fx_values::get_render_exposure @ 0x18068e3e0` to
     /// produce the per-frame `view_exposure` (typically ~0.67).
     pub camera_fx_settings: String,
+
+    /// `chocalate mountain` tag reference — the per-object-type
+    /// minimum-luminance table (chmt). Cache-bake target field;
+    /// engine reads `global_scenario->chocalate_mountain_settings`
+    /// from here. Schema also exposes a `chocalate mountains` block
+    /// of overrides — only the singular bake target is surfaced.
+    pub chocolate_mountain: String,
 }
 
 impl Scenario {
@@ -214,6 +221,10 @@ impl Scenario {
                 .read_tag_ref_path("camera fx settings")
                 .or_else(|| s.read_tag_ref_path("camera_fx_settings"))
                 .or_else(|| s.read_tag_ref_path("camera effects"))
+                .unwrap_or_default(),
+            chocolate_mountain: s
+                .read_tag_ref_path("chocalate mountain")
+                .or_else(|| s.read_tag_ref_path("chocolate mountain"))
                 .unwrap_or_default(),
         }
     }

@@ -21,7 +21,7 @@
 
 use crate::api::{TagBlock, TagStruct};
 use crate::file::TagFile;
-use crate::math::RealVector3d;
+use crate::math::{RealPoint3d, RealVector3d};
 
 const SCNL_BSP_GROUP: [u8; 4] = *b"Lbsp";
 
@@ -92,15 +92,21 @@ pub struct LightmapBspData {
     /// per-vertex SH samples for the matching mesh's vertex buffer.
     pub bsp_per_vertex_data: Vec<LightmapPerVertexBlock>,
 
-    /// Per-scenery-placement single probes (one per `scenario.scenery[i]`).
-    /// Most scenery in maps relies on these for ambient lighting.
-    pub scenery_probes: Vec<LightmapProbe>,
+    /// Per-scenery-placement probes — each carries a
+    /// [`ScenarioObjectId`] header (placement reference) plus the
+    /// SH coefficients. One per `scenario.scenery[i]`.
+    pub scenery_probes: Vec<LightmapSceneryProbe>,
 
     /// Per-airprobe single probes (manually-placed lighting samples).
-    pub airprobes: Vec<LightmapProbe>,
+    /// Each carries position + name + `manual_bsp_flags` plus the
+    /// SH coefficients.
+    pub airprobes: Vec<LightmapAirprobe>,
 
-    /// Per-machine-placement single probes (one per device_machine).
-    pub device_machine_probes: Vec<LightmapProbe>,
+    /// Per-machine-placement probe DATA: [`ScenarioObjectId`] +
+    /// world-space bounding box + a list of nested per-position
+    /// probes. NOT a single probe like the schema name might
+    /// suggest — `device_machine_probe_data` is a CONTAINER.
+    pub device_machine_probes: Vec<LightmapDeviceMachineProbeData>,
 }
 
 impl LightmapBspData {
@@ -152,12 +158,12 @@ impl LightmapBspData {
                 "bsp per-vertex data",
                 LightmapPerVertexBlock::from_struct,
             ),
-            scenery_probes: read_block(s, "scenery probes", LightmapProbe::from_struct),
-            airprobes: read_block(s, "airprobes", LightmapProbe::from_struct),
+            scenery_probes: read_block(s, "scenery probes", LightmapSceneryProbe::from_struct),
+            airprobes: read_block(s, "airprobes", LightmapAirprobe::from_struct),
             device_machine_probes: read_block(
                 s,
                 "device machine probes",
-                LightmapProbe::from_struct,
+                LightmapDeviceMachineProbeData::from_struct,
             ),
         }
     }
@@ -319,6 +325,130 @@ pub struct DequantizedLightmapProbe {
     pub blue_terms: [f32; 9],
 }
 
+/// `scenario_object_id_struct` (8B) — a placement reference inside
+/// the scenario tag. Identifies which placement a probe belongs to.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScenarioObjectId {
+    /// Globally-unique placement id.
+    pub unique_id: i32,
+    /// Block index of the BSP this placement originates in (-1 if
+    /// not bound to a specific BSP).
+    pub origin_bsp_index: i16,
+    /// `e_object_type` value (scenery, biped, vehicle, …).
+    pub object_type: i8,
+    /// Authoring source enum (auto-placed vs manual vs script-spawned).
+    pub source: i8,
+}
+
+impl ScenarioObjectId {
+    fn from_struct(s: &TagStruct<'_>) -> Self {
+        Self {
+            unique_id: s.read_int_any("unique id").unwrap_or(0) as i32,
+            origin_bsp_index: s.read_block_index("origin bsp index"),
+            object_type: s.read_int_any("type").unwrap_or(-1) as i8,
+            source: s.read_int_any("source").unwrap_or(-1) as i8,
+        }
+    }
+}
+
+/// One airprobe entry — manually-placed in the editor for spotty
+/// fill light. Has world-space position + name + manual-bsp flags
+/// plus the standard SH probe payload.
+#[derive(Debug, Clone, Default)]
+pub struct LightmapAirprobe {
+    pub position: RealPoint3d,
+    pub name: String,
+    pub manual_bsp_flags: i16,
+    pub probe: LightmapProbe,
+}
+
+impl LightmapAirprobe {
+    pub fn from_struct(s: &TagStruct<'_>) -> Self {
+        Self {
+            position: s.read_point3d("airprobe position"),
+            name: s.read_string_id("airprobe name").unwrap_or_default(),
+            manual_bsp_flags: s.read_int_any("manual bsp flags").unwrap_or(0) as i16,
+            probe: LightmapProbe::from_struct(s),
+        }
+    }
+}
+
+/// One scenery-placement probe — bound to a specific scenery
+/// placement via [`ScenarioObjectId`] + the SH probe payload.
+#[derive(Debug, Clone, Default)]
+pub struct LightmapSceneryProbe {
+    pub object_id: ScenarioObjectId,
+    pub probe: LightmapProbe,
+}
+
+impl LightmapSceneryProbe {
+    pub fn from_struct(s: &TagStruct<'_>) -> Self {
+        let object_id = s
+            .field("object id")
+            .and_then(|f| f.as_struct())
+            .map(|sub| ScenarioObjectId::from_struct(&sub))
+            .unwrap_or_default();
+        Self {
+            object_id,
+            probe: LightmapProbe::from_struct(s),
+        }
+    }
+}
+
+/// One device-machine probe data block — bound to a device_machine
+/// placement, defines a world-space bounding box, and carries a
+/// list of per-position probes inside that box. The schema name
+/// `_value` is misleading: this is a CONTAINER, not a single probe.
+#[derive(Debug, Clone, Default)]
+pub struct LightmapDeviceMachineProbeData {
+    pub object_id: ScenarioObjectId,
+    /// World-space bounding box `[x0, x1, y0, y1, z0, z1]`. Schema
+    /// stores 6 reals; we keep them in axis-pair order.
+    pub bbox: [f32; 6],
+    /// Per-position probes within the bbox.
+    pub probes: Vec<LightmapDeviceMachineProbe>,
+}
+
+impl LightmapDeviceMachineProbeData {
+    pub fn from_struct(s: &TagStruct<'_>) -> Self {
+        let object_id = s
+            .field("object id")
+            .and_then(|f| f.as_struct())
+            .map(|sub| ScenarioObjectId::from_struct(&sub))
+            .unwrap_or_default();
+        let bbox = [
+            s.read_real("x0").unwrap_or(0.0),
+            s.read_real("x1").unwrap_or(0.0),
+            s.read_real("y0").unwrap_or(0.0),
+            s.read_real("y1").unwrap_or(0.0),
+            s.read_real("z0").unwrap_or(0.0),
+            s.read_real("z1").unwrap_or(0.0),
+        ];
+        Self {
+            object_id,
+            bbox,
+            probes: read_block(s, "probes", LightmapDeviceMachineProbe::from_struct),
+        }
+    }
+}
+
+/// One device-machine probe — world-space position + SH probe
+/// payload. Nested inside [`LightmapDeviceMachineProbeData::probes`].
+#[derive(Debug, Clone, Default)]
+pub struct LightmapDeviceMachineProbe {
+    pub position: RealPoint3d,
+    pub probe: LightmapProbe,
+}
+
+impl LightmapDeviceMachineProbe {
+    fn from_struct(s: &TagStruct<'_>) -> Self {
+        Self {
+            position: s.read_point3d("position"),
+            probe: LightmapProbe::from_struct(s),
+        }
+    }
+}
+
 /// One per-vertex SH block — a flat list of vertex-aligned probes.
 /// Index in [`LightmapBspData::bsp_per_vertex_data`] is what
 /// cluster/instance entries reference.
@@ -329,6 +459,10 @@ pub struct DequantizedLightmapProbe {
 #[derive(Debug, Clone, Default)]
 pub struct LightmapPerVertexBlock {
     pub lightprobe_data: Vec<LightmapPerVertexProbe>,
+    /// Runtime hint — index of the vertex buffer the per-vertex SH
+    /// stream is bound to. Engine uses this to pick the right
+    /// cluster mesh's vertex buffer when sampling per-vertex SH.
+    pub vertex_buffer_index: i32,
 }
 
 impl LightmapPerVertexBlock {
@@ -339,6 +473,9 @@ impl LightmapPerVertexBlock {
                 "lightprobe data",
                 LightmapPerVertexProbe::from_struct,
             ),
+            vertex_buffer_index: s
+                .read_int_any("light probe vertex buffer index")
+                .unwrap_or(-1) as i32,
         }
     }
 }

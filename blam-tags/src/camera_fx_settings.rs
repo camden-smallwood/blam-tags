@@ -43,27 +43,113 @@ impl std::fmt::Display for CameraFxError {
 }
 impl std::error::Error for CameraFxError {}
 
-/// Decoded `.camera_fx_settings`. Subset — exposure + bloom basics.
+/// `c_camera_fx_settings::s_real_parameter` (16B) — the parameter
+/// block for every "value + max_change + blend_speed + flags"
+/// authored slider in cfxs (bloom_point/inherent/intensity,
+/// bling_intensity/size/angle, self_illum_*). Engine
+/// `c_camera_fx_values::update @ 0x180687CB0` reads ALL these
+/// fields per frame when blending the runtime `c_camera_fx_values`
+/// toward the cfxs target — dropping any of them breaks faithful
+/// per-frame parameter interpolation.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScalarParameter {
+    /// `camera_fx_parameter_flags_no_auto_adjust`. Bit 0 = `use
+    /// default (ignore these values)` — engine treats the parameter
+    /// as absent when set, falling through to the default cfxs.
+    pub flags: u16,
+    /// Authored target value (units depend on the parameter — stops,
+    /// HDR multiplier, length, angle, etc.).
+    pub value: f32,
+    /// Maximum delta the runtime value can move per frame.
+    pub max_change: f32,
+    /// Blend rate per frame (1 = instantaneous, 0.01 = slow).
+    pub blend_speed: f32,
+}
+
+/// `c_camera_fx_settings::s_real_instant_parameter` (8B) — the
+/// snap-to-target variant (no blending). Used by
+/// `auto_exposure_sensitivity` and `auto_exposure_anti_bloom`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InstantScalarParameter {
+    pub flags: u16,
+    pub value: f32,
+}
+
+/// `c_camera_fx_settings::s_color_parameter` (16B + flags) — the
+/// per-stage bloom color overrides. The `flags` `use default`
+/// bit (0x01) tells the engine to ignore the per-stage color and
+/// substitute the global default (1, 1, 1).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ColorParameter {
+    pub flags: u16,
+    pub color: RealRgbColor,
+}
+
+impl ColorParameter {
+    /// Per the schema's `use default` bit (0x01) — when set, engine
+    /// ignores `color` and substitutes (1, 1, 1).
+    pub fn use_default(&self) -> bool {
+        (self.flags & 0x01) != 0
+    }
+
+    /// The effective color the engine actually applies — `(1,1,1)`
+    /// when `use_default` is set, else the authored color.
+    pub fn effective_color(&self) -> RealRgbColor {
+        if self.use_default() {
+            RealRgbColor { red: 1.0, green: 1.0, blue: 1.0 }
+        } else {
+            self.color
+        }
+    }
+}
+
+/// `c_camera_fx_settings::s_word_parameter` (4B) — bling spike count.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WordParameter {
+    pub flags: u16,
+    pub value: u16,
+}
+
+/// Decoded `.camera_fx_settings`. Carries every authored block —
+/// callers pull `.value` (or sub-fields) when they need the scalar.
 #[derive(Debug, Clone, Default)]
 pub struct CameraFxSettings {
-    /// Exposure block.
+    /// Exposure block — auto-exposure tuning + flags + min/max stops.
     pub exposure: ExposureBlock,
-    /// `bloom_point` — bright threshold (typically 1.5 in HDR units).
-    pub bloom_point: f32,
-    /// `bloom_intensity` — global bloom multiplier (riverworld: 0.1).
-    pub bloom_intensity: f32,
-    /// `bloom_inherent` — additional bloom on top of the threshold (0.1 default).
-    pub bloom_inherent: f32,
-    /// `bling_intensity`, `bling_size`, `bling_angle`, `bling_count`
-    /// — sun-disc spike effects, captured for completeness.
-    pub bling_intensity: f32,
-    pub bling_size: f32,
-    pub bling_angle_deg: f32,
-    pub bling_count: u8,
-    /// Per-stage bloom color overrides (when not flagged "use default").
-    pub bloom_large_color: RealRgbColor,
-    pub bloom_medium_color: RealRgbColor,
-    pub bloom_small_color: RealRgbColor,
+    /// `auto_exposure_sensitivity` — controls how shader 35
+    /// (`exposure_downsample`) lerps between mean(log) and log(mean)
+    /// average-luminance interpretations.
+    pub auto_exposure_sensitivity: InstantScalarParameter,
+    /// `auto_exposure_anti_bloom` — reduces overexposure bloom from
+    /// elements that don't bloom at exposure_stops = 0.
+    pub auto_exposure_anti_bloom: InstantScalarParameter,
+    /// Bright threshold (typically 1.5 HDR units). Above this point
+    /// the bloom curve kicks in heavily.
+    pub bloom_point: ScalarParameter,
+    /// Additional bloom-curve contribution on intensities BELOW the
+    /// bloom point (riverworld: 0.1).
+    pub bloom_inherent: ScalarParameter,
+    /// Global bloom multiplier vs. underlying scene (riverworld: 0.1).
+    pub bloom_intensity: ScalarParameter,
+    /// Per-stage bloom color tints — composited over the global
+    /// large/medium/small bloom result. When `use_default` is set,
+    /// engine substitutes (1, 1, 1).
+    pub bloom_large_color: ColorParameter,
+    pub bloom_medium_color: ColorParameter,
+    pub bloom_small_color: ColorParameter,
+    /// Bling (sun-disc / lens spike) intensity multiplier.
+    pub bling_intensity: ScalarParameter,
+    /// Spike length in 1/2-res pixels.
+    pub bling_size: ScalarParameter,
+    /// Spike rotation, in degrees (schema-named "bling angle").
+    pub bling_angle_deg: ScalarParameter,
+    /// Number of spikes (typically 3 or 4).
+    pub bling_count: WordParameter,
+    /// Self-illumination preferred exposure stops + blend tuning.
+    pub self_illum_preferred: ScalarParameter,
+    /// `Self illum change` — `[0,1]` cap on how much the self-illum
+    /// exposure is allowed to track the scene exposure.
+    pub self_illum_scale: ScalarParameter,
     /// `ssao` sub-struct. Older tags (riverworld) have it absent — `None`.
     pub ssao: Option<SsaoBlock>,
     /// `lightshafts` sub-struct. Same shape — older tags omit it.
@@ -366,18 +452,45 @@ impl CameraFxSettings {
             })
             .unwrap_or_default();
 
-        // Bloom + bling fields are nested structs with `value` field
-        // for the scalar plus blend-speed/max-change wrappers.
-        let read_struct_real = |name: &str, field: &str| -> f32 {
-            s.field(name)
+        // Generic readers for the parameter shapes. Each parameter
+        // sub-struct has the same shape — flags + named-value field
+        // (+ max_change + blend_speed for blend-mode parameters).
+        let read_scalar_param = |struct_name: &str, value_field: &str| -> ScalarParameter {
+            s.field(struct_name)
                 .and_then(|f| f.as_struct())
-                .and_then(|sub| sub.read_real(field))
-                .unwrap_or(0.0)
+                .map(|sub| ScalarParameter {
+                    flags: sub.read_int_any("flags").unwrap_or(0) as u16,
+                    value: sub.read_real(value_field).unwrap_or(0.0),
+                    max_change: sub.read_real("maximum change").unwrap_or(0.0),
+                    blend_speed: sub.read_real("blend speed (0-1)").unwrap_or(0.0),
+                })
+                .unwrap_or_default()
         };
-        let read_struct_color = |name: &str, field: &str| -> RealRgbColor {
-            s.field(name)
+        let read_instant_param = |struct_name: &str, value_field: &str| -> InstantScalarParameter {
+            s.field(struct_name)
                 .and_then(|f| f.as_struct())
-                .map(|sub| sub.read_rgb(field))
+                .map(|sub| InstantScalarParameter {
+                    flags: sub.read_int_any("flags").unwrap_or(0) as u16,
+                    value: sub.read_real(value_field).unwrap_or(0.0),
+                })
+                .unwrap_or_default()
+        };
+        let read_color_param = |struct_name: &str, value_field: &str| -> ColorParameter {
+            s.field(struct_name)
+                .and_then(|f| f.as_struct())
+                .map(|sub| ColorParameter {
+                    flags: sub.read_int_any("flags").unwrap_or(0) as u16,
+                    color: sub.read_rgb(value_field),
+                })
+                .unwrap_or_default()
+        };
+        let read_word_param = |struct_name: &str, value_field: &str| -> WordParameter {
+            s.field(struct_name)
+                .and_then(|f| f.as_struct())
+                .map(|sub| WordParameter {
+                    flags: sub.read_int_any("flags").unwrap_or(0) as u16,
+                    value: sub.read_int_any(value_field).unwrap_or(0) as u16,
+                })
                 .unwrap_or_default()
         };
 
@@ -402,20 +515,29 @@ impl CameraFxSettings {
 
         Self {
             exposure,
-            bloom_point: read_struct_real("bloom_point", "bloom point"),
-            bloom_intensity: read_struct_real("bloom_intensity", "bloom intensity"),
-            bloom_inherent: read_struct_real("bloom_inherent", "inherent bloom"),
-            bling_intensity: read_struct_real("bling_intensity", "bling intensity"),
-            bling_size: read_struct_real("bling_size", "bling length"),
-            bling_angle_deg: read_struct_real("bling_angle", "bling angle"),
-            bling_count: s
-                .field("bling_count")
-                .and_then(|f| f.as_struct())
-                .and_then(|sub| sub.read_int_any("bling spikes"))
-                .unwrap_or(0) as u8,
-            bloom_large_color: read_struct_color("bloom_large_color", "large color"),
-            bloom_medium_color: read_struct_color("bloom_medium_color", "medium color"),
-            bloom_small_color: read_struct_color("bloom_small_color", "small color"),
+            auto_exposure_sensitivity: read_instant_param(
+                "auto_exposure_sensitivity",
+                "sensitivity (0-1)",
+            ),
+            auto_exposure_anti_bloom: read_instant_param(
+                "auto_exposure_anti_bloom",
+                "anti-bloom (0-1)",
+            ),
+            bloom_point: read_scalar_param("bloom_point", "bloom point"),
+            bloom_inherent: read_scalar_param("bloom_inherent", "inherent bloom"),
+            bloom_intensity: read_scalar_param("bloom_intensity", "bloom intensity"),
+            bloom_large_color: read_color_param("bloom_large_color", "large color"),
+            bloom_medium_color: read_color_param("bloom_medium_color", "medium color"),
+            bloom_small_color: read_color_param("bloom_small_color", "small color"),
+            bling_intensity: read_scalar_param("bling_intensity", "bling intensity"),
+            bling_size: read_scalar_param("bling_size", "bling length"),
+            bling_angle_deg: read_scalar_param("bling_angle", "bling angle"),
+            bling_count: read_word_param("bling_count", "bling spikes"),
+            self_illum_preferred: read_scalar_param(
+                "self_illum_preferred",
+                "preferred exposure",
+            ),
+            self_illum_scale: read_scalar_param("self_illum_scale", "exposure change"),
             ssao,
             lightshafts,
             color_grading,

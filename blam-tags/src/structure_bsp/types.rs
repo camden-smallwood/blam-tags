@@ -91,6 +91,23 @@ pub struct StructureBsp {
     /// `compression_info[]` entry to use for that mesh's vertex
     /// decompression).
     pub instance_definitions: Vec<BspInstanceDefinition>,
+
+    /// `atmosphere palette[i]` — per-BSP atmosphere palette indirection.
+    /// Each entry maps a name + index into the scenario's
+    /// `sky_atm_parameters.atmosphere_settings[]`. `BspCluster::atmosphere_index`
+    /// indexes this table; the resolved entry's `atmosphere_setting_index`
+    /// then indexes the global atmosphere settings. Engine
+    /// `c_atmosphere_fog_interface::get_atmosphere_setting @ 0x1803AFBA0`.
+    pub atmosphere_palette: Vec<BspAtmospherePaletteEntry>,
+
+    /// `weather palette[i]` — per-BSP weather palette. Engine: weather
+    /// is a normal particle effect with the `_effect_weather_bit` flag
+    /// (see `effect_new_weather @ 0x18053D720` per the plan). The
+    /// palette entries carry per-effect wind direction/magnitude/scale
+    /// function, indexed by per-cluster activation in the scenario's
+    /// `scenario_cluster_weather_properties` block. NO separate weather
+    /// renderer — particle effects render through standard transparency.
+    pub weather_palette: Vec<BspWeatherPaletteEntry>,
 }
 
 impl StructureBsp {
@@ -143,6 +160,70 @@ impl StructureBsp {
                 .unwrap_or_default(),
             markers: read_block(s, "markers", BspMarker::from_struct),
             instance_definitions: read_instance_definitions(s),
+            atmosphere_palette: read_block(
+                s,
+                "atmosphere palette",
+                BspAtmospherePaletteEntry::from_struct,
+            ),
+            weather_palette: read_block(
+                s,
+                "weather palette",
+                BspWeatherPaletteEntry::from_struct,
+            ),
+        }
+    }
+}
+
+/// One BSP-side weather palette entry. Schema
+/// `structure_bsp_weather_palette_block` (120B). Each entry's named
+/// effect-tag-ref + wind parameters drive a particle system; the entry
+/// itself is a static palette slot referenced by per-cluster weather
+/// activation in the scenario's `scenario_cluster_weather_properties`
+/// block.
+#[derive(Debug, Clone, Default)]
+pub struct BspWeatherPaletteEntry {
+    /// `name^` — palette entry author name.
+    pub name: String,
+    /// `wind direction` — world-space direction the wind blows (toward).
+    pub wind_direction: RealVector3d,
+    /// `wind magnitude` — per-effect wind speed scale.
+    pub wind_magnitude: f32,
+    /// `wind scale function` — string id of the scenario function that
+    /// modulates wind magnitude over time. Empty when no animation.
+    pub wind_scale_function: String,
+}
+
+impl BspWeatherPaletteEntry {
+    fn from_struct(s: &TagStruct<'_>) -> Self {
+        Self {
+            name: s.read_string_id("name").unwrap_or_default(),
+            wind_direction: s.read_vec3("wind direction"),
+            wind_magnitude: s.read_real("wind magnitude").unwrap_or(0.0),
+            wind_scale_function: s.read_string_id("wind scale function").unwrap_or_default(),
+        }
+    }
+}
+
+/// One BSP-side atmosphere palette entry. Schema
+/// `structure_bsp_atmosphere_palette_block` (8B). Per-BSP indirection
+/// from `BspCluster::atmosphere_index` → `atmosphere_setting_index`,
+/// which indexes the scenario's `sky_atm_parameters.atmosphere_settings[]`.
+#[derive(Debug, Clone, Default)]
+pub struct BspAtmospherePaletteEntry {
+    /// `name^` (string_id) — author-friendly name.
+    pub name: String,
+    /// `Atmosphere Setting Index` (i16) — index into the scenario's
+    /// `sky_atm_parameters.atmosphere_settings[]`. -1 = no setting.
+    pub atmosphere_setting_index: i16,
+}
+
+impl BspAtmospherePaletteEntry {
+    fn from_struct(s: &TagStruct<'_>) -> Self {
+        Self {
+            name: s.read_string_id("name").unwrap_or_default(),
+            atmosphere_setting_index: s
+                .read_int_any("Atmosphere Setting Index")
+                .unwrap_or(-1) as i16,
         }
     }
 }

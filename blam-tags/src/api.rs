@@ -305,6 +305,17 @@ impl<'a> TagStruct<'a> {
         }
     }
 
+    /// Read a `long_string` (256-byte fixed-length null-terminated)
+    /// field. Returns `None` for missing fields or non-long-string
+    /// values. An empty string maps to `Some("")` so callers can
+    /// distinguish "field absent" (None) from "field present, empty".
+    pub fn read_long_string(&self, name: &str) -> Option<String> {
+        match self.field(name)?.value()? {
+            TagFieldData::LongString(s) => Some(s),
+            _ => None,
+        }
+    }
+
     /// Read a `string_id` (or legacy `old_string_id`) field's resolved
     /// string. Returns `None` for missing fields, non-string-id values,
     /// or empty strings.

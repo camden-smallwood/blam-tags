@@ -3,10 +3,13 @@
 //!
 //! Reference: `Ares/source/scenario/scenario_lightmap_definitions.h:90`.
 
+mod top;
 mod types;
 
+pub use top::ScenarioLightmap;
 pub use types::{
-    DequantizedLightmapProbe, DequantizedPerVertexProbe, LightmapBspData, LightmapClusterEntry,
+    DequantizedLightmapProbe, DequantizedPerVertexProbe, LightmapAirprobe, LightmapBspData,
+    LightmapClusterEntry, LightmapDeviceMachineProbe, LightmapDeviceMachineProbeData,
     LightmapError, LightmapInstanceEntry, LightmapPerVertexBlock, LightmapPerVertexProbe,
-    LightmapPolicy, LightmapProbe,
+    LightmapPolicy, LightmapProbe, LightmapSceneryProbe, ScenarioObjectId,
 };
