@@ -112,6 +112,32 @@ pub struct RenderPermutation {
     pub mesh_count: i16,
 }
 
+/// `mesh_transfer_vertex_type_definition` (schema enum on `meshes[i]`,
+/// field name `PRT vertex type*`). Selects which PRT entry point the
+/// engine remaps to at `render_mesh_part_default @ 0x18069EBC0` via
+/// `entry_point_remapping_0[transfer_vector_vertex_type]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum PrtVertexType {
+    #[default]
+    None = 0,
+    Ambient = 1,
+    Linear = 2,
+    Quadratic = 3,
+}
+
+impl PrtVertexType {
+    pub fn from_raw(v: i32) -> Self {
+        match v {
+            1 => Self::Ambient,
+            2 => Self::Linear,
+            3 => Self::Quadratic,
+            _ => Self::None,
+        }
+    }
+    pub fn is_some(self) -> bool { !matches!(self, Self::None) }
+}
+
 /// One mesh from `render geometry/meshes[i]`. Index in the parent
 /// [`RenderModel::meshes`] vec matches the `mesh_index` stored in
 /// permutations.
@@ -133,6 +159,32 @@ pub struct RenderMesh {
     /// regular `vertices` pool (sequential indexing — see
     /// [`RawWaterData::indices`]).
     pub water_data: Option<RawWaterData>,
+    /// `meshes[i].PRT vertex type` — author-declared PRT variant. Only
+    /// `Ambient` appears in the sampled MCC H3 corpus.
+    pub prt_vertex_type: PrtVertexType,
+    /// True iff `meshes[i].vertex_buffer_indices[3] != 0xFFFF`, i.e. a
+    /// runtime PRT vertex buffer is present. Mirrors the engine check
+    /// at `select_instance_entry_point @ 0x180691340` and
+    /// `render_mesh_part_default @ 0x18069EBC0`. Required (alongside
+    /// `structure_instance.lightmapping_policy == 2`) to activate the
+    /// PRT entry-point path. See
+    /// `project_research_per_mesh_prt_2026_05_11.md`.
+    pub has_prt_vertex_stream: bool,
+    /// Pre-baked PRT Ambient per-vertex transfer scalar (grayscale).
+    /// One `f32` per vertex; matches MCC PC vertex declaration
+    /// `transfer_prt_ambient_only_elements` (`R32_FLOAT` `BLENDWEIGHT1`
+    /// slot 2; Ares `rasterizer_resource_definitions.cpp:46`). Empty
+    /// when the mesh declares no PRT or its `mesh pca data` blob is
+    /// missing / size-mismatched.
+    ///
+    /// Source: `per_mesh_prt_data[i].mesh_pca_data` carries 3 floats
+    /// per vertex (RGB transfer); Reach `create_prt_vertex_buffer @
+    /// 0x82E080F0` averages to grayscale (Reach quantizes to 1 byte;
+    /// MCC keeps the float). When this stream is non-empty AND
+    /// `lightmapping_policy == 2` on the instance, the engine routes
+    /// the draw via `_entry_point_static_lighting_prt_quadratic`
+    /// (remapped to the actual variant by `render_mesh_part_default`).
+    pub prt_ambient_stream: Vec<f32>,
 }
 
 /// Per-mesh water-surface data, fully resolved at parse time. Each
@@ -825,6 +877,15 @@ where
         .and_then(|f| f.as_block())
         .ok_or(RenderModelError::MissingField("render geometry/meshes"))?;
 
+    // Parallel `per mesh prt data` block — one entry per mesh, holding
+    // the author-time PCA codebook (`mesh pca data*` = 3 floats RGB per
+    // vertex). Reach `create_prt_vertex_buffer @ 0x82E080F0` averages
+    // these to grayscale to produce the runtime slot-2 vertex stream.
+    // Not present on every tag (render_model tags typically empty);
+    // None falls back to "no PRT data on any mesh".
+    let prt_path = format!("{path_prefix}/per_mesh_prt_data");
+    let prt_data_block = root.field_path(&prt_path).and_then(|f| f.as_block());
+
     let count = meshes_block.len();
     let mut out = Vec::with_capacity(count);
     for mi in 0..count {
@@ -840,19 +901,58 @@ where
             mesh.read_int_any("rigid node index").map(|v| v as i16).filter(|&v| v >= 0)
         } else { None };
 
+        // `PRT vertex type` enum + slot-3 (`_vertex_buffer_usage_prt`)
+        // population. The picker in `select_instance_entry_point @
+        // 0x180691340` activates PRT only when both the instance has
+        // `lightmapping_policy == 2 (single-probe)` AND
+        // `vertex_buffer_indices[3] != 0xFFFF`. We surface the per-mesh
+        // half here; the policy bit comes from sbsp at the caller.
+        let prt_vertex_type = mesh
+            .field("PRT vertex type")
+            .and_then(|f| f.value())
+            .map(|v| match v {
+                TagFieldData::CharEnum { value, .. } => value as i32,
+                _ => 0,
+            })
+            .map(PrtVertexType::from_raw)
+            .unwrap_or(PrtVertexType::None);
+        let has_prt_vertex_stream = mesh
+            .field("vertex buffer indices")
+            .and_then(|f| f.as_array())
+            .and_then(|arr| arr.element(3))
+            .and_then(|e| e.fields().next())
+            .and_then(|f| f.value())
+            .map(|v| match v {
+                TagFieldData::ShortInteger(s) => (s as u16) != 0xFFFF,
+                _ => false,
+            })
+            .unwrap_or(false);
+
         // No raw_vertex / raw_indices means no inline geometry — emit
         // an empty mesh placeholder so indexing into `meshes` still
-        // matches the tag's `meshes[i]` order.
+        // matches the tag's `meshes[i]` order. PRT eligibility is kept
+        // from the schema fields above (the placeholder still reflects
+        // what `meshes[i]` declares).
+        let empty_with_prt = || RenderMesh {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            parts: Vec::new(),
+            rigid_node_index,
+            water_data: None,
+            prt_vertex_type,
+            has_prt_vertex_stream,
+            prt_ambient_stream: Vec::new(),
+        };
         let Some(pmt) = pmt_block.element(mi) else {
-            out.push(empty_mesh(rigid_node_index));
+            out.push(empty_with_prt());
             continue;
         };
         let Some(raw_v) = pmt.field("raw vertices").and_then(|f| f.as_block()) else {
-            out.push(empty_mesh(rigid_node_index));
+            out.push(empty_with_prt());
             continue;
         };
         let Some(raw_i) = pmt.field("raw indices").and_then(|f| f.as_block()) else {
-            out.push(empty_mesh(rigid_node_index));
+            out.push(empty_with_prt());
             continue;
         };
 
@@ -933,19 +1033,44 @@ where
         }
 
         let water_data = read_raw_water_data(&mesh, &pmt, &raw_index_list, &parts_block);
-        out.push(RenderMesh { vertices, indices, parts, rigid_node_index, water_data });
+
+        // PRT Ambient bake. Source: `per_mesh_prt_data[mi].mesh pca
+        // data` = 3 little-endian floats RGB per vertex. Output: one
+        // `f32` per vertex = `(R + G + B) / 3`. Mirrors Reach's
+        // `create_prt_vertex_buffer @ 0x82E080F0` but skips the
+        // X360-only `* 255 + 0.5` byte quantization (MCC PC declaration
+        // is `R32_FLOAT`, see Ares
+        // `rasterizer_resource_definitions.cpp:46`).
+        let prt_ambient_stream: Vec<f32> = prt_data_block
+            .as_ref()
+            .and_then(|blk| blk.element(mi))
+            .and_then(|e| e.field("mesh pca data").and_then(|f| f.as_data()))
+            .filter(|bytes| !bytes.is_empty() && bytes.len() == 12 * vertices.len())
+            .map(|bytes| {
+                let mut out = Vec::with_capacity(vertices.len());
+                for v in 0..vertices.len() {
+                    let off = v * 12;
+                    let r = f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+                    let g = f32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
+                    let b = f32::from_le_bytes(bytes[off + 8..off + 12].try_into().unwrap());
+                    out.push((r + g + b) * (1.0 / 3.0));
+                }
+                out
+            })
+            .unwrap_or_default();
+
+        out.push(RenderMesh {
+            vertices,
+            indices,
+            parts,
+            rigid_node_index,
+            water_data,
+            prt_vertex_type,
+            has_prt_vertex_stream,
+            prt_ambient_stream,
+        });
     }
     Ok(out)
-}
-
-fn empty_mesh(rigid_node_index: Option<i16>) -> RenderMesh {
-    RenderMesh {
-        vertices: Vec::new(),
-        indices: Vec::new(),
-        parts: Vec::new(),
-        rigid_node_index,
-        water_data: None,
-    }
 }
 
 /// Walk water-flagged parts and produce already-resolved per-triangle
