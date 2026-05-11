@@ -18,7 +18,7 @@
 use crate::api::{TagBlock, TagStruct};
 use crate::file::TagFile;
 use crate::fields::TagFieldData;
-use crate::math::{RealBounds, RealPlane3d, RealPoint3d, RealVector3d};
+use crate::math::{RealBounds, RealPlane2d, RealPlane3d, RealPoint3d, RealVector3d};
 
 const SBSP_GROUP: [u8; 4] = *b"sbsp";
 
@@ -407,14 +407,129 @@ impl Bsp3dNode {
     }
 }
 
-/// `bsp3d` — schema `global_collision_bsp_block`. Engine
-/// `Ares/source/physics/bsp3d.h:32-37`. Holds the node table + plane
-/// table; `bsp3d_test_point` walks down node[0] applying plane tests
-/// until reaching a leaf.
+/// `collision_bsp` — schema `global_collision_bsp_struct/_block`
+/// (sizeof=96). Engine `physics/collision_bsp_definitions.h`. Holds
+/// the full collision tree: BSP3D nodes (kd-tree) + planes + leaves
+/// (with bsp2d references) + bsp2d nodes (per-leaf surface kd-tree)
+/// + surface polygons (with edges + vertices).
+///
+/// Two readers:
+/// - `bsp3d_test_point` walks `nodes`/`planes` to find the leaf
+///   containing a world point.
+/// - `collision_bsp_test_vector_recursive @ 0x180513f80` walks the
+///   same nodes for a ray, then `collision_leaf_test_vector @
+///   0x180514460` uses each leaf's `bsp2d_references` to find which
+///   surface polygon the ray hits.
 #[derive(Debug, Clone, Default)]
 pub struct Bsp3d {
     pub nodes: Vec<Bsp3dNode>,
     pub planes: Vec<RealPlane3d>,
+    /// `leaves*` — one per BSP3D leaf the recursive walker can reach.
+    pub leaves: Vec<CollisionLeaf>,
+    /// `bsp2d references*` — per-leaf surface-tree roots. Each leaf
+    /// addresses `[first_bsp2d_reference ..
+    /// first_bsp2d_reference + bsp2d_reference_count)` of this array.
+    pub bsp2d_references: Vec<CollisionBsp2dReference>,
+    /// `bsp2d nodes*` — kd-tree nodes for per-surface ray-in-polygon
+    /// testing. Leaf indices into `surfaces`.
+    pub bsp2d_nodes: Vec<CollisionBsp2dNode>,
+    /// `surfaces*` — collision polygons (one per BSP face).
+    pub surfaces: Vec<CollisionSurface>,
+    /// `edges*` — half-edge graph linking surfaces via shared edges
+    /// (the surface-adjacency table the decal fragment walker uses).
+    pub edges: Vec<CollisionEdge>,
+    /// `vertices*` — collision vertices indexed by edges.
+    pub vertices: Vec<CollisionVertex>,
+}
+
+/// `collision_leaf_struct` (sizeof=8). One per leaf of the BSP3D
+/// collision tree. `bsp2d_reference_count` consecutive entries in
+/// `Bsp3d::bsp2d_references` (starting at `first_bsp2d_reference`)
+/// describe which surface trees this leaf intersects.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CollisionLeaf {
+    /// `flags*` (byte_flags `leaf_flags`). bit 0 = "contains double-
+    /// sided surfaces" per the engine `collision_bsp_test_vector_recursive`
+    /// contents logic.
+    pub flags: u8,
+    /// `bsp2d reference count*`.
+    pub bsp2d_reference_count: i16,
+    /// `first bsp2d reference*` — block index into
+    /// `Bsp3d::bsp2d_references`.
+    pub first_bsp2d_reference: i32,
+}
+
+/// `bsp2d_references_block` (sizeof=4). Maps a leaf to a per-plane
+/// surface kd-tree root. The `plane` field uses the same sign-bit
+/// "designator" convention as BSP3D plane indices: bit 15 flips the
+/// half-space (negate the plane equation).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CollisionBsp2dReference {
+    /// `plane*` — plane_designator (i16). Low 15 bits index into
+    /// `Bsp3d::planes`; bit 15 = negate.
+    pub plane_designator: i16,
+    /// `bsp2d node*` — root node index into `Bsp3d::bsp2d_nodes`.
+    /// Bit 15 set = leaf (surface index = value & 0x7FFF).
+    pub bsp2d_node: i16,
+}
+
+/// `bsp2d_nodes_block` (sizeof=16). A node in the per-leaf surface
+/// kd-tree. Left/right children use the same sign-bit-leaf convention
+/// as `CollisionBsp2dReference::bsp2d_node`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CollisionBsp2dNode {
+    pub plane: RealPlane2d,
+    pub left_child: i16,
+    pub right_child: i16,
+}
+
+/// `surfaces_block` (sizeof=12). One per collision polygon (the
+/// engine calls these "surfaces"; each is a planar face described as
+/// an edge ring).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CollisionSurface {
+    /// `plane*` — plane_designator (i16); bit 15 = negate.
+    pub plane_designator: i16,
+    /// `first edge*` — entry into `Bsp3d::edges` for the edge ring.
+    /// Walk via `CollisionEdge::forward_edge` until you return to
+    /// `first_edge`.
+    pub first_edge: i16,
+    /// `material*` — index into `StructureBsp::collision_materials`.
+    pub material: i16,
+    /// `breakable surface set*` — index into per-BSP breakable
+    /// surface set table (unused outside breakable physics).
+    pub breakable_surface_set: i16,
+    /// `breakable surface*` — index into the breakable set.
+    pub breakable_surface: i16,
+    /// `flags*` (byte_flags `surface_flags`). The decal walker reads
+    /// bits 1 and 3 to filter (bit 1: invisible/sky, bit 3: two-sided).
+    pub flags: u8,
+    /// `best plane calculation vertex index *!` — i8, runtime
+    /// optimization hint; ignored by the decal port.
+    pub best_plane_vertex_index: i8,
+}
+
+/// `edges_block` (sizeof=12). Each edge is shared by EXACTLY TWO
+/// surfaces (left + right). `forward_edge` follows the edge ring
+/// around `left_surface`; `reverse_edge` follows the ring around
+/// `right_surface` (with start/end vertices swapped semantically).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CollisionEdge {
+    pub start_vertex: i16,
+    pub end_vertex: i16,
+    pub forward_edge: i16,
+    pub reverse_edge: i16,
+    pub left_surface: i16,
+    pub right_surface: i16,
+}
+
+/// `vertices_block` (sizeof=16). Collision vertex with a back-pointer
+/// to one of its edges (used for vertex-graph operations the decal
+/// port doesn't exercise).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CollisionVertex {
+    pub point: RealPoint3d,
+    pub first_edge: i16,
 }
 
 impl Bsp3d {
@@ -488,7 +603,9 @@ fn parse_small_bsp3d(entry: &TagStruct<'_>) -> Bsp3d {
         })
         .unwrap_or_default();
     let planes = read_planes(entry);
-    Bsp3d { nodes, planes }
+    let mut out = Bsp3d { nodes, planes, ..Bsp3d::default() };
+    populate_collision_subblocks(entry, &mut out);
+    out
 }
 
 fn parse_large_bsp3d(entry: &TagStruct<'_>) -> Bsp3d {
@@ -512,7 +629,139 @@ fn parse_large_bsp3d(entry: &TagStruct<'_>) -> Bsp3d {
         })
         .unwrap_or_default();
     let planes = read_planes(entry);
-    Bsp3d { nodes, planes }
+    let mut out = Bsp3d { nodes, planes, ..Bsp3d::default() };
+    populate_collision_subblocks(entry, &mut out);
+    out
+}
+
+fn populate_collision_subblocks(entry: &TagStruct<'_>, bsp: &mut Bsp3d) {
+    bsp.leaves = entry
+        .field("leaves")
+        .and_then(|f| f.as_block())
+        .map(|b| {
+            let mut out = Vec::with_capacity(b.len());
+            for i in 0..b.len() {
+                if let Some(e) = b.element(i) {
+                    out.push(CollisionLeaf {
+                        flags: e.read_int_any("flags").unwrap_or(0) as u8,
+                        bsp2d_reference_count: e
+                            .read_int_any("bsp2d reference count")
+                            .unwrap_or(0) as i16,
+                        first_bsp2d_reference: e
+                            .read_int_any("first bsp2d reference")
+                            .unwrap_or(0) as i32,
+                    });
+                }
+            }
+            out
+        })
+        .unwrap_or_default();
+
+    bsp.bsp2d_references = entry
+        .field("bsp2d references")
+        .and_then(|f| f.as_block())
+        .map(|b| {
+            let mut out = Vec::with_capacity(b.len());
+            for i in 0..b.len() {
+                if let Some(e) = b.element(i) {
+                    out.push(CollisionBsp2dReference {
+                        plane_designator: e.read_int_any("plane").unwrap_or(0) as i16,
+                        bsp2d_node: e.read_int_any("bsp2d node").unwrap_or(0) as i16,
+                    });
+                }
+            }
+            out
+        })
+        .unwrap_or_default();
+
+    bsp.bsp2d_nodes = entry
+        .field("bsp2d nodes")
+        .and_then(|f| f.as_block())
+        .map(|b| {
+            let mut out = Vec::with_capacity(b.len());
+            for i in 0..b.len() {
+                if let Some(e) = b.element(i) {
+                    let plane = match e.field("plane").and_then(|f| f.value()) {
+                        Some(TagFieldData::RealPlane2d(p)) => p,
+                        _ => RealPlane2d::default(),
+                    };
+                    out.push(CollisionBsp2dNode {
+                        plane,
+                        left_child: e.read_int_any("left child").unwrap_or(0) as i16,
+                        right_child: e.read_int_any("right child").unwrap_or(0) as i16,
+                    });
+                }
+            }
+            out
+        })
+        .unwrap_or_default();
+
+    bsp.surfaces = entry
+        .field("surfaces")
+        .and_then(|f| f.as_block())
+        .map(|b| {
+            let mut out = Vec::with_capacity(b.len());
+            for i in 0..b.len() {
+                if let Some(e) = b.element(i) {
+                    out.push(CollisionSurface {
+                        plane_designator: e.read_int_any("plane").unwrap_or(0) as i16,
+                        first_edge: e.read_int_any("first edge").unwrap_or(0) as i16,
+                        material: e.read_int_any("material").unwrap_or(-1) as i16,
+                        breakable_surface_set: e
+                            .read_int_any("breakable surface set")
+                            .unwrap_or(-1) as i16,
+                        breakable_surface: e
+                            .read_int_any("breakable surface")
+                            .unwrap_or(-1) as i16,
+                        flags: e.read_int_any("flags").unwrap_or(0) as u8,
+                        best_plane_vertex_index: e
+                            .read_int_any("best plane calculation vertex index ")
+                            .unwrap_or(0) as i8,
+                    });
+                }
+            }
+            out
+        })
+        .unwrap_or_default();
+
+    bsp.edges = entry
+        .field("edges")
+        .and_then(|f| f.as_block())
+        .map(|b| {
+            let mut out = Vec::with_capacity(b.len());
+            for i in 0..b.len() {
+                if let Some(e) = b.element(i) {
+                    out.push(CollisionEdge {
+                        start_vertex: e.read_int_any("start vertex").unwrap_or(0) as i16,
+                        end_vertex: e.read_int_any("end vertex").unwrap_or(0) as i16,
+                        forward_edge: e.read_int_any("forward edge").unwrap_or(0) as i16,
+                        reverse_edge: e.read_int_any("reverse edge").unwrap_or(0) as i16,
+                        left_surface: e.read_int_any("left surface").unwrap_or(-1) as i16,
+                        right_surface: e.read_int_any("right surface").unwrap_or(-1) as i16,
+                    });
+                }
+            }
+            out
+        })
+        .unwrap_or_default();
+
+    bsp.vertices = entry
+        .field("vertices")
+        .and_then(|f| f.as_block())
+        .map(|b| {
+            let mut out = Vec::with_capacity(b.len());
+            for i in 0..b.len() {
+                if let Some(e) = b.element(i) {
+                    let point = e.read_point3d("point");
+                    out.push(CollisionVertex {
+                        point,
+                        first_edge: e.read_int_any("first edge").unwrap_or(0) as i16,
+                    });
+                }
+            }
+            out
+        })
+        .unwrap_or_default();
 }
 
 fn read_planes(entry: &TagStruct<'_>) -> Vec<RealPlane3d> {
