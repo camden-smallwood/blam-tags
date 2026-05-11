@@ -563,6 +563,30 @@ impl Bsp3d {
         }
         None
     }
+
+    /// Parse a `collision_bsp` carried inline as a sub-struct (rather
+    /// than referenced through a resource-interface block). Tag schema
+    /// labels this field `collision info` inside each
+    /// `instanced geometries definitions[i]` entry — see Ares
+    /// `structures/instanced_geometry_definitions.h:38` (the
+    /// `collision_bsp bsp` field of `structure_instanced_geometry_definition`).
+    /// The shape matches a `collision bsp` block element so the same
+    /// small/large node parsers apply.
+    pub fn from_inline_struct(entry: &TagStruct<'_>) -> Option<Self> {
+        // Small-bsp shape uses `bsp3d nodes` with `node data designator`
+        // (64-bit packed). Large-bsp shape uses `bsp3d nodes` with
+        // `plane`/`back child`/`front child`. Try small first; fall
+        // back to large.
+        let small = parse_small_bsp3d(entry);
+        if !small.nodes.is_empty() {
+            return Some(small);
+        }
+        let large = parse_large_bsp3d(entry);
+        if !large.nodes.is_empty() {
+            return Some(large);
+        }
+        None
+    }
 }
 
 fn parse_small_bsp3d(entry: &TagStruct<'_>) -> Bsp3d {
@@ -1041,10 +1065,21 @@ pub struct BspInstanceDefinition {
     /// this def's vertex positions + texcoords.
     pub compression_index: i16,
     pub global_lightmap_resolution_scale: f32,
+    /// Inline `collision_bsp` for this definition — schema field
+    /// `collision info`. Ares
+    /// `structure_instanced_geometry_definition::bsp` at offset 0x14.
+    /// Used by `instanced_geometry_test_vector_internal @ 0x180400170`
+    /// to raycast against per-instance geometry in instance-local
+    /// space.
+    pub bsp: Option<Bsp3d>,
 }
 
 impl BspInstanceDefinition {
     fn from_struct(s: &TagStruct<'_>) -> Self {
+        let bsp = s
+            .field("collision info")
+            .and_then(|f| f.as_struct())
+            .and_then(|cs| Bsp3d::from_inline_struct(&cs));
         Self {
             checksum: s.read_int_any("checksum").unwrap_or(0) as i32,
             bounding_sphere_center: s.read_point3d("bounding sphere center"),
@@ -1054,6 +1089,7 @@ impl BspInstanceDefinition {
             global_lightmap_resolution_scale: s
                 .read_real("global lightmap resolution scale")
                 .unwrap_or(1.0),
+            bsp,
         }
     }
 }
