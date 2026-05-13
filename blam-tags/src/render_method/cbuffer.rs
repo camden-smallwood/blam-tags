@@ -174,6 +174,47 @@ pub fn rebuild_cbuffer_bytes_at_time(
     resolve_pixel_user_cbuffer_at_time(rmsh, rmt2, rmop_params, eval_time).bytes
 }
 
+/// Time-aware re-resolve that handles both load-time paths:
+/// - `Some(rmt2)` → walks `rmt2.float_constants[i]` order (the engine's
+///   cache-built path, same as `resolve_pixel_user_cbuffer_at_time`).
+/// - `None` → walks `rmop_params[i]` order (author-format tags with
+///   empty `rmsh.postprocess_definition` — e.g. vahalla_waterfall).
+///
+/// Caller must use the SAME path here that was used at load time so
+/// the produced bytes match the layout that `CbufferLayout` was built
+/// against. `MaterialData::cbuffer.bytes` was produced by whichever
+/// path applied; pass `source.rmt2.as_ref()` to mirror it.
+pub fn rebuild_cbuffer_bytes_with_optional_rmt2(
+    rmsh: &RenderMethod,
+    rmt2: Option<&RenderMethodTemplate>,
+    rmop_params: &[RenderMethodOptionParameter],
+    eval_time: f32,
+) -> Vec<u8> {
+    match rmt2 {
+        Some(rmt2) => resolve_pixel_user_cbuffer_at_time(rmsh, rmt2, rmop_params, eval_time).bytes,
+        None => {
+            // Mirror of `loader.rs::shader_from_render_method` rmop
+            // fallback (the `cbuffer_from_rmt2.unwrap_or_else(...)`
+            // arm). Walks rmop_params source order, evaluates each
+            // animated function at `eval_time`.
+            let mut bytes = vec![0u8; rmop_params.len() * 16];
+            for (i, op) in rmop_params.iter().enumerate() {
+                let rmsh_param = rmsh
+                    .parameters
+                    .iter()
+                    .find(|p| p.parameter_name == op.parameter_name);
+                let (value, _is_xform) =
+                    compile_real_constant_at_time(op, rmsh_param, eval_time);
+                let off = i * 16;
+                for (c, v) in value.iter().enumerate() {
+                    bytes[off + c * 4..off + c * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                }
+            }
+            bytes
+        }
+    }
+}
+
 /// Canonical per-slot merge — mirror of
 /// `c_render_method::compile_single_real_constant @ 0x826E42E8` from
 /// Reach tag-debug XEX. Reproduces the cache-builder's two-stage bake.
@@ -355,28 +396,43 @@ fn extract_first_color(f: &TagFunction) -> Option<[f32; 4]> {
 // Cbuffer animation detection (P6.2)
 // =============================================================================
 
-/// Returns `true` if any cbuffer slot's resolved vec4 differs between
-/// `eval_time = 0.0` and `eval_time = 1.0` — i.e., the cbuffer contains
-/// at least one time-bearing parameter (animated TagFunction).
+/// Returns `true` if any of the rmsh's `animated_parameters` carries a
+/// non-constant TagFunction — i.e., the cbuffer has a slot whose value
+/// changes over the input domain.
 ///
 /// Engine equivalent: `c_render_method::has_animated_parameters` (not
-/// directly named in dllcache; the engine drives per-frame
+/// directly named in dllcache; engine drives per-frame
 /// `update_constants @ 0x180685300` calls only for materials that
-/// declared `m_overlays` non-empty). For protomorph, an empirical
-/// time-vs-time comparison is cheaper than parsing the overlay metadata
-/// and produces the same answer for any material whose evaluated value
-/// actually changes with time.
+/// declared `m_overlays` non-empty). The engine walks the overlays at
+/// tag-build time, dropping constant entries — so a non-empty
+/// `animated_parameters` with at least one non-constant function is the
+/// authoritative "this material animates" signal.
 ///
-/// O(N) in cbuffer slot count, called once at material load. Result is
-/// cached on `MaterialData::is_animated` on the protomorph side.
+/// Previously this used an empirical `t=0` vs `t=1` byte comparison,
+/// which silently false-negatived periodic TagFunctions where both
+/// endpoints happen to evaluate equal (e.g. `sin(2πt)` at integer t).
+/// The structural check below catches those.
+///
+/// `rmt2` and `rmop_params` are kept in the signature for API
+/// continuity (callers pass them already-resolved) even though the
+/// current check only consults `rmsh.animated_parameters`. If a future
+/// audit shows the engine also pulls overlays from rmt2-side state,
+/// extend here.
+///
+/// O(N) in animated_parameters count (small — typically 0..10). Called
+/// once at material load; result cached on `MaterialData::is_animated`
+/// on the protomorph side.
 pub fn is_cbuffer_animated(
     rmsh: &RenderMethod,
-    rmt2: &RenderMethodTemplate,
-    rmop_params: &[RenderMethodOptionParameter],
+    _rmt2: Option<&RenderMethodTemplate>,
+    _rmop_params: &[RenderMethodOptionParameter],
 ) -> bool {
-    let cb0 = resolve_pixel_user_cbuffer_at_time(rmsh, rmt2, rmop_params, 0.0);
-    let cb1 = resolve_pixel_user_cbuffer_at_time(rmsh, rmt2, rmop_params, 1.0);
-    cb0.bytes != cb1.bytes
+    rmsh.parameters.iter().any(|p| {
+        p.animated_parameters.iter().any(|anim| match &anim.function {
+            Some(f) => !f.is_constant(),
+            None => false,
+        })
+    })
 }
 
 // =============================================================================
