@@ -1132,6 +1132,16 @@ pub struct BspInstanceDefinition {
     /// to raycast against per-instance geometry in instance-local
     /// space.
     pub bsp: Option<Bsp3d>,
+
+    /// `render bsp[i]` count — Ares
+    /// `structure_instanced_geometry_definition::render_bsp` (`s_tag_block`
+    /// at offset 0x74). When non-zero the definition is "render-only":
+    /// instances of this def carry geometry but no collision data.
+    /// Engine `s_decal_collision_result::decalable_surface() const @
+    /// 0x18039FE50` rejects decal hits on such instances. We only need
+    /// the count for that predicate, so we don't materialize the
+    /// contents.
+    pub render_bsp_count: usize,
 }
 
 impl BspInstanceDefinition {
@@ -1140,6 +1150,11 @@ impl BspInstanceDefinition {
             .field("collision info")
             .and_then(|f| f.as_struct())
             .and_then(|cs| Bsp3d::from_inline_struct(&cs));
+        let render_bsp_count = s
+            .field("render bsp")
+            .and_then(|f| f.as_block())
+            .map(|b| b.len())
+            .unwrap_or(0);
         Self {
             checksum: s.read_int_any("checksum").unwrap_or(0) as i32,
             bounding_sphere_center: s.read_point3d("bounding sphere center"),
@@ -1150,6 +1165,7 @@ impl BspInstanceDefinition {
                 .read_real("global lightmap resolution scale")
                 .unwrap_or(1.0),
             bsp,
+            render_bsp_count,
         }
     }
 }
