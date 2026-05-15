@@ -185,6 +185,14 @@ pub struct RenderMesh {
     /// the draw via `_entry_point_static_lighting_prt_quadratic`
     /// (remapped to the actual variant by `render_mesh_part_default`).
     pub prt_ambient_stream: Vec<f32>,
+    /// `mesh->flags & _mesh_has_vertex_color_bit` (Ares
+    /// `geometry_definitions.h:15`). Engine signal that the mesh
+    /// carries the `_vertex_buffer_usage_vert_color` stream; consumed
+    /// by `render_mesh_part_default @ 0x18069EBC0` to remap the entry
+    /// point from `_entry_point_static_lighting_prt_quadratic` to
+    /// `_entry_point_vertex_color_lighting` (idx=14, sky shader path).
+    /// Tag field is `s_mesh.flags` at offset 0x2C.
+    pub has_vertex_color: bool,
 }
 
 /// Per-mesh water-surface data, fully resolved at parse time. Each
@@ -288,6 +296,14 @@ pub struct RenderVertex {
     /// UVs should walk the lightmap tag's geometry and zip with the
     /// SBSP vertices on `(mesh_index, vertex_index)`.
     pub lightmap_texcoord: RealPoint2d,
+    /// `raw_vertex.vert_color` (Ares `RawVertex.vert_color @ 0x54`,
+    /// `render_geometry.rs:155`). Per-vertex baked color used by sky
+    /// `.render_model` meshes — engine binds this as the
+    /// `_vertex_buffer_usage_vert_color` stream
+    /// (geometry_definitions.h:27) for the
+    /// `_entry_point_vertex_color_lighting` (idx=14) draw path. Zero on
+    /// meshes that don't have `_mesh_has_vertex_color_bit` set.
+    pub vert_color: RealVector3d,
 }
 
 /// One draw range within a [`RenderMesh`]. `material_index` indexes
@@ -928,6 +944,15 @@ where
             })
             .unwrap_or(false);
 
+        // `s_mesh.flags` byte_flags at offset 0x2C (Ares
+        // `geometry_definitions.h:13-21`). Bit 0 =
+        // `_mesh_has_vertex_color_bit`. Tag schema name: `"mesh flags"`.
+        // Engine `render_mesh_part_default @ 0x18069EBC0` reads this
+        // bit to remap `_entry_point_static_lighting_prt_quadratic` →
+        // `_entry_point_vertex_color_lighting` at draw time.
+        let mesh_flags = mesh.read_int_any("mesh flags").unwrap_or(0) as u32;
+        let has_vertex_color = (mesh_flags & 1) != 0;
+
         // No raw_vertex / raw_indices means no inline geometry — emit
         // an empty mesh placeholder so indexing into `meshes` still
         // matches the tag's `meshes[i]` order. PRT eligibility is kept
@@ -942,6 +967,7 @@ where
             prt_vertex_type,
             has_prt_vertex_stream,
             prt_ambient_stream: Vec::new(),
+            has_vertex_color,
         };
         let Some(pmt) = pmt_block.element(mi) else {
             out.push(empty_with_prt());
@@ -1068,6 +1094,7 @@ where
             prt_vertex_type,
             has_prt_vertex_stream,
             prt_ambient_stream,
+            has_vertex_color,
         });
     }
     Ok(out)
@@ -1235,6 +1262,9 @@ fn read_vertex(
     // real values. Read whatever's here verbatim — caller decides
     // whether to source from sbsp or lightmap.
     let lightmap_texcoord = v.read_point2d("lightmap texcoord");
+    // `raw_vertex.vert_color` — per-vertex baked color (sky meshes).
+    // Stored as a `real_point3d`; read directly (no compression bounds).
+    let vert_color = v.read_point3d("vertex color").as_vector();
 
     let mut node_indices = [0u8; 4];
     let mut node_weights = [0f32; 4];
@@ -1280,5 +1310,6 @@ fn read_vertex(
         node_indices,
         node_weights,
         lightmap_texcoord,
+        vert_color,
     }
 }

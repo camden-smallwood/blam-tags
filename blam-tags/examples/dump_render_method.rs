@@ -134,7 +134,7 @@ fn dump_render_method(rm: &RenderMethod) {
             for (i, r) in pp.routing_info.iter().enumerate() {
                 println!(
                     "    [{i}] dst={} src={} flags=0x{:02x}",
-                    r.destination_index, r.source_index, r.bitmap_flags,
+                    r.destination_index, r.source_index, r.type_specific,
                 );
             }
             println!("  overlays:           [{}]", pp.overlays.len());
@@ -206,7 +206,7 @@ fn dump_rmt2(rmt2: &RenderMethodTemplate) {
     for (i, r) in rmt2.routing_info.iter().enumerate() {
         println!(
             "  [{i}] dst={} src={} flags=0x{:02x}",
-            r.destination_index, r.source_index, r.bitmap_flags
+            r.destination_index, r.source_index, r.type_specific
         );
     }
     println!("float_constants: {:?}", rmt2.float_constants);

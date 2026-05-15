@@ -189,7 +189,17 @@ impl DecalDefinition {
             .descend("actual shader")
             .or_else(|| s.descend("actual shader?"));
         let shader = match shader_struct {
-            Some(view) => Some(RenderMethod::from_struct(&view)?),
+            Some(view) => {
+                let mut rm = RenderMethod::from_struct(&view)?;
+                // `actual shader` is by construction a
+                // `c_render_method_shader_decal` — set the group_tag
+                // explicitly since `from_struct` can't infer it (no
+                // outer tag context). Without this, downstream
+                // dispatchers keyed off `group_tag.to_be_bytes()` see
+                // 0x00000000 and miss the rmd arm.
+                rm.group_tag = u32::from_be_bytes(*b"rmd ");
+                Some(rm)
+            }
             None => None,
         };
         let radius = read_real_bounds(s, "radius");
