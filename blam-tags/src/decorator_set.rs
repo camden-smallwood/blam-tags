@@ -43,8 +43,14 @@ pub mod render_flags {
     /// Render two-sided (no back-face culling). Set on most leafy
     /// foliage like thistle, ferns.
     pub const TWO_SIDED: u8 = 1 << 0;
-    /// Don't sample lighting through geometry — use the placement's
-    /// authored tint directly instead of looking up cluster lightprobe.
+    /// Gate the 10-sample lightprobe bake with a visibility pre-cast:
+    /// before evaluating each sample, cast a segment from the placement's
+    /// mesh-bounding-sphere center to the sample world position and
+    /// skip samples blocked by BSP geometry. Engine still samples the
+    /// atlas lightprobe per surviving sample — this is NOT a "use tint
+    /// directly" shortcut. Schema annotation: "takes twice as long to
+    /// light." Consumed in `decorators::bake::bake_placement` (Reach
+    /// `light_placement @ 0x82797d00` step 6d).
     pub const DONT_SAMPLE_LIGHTING_THROUGH_GEOMETRY: u8 = 1 << 1;
 }
 
