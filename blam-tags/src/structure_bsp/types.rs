@@ -296,11 +296,16 @@ pub struct BspCameraFxPaletteEntry {
 
 impl BspCameraFxPaletteEntry {
     fn from_struct(s: &TagStruct<'_>) -> Self {
-        // Tag-field names verified against riverworld.scenario_structure_bsp
-        // raw strings (2026-05-20). Engine bit-1 override path reads the
-        // `forced auto-exposure screen brightness` field — distinct from
-        // `forced exposure` (which is the bit-0 override). The bloom
-        // overrides are prefixed "override" in the tag schema.
+        // Field names verified against definitions/halo3_mcc/
+        // scenario_structure_bsp.json `structure_bsp_camera_fx_palette_block`
+        // (2026-05-20). The bit-1 override path field is
+        // `forced auto-exposure screen brightness` (NOT
+        // `forced auto exposure brightness` — missing hyphen and
+        // "screen" causes silent unwrap_or(0.0)). The bloom field
+        // names are plain `inherent bloom` / `bloom intensity`; the
+        // schema's `override inherent bloom` / `override bloom intensity`
+        // are FLAG-BIT LABELS in camera_fx_palette_flags, not field
+        // names.
         Self {
             name: s.read_string_id("name").unwrap_or_default(),
             flags: s.read_int_any("camera_fx_palette_flags").unwrap_or(0) as u8,
@@ -310,8 +315,8 @@ impl BspCameraFxPaletteEntry {
                 .unwrap_or(0.0),
             exposure_min: s.read_real("exposure min").unwrap_or(0.0),
             exposure_max: s.read_real("exposure max").unwrap_or(0.0),
-            inherent_bloom: s.read_real("override inherent bloom").unwrap_or(0.0),
-            bloom_intensity: s.read_real("override bloom intensity").unwrap_or(0.0),
+            inherent_bloom: s.read_real("inherent bloom").unwrap_or(0.0),
+            bloom_intensity: s.read_real("bloom intensity").unwrap_or(0.0),
         }
     }
 }
