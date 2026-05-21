@@ -104,6 +104,7 @@ pub mod giant;
 pub mod item;
 pub mod light;
 pub mod object;
+pub mod particle;
 pub mod projectile;
 pub mod scenery;
 pub mod sound_scenery;
