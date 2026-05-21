@@ -125,6 +125,7 @@ pub fn group_tag_to_extension(group: u32) -> Option<&'static str> {
         b"crea" => "creature",
         b"gint" => "giant",
         b"efsc" => "effect_scenery",
+        b"effe" => "effect",
         _ => return None,
     })
 }
