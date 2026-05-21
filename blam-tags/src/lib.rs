@@ -114,6 +114,7 @@ pub mod weapon;
 pub mod area_screen_effect;
 pub mod camera_fx_settings;
 pub mod shield_impact;
+pub mod effect_globals;
 pub mod chocolate_mountain;
 pub mod rasterizer_globals;
 pub mod structure_bsp;
