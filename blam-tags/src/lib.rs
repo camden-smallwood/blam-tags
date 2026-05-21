@@ -117,6 +117,7 @@ pub mod shield_impact;
 pub mod effect_globals;
 pub mod particle_model;
 pub mod damage_effect;
+pub mod particle_physics;
 pub mod chocolate_mountain;
 pub mod rasterizer_globals;
 pub mod structure_bsp;
