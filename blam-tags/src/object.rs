@@ -263,6 +263,13 @@ impl ObjectAiProperties {
 pub struct ObjectAttachment {
     /// `type^` (tag_reference — many allowed groups, mostly effe/lens/snd!/cont/lsnd).
     pub type_ref: String,
+    /// 4-byte big-endian group fourcc of the [`Self::type_ref`] tag —
+    /// `b"effe"` / `b"lens"` / `b"snd!"` / `b"cont"` / `b"lsnd"` /
+    /// `b"ligh"` / etc. Engine `attachments_new @ 0x1807E2F60`
+    /// dispatches on this exact value (effe→effect_check_object_function_determinacy,
+    /// ligh→light_new_attached, lsnd→game_looping_sound_attachment_new,
+    /// lens→queued per-frame). `[0; 4]` when the attachment is null.
+    pub type_group: [u8; 4],
     /// `marker` (old_string_id) — the node/marker the attachment binds to.
     pub marker: String,
     /// `change color` (short_enum, `global_object_change_color_enum`).
@@ -275,8 +282,12 @@ pub struct ObjectAttachment {
 
 impl ObjectAttachment {
     fn from_struct(s: &TagStruct<'_>) -> Self {
+        let (type_group_u32, type_ref) = s
+            .read_tag_ref_with_group("type")
+            .unwrap_or((0, String::new()));
         Self {
-            type_ref: s.read_tag_ref_path("type").unwrap_or_default(),
+            type_ref,
+            type_group: type_group_u32.to_be_bytes(),
             marker: s.read_string_id("marker").unwrap_or_default(),
             change_color: s.read_int_any("change color").unwrap_or(0) as i16,
             primary_scale: s.read_string_id("primary scale").unwrap_or_default(),
