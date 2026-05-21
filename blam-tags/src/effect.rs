@@ -614,16 +614,14 @@ impl EffectAcceleration {
 }
 
 // ---------------------------------------------------------------------------
-// `particle_system_emitter_definition_block` — 752B authored. P1
-// captures the outer scalar fields only; per-emitter property
-// evaluators (translational_offset, relative_direction, emission_radius,
-// emission_angle, particle_velocity / lifespan / rotation / size /
-// scale / tint / alpha / black_point, particle_movement,
-// particle_self_acceleration) are walked in P3 with the standalone
-// particle subsystem port — they need the `c_editable_property`
-// evaluator + GPU property/function/color blocks which the multiplexer
-// doesn't dispatch on.
+// `particle_system_emitter_definition_block` — 752B authored. Tier
+// 1.12 (P3) expansion: walk all 18 per-emitter property curves +
+// the inline particle_physics struct so consumers can evaluate emitter
+// behaviour without going back to the bytes.
 // ---------------------------------------------------------------------------
+
+use crate::effects_properties::EditableProperty;
+use crate::particle_physics::ParticlePhysics;
 
 #[derive(Debug, Clone, Default)]
 pub struct ParticleSystemEmitter {
@@ -640,7 +638,46 @@ pub struct ParticleSystemEmitter {
     pub bounding_radius_estimate: f32,
     pub bounding_radius_override: f32,
     pub uv_scrolling: crate::math::RealVector2d,
-    // Property evaluators + particle_movement + GPU blocks: P3 fills in.
+
+    // ---- 5 emission shape curves ----
+    pub translational_offset: EditableProperty,
+    pub relative_direction: EditableProperty,
+    pub emission_radius: EditableProperty,
+    pub emission_angle: EditableProperty,
+    pub emission_axis_angle: EditableProperty,
+
+    // ---- 4 emission rate curves ----
+    pub particle_starting_count: EditableProperty,
+    pub particle_max_count: EditableProperty,
+    pub particle_emission_rate: EditableProperty,
+    pub particle_lifespan: EditableProperty,
+
+    /// Inline `particle_physics_struct` — engine treats this as either
+    /// an external pmov template reference (`template` field set) or a
+    /// fully inlined movements[] authoring. Same shape as the standalone
+    /// pmov tag root struct.
+    pub particle_movement: ParticlePhysics,
+
+    // ---- 4 motion curves ----
+    pub particle_self_acceleration: EditableProperty,
+    pub particle_initial_velocity: EditableProperty,
+    pub particle_rotation: EditableProperty,
+    pub particle_initial_rotation_rate: EditableProperty,
+
+    // ---- 5 appearance curves ----
+    pub particle_size: EditableProperty,
+    pub particle_scale: EditableProperty,
+    /// `particle tint` — RGB color property. Layout matches scalar
+    /// (`particle_property_color_struct_new` is identical to scalar);
+    /// runtime interprets `constant_value` differently for color slots.
+    pub particle_tint: EditableProperty,
+    pub particle_alpha: EditableProperty,
+    pub particle_alpha_black_point: EditableProperty,
+
+    // ---- runtime-resolved gpu_data summary ----
+    pub runtime_constant_per_particle_properties: i32,
+    pub runtime_constant_over_time_properties: i32,
+    pub runtime_used_particle_states: i32,
 }
 
 impl ParticleSystemEmitter {
@@ -653,12 +690,21 @@ impl ParticleSystemEmitter {
             s.read_int_any("particle axis (for models)").unwrap_or(0) as i8;
         let particle_reference_axis =
             s.read_int_any("particle reference axis").unwrap_or(0) as i8;
-        // `estimate*` is stripped per `*` annotation; override is kept.
-        let bounding_radius_estimate: f32 = 0.0;
+        let bounding_radius_estimate = s
+            .read_real("bounding radius estimate")
+            .unwrap_or(0.0);
         let bounding_radius_override = s
             .read_real("bounding radius override")
             .unwrap_or(0.0);
         let uv_scrolling = s.read_vec2("uv scrolling");
+
+        // Inline particle_physics_struct — reuse the standalone walker.
+        let particle_movement = s
+            .field("particle movement")
+            .and_then(|f| f.as_struct())
+            .map(|inner| ParticlePhysics::from_struct(&inner))
+            .unwrap_or_default();
+
         Self {
             name,
             emission_shape,
@@ -668,8 +714,44 @@ impl ParticleSystemEmitter {
             bounding_radius_estimate,
             bounding_radius_override,
             uv_scrolling,
+            translational_offset: read_property(s, "translational offset"),
+            relative_direction: read_property(s, "relative direction"),
+            emission_radius: read_property(s, "emission radius"),
+            emission_angle: read_property(s, "emission angle"),
+            emission_axis_angle: read_property(s, "emission axis angle"),
+            particle_starting_count: read_property(s, "particle starting count"),
+            particle_max_count: read_property(s, "particle max count"),
+            particle_emission_rate: read_property(s, "particle emission rate"),
+            particle_lifespan: read_property(s, "particle lifespan"),
+            particle_movement,
+            particle_self_acceleration: read_property(s, "particle self-acceleration"),
+            particle_initial_velocity: read_property(s, "particle initial velocity"),
+            particle_rotation: read_property(s, "particle rotation"),
+            particle_initial_rotation_rate: read_property(s, "particle initial rotation rate"),
+            particle_size: read_property(s, "particle size"),
+            particle_scale: read_property(s, "particle scale"),
+            particle_tint: read_property(s, "particle tint"),
+            particle_alpha: read_property(s, "particle alpha"),
+            particle_alpha_black_point: read_property(s, "particle alpha black point"),
+            runtime_constant_per_particle_properties: s
+                .read_int_any("runtime m_constant_per_particle_properties")
+                .unwrap_or(0) as i32,
+            runtime_constant_over_time_properties: s
+                .read_int_any("runtime m_constant_over_time_properties")
+                .unwrap_or(0) as i32,
+            runtime_used_particle_states: s
+                .read_int_any("runtime m_used_particle_states")
+                .unwrap_or(0) as i32,
         }
     }
+}
+
+fn read_property(parent: &TagStruct<'_>, name: &str) -> EditableProperty {
+    parent
+        .field(name)
+        .and_then(|f| f.as_struct())
+        .map(|inner| EditableProperty::from_struct(&inner))
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
