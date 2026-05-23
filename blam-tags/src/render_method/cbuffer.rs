@@ -246,7 +246,23 @@ pub fn compile_real_constant_at_time(
 
     // ---- Stage 1: rmop default ----
     let mut slot: [f32; 4] = match pt {
-        Some(P::Bitmap) => [1.0, 1.0, 0.0, 0.0],
+        Some(P::Bitmap) => {
+            // Bitmap xform Stage 1 default is identity scale + zero
+            // translation. The rmop's `default_bitmap_scale` field is
+            // NOT applied here despite the name — confirmed by shrine
+            // sky shaders (e.g. shrine_clouds_sandstorm), where the
+            // rmop authors default_bitmap_scale=16 for `detail_map_overlay`
+            // but the runtime samples without tiling. The engine path
+            // that uses `default_bitmap_scale` is in
+            // `c_render_method_query::get_parameter` (stripped in MCC,
+            // intact in Reach XEX) and only applies when the rmsh has
+            // NO parameter entry at all — i.e., the editor-preview
+            // path, not the rendered cbuffer fill which we're walking
+            // here. The rmsh animated_parameters (Stage 2 below) carry
+            // the artist's intended scale/translation when they author
+            // a parameter entry at all.
+            [1.0, 1.0, 0.0, 0.0]
+        }
         Some(P::Color) => {
             let mut c = argb_u32_to_rgba(op_param.default_color);
             c[3] = 1.0; // type Color forces alpha=1

@@ -372,7 +372,8 @@ impl BitmapFilterMode {
     }
 }
 
-/// Bitmap sampler address mode (rmop default).
+/// Bitmap sampler address mode (rmop default). Mirrors the schema's
+/// `render_method_bitmap_address_mode_enum`.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum BitmapAddressMode {
@@ -390,6 +391,39 @@ impl BitmapAddressMode {
             1 => Self::Clamp,
             2 => Self::Mirror,
             3 => Self::BlackBorder,
+            _ => return None,
+        })
+    }
+}
+
+/// Bitmap sampler comparison function (rmop default). Mirrors the
+/// schema's `render_method_bitmap_comparison_function_enum`. Used by
+/// the comparison-filter sampler modes for shadow / depth fetches.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum BitmapComparisonFunction {
+    #[default]
+    Never        = 0,
+    Less         = 1,
+    Equal        = 2,
+    LessEqual    = 3,
+    Greater      = 4,
+    NotEqual     = 5,
+    GreaterEqual = 6,
+    Always       = 7,
+}
+
+impl BitmapComparisonFunction {
+    pub fn from_index(i: i128) -> Option<Self> {
+        Some(match i {
+            0 => Self::Never,
+            1 => Self::Less,
+            2 => Self::Equal,
+            3 => Self::LessEqual,
+            4 => Self::Greater,
+            5 => Self::NotEqual,
+            6 => Self::GreaterEqual,
+            7 => Self::Always,
             _ => return None,
         })
     }
@@ -508,18 +542,23 @@ pub struct RenderMethodTemplatePass {
 
 /// Per-pass texture binding inside a postprocess definition. Mirrors
 /// `s_render_method_postprocess_texture` (28 bytes in the MCC schema).
+///
+/// The `address_mode` byte at offset 0x12 in Ares is two 4-bit nibbles
+/// (`address_mode_x : 4` low, `address_mode_y : 4` high). It is split
+/// into the two enum fields here for direct use.
 #[derive(Debug, Clone)]
 pub struct RenderMethodPostprocessTexture {
     /// Path to the bound `bitmap` tag (empty when the slot uses an
     /// extern texture instead).
     pub bitmap_path: String,
     pub bitmap_index: i16,
-    pub address_mode: u8,
-    pub filter_mode: u8,
-    pub comparison_function: u8,
-    /// When non-zero, the texture comes from
-    /// [`RenderMethodExtern`] discriminant — bitmap_path is ignored.
-    pub extern_texture_mode: u8,
+    pub address_mode_x: BitmapAddressMode,
+    pub address_mode_y: BitmapAddressMode,
+    pub filter_mode: BitmapFilterMode,
+    pub comparison_function: BitmapComparisonFunction,
+    /// `None` when the slot uses the inline `bitmap_path`; `Some(extern)`
+    /// when the texture is sourced from engine state.
+    pub extern_texture_mode: Option<RenderMethodExtern>,
     pub texture_transform_constant_index: i8,
     pub texture_transform_overlay_indices: TagBlockIndex,
 }
@@ -528,6 +567,13 @@ pub struct RenderMethodPostprocessTexture {
 /// parameter the artist set on this rmsh. Mirrors
 /// `s_render_method_parameter` (60 bytes). Optionally carries one or
 /// more animated functions that re-evaluate the value each frame.
+///
+/// Enum-typed fields (`bitmap_filter_mode`, `bitmap_comparison_function`,
+/// `bitmap_address_mode`, `bitmap_address_mode_x`, `bitmap_address_mode_y`)
+/// are declared as `_field_short_integer` in the rmsh schema rather than
+/// `_field_short_enum`, but the underlying values index the same enums
+/// the rmop declares — they are stored as the strong enum type here so
+/// downstream code can pattern-match without re-converting from i16.
 #[derive(Debug, Clone)]
 pub struct RenderMethodParameter {
     pub parameter_name: String,
@@ -536,13 +582,15 @@ pub struct RenderMethodParameter {
     pub real_parameter: f32,
     pub int_parameter: i32,
     pub bitmap_flags: i16,
-    pub bitmap_filter_mode: i16,
-    pub bitmap_comparison_function: i16,
-    pub bitmap_address_mode: i16,
-    pub bitmap_address_mode_x: i16,
-    pub bitmap_address_mode_y: i16,
+    pub bitmap_filter_mode: BitmapFilterMode,
+    pub bitmap_comparison_function: BitmapComparisonFunction,
+    pub bitmap_address_mode: BitmapAddressMode,
+    pub bitmap_address_mode_x: BitmapAddressMode,
+    pub bitmap_address_mode_y: BitmapAddressMode,
     pub bitmap_anisotropy_amount: i16,
-    pub bitmap_extern_mode: i16,
+    /// `None` when the slot uses an inline bitmap; `Some(extern)` when
+    /// the texture is sourced from engine state (e.g., scene HDR).
+    pub bitmap_extern_mode: Option<RenderMethodExtern>,
     pub animated_parameters: Vec<RenderMethodAnimatedParameter>,
 }
 
@@ -561,7 +609,7 @@ pub struct RenderMethodOptionParameter {
     pub default_int_bool_value: i32,
     pub flags: i16,
     pub default_filter_mode: BitmapFilterMode,
-    pub default_comparison_function: i16,
+    pub default_comparison_function: BitmapComparisonFunction,
     pub default_address_mode: BitmapAddressMode,
     pub anisotropy_amount: i16,
     pub default_color: ArgbColor,
@@ -591,7 +639,7 @@ pub struct RenderMethodAnimatedParameter {
 /// When this is non-empty, the runtime hot path uses it directly to
 /// push constants — only animated params force a re-walk through
 /// [`RenderMethod::parameters`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RenderMethodPostprocessDefinition {
     /// Path to the `rmt2` tag this postprocess was baked against.
     pub template_path: String,
@@ -935,7 +983,8 @@ impl RenderMethodOptionParameter {
                 .and_then(BitmapFilterMode::from_index)
                 .unwrap_or_default(),
             default_comparison_function: s.read_int_any("default comparison function")
-                .unwrap_or(0) as i16,
+                .and_then(BitmapComparisonFunction::from_index)
+                .unwrap_or_default(),
             default_address_mode: s.read_int_any("default address mode")
                 .and_then(BitmapAddressMode::from_index)
                 .unwrap_or_default(),
@@ -1150,13 +1199,29 @@ impl RenderMethodPostprocessTexture {
             .descend("texture transform overlay indices")
             .map(|inner| read_packed_block_index(&inner, "block index data"))
             .unwrap_or_default();
+        // The `address mode` byte packs `address_mode_x : 4` (low) and
+        // `address_mode_y : 4` (high) per Ares
+        // `s_render_method_postprocess_texture` layout. Split into the
+        // typed enum fields directly.
+        let address_packed = s.read_int_any("address mode").unwrap_or(0) as u8;
+        let address_mode_x = BitmapAddressMode::from_index((address_packed & 0x0F) as i128)
+            .unwrap_or_default();
+        let address_mode_y = BitmapAddressMode::from_index((address_packed >> 4) as i128)
+            .unwrap_or_default();
         Self {
             bitmap_path: s.read_tag_ref_path("bitmap reference").unwrap_or_default(),
             bitmap_index: s.read_int_any("bitmap index").unwrap_or(-1) as i16,
-            address_mode: s.read_int_any("address mode").unwrap_or(0) as u8,
-            filter_mode: s.read_int_any("filter mode").unwrap_or(0) as u8,
-            comparison_function: s.read_int_any("comparison function").unwrap_or(0) as u8,
-            extern_texture_mode: s.read_int_any("extern texture mode").unwrap_or(0) as u8,
+            address_mode_x,
+            address_mode_y,
+            filter_mode: s.read_int_any("filter mode")
+                .and_then(BitmapFilterMode::from_index)
+                .unwrap_or_default(),
+            comparison_function: s.read_int_any("comparison function")
+                .and_then(BitmapComparisonFunction::from_index)
+                .unwrap_or_default(),
+            extern_texture_mode: s.read_int_any("extern texture mode")
+                .and_then(RenderMethodExtern::from_index)
+                .filter(|e| !matches!(e, RenderMethodExtern::None)),
             texture_transform_constant_index: s.read_int_any("texture transform constant index")
                 .unwrap_or(-1) as i8,
             texture_transform_overlay_indices,
@@ -1186,13 +1251,28 @@ impl RenderMethodParameter {
             real_parameter: s.read_real("real").unwrap_or(0.0),
             int_parameter: s.read_int_any("int/bool").unwrap_or(0) as i32,
             bitmap_flags: s.read_int_any("bitmap flags").unwrap_or(0) as i16,
-            bitmap_filter_mode: s.read_int_any("bitmap filter mode").unwrap_or(0) as i16,
-            bitmap_comparison_function: s.read_int_any("bitmap comparison function").unwrap_or(0) as i16,
-            bitmap_address_mode: s.read_int_any("bitmap address mode").unwrap_or(0) as i16,
-            bitmap_address_mode_x: s.read_int_any("bitmap address mode x").unwrap_or(0) as i16,
-            bitmap_address_mode_y: s.read_int_any("bitmap address mode y").unwrap_or(0) as i16,
+            bitmap_filter_mode: s.read_int_any("bitmap filter mode")
+                .and_then(BitmapFilterMode::from_index)
+                .unwrap_or_default(),
+            bitmap_comparison_function: s.read_int_any("bitmap comparison function")
+                .and_then(BitmapComparisonFunction::from_index)
+                .unwrap_or_default(),
+            bitmap_address_mode: s.read_int_any("bitmap address mode")
+                .and_then(BitmapAddressMode::from_index)
+                .unwrap_or_default(),
+            bitmap_address_mode_x: s.read_int_any("bitmap address mode x")
+                .and_then(BitmapAddressMode::from_index)
+                .unwrap_or_default(),
+            bitmap_address_mode_y: s.read_int_any("bitmap address mode y")
+                .and_then(BitmapAddressMode::from_index)
+                .unwrap_or_default(),
             bitmap_anisotropy_amount: s.read_int_any("bitmap anisotropy amount").unwrap_or(0) as i16,
-            bitmap_extern_mode: s.read_int_any("bitmap extern RTT mode").unwrap_or(0) as i16,
+            // `bitmap extern RTT mode` is `_field_short_integer` in the
+            // rmsh schema (no enum binding) — convert via from_index to
+            // match the rmop's `source extern` enum semantics. 0 = None.
+            bitmap_extern_mode: s.read_int_any("bitmap extern RTT mode")
+                .and_then(RenderMethodExtern::from_index)
+                .filter(|e| !matches!(e, RenderMethodExtern::None)),
             animated_parameters,
         })
     }

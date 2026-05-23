@@ -94,6 +94,24 @@ fn dump_render_method(rm: &RenderMethod) {
             p.int_parameter,
             p.animated_parameters.len(),
         );
+        println!(
+            "       flags=0x{:04x} filter={:?} cmp={:?} addr={:?} addr_x={:?} addr_y={:?} aniso={} extern={:?}",
+            p.bitmap_flags,
+            p.bitmap_filter_mode,
+            p.bitmap_comparison_function,
+            p.bitmap_address_mode,
+            p.bitmap_address_mode_x,
+            p.bitmap_address_mode_y,
+            p.bitmap_anisotropy_amount,
+            p.bitmap_extern_mode,
+        );
+        for (ai, a) in p.animated_parameters.iter().enumerate() {
+            println!(
+                "       anim[{ai}] type={:?} input={:?} range={:?} period={}s fn={}",
+                a.parameter_type, a.input_name, a.range_name, a.time_period_in_seconds,
+                if a.function.is_some() { "yes" } else { "no" },
+            );
+        }
     }
     match &rm.postprocess_definition {
         None => println!("postprocess_definition: <empty>"),
@@ -103,11 +121,13 @@ fn dump_render_method(rm: &RenderMethod) {
             println!("  textures:           [{}]", pp.textures.len());
             for (i, t) in pp.textures.iter().enumerate() {
                 println!(
-                    "    [{i}] bitmap={:?} idx={} addr={} filter={} extern={}",
+                    "    [{i}] bitmap={:?} idx={} addr=({:?},{:?}) filter={:?} cmp={:?} extern={:?}",
                     short_path(&t.bitmap_path),
                     t.bitmap_index,
-                    t.address_mode,
+                    t.address_mode_x,
+                    t.address_mode_y,
                     t.filter_mode,
+                    t.comparison_function,
                     t.extern_texture_mode,
                 );
             }
@@ -168,14 +188,26 @@ fn dump_rmop(rmop: &RenderMethodOption) {
     println!("parameters: [{}]", rmop.parameters.len());
     for (i, p) in rmop.parameters.iter().enumerate() {
         println!(
-            "  [{i}] {:30} type={:?} extern={:?} default_real={} default_int={} default_color=0x{:08x} bitmap={:?}",
+            "  [{i}] {:30} type={:?} extern={:?} bitmap={:?}",
             p.parameter_name,
             p.parameter_type,
             p.source_extern,
+            short_path(&p.default_bitmap_path),
+        );
+        println!(
+            "       filter={:?} cmp={:?} addr={:?} aniso={} scale={} flags=0x{:04x}",
+            p.default_filter_mode,
+            p.default_comparison_function,
+            p.default_address_mode,
+            p.anisotropy_amount,
+            p.default_bitmap_scale,
+            p.flags,
+        );
+        println!(
+            "       real={} int/bool={} color=0x{:08x}",
             p.default_real_value,
             p.default_int_bool_value,
             p.default_color.0,
-            short_path(&p.default_bitmap_path),
         );
     }
 }

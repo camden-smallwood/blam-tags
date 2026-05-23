@@ -36,6 +36,8 @@ use super::types::{
     RenderMethodExtern, RenderMethodOption, RenderMethodOptionParameter,
     RenderMethodParameter, RenderMethodParameterType,
 };
+#[allow(unused_imports)] // re-exported for downstream consumers that match on it
+use super::types::BitmapComparisonFunction;
 
 // =============================================================================
 // Output types
@@ -77,22 +79,36 @@ pub enum ResolvedValue {
 
 /// Per-bitmap-parameter binding info. Mirrors the union of fields the
 /// runtime samples per-texture (path + sampler state + extern mode).
+///
+/// `address_mode` is the unified axis mode — for materials that author
+/// per-axis overrides (`bitmap_address_mode_x` / `_y` on the rmsh
+/// parameter), see [`address_mode_x`] / [`address_mode_y`].
 #[derive(Debug, Clone)]
 pub struct BitmapBinding {
     /// Tag-relative path to the `.bitmap` (e.g.,
     /// `objects\characters\grunt\bitmaps\grunt`). Empty when
-    /// `extern_texture_mode` is non-zero (the texture comes from
-    /// engine state instead).
+    /// `extern_texture_mode` is `Some` (the texture comes from engine
+    /// state instead).
     pub bitmap_path: String,
     /// Index into the bitmap tag's images block — most rmop defaults
     /// use index 0; rmsh overrides may select an alternate image.
     pub bitmap_index: i16,
     pub filter_mode: BitmapFilterMode,
+    /// Unified address mode — when the rmsh parameter is present, this
+    /// is its `bitmap_address_mode` field; otherwise the rmop's
+    /// `default_address_mode`. Per-axis overrides (`bitmap_address_mode_x` /
+    /// `_y`) are surfaced separately as [`address_mode_x`] / [`address_mode_y`].
     pub address_mode: BitmapAddressMode,
-    /// When non-zero, the texture is sourced from a runtime render
-    /// target (camera/refraction/mirror/scope) — see
-    /// `e_render_method_extern_mode`.
-    pub extern_texture_mode: u8,
+    /// Per-axis U/X address mode. Falls back to `address_mode` when the
+    /// rmsh parameter doesn't author a per-axis override.
+    pub address_mode_x: BitmapAddressMode,
+    /// Per-axis V/Y address mode. Falls back to `address_mode` when the
+    /// rmsh parameter doesn't author a per-axis override.
+    pub address_mode_y: BitmapAddressMode,
+    /// `Some(extern)` when the texture is sourced from a runtime
+    /// render target (camera/refraction/mirror/scope) or another engine
+    /// state slot. `None` when the binding uses the inline `bitmap_path`.
+    pub extern_texture_mode: Option<RenderMethodExtern>,
     /// Anisotropy override; 0 means "use sampler default".
     pub anisotropy_amount: i16,
 }
@@ -294,31 +310,72 @@ fn resolve_bitmap(
     rm_param: Option<&RenderMethodParameter>,
 ) -> BitmapBinding {
     // rmsh override: any non-empty bitmap_path wins; sampler state
-    // overrides only when the rmsh actually supplies non-zero values
-    // (the schema's "0" defaults map to "use rmop's value").
+    // overrides are gated per-field by `bitmap_flags`. Mirrors
+    // `update_texture_parameter @ tool.exe 0x140C50260`.
     let path = rm_param
         .map(|p| p.bitmap_path.as_str())
         .filter(|p| !p.is_empty())
         .unwrap_or(op_param.default_bitmap_path.as_str())
         .to_string();
 
-    let bitmap_index = rm_param
-        .map(|p| if p.bitmap_extern_mode != 0 { 0 } else { 0 }) // schema doesn't carry index in rmsh
-        .unwrap_or(0);
+    // rmsh schema doesn't carry a per-instance bitmap index — only the
+    // postprocess texture block does. Default to 0 here.
+    let bitmap_index = 0;
 
-    let filter_mode = rm_param
-        .and_then(|p| BitmapFilterMode::from_index(p.bitmap_filter_mode as i128))
-        .unwrap_or(op_param.default_filter_mode);
-    let address_mode = rm_param
-        .and_then(|p| BitmapAddressMode::from_index(p.bitmap_address_mode as i128))
-        .unwrap_or(op_param.default_address_mode);
-    let extern_texture_mode = rm_param
-        .map(|p| p.bitmap_extern_mode as u8)
-        .unwrap_or(0);
-    let anisotropy_amount = rm_param
-        .map(|p| p.bitmap_anisotropy_amount)
-        .unwrap_or(op_param.anisotropy_amount);
+    // `bitmap_flags` is the per-field override mask the engine bake
+    // consults; only when a bit is set does the rmsh's authored value
+    // win over the rmop's default. Verified against tool.exe's bake
+    // function (see [[reference_tool_exe_bake_vs_tagtool_2026_05_23]]).
+    const FLAG_FILTER:     i16 = 0x01;
+    const FLAG_ADDRESS:    i16 = 0x02; // unified — broadcasts to both x and y
+    const FLAG_ADDRESS_X:  i16 = 0x04; // takes precedence over the unified bit for x
+    const FLAG_ADDRESS_Y:  i16 = 0x08; // takes precedence over the unified bit for y
+    const FLAG_ANISO:      i16 = 0x10;
+    const FLAG_COMPARISON: i16 = 0x20;
+    let flags = rm_param.map(|p| p.bitmap_flags).unwrap_or(0);
 
-    BitmapBinding { bitmap_path: path, bitmap_index, filter_mode, address_mode, extern_texture_mode, anisotropy_amount }
+    let filter_mode = match rm_param {
+        Some(p) if flags & FLAG_FILTER != 0 => p.bitmap_filter_mode,
+        _ => op_param.default_filter_mode,
+    };
+
+    // The "unified" rmsh override broadcasts to both axes; per-axis bits
+    // (0x04 / 0x08) take precedence over 0x02 for their respective axis.
+    let address_mode = match rm_param {
+        Some(p) if flags & FLAG_ADDRESS != 0 => p.bitmap_address_mode,
+        _ => op_param.default_address_mode,
+    };
+    let address_mode_x = match rm_param {
+        Some(p) if flags & FLAG_ADDRESS_X != 0 => p.bitmap_address_mode_x,
+        Some(p) if flags & FLAG_ADDRESS    != 0 => p.bitmap_address_mode,
+        _ => op_param.default_address_mode,
+    };
+    let address_mode_y = match rm_param {
+        Some(p) if flags & FLAG_ADDRESS_Y != 0 => p.bitmap_address_mode_y,
+        Some(p) if flags & FLAG_ADDRESS    != 0 => p.bitmap_address_mode,
+        _ => op_param.default_address_mode,
+    };
+
+    let extern_texture_mode = rm_param.and_then(|p| p.bitmap_extern_mode);
+    let anisotropy_amount = match rm_param {
+        Some(p) if flags & FLAG_ANISO != 0 => p.bitmap_anisotropy_amount,
+        _ => op_param.anisotropy_amount,
+    };
+    // comparison_function isn't exposed on BitmapBinding (DEAD in
+    // engine runtime sampler creator — verified against d3d11_sampler_state_cache::get
+    // @ dllcache 0x1806F1C70 which hardcodes ComparisonFunc=NEVER), but
+    // the gated resolution still applies if we surface it later.
+    let _ = FLAG_COMPARISON;
+
+    BitmapBinding {
+        bitmap_path: path,
+        bitmap_index,
+        filter_mode,
+        address_mode,
+        address_mode_x,
+        address_mode_y,
+        extern_texture_mode,
+        anisotropy_amount,
+    }
 }
 
