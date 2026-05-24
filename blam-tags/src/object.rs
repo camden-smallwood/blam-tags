@@ -102,6 +102,16 @@ impl std::error::Error for ObjectDefinitionError {}
 /// Drives `render_object_has_lightmap_shadow @ 0x180696EE0`.
 pub const OBJ_FLAG_DOES_NOT_CAST_SHADOW: u16 = 1 << 0;
 
+/// `flags & 0x0002` — engine `_object_searches_lightmaps_on_failure_bit`.
+/// When set, `lights_prepare_for_object_static_new @ 0x1808A2930:376`
+/// or's `flags |= 1` before calling `lights_distant_lighting_at_point_new
+/// @ 0x1808A3220`, which selects the 9-ray sideways direction-builder
+/// branch (`lightmap_sample_raycast_sideways`). When unset, the
+/// default 1-ray-with-offset branch fires instead. The flag is per-tag,
+/// not per-class — IDA's mistyped `v71->class_index` decompile reads
+/// the low byte of `_object_definition.flags` at +2.
+pub const OBJ_FLAG_SEARCHES_LIGHTMAPS_ON_FAILURE: u16 = 1 << 1;
+
 // ---------------------------------------------------------------------------
 // object_function_flags
 // ---------------------------------------------------------------------------
