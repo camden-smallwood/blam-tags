@@ -143,7 +143,43 @@ impl LensFlare {
         if actual != LENS_GROUP {
             return Err(LensFlareError::WrongGroup { expected: LENS_GROUP, actual });
         }
-        Ok(Self::from_struct(&tag.root()))
+        let mut out = Self::from_struct(&tag.root());
+        out.apply_engine_postprocess();
+        Ok(out)
+    }
+
+    /// Mirror tool.exe `sub_1403E5440`'s tag-group postprocess: clamp the
+    /// occlusion-cone angles to `[0, π]` with `cutoff ≥ falloff`, and
+    /// remove reflections flagged for debug-only suppression.
+    ///
+    /// Engine source:
+    /// ```c
+    /// v4 = clamp(*(float*)(a2 + 0), 0.0, π);     // falloff
+    /// v5 = clamp(*(float*)(a2 + 4), v4,  π);     // cutoff (ordered ≥ falloff)
+    /// *(float*)(a2 + 0) = v4;
+    /// *(float*)(a2 + 4) = v5;
+    /// *(u16*)(a2 + 54) |= 1;                      // post-processed marker
+    /// for r in reflections:
+    ///     if (r.flags & 0x100) remove(r);         // bit 8 = "disabled for debugging"
+    /// ```
+    ///
+    /// Real-tag evidence: `activate.lens_flare` authors
+    /// `cutoff angle = 2π (360°)` — engine clamps it to π (180°).
+    ///
+    /// Note: protomorph's field names suffix `_degrees` is a misnomer —
+    /// the schema field type is `angle`, which Halo's tag system stores
+    /// in **radians**. Both clamp bounds and the underlying storage are
+    /// radians; the `_degrees` suffix is just leftover labelling.
+    pub fn apply_engine_postprocess(&mut self) {
+        let pi = std::f32::consts::PI;
+        let falloff = self.falloff_angle_degrees.clamp(0.0, pi);
+        let cutoff = self.cutoff_angle_degrees.max(falloff).min(pi);
+        self.falloff_angle_degrees = falloff;
+        self.cutoff_angle_degrees = cutoff;
+
+        // Reflection-flags bit 8 = "disabled for debugging" — engine
+        // strips these from the runtime list so they never render.
+        self.reflections.retain(|r| (r.flags & 0x100) == 0);
     }
 
     pub fn from_struct(s: &TagStruct<'_>) -> Self {

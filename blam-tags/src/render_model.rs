@@ -193,6 +193,18 @@ pub struct RenderMesh {
     /// `_entry_point_vertex_color_lighting` (idx=14, sky shader path).
     /// Tag field is `s_mesh.flags` at offset 0x2C.
     pub has_vertex_color: bool,
+    /// True iff the LBSP's raw_vertices for this mesh carried a
+    /// populated `lightmap texcoord` field (i.e. at least one vertex's
+    /// lightmap UV is non-zero). Engine-equivalent of the runtime check
+    /// `meshes[i].vertex_buffer_indices[1] != 0xFFFF` from
+    /// `geometry_test_collision_result @ dllcache 0x18048C620:749` — at
+    /// runtime the cache-builder allocates the second vertex buffer iff
+    /// the lightmap tag actually carried UVs for this mesh; tag builds
+    /// like Reach (and protomorph) don't have vertex buffers per se, so
+    /// we detect the same condition by inspecting the raw_vertex data.
+    /// Consumed by `c_geometry_sampler::sample`'s cluster branch to
+    /// dispatch into the per-pixel atlas vs. the white-default fallback.
+    pub has_lightmap_uvs: bool,
 }
 
 /// Per-mesh water-surface data, fully resolved at parse time. Each
@@ -1040,6 +1052,7 @@ where
             has_prt_vertex_stream,
             prt_ambient_stream: Vec::new(),
             has_vertex_color,
+            has_lightmap_uvs: false,
         };
         let Some(pmt) = pmt_block.element(mi) else {
             out.push(empty_with_prt());
@@ -1157,6 +1170,9 @@ where
             })
             .unwrap_or_default();
 
+        let has_lightmap_uvs = vertices
+            .iter()
+            .any(|v| v.lightmap_texcoord.x != 0.0 || v.lightmap_texcoord.y != 0.0);
         out.push(RenderMesh {
             vertices,
             indices,
@@ -1167,6 +1183,7 @@ where
             has_prt_vertex_stream,
             prt_ambient_stream,
             has_vertex_color,
+            has_lightmap_uvs,
         });
     }
     Ok(out)

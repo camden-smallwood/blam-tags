@@ -133,6 +133,29 @@ pub struct StructureBsp {
     /// `scenario_cluster_weather_properties` block. NO separate weather
     /// renderer — particle effects render through standard transparency.
     pub weather_palette: Vec<BspWeatherPaletteEntry>,
+
+    /// `structure surfaces[i]` — one per collision polygon. Each entry
+    /// references a contiguous range of [`Self::structure_surface_to_triangle_mappings`]
+    /// via `first_mapping_index` + `mapping_count`. The runtime
+    /// engine's `c_geometry_sampler::geometry_test_collision_result @
+    /// 0x18048c620` reads this to map a BSP3D collision hit
+    /// (`collision_surface_index`) back to the render geometry's
+    /// triangle index range, then interpolates the lightmap UV from
+    /// the render-vertex buffer.
+    ///
+    /// Ares: `structure_bsp_definitions.h:173`. 4 bytes per entry.
+    pub structure_surfaces: Vec<StructureSurface>,
+
+    /// `structure surface to triangle mapping[j]` — runs of triangle
+    /// index ranges per mesh (= `section_index`). Each `structure_surface`
+    /// owns a contiguous range of these. `last_index` is the END index
+    /// in the mesh's index buffer for this run; the START is the
+    /// previous mapping's `last_index` (or 0 for the surface's first
+    /// mapping). `section_index` selects which render-geometry mesh
+    /// the run belongs to.
+    ///
+    /// Ares: `structure_bsp_definitions.h:180`. 4 bytes per entry.
+    pub structure_surface_to_triangle_mappings: Vec<StructureSurfaceTriangleMapping>,
 }
 
 impl StructureBsp {
@@ -201,6 +224,16 @@ impl StructureBsp {
                 s,
                 "weather palette",
                 BspWeatherPaletteEntry::from_struct,
+            ),
+            structure_surfaces: read_block(
+                s,
+                "structure surfaces",
+                StructureSurface::from_struct,
+            ),
+            structure_surface_to_triangle_mappings: read_block(
+                s,
+                "structure surface to triangle mapping",
+                StructureSurfaceTriangleMapping::from_struct,
             ),
         }
     }
@@ -412,6 +445,82 @@ impl BspCollisionMaterial {
                 .unwrap_or(0) as i16,
             conveyor_surface_index: s.read_block_index("conveyor surface index"),
             seam_mapping_index: s.read_block_index("seam mapping index"),
+        }
+    }
+}
+
+// =============================================================================
+// structure_surface / structure_surface_to_triangle_mapping
+// =============================================================================
+//
+// Bridge between BSP3D collision surfaces and render-geometry
+// triangles. Engine `c_geometry_sampler::geometry_test_collision_result @
+// dllcache 0x18048c620` uses this chain to map a collision raycast hit
+// back to a render triangle's lightmap UV.
+//
+// Lookup flow per surface_index:
+//   ss = structure_surfaces[surface_index]
+//   for j in 0..ss.mapping_count:
+//     m = structure_surface_to_triangle_mappings[ss.first_mapping_index + j]
+//     // Render mesh m.section_index has an index run ending at m.last_index;
+//     // its start is the previous mapping's last_index (or 0 for first).
+//     // Each triangle in that run is a candidate; pick the closest hit.
+
+/// One collision-polygon → render-triangle-range descriptor. Owns a
+/// contiguous run of [`StructureBsp::structure_surface_to_triangle_mappings`]
+/// entries describing which render triangles (potentially across
+/// multiple meshes) cover this collision polygon. Ares
+/// `structure_bsp_definitions.h:173`. 4 bytes per entry.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StructureSurface {
+    /// `first_structure_surface_to_triangle_mapping_index` — block
+    /// index into [`StructureBsp::structure_surface_to_triangle_mappings`].
+    pub first_mapping_index: u16,
+    /// `structure_surface_to_triangle_mapping_count` — number of
+    /// consecutive entries in that block owned by this surface.
+    pub mapping_count: u16,
+}
+
+impl StructureSurface {
+    fn from_struct(s: &TagStruct<'_>) -> Self {
+        // MCC schema uses underscored field names for this block
+        // (vs. spaced for most other blocks). Verified 2026-05-26
+        // against ghosttown.scenario_structure_bsp via fields()
+        // dump. Ares header has the same names.
+        Self {
+            first_mapping_index: s
+                .read_int_any("first_structure_surface_to_triangle_mapping_index")
+                .unwrap_or(0) as u16,
+            mapping_count: s
+                .read_int_any("structure_surface_to_triangle_mapping_count")
+                .unwrap_or(0) as u16,
+        }
+    }
+}
+
+/// One entry in the per-surface triangle list. Each mapping is a
+/// DIRECT triangle reference (NOT an end-of-run indicator, despite the
+/// Ares field name `last_index`). `triangle_index` is the index of the
+/// triangle within `section_index`'s render mesh — specifically, the
+/// base of a 3-index triangle in that mesh's index buffer
+/// (i.e., index buffer positions `triangle_index..triangle_index+3`).
+/// Verified 2026-05-26 against ghosttown.scenario_structure_bsp
+/// (mapping[0] = `triangle_index=28925, section_index=40`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StructureSurfaceTriangleMapping {
+    /// Index into the mesh's index buffer pointing at the first
+    /// vertex of a 3-vertex triangle.
+    pub triangle_index: u16,
+    /// Block index into `render_geometry.meshes` — which render mesh
+    /// the triangle lives in.
+    pub section_index: u16,
+}
+
+impl StructureSurfaceTriangleMapping {
+    fn from_struct(s: &TagStruct<'_>) -> Self {
+        Self {
+            triangle_index: s.read_int_any("triangle_index").unwrap_or(0) as u16,
+            section_index: s.read_int_any("section_index").unwrap_or(0) as u16,
         }
     }
 }
@@ -1217,6 +1326,26 @@ pub struct BspInstanceDefinition {
     /// the count for that predicate, so we don't materialize the
     /// contents.
     pub render_bsp_count: usize,
+
+    /// Per-instance-definition surface descriptors (schema field
+    /// `surfaces*`, `structure_surface_small_block`, 4 B each). Same shape
+    /// as the top-level [`StructureBsp::structure_surfaces`] but scoped
+    /// to this definition's geometry. Engine
+    /// `c_geometry_sampler::geometry_test_collision_result` instance branch
+    /// reads these to map a collision surface index → triangle range.
+    ///
+    /// The MCC schema has BOTH `surfaces*` (small, u16 indices) AND
+    /// `large surfaces*` (u32 indices). Engine code reads the small variant
+    /// (4-byte stride); we follow.
+    pub structure_surfaces: Vec<StructureSurface>,
+
+    /// Per-instance-definition surface → triangle mapping table (schema
+    /// `surface to triangle mapping*`, 4 B each). Mirrors the top-level
+    /// [`StructureBsp::structure_surface_to_triangle_mappings`] shape.
+    /// `triangle_index` indexes into this definition's render mesh's
+    /// index buffer; `section_index` is unused here (instance defs map
+    /// to a single mesh, not multiple clusters).
+    pub structure_surface_to_triangle_mappings: Vec<StructureSurfaceTriangleMapping>,
 }
 
 impl BspInstanceDefinition {
@@ -1230,6 +1359,16 @@ impl BspInstanceDefinition {
             .and_then(|f| f.as_block())
             .map(|b| b.len())
             .unwrap_or(0);
+        let structure_surfaces = read_block_named(
+            s,
+            "surfaces",
+            StructureSurface::from_struct,
+        );
+        let structure_surface_to_triangle_mappings = read_block_named(
+            s,
+            "surface to triangle mapping",
+            StructureSurfaceTriangleMapping::from_struct,
+        );
         Self {
             checksum: s.read_int_any("checksum").unwrap_or(0) as i32,
             bounding_sphere_center: s.read_point3d("bounding sphere center"),
@@ -1241,8 +1380,29 @@ impl BspInstanceDefinition {
                 .unwrap_or(1.0),
             bsp,
             render_bsp_count,
+            structure_surfaces,
+            structure_surface_to_triangle_mappings,
         }
     }
+}
+
+fn read_block_named<T, F: Fn(&TagStruct<'_>) -> T>(
+    s: &TagStruct<'_>,
+    name: &str,
+    f: F,
+) -> Vec<T> {
+    s.field(name)
+        .and_then(|fld| fld.as_block())
+        .map(|b| {
+            let mut out = Vec::with_capacity(b.len());
+            for i in 0..b.len() {
+                if let Some(e) = b.element(i) {
+                    out.push(f(&e));
+                }
+            }
+            out
+        })
+        .unwrap_or_default()
 }
 
 /// One marker placed in the BSP — name + position + node ref.

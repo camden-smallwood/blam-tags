@@ -429,7 +429,47 @@ impl CameraFxSettings {
         if actual != CFXS_GROUP {
             return Err(CameraFxError::WrongGroup { expected: CFXS_GROUP, actual });
         }
-        Ok(Self::from_struct(&tag.root()))
+        let mut out = Self::from_struct(&tag.root());
+        out.apply_engine_postprocess();
+        Ok(out)
+    }
+
+    /// Mirror `c_camera_fx_settings`'s tag-group postprocess callback
+    /// (tool.exe `sub_140C711E0`). Brings source-format fields to the
+    /// runtime representation that the cache file would contain after
+    /// tool.exe's bake — protomorph reads TagTool-extracted source tags
+    /// (e.g. zanzibar.camera_fx_settings stores 0.045 linear at offset
+    /// 0x18) but engine math expects log2-stops, so we apply the same
+    /// transform tool.exe would.
+    ///
+    /// Engine source (`tool.exe::sub_140C711E0`):
+    /// ```c
+    /// if ((flags & 0x10) == 0) {
+    ///     auto_exposure_screen_brightness = 0.035f;   // first-time default
+    ///     flags |= 0x10;
+    /// }
+    /// X = fmaxf(auto_exposure_screen_brightness, 1.0e-5f);
+    /// auto_exposure_screen_brightness = X;
+    /// if (!skip_log) auto_exposure_screen_brightness = log2(X);
+    /// ```
+    /// Plus a pile of bling/lightshafts/color-tint defaults the same
+    /// callback fills if their own bit-4 flags are unset — covered
+    /// piecemeal as protomorph wires those passes.
+    ///
+    /// Verified against `globals/default.camera_fx_settings` exportcommands
+    /// dump (`AutoBrightness -4.836501 = log2(0.035)`).
+    pub fn apply_engine_postprocess(&mut self) {
+        const INIT_BIT: u16 = 0x10;           // engine's "already postprocessed" sentinel
+        const DEFAULT_BRIGHTNESS: f32 = 0.035; // baked default seen in default.cfxs
+        const MIN_CLAMP: f32 = 1.0e-5;        // engine's fmaxf floor
+
+        let e = &mut self.exposure;
+        if (e.flags & INIT_BIT) == 0 {
+            e.auto_exposure_screen_brightness = DEFAULT_BRIGHTNESS;
+            e.flags |= INIT_BIT;
+        }
+        e.auto_exposure_screen_brightness = e.auto_exposure_screen_brightness.max(MIN_CLAMP);
+        e.auto_exposure_screen_brightness = e.auto_exposure_screen_brightness.log2();
     }
 
     pub fn from_struct(s: &TagStruct<'_>) -> Self {

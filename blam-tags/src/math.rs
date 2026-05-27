@@ -147,6 +147,57 @@ pub struct RealPlane3d {
     pub d: f32,
 }
 
+/// `real_rectangle2d` — engine source `math/real_math.h:239-250` (16 B).
+///
+/// Two intervals (`[x0,x1] × [y0,y1]`) packed as four floats. Engine uses
+/// this for frustum bounds in screen / projection space.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[repr(C)]
+pub struct RealRectangle2d {
+    pub x0: f32,
+    pub x1: f32,
+    pub y0: f32,
+    pub y1: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<RealRectangle2d>() == 16);
+
+/// `real_rectangle3d` — engine source `math/real_math.h:253-266` (24 B).
+///
+/// Three intervals (`[x0,x1] × [y0,y1] × [z0,z1]`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[repr(C)]
+pub struct RealRectangle3d {
+    pub x0: f32,
+    pub x1: f32,
+    pub y0: f32,
+    pub y1: f32,
+    pub z0: f32,
+    pub z1: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<RealRectangle3d>() == 24);
+
+/// `real_matrix4x3` — engine source `math/real_math.h:198-215` (52 B).
+///
+/// Affine TRS-style transform. Engine layout: `scale` at +0, then 3 basis
+/// vectors (`forward`/`left`/`up`, each `real_vector3d` = 12 B), then
+/// `position` (`real_point3d`, 12 B). Inner union with `n[4][3]` /
+/// `matrix3x3` / `basis[3]+origin` — same bytes, different views; we expose
+/// only the named-field form because the union views are aliases over the
+/// same bytes and Rust callers can recompute them trivially.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[repr(C)]
+pub struct RealMatrix4x3 {
+    pub scale: f32,
+    pub forward: RealVector3d,
+    pub left: RealVector3d,
+    pub up: RealVector3d,
+    pub position: RealPoint3d,
+}
+
+const _: () = assert!(std::mem::size_of::<RealMatrix4x3>() == 52);
+
 /// RGB color (float, 0.0–1.0).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct RealRgbColor {

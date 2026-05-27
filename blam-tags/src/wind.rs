@@ -76,7 +76,7 @@ pub struct Wind {
 impl Wind {
     pub fn from_tag(tag: &TagFile) -> Result<Self, WindError> {
         let root = tag.root();
-        Ok(Self {
+        let mut out = Self {
             direction: read_wind_function(&root, "direction")?,
             speed: read_wind_function(&root, "speed")?,
             bend: read_wind_function(&root, "bend")?,
@@ -88,7 +88,24 @@ impl Wind {
             gust_noise_bitmap_path: root
                 .read_tag_ref_path("gust noise bitmap")
                 .unwrap_or_default(),
-        })
+        };
+        out.apply_engine_postprocess();
+        Ok(out)
+    }
+
+    /// Mirror tool.exe `sub_1403E48F0`'s tag-group postprocess: clamp
+    /// `gust_size` (offset +100 of `wind_block`) to `[0.001, 1000.0]`.
+    /// Engine source:
+    /// ```c
+    /// v3 = fmaxf(gust_size, 0.001);
+    /// gust_size = v3 >= 1000.0 ? 1000.0 : v3;
+    /// ```
+    /// Default authored value is 1.0 (default_wind) / 30.0 (riverworld) so
+    /// the clamp is normally a no-op, but protects against authored 0 or
+    /// negative values that would produce `1.0 / gust_size = inf` when the
+    /// engine builds `wind_data.z = 1.0 / gust_size`.
+    pub fn apply_engine_postprocess(&mut self) {
+        self.gust_size = self.gust_size.clamp(0.001, 1000.0);
     }
 }
 

@@ -212,7 +212,42 @@ impl DecoratorSet {
                 actual,
             });
         }
-        Ok(Self::from_struct(&tag.root()))
+        let mut out = Self::from_struct(&tag.root());
+        out.apply_engine_postprocess();
+        Ok(out)
+    }
+
+    /// Mirror tool.exe `sub_140637DB0`'s tag-group postprocess: derive
+    /// `translucency_a/b/c` at top-level struct offsets +52/+56/+60 from
+    /// the authored `translucency` at +64. The engine writes these
+    /// **once at cache-bake time**; source-format tags (TagTool-extracted)
+    /// leave them as zero, so protomorph would run decorator dynamic-light
+    /// shaders with zero coefficients without this.
+    ///
+    /// Engine source:
+    /// ```c
+    /// s = translucency;                                  // +64
+    /// v15 = ((1-s) + 1.0) * 0.5 / ((1-s) + 1.0 + (1-s)*(1-s)*0.25);
+    /// translucency_a = v15;                              // +52
+    /// translucency_b = v15 * (1-s);                      // +56
+    /// translucency_c = v15 * (1-s)*(1-s)*0.25 + s*0.5;   // +60
+    /// ```
+    ///
+    /// Verified against `grass_thick.decorator_set` which authors
+    /// `translucency=0.8` and stores A=B=C=0 in source format — engine
+    /// post-derived values are A≈0.4959, B≈0.0992, C≈0.4050.
+    ///
+    /// The engine function also runs render-model-instance-index
+    /// validation and palette renumbering — those are diagnostics /
+    /// runtime-asset binding and don't transform tag data; we skip them.
+    pub fn apply_engine_postprocess(&mut self) {
+        let s = self.translucency;
+        let one_minus_s = 1.0 - s;
+        let denom = one_minus_s + 1.0 + one_minus_s * one_minus_s * 0.25;
+        let v15 = (one_minus_s + 1.0) * 0.5 / denom;
+        self.translucency_a = v15;
+        self.translucency_b = v15 * one_minus_s;
+        self.translucency_c = v15 * one_minus_s * one_minus_s * 0.25 + s * 0.5;
     }
 
     pub fn from_struct(s: &TagStruct<'_>) -> Self {
