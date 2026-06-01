@@ -441,6 +441,15 @@ pub struct RenderModel {
     /// `setup_default_lighting` reads this when the per-instance
     /// lightmap chain misses. Empty (or all-zero) for non-sky models.
     pub default_lightprobe: Option<DefaultLightprobe>,
+    /// `render geometry/compression info[0]` — the model's overall
+    /// vertex-position bounds. Engine `light_placement @ tool.exe
+    /// sub_140C4AF00:151` reads this (hardcoded element 0) for the
+    /// decorator bake's mesh extent / radius / r_threshold / sample
+    /// position derivation, regardless of which subpart the
+    /// placement instances. For multi-subpart decorator render_models
+    /// (small / medium / large fern variants), all placements use
+    /// these overall-model bounds — NOT per-subpart vertex AABBs.
+    pub compression_info_0: crate::geometry::CompressionBounds,
 }
 
 /// One entry from the render_model's `sky lights` block. 28 bytes on
@@ -487,6 +496,7 @@ impl RenderModel {
             instance_placements: read_instance_placements(&root),
             sky_lights: read_sky_lights(&root),
             default_lightprobe: read_default_lightprobe(&root),
+            compression_info_0: bounds,
         })
     }
 

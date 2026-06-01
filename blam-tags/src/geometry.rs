@@ -45,6 +45,8 @@ pub(crate) const SCALE: f32 = 100.0;
 /// the original world / uv coordinate.
 #[derive(Debug, Clone, Copy)]
 pub struct CompressionBounds {
+    // Default impl below delegates to `identity()` so callers (like
+    // `RenderModel` which has `#[derive(Default)]`) compile.
     /// `true` if positions in this group were quantized — when `false`,
     /// [`Self::decompress_position`] is a passthrough.
     pub pos_compressed: bool,
@@ -55,6 +57,10 @@ pub struct CompressionBounds {
     pub pz_min: f32, pub pz_max: f32,
     pub u_min: f32, pub u_max: f32,
     pub v_min: f32, pub v_max: f32,
+}
+
+impl Default for CompressionBounds {
+    fn default() -> Self { Self::identity() }
 }
 
 impl CompressionBounds {

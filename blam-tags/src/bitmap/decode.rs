@@ -117,6 +117,87 @@ pub fn decode_to_rgba8(
     Ok(out)
 }
 
+/// Decode a single pixel from a multi-mip compressed or uncompressed
+/// bitmap input. Walks the mip chain to `mip_index` (clamped to
+/// available mips by the caller — this function only validates byte
+/// bounds, not mip count), then fetches the pixel.
+///
+/// Returns `None` when the format isn't in the supported subset:
+/// currently `Dxt1` / `Dxt3` / `Dxt5` / `A8r8g8b8` / `X8r8g8b8`. These
+/// cover the formats observed on Halo 3 MCC postprocess albedo +
+/// blend_map textures. Other formats can round-trip through
+/// [`decode_to_rgba8`] which allocates a per-mip RGBA8 surface; this
+/// helper exists so hot-path callers (decorator/lightprobe bakes
+/// running 100K+ sample queries) can keep per-call allocation at zero.
+pub fn decode_pixel_at(
+    format: BitmapFormat,
+    base_width: u32,
+    base_height: u32,
+    input: &[u8],
+    mip_index: u32,
+    x: u32,
+    y: u32,
+) -> Option<[u8; 4]> {
+    let mut w = base_width.max(1);
+    let mut h = base_height.max(1);
+    let mut offset = 0usize;
+    for _ in 0..mip_index {
+        offset = offset.checked_add(format.level_bytes(w, h) as usize)?;
+        w = (w / 2).max(1);
+        h = (h / 2).max(1);
+    }
+    let mip_bytes = format.level_bytes(w, h) as usize;
+    if offset + mip_bytes > input.len() {
+        return None;
+    }
+    let mip = &input[offset..offset + mip_bytes];
+    if x >= w || y >= h {
+        return None;
+    }
+
+    use BitmapFormat::*;
+    match format {
+        Dxt1 => bc_decode_pixel(mip, w, x, y, 8, |block, out| bcdec_rs::bc1(block, out, 16)),
+        Dxt3 => bc_decode_pixel(mip, w, x, y, 16, |block, out| bcdec_rs::bc2(block, out, 16)),
+        Dxt5 => bc_decode_pixel(mip, w, x, y, 16, |block, out| bcdec_rs::bc3(block, out, 16)),
+        A8r8g8b8 => {
+            // Stored little-endian as (B, G, R, A) per dword.
+            let off = ((y * w + x) * 4) as usize;
+            Some([mip[off + 2], mip[off + 1], mip[off], mip[off + 3]])
+        }
+        X8r8g8b8 => {
+            // Same layout as A8r8g8b8 with alpha forced to 0xFF.
+            let off = ((y * w + x) * 4) as usize;
+            Some([mip[off + 2], mip[off + 1], mip[off], 0xFF])
+        }
+        _ => None,
+    }
+}
+
+fn bc_decode_pixel(
+    mip: &[u8],
+    mip_width: u32,
+    x: u32,
+    y: u32,
+    block_bytes: usize,
+    decode: impl FnOnce(&[u8], &mut [u8]),
+) -> Option<[u8; 4]> {
+    let bx = (x / 4) as usize;
+    let by = (y / 4) as usize;
+    let blocks_w = ((mip_width + 3) / 4).max(1) as usize;
+    let block_idx = by * blocks_w + bx;
+    let block_off = block_idx * block_bytes;
+    if block_off + block_bytes > mip.len() {
+        return None;
+    }
+    let mut staging = [0u8; 64];
+    decode(&mip[block_off..block_off + block_bytes], &mut staging);
+    let in_x = (x & 3) as usize;
+    let in_y = (y & 3) as usize;
+    let p = (in_y * 4 + in_x) * 4;
+    Some([staging[p], staging[p + 1], staging[p + 2], staging[p + 3]])
+}
+
 /// Channel-mask flag for BC4-derived decoders that all share the
 /// "decode a single value per pixel and splat it" shape. The R/G/B
 /// flags carry the value to the named output channel; `ALPHA` carries
