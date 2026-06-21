@@ -159,6 +159,100 @@ pub(crate) fn field_name_matches(stored: Option<&str>, query: &str) -> bool {
     }
 }
 
+/// Heuristic: does this layout describe a Halo 2 classic tag? H2 classic
+/// definitions carry per-struct tag signatures and/or a struct-version
+/// table; MCC and Halo CE layouts have neither. Used to gate H2-only
+/// block-header synthesis.
+fn looks_like_h2_classic_layout(layout: &TagLayout) -> bool {
+    layout.struct_tags.iter().any(|tag| *tag != 0)
+        || layout.struct_version_table.iter().any(Option::is_some)
+}
+
+#[cfg(test)]
+mod dirty_tests {
+    use super::{TagBlockData, TagStructData};
+    use crate::io::Endian;
+    use crate::layout::TagLayout;
+
+    #[test]
+    fn add_element_preserves_versioned_classic_block_width() {
+        let layout = TagLayout::from_json("../definitions/halo2_mcc/model.json").unwrap();
+        let (block_index, base_struct_index, active_struct_index) = layout
+            .block_layouts
+            .iter()
+            .enumerate()
+            .find_map(|(block_index, block)| {
+                let base_struct_index = block.struct_index as usize;
+                let active_struct_index =
+                    *layout.struct_version_table.get(base_struct_index)?.as_ref()?.first()? as usize;
+                (layout.struct_layouts[active_struct_index].size
+                    != layout.struct_layouts[base_struct_index].size)
+                    .then_some((block_index, base_struct_index, active_struct_index))
+            })
+            .unwrap();
+        let active_size = layout.struct_layouts[active_struct_index].size;
+        assert_ne!(active_size, layout.struct_layouts[base_struct_index].size);
+
+        let mut block = TagBlockData {
+            block_index: block_index as u32,
+            flags: 0,
+            raw_data: vec![0; active_size],
+            endian: Endian::Le,
+            elements: vec![TagStructData::new_default(&layout, active_struct_index, Endian::Le)],
+            classic_block_header: Some(vec![0; 16]),
+            classic_structural_dirty: false,
+            classic_trailing: None,
+        };
+
+        block.add_element(&layout);
+
+        // The new element keeps the existing on-disk variant width, so
+        // raw_data stays count * active_size (not base_size).
+        assert_eq!(block.raw_data.len(), active_size * 2);
+        assert_eq!(block.elements[1].struct_index as usize, active_struct_index);
+        assert!(block.classic_structural_dirty);
+    }
+
+    #[test]
+    fn empty_to_nonempty_and_back_marks_dirty_and_synthesizes_header() {
+        let layout = TagLayout::from_json("../definitions/halo2_mcc/model.json").unwrap();
+        let block_index = layout
+            .block_layouts
+            .iter()
+            .position(|block| {
+                layout
+                    .get_string(block.name_offset)
+                    .is_some_and(|name| name == "model_variant_block_2")
+            })
+            .unwrap();
+
+        let mut block = TagBlockData {
+            block_index: block_index as u32,
+            flags: 0,
+            raw_data: Vec::new(),
+            endian: Endian::Le,
+            elements: Vec::new(),
+            classic_block_header: None,
+            classic_structural_dirty: false,
+            classic_trailing: None,
+        };
+
+        // Empty -> non-empty: a dfbt header is synthesized and the block is
+        // marked dirty so the encoder rewrites the inline count word.
+        block.add_element(&layout);
+        assert!(block.classic_structural_dirty);
+        let header = block.classic_block_header.as_deref().expect("header synthesized");
+        assert_eq!(&header[0..4], b"dfbt");
+
+        // Non-empty -> empty: clearing also marks dirty so the now-empty
+        // block emits no trailing header/data on the next encode.
+        block.classic_structural_dirty = false;
+        block.clear();
+        assert!(block.classic_structural_dirty);
+        assert!(block.elements.is_empty());
+    }
+}
+
 impl TagStructData {
     /// Parse a `tgst` chunk.
     ///
@@ -353,6 +447,7 @@ impl TagStructData {
                         endian,
                         elements: Vec::new(),
                         classic_block_header: None,
+                        classic_structural_dirty: false,
                         classic_trailing: None,
                     }))
                 }
@@ -892,6 +987,13 @@ pub(crate) struct TagBlockData {
     /// Preserved verbatim for byte-exact write; the count is re-synced
     /// from `elements.len()` on encode. The root block carries one too.
     pub(crate) classic_block_header: Option<Vec<u8>>,
+    /// Classic **Halo 2** only: this block's structure was changed after
+    /// load (add/insert/delete/clear/paste/reorder). H2 normally treats
+    /// inline block-count words as runtime garbage, so unmodified blocks
+    /// preserve them byte-exactly. Once edited, the inline presence/count
+    /// must match the emitted trailing block data or the next read will
+    /// skip/over-read bytes and misalign the tag stream.
+    pub(crate) classic_structural_dirty: bool,
     /// Classic **Halo 2** only, **root block only**: raw bytes that follow
     /// the entire structured body on disk (appended sample/cache data,
     /// e.g. multi-MB ambience-sound audio) which no layout field
@@ -954,6 +1056,7 @@ impl TagBlockData {
             endian,
             elements,
             classic_block_header: None,
+            classic_structural_dirty: false,
             classic_trailing: None,
         })
     }
@@ -997,12 +1100,55 @@ impl TagBlockData {
         layout.struct_layouts[struct_index].size
     }
 
+    /// The struct index a newly added element should use: the variant the
+    /// existing elements already use (so versioned classic blocks stay on
+    /// their on-disk FieldSet), falling back to the block's base struct for
+    /// an empty block.
+    fn element_struct_index(&self, layout: &TagLayout) -> usize {
+        self.elements
+            .first()
+            .map(|element| element.struct_index as usize)
+            .unwrap_or_else(|| layout.block_layouts[self.block_index as usize].struct_index as usize)
+    }
+
+    /// Synthesize the 16-byte H2 classic block header (`dfbt` + version 0
+    /// + count 0 + element_size) for a block that is about to gain its
+    /// first element. An empty H2 block carries no header on disk; once it
+    /// becomes non-empty the encoder needs a header to emit the
+    /// authoritative count/size, so create one if the layout looks like H2
+    /// classic and the block has none yet. No-op for MCC/CE.
+    fn ensure_h2_classic_header_for_nonempty(&mut self, layout: &TagLayout, element_size: usize) {
+        if self.classic_block_header.is_some()
+            || !self.elements.is_empty()
+            || !looks_like_h2_classic_layout(layout)
+        {
+            return;
+        }
+
+        let mut header = Vec::with_capacity(16);
+        header.extend_from_slice(b"dfbt");
+        header.extend_from_slice(&0u32.to_le_bytes());
+        header.extend_from_slice(&0u32.to_le_bytes());
+        header.extend_from_slice(&(element_size as u32).to_le_bytes());
+        self.classic_block_header = Some(header);
+    }
+
+    /// Mark this block as structurally edited (element count/order changed)
+    /// so the H2 classic encoder rewrites the inline count word and block
+    /// header to match the emitted body instead of preserving the original
+    /// (possibly runtime-garbage) bytes verbatim.
+    pub(crate) fn mark_classic_structural_dirty(&mut self) {
+        self.classic_structural_dirty = true;
+    }
+
     /// Append a fresh zero-initialized element. Grows `raw_data` by
     /// one element_size and pushes a default `TagStructData`. Returns a
     /// mutable reference to the new element.
     pub(crate) fn add_element(&mut self, layout: &TagLayout) -> &mut TagStructData {
-        let struct_index = layout.block_layouts[self.block_index as usize].struct_index as usize;
-        let element_size = layout.struct_layouts[struct_index].size;
+        let struct_index = self.element_struct_index(layout);
+        let element_size = self.element_size(layout);
+        self.ensure_h2_classic_header_for_nonempty(layout, element_size);
+        self.mark_classic_structural_dirty();
         let old_len = self.raw_data.len();
         self.raw_data.resize(old_len + element_size, 0);
         self.elements.push(TagStructData::new_default(layout, struct_index, self.endian));
@@ -1012,8 +1158,10 @@ impl TagBlockData {
     /// Insert a fresh zero-initialized element at `index` (shifting
     /// later elements right).
     pub(crate) fn insert_element(&mut self, layout: &TagLayout, index: usize) -> &mut TagStructData {
-        let struct_index = layout.block_layouts[self.block_index as usize].struct_index as usize;
-        let element_size = layout.struct_layouts[struct_index].size;
+        let struct_index = self.element_struct_index(layout);
+        let element_size = self.element_size(layout);
+        self.ensure_h2_classic_header_for_nonempty(layout, element_size);
+        self.mark_classic_structural_dirty();
         let insert_offset = index * element_size;
         self.raw_data.splice(
             insert_offset..insert_offset,
@@ -1027,6 +1175,7 @@ impl TagBlockData {
     /// after it. Returns a mutable reference to the new element.
     pub(crate) fn duplicate_element(&mut self, layout: &TagLayout, index: usize) -> &mut TagStructData {
         let element_size = self.element_size(layout);
+        self.mark_classic_structural_dirty();
         let src_offset = index * element_size;
         let copy_bytes: Vec<u8> = self.raw_data[src_offset..src_offset + element_size].to_vec();
         let insert_offset = (index + 1) * element_size;
@@ -1039,6 +1188,7 @@ impl TagBlockData {
     /// Remove the element at `index`. Panics if out of range.
     pub(crate) fn remove_element(&mut self, layout: &TagLayout, index: usize) {
         let element_size = self.element_size(layout);
+        self.mark_classic_structural_dirty();
         let start = index * element_size;
         self.raw_data.drain(start..start + element_size);
         self.elements.remove(index);
@@ -1049,6 +1199,7 @@ impl TagBlockData {
         if i == j {
             return;
         }
+        self.mark_classic_structural_dirty();
         let size = self.element_size(layout);
         self.elements.swap(i, j);
 
@@ -1069,6 +1220,7 @@ impl TagBlockData {
         if from == to {
             return;
         }
+        self.mark_classic_structural_dirty();
         let size = self.element_size(layout);
         let src = from * size;
         let bytes: Vec<u8> = self.raw_data.drain(src..src + size).collect();
@@ -1081,6 +1233,7 @@ impl TagBlockData {
 
     /// Remove all elements.
     pub(crate) fn clear(&mut self) {
+        self.mark_classic_structural_dirty();
         self.raw_data.clear();
         self.elements.clear();
     }
@@ -1127,6 +1280,7 @@ impl TagBlockData {
                 endian,
             )],
             classic_block_header: None,
+            classic_structural_dirty: false,
             classic_trailing: None,
         }
     }

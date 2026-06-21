@@ -295,6 +295,27 @@ fn header_version(h: &[u8], engine: ClassicEngine) -> u32 {
     }
 }
 
+/// Inverse of [`resolve_version_variant`]: given a block's base struct and
+/// the resolved variant its live elements use, find the on-disk version
+/// index to stamp into a rebuilt H2 block header. Falls back to 0 (the
+/// latest/base variant convention) when there's no version table or the
+/// variant isn't found.
+fn infer_struct_version(layout: &TagLayout, base: u32, resolved: u32) -> u32 {
+    match layout.struct_version_table.get(base as usize) {
+        Some(Some(versions)) => versions
+            .iter()
+            .position(|candidate| *candidate == resolved)
+            .map(|index| index as u32)
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+#[inline]
+fn h2_classic_block_signature() -> [u8; 4] {
+    *b"dfbt"
+}
+
 /// The struct index to use when statically sizing an inline `<Struct>`
 /// field. An UNTAGGED inline struct is always on-disk version 0 (HABT
 /// picks `version==0`), so it resolves to its v0 variant. A TAGGED inline
@@ -599,6 +620,7 @@ pub(crate) fn read_classic_body(
         endian,
         elements,
         classic_block_header: header,
+        classic_structural_dirty: false,
         classic_trailing,
     })
 }
@@ -816,6 +838,7 @@ fn decode_block(
             endian,
             elements: Vec::new(),
             classic_block_header: None,
+            classic_structural_dirty: false,
             classic_trailing: None,
         });
     }
@@ -851,6 +874,7 @@ fn decode_block(
         endian,
         elements,
         classic_block_header: header,
+        classic_structural_dirty: false,
         classic_trailing: None,
     })
 }
@@ -951,12 +975,15 @@ fn sync_fixed_counts(
             }
             (TagFieldType::Block, Some(TagSubChunkContent::Block(b))) => {
                 // count(i32) + 2 runtime pointers. On CE the inline count
-                // is authoritative, so sync it. On H2 the element count
-                // lives in the block's own trailing header (synced in
+                // is authoritative, so sync it. On unmodified H2 the element
+                // count lives in the block's own trailing header (synced in
                 // `encode_block`) and this inline word is runtime garbage —
                 // preserve it verbatim (some tags, e.g. speedtree foliage,
-                // store a non-count value here that must round-trip).
-                if !engine.is_halo2() {
+                // store a non-count value here that must round-trip). Once a
+                // block is structurally edited, the inline word must match
+                // the trailing block we emit (in particular its zero/
+                // non-zero state gates the empty-block decode), so sync it.
+                if !engine.is_halo2() || b.classic_structural_dirty {
                     wr_u32(raw, *off, b.elements.len() as u32, endian);
                 }
             }
@@ -1086,18 +1113,59 @@ fn encode_block(layout: &TagLayout, block: &TagBlockData, engine: ClassicEngine,
     // Halo 2: re-emit the block header, re-syncing the count from the live
     // element count. The modern 16-byte header stores count as an LE i32
     // at offset 8; the legacy 12-byte (`ambl`) header stores it as an LE
-    // i16 at offset 6. Empty H2 blocks carry no header (None).
-    if let Some(hdr) = &block.classic_block_header {
-        let mut h = hdr.clone();
-        if h.len() == 12 {
-            h[6..8].copy_from_slice(&(elem_count as u16).to_le_bytes());
-        } else {
-            h[8..12].copy_from_slice(&(elem_count as u32).to_le_bytes());
-        }
-        out.extend_from_slice(&h);
+    // i16 at offset 6. An empty H2 block carries no trailing header/data,
+    // even if a now-deleted edit left a synthesized header behind.
+    if engine.is_halo2() && elem_count == 0 {
+        // Empty H2 blocks carry no trailing header/data.
+    } else if let Some(hdr) = canonical_h2_block_header(layout, block, elem_count, sz, engine) {
+        out.extend_from_slice(&hdr);
     }
     out.extend_from_slice(&raw);
     for elem in &block.elements {
         encode_struct_trailing(layout, elem, engine, out);
     }
+}
+
+/// Produce the on-disk block header bytes for `block`. For unmodified
+/// blocks (or any non-H2 engine) the original header is preserved and only
+/// the count word re-synced. For a structurally edited H2 block the 16-byte
+/// header is rebuilt from scratch (`dfbt` + inferred version + count +
+/// on-disk element size) so it matches the body we emit; the legacy 12-byte
+/// form only carries a count, so it is just re-synced. Returns `None` when
+/// the block has no header (e.g. MCC/CE, or an empty H2 block).
+fn canonical_h2_block_header(
+    layout: &TagLayout,
+    block: &TagBlockData,
+    elem_count: usize,
+    sz: usize,
+    engine: ClassicEngine,
+) -> Option<Vec<u8>> {
+    let hdr = block.classic_block_header.as_ref()?;
+    let mut out = hdr.clone();
+    if !engine.is_halo2() || !block.classic_structural_dirty {
+        if out.len() == 12 {
+            out[6..8].copy_from_slice(&(elem_count as u16).to_le_bytes());
+        } else {
+            out[8..12].copy_from_slice(&(elem_count as u32).to_le_bytes());
+        }
+        return Some(out);
+    }
+
+    if out.len() == 12 {
+        out[6..8].copy_from_slice(&(elem_count as u16).to_le_bytes());
+        return Some(out);
+    }
+
+    let base_struct_index = layout.block_layouts[block.block_index as usize].struct_index;
+    let resolved_struct_index = block
+        .elements
+        .first()
+        .map(|element| element.struct_index)
+        .unwrap_or(base_struct_index);
+    let version = infer_struct_version(layout, base_struct_index, resolved_struct_index);
+    out[0..4].copy_from_slice(&h2_classic_block_signature());
+    out[4..8].copy_from_slice(&version.to_le_bytes());
+    out[8..12].copy_from_slice(&(elem_count as u32).to_le_bytes());
+    out[12..16].copy_from_slice(&(sz as u32).to_le_bytes());
+    Some(out)
 }

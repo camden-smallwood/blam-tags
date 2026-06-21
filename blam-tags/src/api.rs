@@ -108,7 +108,7 @@ impl TagFile {
     }
 }
 
-fn stream_root(stream: &crate::stream::TagStream) -> Option<TagStruct<'_>> {
+pub(crate) fn stream_root(stream: &crate::stream::TagStream) -> Option<TagStruct<'_>> {
     let layout = &stream.layout;
     let block = &stream.data;
     let endian = block.endian;
@@ -909,6 +909,9 @@ impl<'a> TagBlock<'a> {
     /// `true` when this block has zero elements.
     pub fn is_empty(&self) -> bool { self.block_data.elements.is_empty() }
 
+    /// On-disk byte size of one element in this block.
+    pub fn element_size(&self) -> usize { block_element_size(self.layout, self.block_data) }
+
     /// Get the element at `index`. `None` if out of range.
     pub fn element(&self, index: usize) -> Option<TagStruct<'a>> {
         let struct_data = self.block_data.elements.get(index)?;
@@ -926,6 +929,39 @@ impl<'a> TagBlock<'a> {
             TagStruct { layout, struct_data, struct_raw, endian }
         })
     }
+
+    /// Take an owned snapshot of element `index` for copy/paste into another
+    /// block with the same element struct.
+    pub fn element_snapshot(&self, index: usize) -> Option<TagBlockElement> {
+        let struct_data = self.block_data.elements.get(index)?;
+        let size = block_element_size(self.layout, self.block_data);
+        let start = index * size;
+        let raw = self.block_data.raw_data.get(start..start + size)?;
+        Some(TagBlockElement {
+            struct_index: self.layout.block_layouts[self.block_data.block_index as usize]
+                .struct_index,
+            endian: self.block_data.endian,
+            raw: raw.to_vec(),
+            data: struct_data.clone(),
+        })
+    }
+}
+
+/// An owned snapshot of one block element.
+#[derive(Debug, Clone)]
+pub struct TagBlockElement {
+    struct_index: u32,
+    endian: Endian,
+    raw: Vec<u8>,
+    data: TagStructData,
+}
+
+/// Why a [`TagBlockMut::paste_element`] was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagPasteError {
+    OutOfRange { index: usize, len: usize },
+    Incompatible,
+    EndianMismatch,
 }
 
 fn block_element_size(layout: &TagLayout, block_data: &TagBlockData) -> usize {
@@ -1515,6 +1551,37 @@ impl<'a> TagBlockMut<'a> {
 
     /// Remove every element.
     pub fn clear(&mut self) { self.block_data.clear(); }
+
+    /// Layout struct index for this block's elements.
+    pub fn element_struct_index(&self) -> u32 {
+        self.layout.block_layouts[self.block_data.block_index as usize].struct_index
+    }
+
+    /// Insert a copy of `element` at `index`, shifting later elements right.
+    pub fn paste_element(
+        &mut self,
+        index: usize,
+        element: &TagBlockElement,
+    ) -> Result<usize, TagPasteError> {
+        let len = self.block_data.elements.len();
+        if index > len {
+            return Err(TagPasteError::OutOfRange { index, len });
+        }
+        if element.endian != self.block_data.endian {
+            return Err(TagPasteError::EndianMismatch);
+        }
+        let size = block_element_size(self.layout, &*self.block_data);
+        if element.struct_index != self.element_struct_index() || element.raw.len() != size {
+            return Err(TagPasteError::Incompatible);
+        }
+        let insert_offset = index * size;
+        self.block_data.mark_classic_structural_dirty();
+        self.block_data
+            .raw_data
+            .splice(insert_offset..insert_offset, element.raw.clone());
+        self.block_data.elements.insert(index, element.data.clone());
+        Ok(index)
+    }
 }
 
 /// Mutable counterpart of [`TagArray`]. Arrays are fixed-count, so no

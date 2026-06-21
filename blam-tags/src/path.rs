@@ -70,7 +70,11 @@ pub(crate) fn lookup_from_struct<'a>(
             TagFieldType::Struct => {
                 let nested_def = &layout.struct_layouts[field.definition as usize];
                 let offset = field.offset as usize;
-                current_raw = &current_raw[offset..offset + nested_def.size];
+                if offset >= current_raw.len() {
+                    return None;
+                }
+                let end = (offset + nested_def.size).min(current_raw.len());
+                current_raw = &current_raw[offset..end];
                 current_struct = descend_struct(current_struct, field_index)?;
             }
             TagFieldType::Block => {
@@ -146,7 +150,11 @@ pub(crate) fn descend_from_struct<'a>(
             TagFieldType::Struct => {
                 let nested_def = &layout.struct_layouts[field.definition as usize];
                 let offset = field.offset as usize;
-                current_raw = &current_raw[offset..offset + nested_def.size];
+                if offset >= current_raw.len() {
+                    return None;
+                }
+                let end = (offset + nested_def.size).min(current_raw.len());
+                current_raw = &current_raw[offset..end];
                 current_struct = descend_struct(current_struct, field_index)?;
             }
             TagFieldType::Block => {

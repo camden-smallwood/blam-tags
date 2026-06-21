@@ -136,9 +136,9 @@ pub mod typed_enums;
 
 // Facade re-exports — the recommended surface for editing tags.
 pub use api::{
-    TagArray, TagArrayMut, TagBlock, TagBlockMut, TagField, TagFieldMut, TagFlag, TagFlagMut,
-    TagFlagOption, TagGroup, TagIndexError, TagOptions, TagResource, TagResourceKind, TagSetError,
-    TagStruct, TagStructMut,
+    TagArray, TagArrayMut, TagBlock, TagBlockElement, TagBlockMut, TagField, TagFieldMut, TagFlag,
+    TagFlagMut, TagFlagOption, TagGroup, TagIndexError, TagOptions, TagPasteError, TagResource,
+    TagResourceKind, TagSetError, TagStruct, TagStructMut,
 };
 pub use definition::{
     TagApiInteropDefinition, TagArrayDefinition, TagBlockDefinition, TagDefinitions,
