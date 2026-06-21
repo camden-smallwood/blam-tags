@@ -122,10 +122,13 @@ fn stream_root_mut(stream: &mut crate::stream::TagStream) -> Option<TagStructMut
     let block = &mut stream.data;
     let endian = block.endian;
 
-    // Inline the element-size math so we can disjoint-split `block`
-    // into its `elements` and `raw_data` fields below.
-    let struct_index = layout.block_layouts[block.block_index as usize].struct_index as usize;
-    let size = layout.struct_layouts[struct_index].size;
+    // Resolve the on-disk element size up front (shared borrow) so we can
+    // disjoint-split `block` into its `elements`/`raw_data` fields below.
+    // Must use the authoritative `raw_data / count` size, not the schema's
+    // latest struct size — versioned classic root structs (e.g. H2
+    // masterchief.shader = 120 bytes vs latest 128) are smaller/larger than
+    // the schema, and slicing by the schema size overruns `raw_data`.
+    let size = block_element_size(layout, block);
 
     let struct_data = block.elements.first_mut()?;
     let struct_raw = &mut block.raw_data[0..size];
