@@ -6,7 +6,7 @@
 
 use std::error::Error;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::TagReadError;
 use crate::io::*;
@@ -311,6 +311,60 @@ impl TagFile {
         self.write_to(&mut writer)
     }
 
+    /// Write to a temporary file, replace `path`, then verify the saved tag
+    /// can be parsed again. Leaves the original untouched on any failure.
+    pub fn write_atomic<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
+        let path = path.as_ref();
+        let (temp_path, file) = create_save_temp_file(path)?;
+        let result = (|| {
+            let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
+            writer.write_all(&self.write_atomic_bytes()?)?;
+            writer.flush()?;
+            let file = writer.into_inner().map_err(|error| error.into_error())?;
+            file.sync_all()?;
+            commit_temp_file(&temp_path, path)?;
+            if let TagContainer::Classic { engine, .. } = self.container {
+                let bytes = std::fs::read(path)?;
+                crate::classic::ClassicHeader::parse(&bytes).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "saved classic tag failed verification: invalid classic header",
+                    )
+                })?;
+                crate::classic::read_classic_body(&bytes[64..], &self.tag_stream.layout, engine)
+                    .map(|_| ())
+                    .map_err(|error| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("saved classic tag failed verification: {error}"),
+                        )
+                    })
+            } else {
+                Self::read(path).map(|_| ()).map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("saved tag failed verification: {error}"),
+                    )
+                })
+            }
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        result
+    }
+
+    fn write_atomic_bytes(&self) -> std::io::Result<Vec<u8>> {
+        let mut bytes = self.write_to_bytes()?;
+        if matches!(self.container, TagContainer::Mcc) {
+            let mut main_stream = Vec::new();
+            self.tag_stream
+                .write(u32::from_be_bytes(*b"tag!"), &mut main_stream)?;
+            patch_live_reload_checksum(&mut bytes, &main_stream);
+        }
+        Ok(bytes)
+    }
+
     /// The classic engine (Halo CE / Halo 2) this tag was read as, or
     /// `None` for MCC self-describing tags. Lets callers branch on the
     /// engine — e.g. preferring the color-plate source for classic
@@ -585,4 +639,96 @@ fn collect_from_field(f: &crate::TagField<'_>, out: &mut Vec<(u32, String)>) {
         && let Some((g, p)) = r.group_tag_and_name {
             out.push((g, p));
     }
+}
+
+fn create_save_temp_file(path: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+    let (parent, base_name) = save_temp_location(path)?;
+    std::fs::create_dir_all(&parent)?;
+    let pid = std::process::id();
+    for attempt in 0..1000u32 {
+        let temp_path = parent.join(format!("{base_name}.blam-save-{pid}-{attempt}.tmp"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique temp save path",
+    ))
+}
+
+fn save_temp_location(path: &Path) -> std::io::Result<(PathBuf, String)> {
+    let parent = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "save path has no file name",
+        )
+    })?;
+    Ok((parent, format!(".{}", file_name.to_string_lossy())))
+}
+
+fn patch_live_reload_checksum(bytes: &mut [u8], main_stream: &[u8]) {
+    const CHECKSUM_OFFSET: usize = 56;
+    const CHECKSUM_END: usize = CHECKSUM_OFFSET + 4;
+
+    if bytes.len() < CHECKSUM_END {
+        return;
+    }
+    let checksum = reflected_crc32_no_final_xor(main_stream);
+    bytes[CHECKSUM_OFFSET..CHECKSUM_END].copy_from_slice(&checksum.to_le_bytes());
+}
+
+fn reflected_crc32_no_final_xor(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in bytes {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            let mask = 0u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    crc
+}
+
+fn commit_temp_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    copy_file_overwrite(from, to)?;
+    let _ = std::fs::remove_file(from);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn copy_file_overwrite(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    unsafe extern "system" {
+        fn CopyFileW(
+            lpExistingFileName: *const u16,
+            lpNewFileName: *const u16,
+            bFailIfExists: i32,
+        ) -> i32;
+    }
+
+    let from_w: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to_w: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    let ok = unsafe { CopyFileW(from_w.as_ptr(), to_w.as_ptr(), 0) };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn copy_file_overwrite(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::copy(from, to).map(|_| ())
 }
