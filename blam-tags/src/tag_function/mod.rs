@@ -560,6 +560,145 @@ impl ExponentCompact {
 }
 
 // ---------------------------------------------------------------------------
+// Serializers — used by the editing API to round-trip a modified curve back
+// to its raw `mapping_function` `data` blob. The compact structs are
+// byte-identical to their on-disk form, so these mirror the `parse`s above.
+// ---------------------------------------------------------------------------
+
+impl TagFunctionHeader {
+    pub fn to_bytes(&self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[0] = self.function_type as u8;
+        out[1] = self.flags.0;
+        out[2] = self.color_graph_type as u8;
+        out[4..8].copy_from_slice(&self.colors[0].to_le_bytes());
+        out[8..12].copy_from_slice(&self.colors[1].to_le_bytes());
+        out[12..16].copy_from_slice(&self.colors[2].to_le_bytes());
+        out[16..20].copy_from_slice(&self.colors[3].to_le_bytes());
+        out[20..24].copy_from_slice(&self.exclusion_min.to_le_bytes());
+        out[24..28].copy_from_slice(&self.exclusion_max.to_le_bytes());
+        out[28..32].copy_from_slice(&self.compact_size.to_le_bytes());
+        out
+    }
+}
+
+impl LinearCompact {
+    fn to_bytes(&self) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        out[0..4].copy_from_slice(&self.slope.to_le_bytes());
+        out[4..8].copy_from_slice(&self.offset.to_le_bytes());
+        out
+    }
+}
+
+impl SplineCompact {
+    fn to_bytes(&self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[0..4].copy_from_slice(&self.i.to_le_bytes());
+        out[4..8].copy_from_slice(&self.j.to_le_bytes());
+        out[8..12].copy_from_slice(&self.k.to_le_bytes());
+        out[12..16].copy_from_slice(&self.l.to_le_bytes());
+        out
+    }
+}
+
+impl Spline2Compact {
+    fn to_bytes(&self) -> [u8; 28] {
+        let mut out = [0u8; 28];
+        out[0..16].copy_from_slice(&self.spline.to_bytes());
+        out[16..20].copy_from_slice(&self.left_x.to_le_bytes());
+        out[20..24].copy_from_slice(&self.width.to_le_bytes());
+        out[24..28].copy_from_slice(&self.bias.to_le_bytes());
+        out
+    }
+}
+
+impl TransitionCompact {
+    fn to_bytes(&self) -> [u8; 12] {
+        let mut out = [0u8; 12];
+        out[0] = self.function_index;
+        out[4..8].copy_from_slice(&self.amplitude_min.to_le_bytes());
+        out[8..12].copy_from_slice(&self.amplitude_max.to_le_bytes());
+        out
+    }
+}
+
+impl PeriodicCompact {
+    fn to_bytes(&self) -> [u8; 20] {
+        let mut out = [0u8; 20];
+        out[0] = self.function_index;
+        out[4..8].copy_from_slice(&self.frequency.to_le_bytes());
+        out[8..12].copy_from_slice(&self.phase.to_le_bytes());
+        out[12..16].copy_from_slice(&self.amplitude_min.to_le_bytes());
+        out[16..20].copy_from_slice(&self.amplitude_max.to_le_bytes());
+        out
+    }
+}
+
+impl LinearKeyCompact {
+    /// Rebuild the engine's cached `times`/`increment`/`y_delta` vectors
+    /// from `graph_points` after an edit. The runtime evaluator reads only
+    /// these caches, so this MUST be called after any `graph_points` change.
+    fn recompute_vectors(&mut self) {
+        for i in 0..4 {
+            self.times_vector[i] = self.graph_points[i].0;
+        }
+        for i in 0..3 {
+            let dx = self.graph_points[i + 1].0 - self.graph_points[i].0;
+            self.increment_vector[i] = if dx.abs() > f32::EPSILON { 1.0 / dx } else { 0.0 };
+            self.y_delta_vector[i] = self.graph_points[i + 1].1 - self.graph_points[i].1;
+        }
+        self.increment_vector[3] = 0.0;
+        self.y_delta_vector[3] = 0.0;
+    }
+
+    fn to_bytes(&self) -> [u8; 80] {
+        let mut out = [0u8; 80];
+        for (i, (x, y)) in self.graph_points.iter().enumerate() {
+            let off = i * 8;
+            out[off..off + 4].copy_from_slice(&x.to_le_bytes());
+            out[off + 4..off + 8].copy_from_slice(&y.to_le_bytes());
+        }
+        for i in 0..4 {
+            out[32 + i * 4..32 + i * 4 + 4].copy_from_slice(&self.times_vector[i].to_le_bytes());
+            out[48 + i * 4..48 + i * 4 + 4]
+                .copy_from_slice(&self.increment_vector[i].to_le_bytes());
+            out[64 + i * 4..64 + i * 4 + 4].copy_from_slice(&self.y_delta_vector[i].to_le_bytes());
+        }
+        out
+    }
+}
+
+impl MultiPartCompact {
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.parts.len() * 16);
+        out.extend_from_slice(&(self.parts.len() as i32).to_le_bytes());
+        for part in &self.parts {
+            let (part_type, body): (u8, Vec<u8>) = match &part.function {
+                MultiPartSubFunction::Linear(c) => (4, c.to_bytes().to_vec()),
+                MultiPartSubFunction::Spline(c) => (7, c.to_bytes().to_vec()),
+                MultiPartSubFunction::Spline2(c) => (10, c.to_bytes().to_vec()),
+            };
+            out.push(part_type);
+            out.extend_from_slice(&[0, 0, 0]);
+            out.extend_from_slice(&part.ending_x.to_le_bytes());
+            out.extend_from_slice(&body);
+        }
+        out
+    }
+}
+
+impl ExponentCompact {
+    fn to_bytes(&self) -> [u8; 12] {
+        let mut out = [0u8; 12];
+        out[0..4].copy_from_slice(&self.amplitude_min.to_le_bytes());
+        out[4..8].copy_from_slice(&self.amplitude_max.to_le_bytes());
+        out[8..12].copy_from_slice(&self.exponent.to_le_bytes());
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TagFunction enum
 // ---------------------------------------------------------------------------
 
@@ -690,6 +829,52 @@ impl FunctionKind {
             | Self::Exponent { header, .. }
             | Self::Unsupported { header, .. } => header,
         }
+    }
+
+    fn header_mut(&mut self) -> &mut TagFunctionHeader {
+        match self {
+            Self::Identity { header }
+            | Self::Constant { header }
+            | Self::Transition { header, .. }
+            | Self::Periodic { header, .. }
+            | Self::Linear { header, .. }
+            | Self::LinearKey { header, .. }
+            | Self::MultiLinearKey { header, .. }
+            | Self::Spline { header, .. }
+            | Self::Spline2 { header, .. }
+            | Self::MultiSpline { header, .. }
+            | Self::Exponent { header, .. }
+            | Self::Unsupported { header, .. } => header,
+        }
+    }
+
+    /// Just the per-type compact block (no header), in on-disk form. Empty
+    /// for Identity/Constant; for Unsupported, the bytes after the header.
+    fn compact_to_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Identity { .. } | Self::Constant { .. } => Vec::new(),
+            Self::Transition { compact, .. } => compact.to_bytes().to_vec(),
+            Self::Periodic { compact, .. } => compact.to_bytes().to_vec(),
+            Self::Linear { compact, .. } => compact.to_bytes().to_vec(),
+            Self::LinearKey { compact, .. } | Self::MultiLinearKey { compact, .. } => {
+                compact.to_bytes().to_vec()
+            }
+            Self::Spline { compact, .. } => compact.to_bytes().to_vec(),
+            Self::Spline2 { compact, .. } => compact.to_bytes().to_vec(),
+            Self::Exponent { compact, .. } => compact.to_bytes().to_vec(),
+            Self::MultiSpline { compact, .. } => compact.to_bytes(),
+            Self::Unsupported { raw, .. } => raw.get(32..).unwrap_or(&[]).to_vec(),
+        }
+    }
+
+    /// Serialize this single curve (header + compact) to its raw blob.
+    fn to_bytes(&self) -> Vec<u8> {
+        if let Self::Unsupported { raw, .. } = self {
+            return raw.clone();
+        }
+        let mut out = self.header().to_bytes().to_vec();
+        out.extend_from_slice(&self.compact_to_bytes());
+        out
     }
 
     /// The raw per-type curve value at `(input, range)` BEFORE exclusion
@@ -951,11 +1136,325 @@ impl TagFunction {
             blue: a.blue + (b.blue - a.blue) * f,
         }
     }
+
+    // -- Editing API -------------------------------------------------------
+
+    fn header_mut(&mut self) -> &mut TagFunctionHeader {
+        self.kind.header_mut()
+    }
+
+    /// The normalized curve shape before output-range remapping. Alias for
+    /// [`Self::evaluate_legacy`] for editors that draw the raw curve.
+    pub fn evaluate_shape(&self, input: f32, range: f32) -> f32 {
+        self.evaluate_legacy(input, range)
+    }
+
+    /// Serialize back to the raw `mapping_function` `data` blob. A
+    /// RANGE-flagged function emits its shared header, the primary compact,
+    /// then the second compact back-to-back (matching [`Self::parse`]).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = self.kind.to_bytes();
+        if let Some(second) = &self.ranged_second {
+            out.extend_from_slice(&second.compact_to_bytes());
+        }
+        out
+    }
+
+    /// Set or clear a header flag bit (`FunctionFlags::RANGE`, `CLAMPED`, ...).
+    pub fn set_flag(&mut self, flag: u8, on: bool) {
+        let header = self.header_mut();
+        if on {
+            header.flags.0 |= flag;
+        } else {
+            header.flags.0 &= !flag;
+        }
+    }
+
+    /// Set the output range `[min, max]`.
+    pub fn set_clamp_range(&mut self, min: f32, max: f32) {
+        let header = self.header_mut();
+        header.clamp_range_min = min;
+        header.clamp_range_max = max;
+        header.colors[0] = min.to_bits();
+        header.colors[1] = max.to_bits();
+    }
+
+    /// Set the constant scalar value.
+    pub fn set_constant_value(&mut self, value: f32) {
+        let max = self.header().clamp_range_max;
+        self.set_clamp_range(value, max);
+    }
+
+    /// Set the color-graph type.
+    pub fn set_color_graph_type(&mut self, kind: ColorGraphType) {
+        self.header_mut().color_graph_type = kind;
+    }
+
+    /// Set one ARGB color slot (0..3).
+    pub fn set_color(&mut self, slot: usize, argb: u32) {
+        if slot < 4 {
+            self.header_mut().colors[slot] = argb;
+        }
+    }
+
+    /// Replace the function type, resetting to a default compact for the
+    /// new type. Clears any RANGE second curve (the old one no longer fits).
+    pub fn set_function_type(&mut self, target: FunctionType) {
+        if self.function_type() == target {
+            return;
+        }
+        let mut header = self.header().clone();
+        header.function_type = target;
+        let (kind, compact_len) = build_default_variant(target, header.clone());
+        header.compact_size = compact_len as i32;
+        self.kind = kind;
+        *self.kind.header_mut() = header;
+        self.ranged_second = None;
+    }
+
+    /// Number of active (non-padding) LinearKey graph points, else 0.
+    pub fn active_linear_key_point_count(&self) -> usize {
+        match &self.kind {
+            FunctionKind::LinearKey { compact, .. } | FunctionKind::MultiLinearKey { compact, .. } => {
+                active_lk_count(&compact.graph_points)
+            }
+            _ => 0,
+        }
+    }
+
+    /// The 4 LinearKey graph points (padding-filled past the active count),
+    /// or `None` for non-LinearKey functions.
+    pub fn linear_key_points(&self) -> Option<[(f32, f32); 4]> {
+        match &self.kind {
+            FunctionKind::LinearKey { compact, .. } | FunctionKind::MultiLinearKey { compact, .. } => {
+                Some(compact.graph_points)
+            }
+            _ => None,
+        }
+    }
+
+    /// Overwrite LinearKey graph point `i` and recompute the eval caches.
+    pub fn set_linear_key_point(&mut self, i: usize, x: f32, y: f32) {
+        if let FunctionKind::LinearKey { compact, .. } | FunctionKind::MultiLinearKey { compact, .. } =
+            &mut self.kind
+            && i < 4
+        {
+            compact.graph_points[i] = (x, y);
+            compact.recompute_vectors();
+        }
+    }
+
+    /// Insert a LinearKey graph point in x-order (max 4). Returns its index.
+    pub fn insert_linear_key_point(&mut self, x: f32, y: f32) -> Option<usize> {
+        let compact = match &mut self.kind {
+            FunctionKind::LinearKey { compact, .. } | FunctionKind::MultiLinearKey { compact, .. } => {
+                compact
+            }
+            _ => return None,
+        };
+        let n = active_lk_count(&compact.graph_points);
+        if n >= 4 {
+            return None;
+        }
+        let x = x.clamp(0.0, 1.0);
+        let y = y.clamp(0.0, 1.0);
+        let idx = (0..n).find(|&i| x <= compact.graph_points[i].0).unwrap_or(n);
+        for j in (idx..n).rev() {
+            compact.graph_points[j + 1] = compact.graph_points[j];
+        }
+        compact.graph_points[idx] = (x, y);
+        let new_last = compact.graph_points[n];
+        for j in (n + 1)..4 {
+            compact.graph_points[j] = new_last;
+        }
+        compact.recompute_vectors();
+        Some(idx)
+    }
+
+    /// Delete LinearKey graph point `i` (keeps a minimum of 2). Returns
+    /// whether a point was removed.
+    pub fn delete_linear_key_point(&mut self, i: usize) -> bool {
+        let compact = match &mut self.kind {
+            FunctionKind::LinearKey { compact, .. } | FunctionKind::MultiLinearKey { compact, .. } => {
+                compact
+            }
+            _ => return false,
+        };
+        let n = active_lk_count(&compact.graph_points);
+        if n <= 2 || i >= n {
+            return false;
+        }
+        for j in i..3 {
+            compact.graph_points[j] = compact.graph_points[j + 1];
+        }
+        let last = compact.graph_points[n - 2];
+        for j in (n - 1)..4 {
+            compact.graph_points[j] = last;
+        }
+        compact.recompute_vectors();
+        true
+    }
+}
+
+/// Count active non-padding points in a LinearKey graph.
+fn active_lk_count(pts: &[(f32, f32); 4]) -> usize {
+    let mut n = 4;
+    while n > 2 {
+        let (ax, ay) = pts[n - 1];
+        let (bx, by) = pts[n - 2];
+        if ax.to_bits() == bx.to_bits() && ay.to_bits() == by.to_bits() {
+            n -= 1;
+        } else {
+            break;
+        }
+    }
+    n
+}
+
+/// Build a default [`FunctionKind`] for `target` with the given header,
+/// returning the kind and its compact byte length.
+fn build_default_variant(target: FunctionType, header: TagFunctionHeader) -> (FunctionKind, usize) {
+    match target {
+        FunctionType::Identity => (FunctionKind::Identity { header }, 0),
+        FunctionType::Constant => (FunctionKind::Constant { header }, 0),
+        FunctionType::Linear => (
+            FunctionKind::Linear { header, compact: LinearCompact { slope: 1.0, offset: 0.0 } },
+            8,
+        ),
+        FunctionType::LinearKey | FunctionType::MultiLinearKey => {
+            let mut compact = LinearKeyCompact {
+                graph_points: [(0.0, 0.0), (1.0, 1.0), (1.0, 1.0), (1.0, 1.0)],
+                times_vector: [0.0; 4],
+                increment_vector: [0.0; 4],
+                y_delta_vector: [0.0; 4],
+            };
+            compact.recompute_vectors();
+            let kind = if target == FunctionType::LinearKey {
+                FunctionKind::LinearKey { header, compact }
+            } else {
+                FunctionKind::MultiLinearKey { header, compact }
+            };
+            (kind, 80)
+        }
+        FunctionType::Transition => (
+            FunctionKind::Transition {
+                header,
+                compact: TransitionCompact { function_index: 0, amplitude_min: 0.0, amplitude_max: 1.0 },
+            },
+            12,
+        ),
+        FunctionType::Periodic => (
+            FunctionKind::Periodic {
+                header,
+                compact: PeriodicCompact {
+                    function_index: 0,
+                    frequency: 1.0,
+                    phase: 0.0,
+                    amplitude_min: 0.0,
+                    amplitude_max: 1.0,
+                },
+            },
+            20,
+        ),
+        FunctionType::Spline => (
+            FunctionKind::Spline {
+                header,
+                compact: SplineCompact { i: 0.0, j: 0.0, k: 1.0, l: 0.0 },
+            },
+            16,
+        ),
+        FunctionType::Spline2 => (
+            FunctionKind::Spline2 {
+                header,
+                compact: Spline2Compact {
+                    spline: SplineCompact { i: 0.0, j: 0.0, k: 1.0, l: 0.0 },
+                    left_x: 0.0,
+                    width: 1.0,
+                    bias: 1.0,
+                },
+            },
+            28,
+        ),
+        FunctionType::Exponent => (
+            FunctionKind::Exponent {
+                header,
+                compact: ExponentCompact { amplitude_min: 0.0, amplitude_max: 1.0, exponent: 1.0 },
+            },
+            12,
+        ),
+        FunctionType::MultiSpline => (
+            FunctionKind::MultiSpline { header, compact: MultiPartCompact { parts: Vec::new() } },
+            4,
+        ),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn linear_blob(flags: u8, compacts: &[(f32, f32)]) -> Vec<u8> {
+        let mut data = vec![0u8; 32];
+        data[0] = FunctionType::Linear as u8;
+        data[1] = flags;
+        data[2] = ColorGraphType::Scalar as u8;
+        data[28..32].copy_from_slice(&8i32.to_le_bytes()); // compact_size
+        for (slope, offset) in compacts {
+            data.extend_from_slice(&slope.to_le_bytes());
+            data.extend_from_slice(&offset.to_le_bytes());
+        }
+        data
+    }
+
+    #[test]
+    fn to_bytes_roundtrips_simple_linear() {
+        let data = linear_blob(0, &[(2.0, 0.5)]);
+        let f = TagFunction::parse(&data).unwrap();
+        let out = f.to_bytes();
+        assert_eq!(out, data);
+        assert_eq!(TagFunction::parse(&out).unwrap().function_type(), FunctionType::Linear);
+    }
+
+    #[test]
+    fn to_bytes_preserves_range_second_curve() {
+        // RANGE-flagged Linear: two compacts back-to-back behind one header.
+        let data = linear_blob(FunctionFlags::RANGE, &[(1.0, 0.0), (3.0, 1.0)]);
+        let f = TagFunction::parse(&data).unwrap();
+        assert!(f.ranged_second.is_some(), "second curve not parsed");
+        // The whole blob (both compacts) must survive serialization.
+        assert_eq!(f.to_bytes(), data, "RANGE second compact dropped on to_bytes");
+        assert!(TagFunction::parse(&f.to_bytes()).unwrap().ranged_second.is_some());
+    }
+
+    #[test]
+    fn set_function_type_clears_range_second_and_resizes() {
+        let mut f = TagFunction::parse(&linear_blob(FunctionFlags::RANGE, &[(1.0, 0.0), (3.0, 1.0)]))
+            .unwrap();
+        assert!(f.ranged_second.is_some());
+        f.set_function_type(FunctionType::Spline);
+        assert_eq!(f.function_type(), FunctionType::Spline);
+        assert!(f.ranged_second.is_none(), "stale second curve survived a type change");
+        assert_eq!(f.header().compact_size, 16);
+        // Still serializes to a valid, re-parseable blob.
+        assert_eq!(TagFunction::parse(&f.to_bytes()).unwrap().function_type(), FunctionType::Spline);
+    }
+
+    #[test]
+    fn linear_key_edit_reflects_in_evaluation() {
+        let mut header = TagFunctionHeader::parse(&[0u8; 32]).unwrap();
+        header.function_type = FunctionType::LinearKey;
+        let (kind, len) = build_default_variant(FunctionType::LinearKey, header.clone());
+        let mut blob = kind.to_bytes();
+        assert_eq!(len, 80);
+        blob[28..32].copy_from_slice(&(len as i32).to_le_bytes());
+        let mut f = TagFunction::parse(&blob).unwrap();
+
+        // Move the last key down to y=0; evaluation near x=1 should follow.
+        f.set_linear_key_point(1, 1.0, 0.0);
+        assert_eq!(f.linear_key_points().unwrap()[1], (1.0, 0.0));
+        // Round-trips and the cached vectors were recomputed (no panic, parses back).
+        assert_eq!(TagFunction::parse(&f.to_bytes()).unwrap().function_type(), FunctionType::LinearKey);
+    }
 
     /// grunt_armor.shader parameters[3] (`diffuse_coefficient`):
     /// constant function, value 1.0.
