@@ -725,6 +725,9 @@ pub struct RenderMethodParameter {
     pub bitmap_path: String,
     pub real_parameter: f32,
     pub int_parameter: i32,
+    /// The per-instance authored color (ARGB). Falls back to opaque-black
+    /// when the slot has no `color` field.
+    pub color_parameter: ArgbColor,
     pub bitmap_flags: i16,
     pub bitmap_filter_mode: BitmapFilterMode,
     pub bitmap_comparison_function: BitmapComparisonFunction,
@@ -1427,6 +1430,11 @@ impl RenderMethodParameter {
             bitmap_path: s.read_tag_ref_path("bitmap").unwrap_or_default(),
             real_parameter: s.read_real("real").unwrap_or(0.0),
             int_parameter: s.read_int_any("int/bool").unwrap_or(0) as i32,
+            color_parameter: match s.field("color").and_then(|f| f.value()) {
+                Some(crate::fields::TagFieldData::ArgbColor(c)) => c,
+                Some(crate::fields::TagFieldData::RgbColor(c)) => ArgbColor(c.0 | 0xFF00_0000),
+                _ => ArgbColor(0),
+            },
             bitmap_flags: s.read_int_any("bitmap flags").unwrap_or(0) as i16,
             bitmap_filter_mode: s.read_int_any("bitmap filter mode")
                 .and_then(BitmapFilterMode::from_index)

@@ -215,6 +215,79 @@ impl TagFile {
         Self::read_from(reader)
     }
 
+    /// Read only the optional dependency-list (`want`) stream from a tag file.
+    /// Returns `Ok(None)` when the tag has no dependency-list stream.
+    ///
+    /// This intentionally skips the main `tag!` payload, which is useful for
+    /// indexing references across very large tag folders.
+    pub fn read_dependency_references<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Option<Vec<(u32, String)>>, TagReadError> {
+        let mut reader = std::io::BufReader::with_capacity(64 * 1024, std::fs::File::open(path)?);
+        reader.seek(SeekFrom::End(0))?;
+        let tag_file_size = reader.stream_position()?;
+        reader.seek(SeekFrom::Start(0))?;
+
+        let mut fixed_header = [0u8; 64];
+        if tag_file_size >= fixed_header.len() as u64 {
+            reader.read_exact(&mut fixed_header)?;
+            reader.seek(SeekFrom::Start(0))?;
+            if crate::classic::ClassicHeader::parse(&fixed_header).is_some() {
+                return Ok(None);
+            }
+        }
+
+        let endian = detect_endian(&mut reader, tag_file_size)?;
+        let _header = TagFileHeader::read(&mut reader, endian)?;
+
+        let tag_chunk_header = read_chunk_header(&mut reader, endian)?;
+        if tag_chunk_header.signature != u32::from_be_bytes(*b"tag!") {
+            return Ok(None);
+        }
+        if tag_chunk_header.version != 0 {
+            return Err(TagReadError::BadChunkVersion {
+                chunk: "tag stream",
+                version: tag_chunk_header.version,
+            });
+        }
+        let tag_chunk_payload = reader.stream_position()?;
+        reader.seek(SeekFrom::Start(
+            tag_chunk_payload + u64::from(tag_chunk_header.size),
+        ))?;
+
+        while reader.stream_position()? != tag_file_size {
+            let chunk_header_offset = reader.stream_position()?;
+            let chunk_signature = read_u32(&mut reader, endian)?;
+            reader.seek(SeekFrom::Start(chunk_header_offset))?;
+            match &chunk_signature.to_be_bytes() {
+                b"want" => {
+                    let stream = TagStream::read(chunk_signature, &mut reader, endian)?;
+                    let Some(root) = crate::api::stream_root(&stream) else {
+                        return Ok(Some(Vec::new()));
+                    };
+                    let mut refs = Vec::new();
+                    collect_tag_references(&root, &mut refs);
+                    return Ok(Some(refs));
+                }
+                b"info" | b"assd" => {
+                    let chunk_header = read_chunk_header(&mut reader, endian)?;
+                    let payload_start = reader.stream_position()?;
+                    reader.seek(SeekFrom::Start(
+                        payload_start + u64::from(chunk_header.size),
+                    ))?;
+                }
+                signature => {
+                    return Err(TagReadError::UnknownSubChunkSignature {
+                        context: "tag-file top-level",
+                        signature: *signature,
+                    });
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Parse a complete tag file from any [`Read`] + [`Seek`] source —
     /// wrapped in a [`std::io::BufReader`] internally if not already
     /// one. Useful for fuzzing, in-memory tag manipulation, and
