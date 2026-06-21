@@ -1043,7 +1043,7 @@ fn read_materials(root: &TagStruct<'_>) -> Result<Vec<Material>, RenderModelErro
     Ok(out)
 }
 
-fn read_geometry(root: &TagStruct<'_>) -> Result<Geometry, RenderModelError> {
+pub(crate) fn read_geometry(root: &TagStruct<'_>) -> Result<Geometry, RenderModelError> {
     let geo = root
         .field("render geometry")
         .and_then(|f| f.as_struct())
