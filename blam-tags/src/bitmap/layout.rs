@@ -104,7 +104,7 @@ pub fn compose_cube_cross(
             unreachable!("cube-cross cell points at out-of-range face {face}");
         }
         let layer_bytes = layer_mip0_bytes(image, face)?;
-        let face_rgba = decode_to_rgba8(format, cell_w, cell_h, layer_bytes)?;
+        let face_rgba = decode_to_rgba8(format, cell_w, cell_h, layer_bytes, image.p8_palette)?;
 
         let dst_x = col * cell_w;
         let dst_y = row * cell_h;
@@ -130,7 +130,7 @@ pub fn compose_layer_strip(
 
     for layer in 0..layers {
         let layer_bytes = layer_mip0_bytes(image, layer)?;
-        let layer_rgba = decode_to_rgba8(format, width, height, layer_bytes)?;
+        let layer_rgba = decode_to_rgba8(format, width, height, layer_bytes, image.p8_palette)?;
         let dst_y = layer * height;
         blit_rgba(&layer_rgba, width, height, &mut out, width, 0, dst_y);
     }

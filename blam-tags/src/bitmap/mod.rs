@@ -40,6 +40,7 @@ pub mod decode;
 pub mod format;
 pub mod layout;
 mod p8;
+pub use p8::P8Palette;
 pub mod tiff;
 pub mod xbox360;
 
@@ -125,6 +126,9 @@ pub struct Bitmap<'a> {
     /// for X360 bitmaps where we deliver just the base mip after
     /// detiling.
     per_image_mip_override: Vec<Option<u32>>,
+    /// Which engine's p8 palette to decode palettized-normal images with
+    /// (Halo 1 and Halo 2 use different tables). Derived from the tag.
+    p8_palette: P8Palette,
 }
 
 impl<'a> Bitmap<'a> {
@@ -201,7 +205,18 @@ impl<'a> Bitmap<'a> {
                 root.field_path("manual sequences").and_then(|f| f.as_block())
             });
 
-        Ok(Self { bitmaps, sequences, per_image_pixels, per_image_mip_override })
+        let p8_palette = if matches!(crate::game::Game::of(tag), crate::game::Game::Halo1) {
+            P8Palette::Halo1
+        } else {
+            P8Palette::Halo2
+        };
+        Ok(Self {
+            bitmaps,
+            sequences,
+            per_image_pixels,
+            per_image_mip_override,
+            p8_palette,
+        })
     }
 
     /// Decode the sprite-sheet `sequences[]` block: each sequence is a
@@ -251,18 +266,25 @@ impl<'a> Bitmap<'a> {
         let elem = self.bitmaps.element(index)?;
         let pixels = self.per_image_pixels.get(index)?.as_slice();
         let mip_override = self.per_image_mip_override.get(index).copied().flatten();
-        Some(BitmapImage { elem, pixels, mip_override })
+        Some(BitmapImage { elem, pixels, mip_override, p8_palette: self.p8_palette })
     }
 
     /// Iterate every image in declaration order.
     pub fn iter(&self) -> impl Iterator<Item = BitmapImage<'_>> + '_ {
         let per_image = &self.per_image_pixels;
         let overrides = &self.per_image_mip_override;
+        let p8_palette = self.p8_palette;
         self.bitmaps.iter().enumerate().map(move |(i, elem)| BitmapImage {
             elem,
             pixels: per_image[i].as_slice(),
             mip_override: overrides[i],
+            p8_palette,
         })
+    }
+
+    /// The engine p8 palette this tag's palettized-normal images decode with.
+    pub fn p8_palette(&self) -> P8Palette {
+        self.p8_palette
     }
 }
 
@@ -500,6 +522,8 @@ pub struct BitmapImage<'a> {
     /// when [`Bitmap::new`] synthesized a mip chain shorter than
     /// what the tag declares (X360 single-mip case).
     mip_override: Option<u32>,
+    /// Engine p8 palette to use for palettized-normal decode (from the tag).
+    p8_palette: P8Palette,
 }
 
 impl<'a> BitmapImage<'a> {
@@ -674,7 +698,7 @@ impl<'a> BitmapImage<'a> {
                     });
                 }
                 let decoded =
-                    decode::decode_to_rgba8(format, w, h, &bytes[cursor..cursor + level_size])?;
+                    decode::decode_to_rgba8(format, w, h, &bytes[cursor..cursor + level_size], self.p8_palette)?;
                 out.extend_from_slice(&decoded);
                 cursor += level_size;
             }

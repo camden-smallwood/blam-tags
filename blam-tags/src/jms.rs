@@ -110,6 +110,11 @@ pub struct JmsMarker {
 pub struct JmsVertex {
     pub position: RealPoint3d,
     pub normal: RealVector3d,
+    /// Authored tangent-space basis, when the source carries it (H2 rendered
+    /// vertices do; CE / lightmap vertices don't). Lets consumers use the
+    /// engine's exact tangent frame for normal mapping instead of deriving one.
+    pub tangent: Option<RealVector3d>,
+    pub binormal: Option<RealVector3d>,
     pub node_sets: Vec<(i16, f32)>,
     pub uvs: Vec<crate::math::RealPoint2d>,
 }
@@ -775,6 +780,8 @@ impl JmsFile {
                     vertices.push(JmsVertex {
                         position: pos,
                         normal: RealVector3d { i: 0.0, j: 0.0, k: 1.0 },
+                        tangent: None,
+                        binormal: None,
                         node_sets: vec![(node_idx, 1.0)],
                         uvs: vec![crate::math::RealPoint2d::ZERO],
                     });
@@ -856,6 +863,9 @@ impl JmsFile {
                     vertices.push(JmsVertex {
                         position: RealPoint3d { x: f(0) * SCALE, y: f(1) * SCALE, z: f(2) * SCALE },
                         normal: RealVector3d { i: f(3), j: f(4), k: f(5) },
+                        // 56-byte rendered vertex: binormal floats 6-8, tangent 9-11.
+                        binormal: Some(RealVector3d { i: f(6), j: f(7), k: f(8) }),
+                        tangent: Some(RealVector3d { i: f(9), j: f(10), k: f(11) }),
                         node_sets: vec![(0, 1.0)],
                         uvs: vec![crate::math::RealPoint2d { x: f(12), y: f(13) }],
                     });
@@ -2421,6 +2431,7 @@ fn read_vertex(v: &TagStruct<'_>, bounds: &CompressionBounds) -> JmsVertex {
     }
     JmsVertex {
         position, normal, node_sets,
+        tangent: None, binormal: None,
         uvs: vec![crate::math::RealPoint2d { x: texcoord.x, y: 1.0 - texcoord.y }],
     }
 }
@@ -2456,9 +2467,16 @@ pub(crate) fn read_h2_vertex(v: &TagStruct<'_>) -> JmsVertex {
             }
         }
     }
+    // H2 raw vertices carry the engine's authored tangent-space basis.
+    let read_basis = |name: &str| {
+        let b = v.read_vec3(name);
+        (b.i * b.i + b.j * b.j + b.k * b.k > 0.25).then_some(b)
+    };
     JmsVertex {
         position,
         normal,
+        tangent: read_basis("tangent"),
+        binormal: read_basis("binormal"),
         node_sets,
         uvs: vec![crate::math::RealPoint2d { x: uv.x, y: 1.0 - uv.y }],
     }
@@ -2483,6 +2501,8 @@ fn read_ce_vertex(v: &TagStruct<'_>) -> JmsVertex {
     JmsVertex {
         position,
         normal,
+        tangent: None,
+        binormal: None,
         node_sets,
         uvs: vec![crate::math::RealPoint2d { x: uv.x, y: 1.0 - uv.y }],
     }

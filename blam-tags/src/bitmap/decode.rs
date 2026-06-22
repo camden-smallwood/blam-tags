@@ -38,6 +38,7 @@ pub fn decode_to_rgba8(
     width: u32,
     height: u32,
     input: &[u8],
+    p8_palette: super::p8::P8Palette,
 ) -> Result<Vec<u8>, BitmapError> {
     let need = format.level_bytes(width, height) as usize;
     if input.len() < need {
@@ -60,7 +61,7 @@ pub fn decode_to_rgba8(
         Ay8 => decode_ay8(&input[..need], &mut out),
 
         // Classic palettized 8-bit (fixed 256-entry palette).
-        P8 | P8Bump => super::p8::decode_p8(&input[..need], &mut out),
+        P8 | P8Bump => super::p8::decode_p8(&input[..need], &mut out, p8_palette),
 
         // 16-bit packed
         A8y8 => decode_a8y8(&input[..need], &mut out),
@@ -1067,7 +1068,7 @@ mod tests {
 
     #[test]
     fn a8_white_with_alpha() {
-        let out = decode_to_rgba8(BitmapFormat::A8, 4, 1, &[0x00, 0x80, 0xFF, 0x40]).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::A8, 4, 1, &[0x00, 0x80, 0xFF, 0x40], crate::bitmap::p8::P8Palette::Halo2).unwrap();
         assert_eq!(&out[0..4], &rgba(255, 255, 255, 0x00));
         assert_eq!(&out[4..8], &rgba(255, 255, 255, 0x80));
         assert_eq!(&out[8..12], &rgba(255, 255, 255, 0xFF));
@@ -1076,66 +1077,66 @@ mod tests {
 
     #[test]
     fn y8_replicates_to_rgb() {
-        let out = decode_to_rgba8(BitmapFormat::Y8, 2, 1, &[0x00, 0x80]).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::Y8, 2, 1, &[0x00, 0x80], crate::bitmap::p8::P8Palette::Halo2).unwrap();
         assert_eq!(&out[0..4], &rgba(0, 0, 0, 255));
         assert_eq!(&out[4..8], &rgba(0x80, 0x80, 0x80, 255));
     }
 
     #[test]
     fn r8_red_only() {
-        let out = decode_to_rgba8(BitmapFormat::R8, 1, 1, &[0xCC]).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::R8, 1, 1, &[0xCC], crate::bitmap::p8::P8Palette::Halo2).unwrap();
         assert_eq!(&out, &rgba(0xCC, 0, 0, 255));
     }
 
     #[test]
     fn ay8_replicates_to_all_four() {
-        let out = decode_to_rgba8(BitmapFormat::Ay8, 1, 1, &[0x40]).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::Ay8, 1, 1, &[0x40], crate::bitmap::p8::P8Palette::Halo2).unwrap();
         assert_eq!(&out, &rgba(0x40, 0x40, 0x40, 0x40));
     }
 
     #[test]
     fn a8y8_y_in_rgb_a_in_alpha() {
         // bytes [Y, A] in memory
-        let out = decode_to_rgba8(BitmapFormat::A8y8, 1, 1, &[0x80, 0x40]).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::A8y8, 1, 1, &[0x80, 0x40], crate::bitmap::p8::P8Palette::Halo2).unwrap();
         assert_eq!(&out, &rgba(0x80, 0x80, 0x80, 0x40));
     }
 
     #[test]
     fn a4r4g4b4_nibble_replication() {
         // u16 LE = 0xFEDC → AAAA=0xF RRRR=0xE GGGG=0xD BBBB=0xC
-        let out = decode_to_rgba8(BitmapFormat::A4r4g4b4, 1, 1, &[0xDC, 0xFE]).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::A4r4g4b4, 1, 1, &[0xDC, 0xFE], crate::bitmap::p8::P8Palette::Halo2).unwrap();
         assert_eq!(&out, &rgba(0xEE, 0xDD, 0xCC, 0xFF));
     }
 
     #[test]
     fn x8r8g8b8_alpha_forced_to_255() {
         // Memory [B, G, R, X]
-        let out = decode_to_rgba8(BitmapFormat::X8r8g8b8, 1, 1, &[0x10, 0x20, 0x30, 0xAA]).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::X8r8g8b8, 1, 1, &[0x10, 0x20, 0x30, 0xAA], crate::bitmap::p8::P8Palette::Halo2).unwrap();
         assert_eq!(&out, &rgba(0x30, 0x20, 0x10, 0xFF));
     }
 
     #[test]
     fn a8r8g8b8_bgra_to_rgba() {
         // Memory [B, G, R, A]
-        let out = decode_to_rgba8(BitmapFormat::A8r8g8b8, 1, 1, &[0x10, 0x20, 0x30, 0x40]).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::A8r8g8b8, 1, 1, &[0x10, 0x20, 0x30, 0x40], crate::bitmap::p8::P8Palette::Halo2).unwrap();
         assert_eq!(&out, &rgba(0x30, 0x20, 0x10, 0x40));
     }
 
     #[test]
     fn v8u8_signed_bias_to_unsigned() {
         // Memory [U, V] = [-1, 0] → expected (V+128, U+128, 128, 255) = (128, 127, 128, 255)
-        let out = decode_to_rgba8(BitmapFormat::V8u8, 1, 1, &[0xFF, 0x00]).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::V8u8, 1, 1, &[0xFF, 0x00], crate::bitmap::p8::P8Palette::Halo2).unwrap();
         assert_eq!(&out, &rgba(128, 127, 128, 255));
 
         // Memory [U=+127, V=-128] → (0, 255, 128, 255)
-        let out = decode_to_rgba8(BitmapFormat::V8u8, 1, 1, &[0x7F, 0x80]).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::V8u8, 1, 1, &[0x7F, 0x80], crate::bitmap::p8::P8Palette::Halo2).unwrap();
         assert_eq!(&out, &rgba(0, 255, 128, 255));
     }
 
     #[test]
     fn q8w8v8u8_signed_bias_per_channel() {
         // Memory [U, V, W, Q] = [-128, 0, +127, +1] → (0, 128, 255, 129)
-        let out = decode_to_rgba8(BitmapFormat::Q8w8v8u8, 1, 1, &[0x80, 0x00, 0x7F, 0x01]).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::Q8w8v8u8, 1, 1, &[0x80, 0x00, 0x7F, 0x01], crate::bitmap::p8::P8Palette::Halo2).unwrap();
         assert_eq!(&out, &rgba(0, 128, 255, 129));
     }
 
@@ -1143,7 +1144,7 @@ mod tests {
     fn a16b16g16r16_high_byte_only() {
         // R=0xFF00, G=0x8000, B=0x0100, A=0xFFFF (LE bytes)
         let bytes = [0x00, 0xFF, 0x00, 0x80, 0x00, 0x01, 0xFF, 0xFF];
-        let out = decode_to_rgba8(BitmapFormat::A16b16g16r16, 1, 1, &bytes).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::A16b16g16r16, 1, 1, &bytes, crate::bitmap::p8::P8Palette::Halo2).unwrap();
         assert_eq!(&out, &rgba(0xFF, 0x80, 0x01, 0xFF));
     }
 
@@ -1155,7 +1156,7 @@ mod tests {
         let b = 32767i16.to_le_bytes();
         let a = (-1i16).to_le_bytes();
         let bytes = [r[0], r[1], g[0], g[1], b[0], b[1], a[0], a[1]];
-        let out = decode_to_rgba8(BitmapFormat::Signedr16g16b16a16, 1, 1, &bytes).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::Signedr16g16b16a16, 1, 1, &bytes, crate::bitmap::p8::P8Palette::Halo2).unwrap();
         assert_eq!(&out, &rgba(0, 128, 255, 127));
     }
 
@@ -1169,7 +1170,7 @@ mod tests {
             0x00, 0x00, // B = 0.0
             0x00, 0x40, // A = 2.0 → clamps to 1.0
         ];
-        let out = decode_to_rgba8(BitmapFormat::Abgrfp16, 1, 1, &bytes).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::Abgrfp16, 1, 1, &bytes, crate::bitmap::p8::P8Palette::Halo2).unwrap();
         assert_eq!(&out, &rgba(255, 128, 0, 255));
     }
 
@@ -1180,13 +1181,13 @@ mod tests {
         bytes.extend_from_slice(&0.5_f32.to_le_bytes());   // G
         bytes.extend_from_slice(&(-0.5_f32).to_le_bytes()); // B → clamps to 0
         bytes.extend_from_slice(&3.0_f32.to_le_bytes());   // A → clamps to 1
-        let out = decode_to_rgba8(BitmapFormat::Abgrfp32, 1, 1, &bytes).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::Abgrfp32, 1, 1, &bytes, crate::bitmap::p8::P8Palette::Halo2).unwrap();
         assert_eq!(&out, &rgba(255, 128, 0, 255));
     }
 
     #[test]
     fn input_too_short_returns_oob() {
-        let err = decode_to_rgba8(BitmapFormat::A8r8g8b8, 2, 2, &[0u8; 12]);
+        let err = decode_to_rgba8(BitmapFormat::A8r8g8b8, 2, 2, &[0u8; 12], crate::bitmap::p8::P8Palette::Halo2);
         assert!(matches!(err, Err(BitmapError::PixelSliceOutOfBounds { .. })));
     }
 
@@ -1206,7 +1207,7 @@ mod tests {
         block[0..2].copy_from_slice(&0xF800u16.to_le_bytes()); // color0
         block[2..4].copy_from_slice(&0xF800u16.to_le_bytes()); // color1
         // index bits all 0 → palette[0] = color0 = red
-        let out = decode_to_rgba8(BitmapFormat::Dxt1, 4, 4, &block).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::Dxt1, 4, 4, &block, crate::bitmap::p8::P8Palette::Halo2).unwrap();
         for i in 0..16 {
             assert_eq!(&out[i * 4..i * 4 + 4], &[0xFF, 0x00, 0x00, 0xFF]);
         }
@@ -1221,7 +1222,7 @@ mod tests {
         let mut block = [0u8; 8];
         block[0] = 0x80;
         block[1] = 0x80;
-        let out = decode_to_rgba8(BitmapFormat::Dxt5a, 4, 4, &block).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::Dxt5a, 4, 4, &block, crate::bitmap::p8::P8Palette::Halo2).unwrap();
         for i in 0..16 {
             assert_eq!(&out[i * 4..i * 4 + 4], &[0x80, 0x80, 0x80, 0x80]);
         }
@@ -1233,7 +1234,7 @@ mod tests {
         let mut block = [0u8; 8];
         block[0] = 0x60;
         block[1] = 0x60;
-        let out = decode_to_rgba8(BitmapFormat::Dxt5aMono, 2, 2, &block).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::Dxt5aMono, 2, 2, &block, crate::bitmap::p8::P8Palette::Halo2).unwrap();
         for i in 0..4 {
             assert_eq!(&out[i * 4..i * 4 + 4], &[0x60, 0x60, 0x60, 0x00]);
         }
@@ -1245,7 +1246,7 @@ mod tests {
         let mut block = [0u8; 8];
         block[0] = 0xA0;
         block[1] = 0xA0;
-        let out = decode_to_rgba8(BitmapFormat::Dxt5aAlpha, 2, 2, &block).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::Dxt5aAlpha, 2, 2, &block, crate::bitmap::p8::P8Palette::Halo2).unwrap();
         for i in 0..4 {
             assert_eq!(&out[i * 4..i * 4 + 4], &[0x00, 0x00, 0x00, 0xA0]);
         }
@@ -1256,7 +1257,7 @@ mod tests {
     #[test]
     fn dxt3a_all_max_nibbles() {
         let block = [0xFFu8; 8];
-        let out = decode_to_rgba8(BitmapFormat::Dxt3a, 4, 4, &block).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::Dxt3a, 4, 4, &block, crate::bitmap::p8::P8Palette::Halo2).unwrap();
         for i in 0..16 {
             assert_eq!(&out[i * 4..i * 4 + 4], &[0xFF, 0xFF, 0xFF, 0xFF]);
         }
@@ -1268,7 +1269,7 @@ mod tests {
     #[test]
     fn dxt3a_1111_unpacks_to_four_binary_channels() {
         let block = [0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA];
-        let out = decode_to_rgba8(BitmapFormat::Dxt3a1111, 2, 2, &block).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::Dxt3a1111, 2, 2, &block, crate::bitmap::p8::P8Palette::Halo2).unwrap();
         for i in 0..4 {
             assert_eq!(&out[i * 4..i * 4 + 4], &[0x00, 0xFF, 0x00, 0xFF]);
         }
@@ -1278,7 +1279,7 @@ mod tests {
     #[test]
     fn r5g6b5_pure_red() {
         let bytes = [0x00, 0xF8]; // LE u16 = 0xF800
-        let out = decode_to_rgba8(BitmapFormat::R5g6b5, 1, 1, &bytes).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::R5g6b5, 1, 1, &bytes, crate::bitmap::p8::P8Palette::Halo2).unwrap();
         assert_eq!(&out, &[0xFF, 0x00, 0x00, 0xFF]);
     }
 
@@ -1286,7 +1287,7 @@ mod tests {
     #[test]
     fn a1r5g5b5_alpha_only() {
         let bytes = [0x00, 0x80]; // LE u16 = 0x8000
-        let out = decode_to_rgba8(BitmapFormat::A1r5g5b5, 1, 1, &bytes).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::A1r5g5b5, 1, 1, &bytes, crate::bitmap::p8::P8Palette::Halo2).unwrap();
         assert_eq!(&out, &[0x00, 0x00, 0x00, 0xFF]);
     }
 
@@ -1300,7 +1301,7 @@ mod tests {
         // Endpoint1: bytes[2]=G=0x80, bytes[3]=R=0x80
         // Indices: any value (all 4 endpoints decode to same color)
         let block = [0x80, 0x80, 0x80, 0x80, 0x00, 0x00, 0x00, 0x00];
-        let out = decode_to_rgba8(BitmapFormat::Ctx1, 2, 2, &block).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::Ctx1, 2, 2, &block, crate::bitmap::p8::P8Palette::Halo2).unwrap();
         let z = calculate_normal_z(0x80, 0x80);
         for i in 0..4 {
             assert_eq!(&out[i * 4..i * 4 + 4], &[0x80, 0x80, z, 0xFF]);
@@ -1318,7 +1319,7 @@ mod tests {
         // Green sub-block: both endpoints = 0xC0
         block[8] = 0xC0;
         block[9] = 0xC0;
-        let out = decode_to_rgba8(BitmapFormat::Dxn, 4, 4, &block).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::Dxn, 4, 4, &block, crate::bitmap::p8::P8Palette::Halo2).unwrap();
         for i in 0..16 {
             assert_eq!(&out[i * 4..i * 4 + 4], &[0x40, 0xC0, 0x80, 0xFF]);
         }
@@ -1335,22 +1336,25 @@ mod tests {
         // Green sub-block (alpha) endpoints
         block[8] = 0x60;
         block[9] = 0x60;
-        let out = decode_to_rgba8(BitmapFormat::DxnMonoAlpha, 4, 4, &block).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::DxnMonoAlpha, 4, 4, &block, crate::bitmap::p8::P8Palette::Halo2).unwrap();
         for i in 0..16 {
             assert_eq!(&out[i * 4..i * 4 + 4], &[0xA0, 0xA0, 0xA0, 0x60]);
         }
     }
 
-    /// P8 / P8-bump are palettized: each byte indexes the fixed 256-entry
-    /// normal palette. Index 0xFF is the flat normal (R=G=128, B=255) with
-    /// zero alpha; index 0x00 is the leading black entry.
+    /// P8 / P8-bump are palettized; Halo 1 and Halo 2 use different palettes.
+    /// decode outputs `[R,G,B,A]`.
     #[test]
     fn p8_bump_palette_lookup() {
-        let out = decode_to_rgba8(BitmapFormat::P8Bump, 2, 1, &[0xFF, 0x00]).unwrap();
-        assert_eq!(&out[0..4], &rgba(0x80, 0x80, 0xFF, 0x00));
-        // Plain `p8` shares the same palette.
-        let out2 = decode_to_rgba8(BitmapFormat::P8, 1, 1, &[0xFF]).unwrap();
-        assert_eq!(&out2, &rgba(0x80, 0x80, 0xFF, 0x00));
+        use crate::bitmap::p8::P8Palette;
+        // Halo 2 spiral palette: index 0 near-flat, index 10 the exact flat normal.
+        let h2 = decode_to_rgba8(BitmapFormat::P8Bump, 2, 1, &[0x00, 0x0A], P8Palette::Halo2).unwrap();
+        assert_eq!(&h2[0..4], &rgba(0x7E, 0x7E, 0xFF, 0xFF)); // index 0
+        assert_eq!(&h2[4..8], &rgba(0x80, 0x80, 0xFF, 0xFF)); // index 10, flat
+        // Halo 1 (CE) palette differs: index 0 is steeply tilted, flat at index 124.
+        let h1 = decode_to_rgba8(BitmapFormat::P8Bump, 2, 1, &[0x00, 0x7C], P8Palette::Halo1).unwrap();
+        assert_eq!(&h1[0..4], &rgba(0x7A, 0x19, 0xCC, 0xFF)); // index 0
+        assert_eq!(&h1[4..8], &rgba(0x80, 0x80, 0xFF, 0xFF)); // index 124, flat
     }
 
     /// Sub-4-pixel mip (1×1) for a BC format: input is still one
@@ -1360,7 +1364,7 @@ mod tests {
         let mut block = [0u8; 8];
         block[0..2].copy_from_slice(&0x07E0u16.to_le_bytes()); // R5G6B5 green
         block[2..4].copy_from_slice(&0x07E0u16.to_le_bytes());
-        let out = decode_to_rgba8(BitmapFormat::Dxt1, 1, 1, &block).unwrap();
+        let out = decode_to_rgba8(BitmapFormat::Dxt1, 1, 1, &block, crate::bitmap::p8::P8Palette::Halo2).unwrap();
         assert_eq!(out.len(), 4);
         assert_eq!(&out, &[0x00, 0xFF, 0x00, 0xFF]);
     }

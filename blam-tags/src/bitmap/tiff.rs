@@ -124,7 +124,7 @@ pub fn write_image_tiff(
                 available: bytes.len() as u64,
             });
         }
-        let rgba = decode_to_rgba8(format, width, height, &bytes[..mip0_len])?;
+        let rgba = decode_to_rgba8(format, width, height, &bytes[..mip0_len], image.p8_palette)?;
         (width, height, rgba)
     };
 
