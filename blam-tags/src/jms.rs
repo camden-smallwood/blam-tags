@@ -525,7 +525,12 @@ impl JmsFile {
                     }
                     for (a, b, c) in strip_to_list(&strip) {
                         let base = vertices.len() as u32;
-                        for vi in [a, b, c] {
+                        // CE gbxmodel triangles wind opposite to their stored
+                        // vertex normals, so emit them reversed (`a, c, b`) to
+                        // make winding agree with the normals — matching the
+                        // General-101 Blender toolset, which reverses CE model
+                        // triangles "to fix facing normals".
+                        for vi in [a, c, b] {
                             let Some(v) = uv.element(vi as usize) else { continue };
                             vertices.push(read_ce_vertex(&v));
                         }
