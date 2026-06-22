@@ -47,10 +47,21 @@ pub enum RenderModelFlags {
     #[strum(serialize = "UNUSED")] Unused = 0,
     #[strum(serialize = "UNUSED2")] Unused2 = 1,
     #[strum(serialize = "has node maps")] HasNodeMaps = 2,
+    // Reach/H4 union (on-disk bit comes from each tag's schema; discriminants
+    // here are just canonical indices appended past the H3 set).
+    #[strum(serialize = "sun as vmf light")] SunAsVmfLight = 3,
+    #[strum(serialize = "this is supposed to be a sky")] ThisIsSupposedToBeASky = 4,
+    #[strum(serialize = "has fur shader")] HasFurShader = 5,
+    #[strum(serialize = "is hologram")] IsHologram = 6,
 }
 
-/// `render_geometry_flags` (long_flags). All three bits are
-/// runtime-only (`*!`) in the schema.
+/// `render_geometry_flags` (long_flags). Runtime-only (`*!`) bits whose
+/// layout diverged across engines: H3 stops at bit 2 ("version 2"), while
+/// Reach/H4 use on-disk bit 2 for "has valid budgets (really)" and add bits
+/// 3-5. Both names are distinct variants; on-disk bit positions come from
+/// each tag's own schema (the variant discriminant is only a canonical index
+/// for the typed view), so `Version2` and `HasValidBudgets` coexisting at
+/// different discriminants despite sharing on-disk bit 2 is intentional.
 #[derive(Clone, Copy, PartialEq, Eq, Debug,
          num_derive::FromPrimitive, num_derive::ToPrimitive,
          strum::EnumString, strum::IntoStaticStr, strum::VariantArray)]
@@ -60,6 +71,10 @@ pub enum RenderGeometryFlags {
     #[strum(serialize = "processed")] Processed = 0,
     #[strum(serialize = "available")] Available = 1,
     #[strum(serialize = "version 2")] Version2 = 2,
+    #[strum(serialize = "manual resource creation")] ManualResourceCreation = 3,
+    #[strum(serialize = "keep raw geometry")] KeepRawGeometry = 4,
+    #[strum(serialize = "dont use compressed vertex positions")] DontUseCompressedVertexPositions = 5,
+    #[strum(serialize = "has valid budgets (really)")] HasValidBudgets = 6,
 }
 
 /// `part_flags` (byte_flags).
@@ -74,6 +89,26 @@ pub enum PartFlags {
     #[strum(serialize = "has transparent sorting plane")] HasTransparentSortingPlane = 2,
     #[strum(serialize = "is water surface")] IsWaterSurface = 3,
     #[strum(serialize = "is hologram")] IsHologram = 4,
+    // Reach/H4 union (on-disk bit comes from each tag's schema; discriminants
+    // here are just canonical indices appended past the H3 set). Reach and H4
+    // drift on a few names ("transparent"/"is transparent", "cannot render
+    // single pass render"/"cannot single pass render", etc.) — both kept.
+    #[strum(serialize = "per vertex lightmap part")] PerVertexLightmapPart = 5,
+    #[strum(serialize = "debug flag instance part")] DebugFlagInstancePart = 6,
+    #[strum(serialize = "subparts has uberlights info")] SubpartsHasUberlightsInfo = 7,
+    #[strum(serialize = "draw cull distance medium")] DrawCullDistanceMedium = 8,
+    #[strum(serialize = "draw cull distance close")] DrawCullDistanceClose = 9,
+    #[strum(serialize = "draw cull rendering shields")] DrawCullRenderingShields = 10,
+    #[strum(serialize = "cannot render single pass render")] CannotRenderSinglePassRender = 11,
+    #[strum(serialize = "transparent")] Transparent = 12,
+    #[strum(serialize = "cannot render two pass")] CannotRenderTwoPass = 13,
+    #[strum(serialize = "cannot single pass render")] CannotSinglePassRender = 14,
+    #[strum(serialize = "is transparent")] IsTransparent = 15,
+    #[strum(serialize = "cannot two pass")] CannotTwoPass = 16,
+    #[strum(serialize = "transparent should output depth for DoF")] TransparentShouldOutputDepthForDof = 17,
+    #[strum(serialize = "do not include in static lightmap")] DoNotIncludeInStaticLightmap = 18,
+    #[strum(serialize = "do not include in PVS generation")] DoNotIncludeInPvsGeneration = 19,
+    #[strum(serialize = "draw cull rendering active camo")] DrawCullRenderingActiveCamo = 20,
 }
 
 /// `e_geometry_part_type` (Ares `geometry_definitions_new.h:25`). Stored
@@ -120,6 +155,19 @@ pub enum MeshFlags {
     #[strum(serialize = "use vertex buffers for indices")] UseVertexBuffersForIndices = 2,
     #[strum(serialize = "mesh has per-instance lighting (do not modify)")] MeshHasPerInstanceLighting = 3,
     #[strum(serialize = "mesh is unindexed (do not modify)")] MeshIsUnindexed = 4,
+    // Reach/H4 union (on-disk bit comes from each tag's schema; discriminants
+    // here are just canonical indices appended past the H3 set).
+    #[strum(serialize = "subpart were merged")] SubpartWereMerged = 5,
+    #[strum(serialize = "mesh has fur")] MeshHasFur = 6,
+    #[strum(serialize = "mesh has decal")] MeshHasDecal = 7,
+    #[strum(serialize = "mesh doesnt use compressed position")] MeshDoesntUseCompressedPosition = 8,
+    #[strum(serialize = "use uncompressed vertex format")] UseUncompressedVertexFormat = 9,
+    #[strum(serialize = "mesh is PCA")] MeshIsPca = 10,
+    #[strum(serialize = "mesh compression determined")] MeshCompressionDetermined = 11,
+    #[strum(serialize = "mesh has authored lightmap texture coords")] MeshHasAuthoredLightmapTexcoords = 12,
+    #[strum(serialize = "mesh has a useful set of second texture coords")] MeshHasUsefulSecondTexcoords = 13,
+    #[strum(serialize = "mesh has no lightmap")] MeshHasNoLightmap = 14,
+    #[strum(serialize = "per vertex lighting")] PerVertexLighting = 15,
 }
 
 /// `compression_flags` (word_flags).
@@ -131,6 +179,8 @@ pub enum MeshFlags {
 pub enum CompressionFlags {
     #[strum(serialize = "compressed position")] CompressedPosition = 0,
     #[strum(serialize = "compressed texcoord")] CompressedTexcoord = 1,
+    // Reach/H4 union.
+    #[strum(serialize = "compression optimized")] CompressionOptimized = 2,
 }
 
 /// `per_mesh_raw_data_flags` (long_flags).
@@ -175,6 +225,45 @@ pub enum MeshVertexType {
     #[strum(serialize = "ripple")] Ripple = 19,
     #[strum(serialize = "implicit geometry")] ImplicitGeometry = 20,
     #[strum(serialize = "beam")] Beam = 21,
+    // Reach/H4 union. Discriminants 22-53 match the on-disk option index; the
+    // few Reach/H4 name drifts (29, 30) are aliased, and H4's `unused0`/`unused1`
+    // (on-disk 11/21, where H3 has contrail/beam) get appended indices. The
+    // preview never reads this value (vertices decode from the buffer format),
+    // so the only requirement is that resolve-by-name finds a variant.
+    #[strum(serialize = "world_tessellated")] WorldTessellated = 22,
+    #[strum(serialize = "rigid_tessellated")] RigidTessellated = 23,
+    #[strum(serialize = "skinned_tessellated")] SkinnedTessellated = 24,
+    #[strum(serialize = "shader_cache")] ShaderCache = 25,
+    #[strum(serialize = "structure_instance_imposter")] StructureInstanceImposter = 26,
+    #[strum(serialize = "object_instance_imposter")] ObjectInstanceImposter = 27,
+    #[strum(serialize = "rigid compressed")] RigidCompressed = 28,
+    #[strum(serialize = "skinned uncompressed", serialize = "skinned compressed")] SkinnedUncompressed = 29,
+    #[strum(serialize = "light volume precompiled", serialize = "light_volume_precompiled")] LightVolumePrecompiled = 30,
+    #[strum(serialize = "blendshape_rigid")] BlendshapeRigid = 31,
+    #[strum(serialize = "blendshape_rigid_blendshaped")] BlendshapeRigidBlendshaped = 32,
+    #[strum(serialize = "rigid_blendshaped")] RigidBlendshaped = 33,
+    #[strum(serialize = "blendshape_skinned")] BlendshapeSkinned = 34,
+    #[strum(serialize = "blendshape_skinned_blendshaped")] BlendshapeSkinnedBlendshaped = 35,
+    #[strum(serialize = "skinned_blendshaped")] SkinnedBlendshaped = 36,
+    #[strum(serialize = "VirtualGeometryHWtess")] VirtualGeometryHwTess = 37,
+    #[strum(serialize = "VirtualGeometryMemexport")] VirtualGeometryMemexport = 38,
+    #[strum(serialize = "position_only")] PositionOnlyUnderscore = 39,
+    #[strum(serialize = "VirtualGeometryDebug")] VirtualGeometryDebug = 40,
+    #[strum(serialize = "blendshapeRigidCompressed")] BlendshapeRigidCompressed = 41,
+    #[strum(serialize = "skinnedUncompressedBlendshaped")] SkinnedUncompressedBlendshaped = 42,
+    #[strum(serialize = "blendshapeSkinnedCompressed")] BlendshapeSkinnedCompressed = 43,
+    #[strum(serialize = "tracer")] Tracer = 44,
+    #[strum(serialize = "polyart")] Polyart = 45,
+    #[strum(serialize = "vectorart")] Vectorart = 46,
+    #[strum(serialize = "rigid_boned")] RigidBoned = 47,
+    #[strum(serialize = "rigid_boned_2uv")] RigidBoned2Uv = 48,
+    #[strum(serialize = "blendshape_skinned_2uv")] BlendshapeSkinned2Uv = 49,
+    #[strum(serialize = "blendshape_skinned_2uv_blendshaped")] BlendshapeSkinned2UvBlendshaped = 50,
+    #[strum(serialize = "skinned_2uv_blendshaped")] Skinned2UvBlendshaped = 51,
+    #[strum(serialize = "polyartUV")] PolyartUv = 52,
+    #[strum(serialize = "blendshape_skinned_uncompressed_blendshaped")] BlendshapeSkinnedUncompressedBlendshaped = 53,
+    #[strum(serialize = "unused0")] Unused0 = 54,
+    #[strum(serialize = "unused1")] Unused1 = 55,
 }
 
 /// `mesh_transfer_vertex_type_definition` (char_enum). Selects which
