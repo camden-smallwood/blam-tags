@@ -208,10 +208,33 @@ pub enum RenderMethodExtern {
     #[strum(serialize = "scene hdr texture")]                SceneHdrTexture                      = 47,
     #[strum(serialize = "water memexport addr")]             WaterMemoryExportAddress             = 48,
     #[strum(serialize = "tree animation timer")]             TreeAnimationTimer                   = 49,
+    // Gen3 remaster externs (ODST/Reach/H4/H2A). Appended rather than inserted:
+    // the rmop `source extern` decode matches by strum NAME, so these only need
+    // unique indices here — the per-game schema index order differs and is the
+    // index-only fields' concern, not this name-bearing one.
+    #[strum(serialize = "depth constants")]                  DepthConstants                       = 50,
+    #[strum(serialize = "camera forward")]                   CameraForward                        = 51,
+    #[strum(serialize = "shadow mask")]                      ShadowMask                           = 52,
+    #[strum(serialize = "dualvmf direction ps")]             DualVmfDirectionPs                   = 53,
+    #[strum(serialize = "dualvmf intensity ps")]             DualVmfIntensityPs                   = 54,
+    #[strum(serialize = "dualvmf direction vs")]             DualVmfDirectionVs                   = 55,
+    #[strum(serialize = "dualvmf intensity vs")]             DualVmfIntensityVs                   = 56,
+    #[strum(serialize = "gel texture of analytical light")]  GelTextureOfAnalyticalLight          = 57,
+    #[strum(serialize = "cook torrance array")]              CookTorranceArray                    = 58,
+    #[strum(serialize = "vmf diffuse table")]                VmfDiffuseTable                      = 59,
+    #[strum(serialize = "vmf diffuse table vs")]             VmfDiffuseTableVs                    = 60,
+    #[strum(serialize = "direction lut")]                    DirectionLut                         = 61,
+    #[strum(serialize = "zonal rotation table")]             ZonalRotationTable                   = 62,
+    #[strum(serialize = "phong specular table")]             PhongSpecularTable                   = 63,
+    #[strum(serialize = "diffuse power specular table")]     DiffusePowerSpecularTable            = 64,
+    #[strum(serialize = "wrinkle weights a")]                WrinkleWeightsA                      = 65,
+    #[strum(serialize = "wrinkle weights b")]                WrinkleWeightsB                      = 66,
+    #[strum(serialize = "static lighting previs")]           StaticLightingPrevis                 = 67,
+    #[strum(serialize = "emblem bitmaps and data")]          EmblemBitmapsAndData                 = 68,
 }
 
 impl RenderMethodExtern {
-    pub const COUNT: usize = 50;
+    pub const COUNT: usize = 69;
 
     /// Map by index. **Only for raw integer fields that carry no embedded
     /// name** — the rmsh `bitmap extern RTT mode` / postprocess `extern
