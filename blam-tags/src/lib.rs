@@ -86,6 +86,7 @@ pub mod render_model;
 pub mod monolithic;
 pub mod tag_function;
 pub mod render_method;
+pub mod shader;
 pub mod scenario;
 pub mod scenario_lightmap;
 pub mod sky_atmosphere;
