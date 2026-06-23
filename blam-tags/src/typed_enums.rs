@@ -367,22 +367,14 @@ impl<T: SchemaEnum + PartialEq, U: TagInt> Flags<T, U> {
     /// map to a `T` variant. A set bit with NO embedded name (past the
     /// schema's string list) is preserved in `raw` but cannot be typed —
     /// that is tolerated (runtime/over-range bits), unlike enums.
-    pub(crate) fn resolve(field: &str, raw: U, names: &[(u32, String)]) -> Self {
+    pub(crate) fn resolve(_field: &str, raw: U, names: &[(u32, String)]) -> Self {
+        // Tolerate set bits whose schema name has no matching variant — newer
+        // or runtime-only flags past this walker's enum. They stay in `raw`
+        // (nothing lost) but can't be typed; skip them rather than panicking,
+        // mirroring how unnamed over-range bits are already handled.
         let set = names
             .iter()
-            .map(|(bit, n)| {
-                T::from_schema_name(n).unwrap_or_else(|| {
-                    panic!(
-                        "flags field {field:?}: set bit {bit} name {n:?} \
-                         (raw {raw:?}) has no matching {} variant; known: {:?}",
-                        std::any::type_name::<T>(),
-                        T::variants()
-                            .iter()
-                            .map(|v| v.schema_name())
-                            .collect::<Vec<_>>(),
-                    )
-                })
-            })
+            .filter_map(|(_bit, n)| T::from_schema_name(n))
             .collect();
         Flags {
             set,
