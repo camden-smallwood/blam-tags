@@ -462,6 +462,15 @@ impl JmsFile {
         let root = tag.root();
         let world_nodes = chain_local_to_world(&read_nodes(&root)?);
 
+        // The gbxmodel header carries a model-level `base map u/v scale` that the
+        // engine multiplies into every vertex texcoord (a value of 0 means "no
+        // scale" -> 1.0). Without it, models authored with tiling UVs (e.g. the
+        // warthog at 2x/3x) collapse into a sub-rect and their textures smear.
+        let uv_scale = [
+            root.read_real("base map u scale").filter(|&s| s > 0.0).unwrap_or(1.0),
+            root.read_real("base map v scale").filter(|&s| s > 0.0).unwrap_or(1.0),
+        ];
+
         let shaders_block = root.field_path("shaders").and_then(|f| f.as_block())
             .ok_or(JmsError::MissingField("shaders"))?;
         let regions_block = root.field_path("regions").and_then(|f| f.as_block())
@@ -537,7 +546,12 @@ impl JmsFile {
                         // triangles "to fix facing normals".
                         for vi in [a, c, b] {
                             let Some(v) = uv.element(vi as usize) else { continue };
-                            vertices.push(read_ce_vertex(&v));
+                            let mut vert = read_ce_vertex(&v);
+                            for uv in &mut vert.uvs {
+                                uv.x *= uv_scale[0];
+                                uv.y *= uv_scale[1];
+                            }
+                            vertices.push(vert);
                         }
                         triangles.push(JmsTriangle {
                             material: mat,
