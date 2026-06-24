@@ -27,6 +27,7 @@
 use crate::api::{TagBlock, TagStruct};
 use crate::fields::TagFieldData;
 use crate::file::TagFile;
+use crate::game::Game;
 use crate::geometry::{read_compression_bounds, strip_to_list, CompressionBounds};
 use crate::math::{
     RealOrientation, RealPlane3d, RealPoint2d, RealPoint3d, RealQuaternion, RealVector3d,
@@ -826,16 +827,34 @@ impl RenderModel {
     /// type tree. Use [`Self::derive_render_meshes`] for renderer-ready
     /// (decompressed, strip-decoded) geometry.
     pub fn from_tag(tag: &TagFile) -> Result<Self, RenderModelError> {
+        // Halo CE is a `gbxmodel` (mod2) — a different layout (geometries/parts,
+        // a `shaders` block, LOD geometry indices). Synthesize the super-type.
+        if matches!(Game::of(tag), Game::Halo1) {
+            return Self::from_gbxmodel_tag(tag);
+        }
         let root = tag.root();
+        // Halo 2 ships the same `render_model` super-type (regions / nodes /
+        // marker groups / materials), but stores geometry in `sections` (not
+        // `render geometry`), references shaders via `shader` (not `render
+        // method`), and selects per-permutation geometry by `L1..L6 section
+        // index` rather than `mesh index`/`mesh count`. Handle those three
+        // deltas here; everything else reuses the H3 readers.
+        let game = Game::of(tag);
         Ok(Self {
             name: root.read_string_id("name").unwrap_or_default(),
             flags: root.try_read_flags("flags").unwrap_or_default(),
-            regions: read_regions(&root)?,
+            regions: read_regions(&root, game)?,
             instance_placements: read_instance_placements(&root),
             nodes: read_nodes(&root)?,
             marker_groups: read_marker_groups(&root),
             materials: read_materials(&root)?,
-            render_geometry: read_geometry(&root)?,
+            // H2 has no `render geometry` block — its meshes live in `sections`
+            // and are decoded by `derive_render_meshes`. Leave it empty.
+            render_geometry: if matches!(game, Game::Halo2) {
+                Geometry::default()
+            } else {
+                read_geometry(&root)?
+            },
             sky_lights: read_sky_lights(&root),
             default_lightprobe: read_default_lightprobe(&root),
             volume_samples: read_volume_samples(&root),
@@ -845,11 +864,50 @@ impl RenderModel {
 
     /// Decode every mesh into the renderer-facing [`RenderMesh`] layer
     /// (decompressed vertices, triangle-list indices, resolved water/PRT).
-    /// Uses the per-mesh `index buffer type` enum for strip-vs-list.
+    /// Uses the per-mesh `index buffer type` enum for strip-vs-list. H2 decodes
+    /// from `sections` (one [`RenderMesh`] per section); H3 from `render geometry`.
     pub fn derive_render_meshes(tag: &TagFile) -> Result<Vec<RenderMesh>, RenderModelError> {
+        match Game::of(tag) {
+            Game::Halo1 => return derive_render_meshes_gbxmodel(tag),
+            Game::Halo2 => return derive_render_meshes_h2(tag),
+            Game::Halo3 => {}
+        }
         let root = tag.root();
         let bounds = read_compression_bounds(&root);
         read_meshes_per_mesh(&root, |_| bounds, IndexFormatPolicy::PerMeshSchema)
+    }
+
+    /// Synthesize the [`RenderModel`] super-type from a Halo CE `gbxmodel`:
+    /// regions/permutations (LOD geometry index → `mesh_index`, since
+    /// `derive_render_meshes` emits one [`RenderMesh`] per geometry), materials
+    /// from the `shaders` block, nodes for marker placement. Geometry lives in
+    /// `geometries` (decoded by `derive_render_meshes`), so `render_geometry`
+    /// stays empty. CE markers (a separate block) aren't surfaced yet.
+    fn from_gbxmodel_tag(tag: &TagFile) -> Result<Self, RenderModelError> {
+        let root = tag.root();
+        let geometry_count = root
+            .field("geometries")
+            .and_then(|f| f.as_block())
+            .map(|b| b.len())
+            .unwrap_or(0);
+        Ok(Self {
+            name: root.read_string_id("name").unwrap_or_default(),
+            flags: Flags::default(),
+            regions: read_gbxmodel_regions(&root, geometry_count)?,
+            instance_placements: Vec::new(),
+            // CE nodes use a different layout (`default translation` is a
+            // real_vector_3d, not real_point_3d) so the H3 `read_nodes` panics on
+            // them. Nodes are only needed for markers, which CE doesn't surface in
+            // the preview yet — leave empty.
+            nodes: Vec::new(),
+            marker_groups: Vec::new(),
+            materials: read_gbxmodel_materials(&root),
+            render_geometry: Geometry::default(),
+            sky_lights: Vec::new(),
+            default_lightprobe: None,
+            volume_samples: Vec::new(),
+            default_node_orientations: Vec::new(),
+        })
     }
 
     /// Bind-pose [`RealOrientation`] per node.
@@ -958,11 +1016,33 @@ fn elem_scalar_f32(e: &TagStruct<'_>) -> f32 {
 // Block readers
 //--------------------------------------------------------------------------------
 
-fn read_regions(root: &TagStruct<'_>) -> Result<Vec<Region>, RenderModelError> {
+fn read_regions(root: &TagStruct<'_>, game: Game) -> Result<Vec<Region>, RenderModelError> {
     let block = root
         .field_path("regions")
         .and_then(|f| f.as_block())
         .ok_or(RenderModelError::MissingField("regions"))?;
+    // H2 maps a permutation to geometry by an LOD section index, and
+    // `derive_render_meshes_h2` emits one `RenderMesh` per section (section i ->
+    // mesh i). For the preview we want the HIGHEST-detail section. The loose-tag
+    // `Lx section index` slots are unreliable (often garbage for the high LODs —
+    // e.g. rocket_launcher's L1/L2 are stale 24932/25714 while L3..L6 point at the
+    // 56-vtx low LOD, with the 1458-vtx mesh referenced by nobody), so pick by
+    // VERTEX COUNT instead of trusting the ordering.
+    let section_verts: Vec<u32> = root
+        .field("sections")
+        .and_then(|f| f.as_block())
+        .map(|b| {
+            (0..b.len())
+                .map(|s| {
+                    b.element(s)
+                        .and_then(|e| e.read_int_any("total vertex count"))
+                        .unwrap_or(0)
+                        .max(0) as u32
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let single_region = block.len() == 1;
     let mut out = Vec::with_capacity(block.len());
     for i in 0..block.len() {
         let r = block.element(i).unwrap();
@@ -971,10 +1051,18 @@ fn read_regions(root: &TagStruct<'_>) -> Result<Vec<Region>, RenderModelError> {
         if let Some(perms) = r.field("permutations").and_then(|f| f.as_block()) {
             for j in 0..perms.len() {
                 let p = perms.element(j).unwrap();
+                let (mesh_index, mesh_count) = if matches!(game, Game::Halo2) {
+                    (h2_permutation_section(&p, &section_verts, single_region), 1)
+                } else {
+                    (
+                        p.read_int_any("mesh index").unwrap_or(-1) as i16,
+                        p.read_int_any("mesh count").unwrap_or(0) as i16,
+                    )
+                };
                 permutations.push(Permutation {
                     name: p.read_string_id("name").unwrap_or_default(),
-                    mesh_index: p.read_int_any("mesh index").unwrap_or(-1) as i16,
-                    mesh_count: p.read_int_any("mesh count").unwrap_or(0) as i16,
+                    mesh_index,
+                    mesh_count,
                     instance_mask: [
                         read_u32_flags_word(&p, "instance mask 0-31"),
                         read_u32_flags_word(&p, "instance mask 32-63"),
@@ -987,6 +1075,319 @@ fn read_regions(root: &TagStruct<'_>) -> Result<Vec<Region>, RenderModelError> {
         out.push(Region { name, permutations });
     }
     Ok(out)
+}
+
+/// Resolve an H2 permutation to its highest-detail section, by VERTEX COUNT
+/// (loose-tag `Lx section index` ordering is unreliable). Candidates are the
+/// permutation's in-range `L1..L6 section index` values; for a single-region
+/// model the candidates are ALL sections (they're that region's LODs, and the
+/// high-detail one is often referenced only by a garbage index). Returns the
+/// section index (= the `RenderMesh` index from `derive_render_meshes_h2`), or
+/// `-1` for an FX/empty permutation.
+fn h2_permutation_section(p: &TagStruct<'_>, section_verts: &[u32], single_region: bool) -> i16 {
+    let n = section_verts.len();
+    let candidates: Vec<usize> = if single_region {
+        (0..n).collect()
+    } else {
+        ["L1 section index", "L2 section index", "L3 section index",
+         "L4 section index", "L5 section index", "L6 section index"]
+            .iter()
+            .filter_map(|f| {
+                p.read_int_any(f)
+                    .map(|v| v as i64)
+                    .filter(|&v| v >= 0 && (v as usize) < n)
+                    .map(|v| v as usize)
+            })
+            .collect()
+    };
+    candidates
+        .into_iter()
+        .max_by_key(|&s| section_verts[s])
+        .map(|s| s as i16)
+        .unwrap_or(-1)
+}
+
+/// Decode H2 geometry: one [`RenderMesh`] per `sections[i]`, so a permutation's
+/// resolved section index ([`h2_permutation_section`]) directly indexes the
+/// result. H2 `raw vertices` are full-precision floats in object space (the
+/// per-section compression bounds are vestigial X360 metadata) — no
+/// dequantization or node transform is needed for a bind-pose preview, and UVs
+/// are already V-down (no flip), matching [`RenderVertex`].
+fn derive_render_meshes_h2(tag: &TagFile) -> Result<Vec<RenderMesh>, RenderModelError> {
+    let root = tag.root();
+    let sections = root
+        .field("sections")
+        .and_then(|f| f.as_block())
+        .ok_or(RenderModelError::MissingField("sections"))?;
+    Ok((0..sections.len())
+        .map(|si| read_h2_section(&sections.element(si).unwrap()))
+        .collect())
+}
+
+/// Decode one H2 `sections[i]` element into a [`RenderMesh`]. Returns an empty
+/// mesh (no vertices/parts) when the section carries no geometry, preserving the
+/// section↔mesh index alignment.
+fn read_h2_section(section: &TagStruct<'_>) -> RenderMesh {
+    let rigid_node = section
+        .read_int_any("rigid node")
+        .map(|v| v as i16)
+        .filter(|&v| v >= 0);
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let mut parts = Vec::new();
+
+    if let Some(sd) = section
+        .field("section data")
+        .and_then(|f| f.as_block())
+        .and_then(|b| b.element(0))
+        .and_then(|e| e.field("section").and_then(|f| f.as_struct()))
+    {
+        if let Some(raw) = sd.field("raw vertices").and_then(|f| f.as_block()) {
+            vertices.reserve(raw.len());
+            for k in 0..raw.len() {
+                vertices.push(read_h2_render_vertex(&raw.element(k).unwrap()));
+            }
+        }
+        // H2 strip indices are u16 with a 0xFFFF restart sentinel between subparts.
+        let strip: Vec<u16> = sd
+            .field("strip indices")
+            .and_then(|f| f.as_block())
+            .map(|b| {
+                (0..b.len())
+                    .filter_map(|k| b.element(k))
+                    .map(|e| e.read_int_any("index").unwrap_or(0) as u16)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(pblock) = sd.field("parts").and_then(|f| f.as_block()) {
+            for pi in 0..pblock.len() {
+                let part = pblock.element(pi).unwrap();
+                let material_index = part.read_int_any("material").unwrap_or(0).max(0) as u16;
+                let part_type =
+                    GeometryPartType::from_raw(part.read_int_any("type").unwrap_or(0) as i8);
+                let start = part.read_int_any("strip start index").unwrap_or(0).max(0) as usize;
+                let len = part.read_int_any("strip length").unwrap_or(0).max(0) as usize;
+                let index_start = indices.len() as u32;
+                if start < strip.len() {
+                    let end = (start + len).min(strip.len());
+                    for (a, b, c) in strip_to_list(&strip[start..end]) {
+                        indices.push(a as u32);
+                        indices.push(b as u32);
+                        indices.push(c as u32);
+                    }
+                }
+                parts.push(RenderMeshPart {
+                    material_index,
+                    index_start,
+                    index_count: indices.len() as u32 - index_start,
+                    part_type,
+                    transparent_sorting_index: -1,
+                    sort_position: None,
+                });
+            }
+        }
+    }
+
+    RenderMesh {
+        vertices,
+        indices,
+        parts,
+        rigid_node_index: rigid_node,
+        water_data: None,
+        prt_vertex_type: Enum::default(),
+        has_prt_vertex_stream: false,
+        prt_ambient_stream: Vec::new(),
+        has_vertex_color: false,
+        use_region_index_for_sorting: false,
+        has_lightmap_uvs: false,
+    }
+}
+
+/// One H2 `raw vertices[i]` element → [`RenderVertex`]. Full-float object-space
+/// position; authored tangent/binormal basis; UV unflipped. Skinning indices are
+/// left at defaults — the preview renders the bind pose without per-vertex skin.
+fn read_h2_render_vertex(v: &TagStruct<'_>) -> RenderVertex {
+    RenderVertex {
+        position: v.read_point3d("position"),
+        texcoord: v.read_point2d("texcoord"),
+        normal: v.read_vec3("normal"),
+        tangent: v.read_vec3("tangent"),
+        binormal: v.read_vec3("binormal"),
+        node_indices: [0; 4],
+        node_weights: [1.0, 0.0, 0.0, 0.0],
+        lightmap_texcoord: RealPoint2d { x: 0.0, y: 0.0 },
+        vert_color: RealVector3d { i: 0.0, j: 0.0, k: 0.0 },
+    }
+}
+
+/// CE `gbxmodel` regions → [`Region`]s. A permutation's geometry is the
+/// highest-detail valid LOD (`super high` → `super low`); store it as
+/// `mesh_index` (= the geometry index, which equals the `RenderMesh` index from
+/// `derive_render_meshes_gbxmodel`), `mesh_count = 1`.
+fn read_gbxmodel_regions(
+    root: &TagStruct<'_>,
+    geometry_count: usize,
+) -> Result<Vec<Region>, RenderModelError> {
+    let block = root
+        .field("regions")
+        .and_then(|f| f.as_block())
+        .ok_or(RenderModelError::MissingField("regions"))?;
+    let mut out = Vec::with_capacity(block.len());
+    for ri in 0..block.len() {
+        let r = block.element(ri).unwrap();
+        let name = r.read_string("name").unwrap_or_default();
+        let mut permutations = Vec::new();
+        if let Some(perms) = r.field("permutations").and_then(|f| f.as_block()) {
+            for pi in 0..perms.len() {
+                let p = perms.element(pi).unwrap();
+                let geo = ["super high", "high", "medium", "low", "super low"]
+                    .iter()
+                    .find_map(|f| {
+                        p.read_int_any(f)
+                            .map(|v| v as i32)
+                            .filter(|&v| v >= 0 && (v as usize) < geometry_count)
+                    })
+                    .map(|v| v as i16)
+                    .unwrap_or(-1);
+                permutations.push(Permutation {
+                    name: p.read_string("name").unwrap_or_default(),
+                    mesh_index: geo,
+                    mesh_count: 1,
+                    instance_mask: [0; 4],
+                });
+            }
+        }
+        out.push(Region { name, permutations });
+    }
+    Ok(out)
+}
+
+/// CE `gbxmodel` `shaders[]` → [`Material`]s. Material `i` ↔ `shaders[i]`; a
+/// part's `shader index` is its material index directly.
+fn read_gbxmodel_materials(root: &TagStruct<'_>) -> Vec<Material> {
+    let Some(block) = root.field("shaders").and_then(|f| f.as_block()) else {
+        return Vec::new();
+    };
+    (0..block.len())
+        .filter_map(|i| block.element(i))
+        .map(|s| {
+            let (group, path) = s
+                .read_tag_ref_with_group("shader")
+                .unwrap_or((0, String::new()));
+            Material {
+                render_method: path,
+                render_method_group: group,
+                properties: Vec::new(),
+                imported_material_index: -1,
+                breakable_surface_index: -1,
+            }
+        })
+        .collect()
+}
+
+/// Decode CE geometry: one [`RenderMesh`] per `geometries[i]`, so a permutation's
+/// resolved geometry index directly indexes the result. Each `geometries[i]`
+/// holds `parts[]` with their own `uncompressed vertices` pool + `triangle data`
+/// (3-index chunks, `-1`/`0xFFFF` restart). CE has no authored tangent basis.
+fn derive_render_meshes_gbxmodel(tag: &TagFile) -> Result<Vec<RenderMesh>, RenderModelError> {
+    let root = tag.root();
+    // Model-level base-map UV scale the engine multiplies into every texcoord
+    // (0 → "no scale" → 1.0). Without it, tiled-UV models (warthog 2x/3x) smear.
+    let uv_scale = [
+        root.read_real("base map u scale").filter(|&s| s > 0.0).unwrap_or(1.0),
+        root.read_real("base map v scale").filter(|&s| s > 0.0).unwrap_or(1.0),
+    ];
+    let geometries = root
+        .field("geometries")
+        .and_then(|f| f.as_block())
+        .ok_or(RenderModelError::MissingField("geometries"))?;
+    Ok((0..geometries.len())
+        .map(|gi| read_gbxmodel_geometry(&geometries.element(gi).unwrap(), uv_scale))
+        .collect())
+}
+
+/// Decode one CE `geometries[i]` into a [`RenderMesh`]. Each part appends its own
+/// vertex pool (offsetting indices) and contributes one [`RenderMeshPart`].
+fn read_gbxmodel_geometry(geo: &TagStruct<'_>, uv_scale: [f32; 2]) -> RenderMesh {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let mut parts = Vec::new();
+
+    if let Some(pblock) = geo.field("parts").and_then(|f| f.as_block()) {
+        for pi in 0..pblock.len() {
+            let part = pblock.element(pi).unwrap();
+            let material_index = part.read_int_any("shader index").unwrap_or(0).max(0) as u16;
+            let vbase = vertices.len() as u32;
+            if let Some(uv) = part.field("uncompressed vertices").and_then(|f| f.as_block()) {
+                for k in 0..uv.len() {
+                    vertices.push(read_gbxmodel_render_vertex(&uv.element(k).unwrap(), uv_scale));
+                }
+            }
+            // Flatten the triangle-data chunks (each holds 3 `indices`) into one
+            // strip; `-1` becomes the 0xFFFF restart sentinel for strip_to_list.
+            let mut strip: Vec<u16> = Vec::new();
+            if let Some(td) = part.field("triangle data").and_then(|f| f.as_block()) {
+                for k in 0..td.len() {
+                    let t = td.element(k).unwrap();
+                    for f in t.fields() {
+                        if let Some(TagFieldData::ShortInteger(i)) = f.value() {
+                            strip.push(i as u16);
+                        }
+                    }
+                }
+            }
+            let index_start = indices.len() as u32;
+            for (a, b, c) in strip_to_list(&strip) {
+                // CE triangles wind opposite to their stored normals — reverse
+                // (a, c, b) so winding agrees with the normals (matches the
+                // General-101 toolset + the existing CE JMS path).
+                indices.push(vbase + a as u32);
+                indices.push(vbase + c as u32);
+                indices.push(vbase + b as u32);
+            }
+            parts.push(RenderMeshPart {
+                material_index,
+                index_start,
+                index_count: indices.len() as u32 - index_start,
+                part_type: GeometryPartType::OpaqueNonShadowing,
+                transparent_sorting_index: -1,
+                sort_position: None,
+            });
+        }
+    }
+
+    RenderMesh {
+        vertices,
+        indices,
+        parts,
+        rigid_node_index: None,
+        water_data: None,
+        prt_vertex_type: Enum::default(),
+        has_prt_vertex_stream: false,
+        prt_ambient_stream: Vec::new(),
+        has_vertex_color: false,
+        use_region_index_for_sorting: false,
+        has_lightmap_uvs: false,
+    }
+}
+
+/// One CE `uncompressed vertices[i]` → [`RenderVertex`]. Full-float object-space
+/// position; the model-level base-map UV scale folded into the texcoord; no
+/// authored tangent basis (the preview derives one). UV is unflipped.
+fn read_gbxmodel_render_vertex(v: &TagStruct<'_>, uv_scale: [f32; 2]) -> RenderVertex {
+    let p = v.read_vec3("position");
+    let uv = v.read_point2d("texture coords");
+    RenderVertex {
+        position: RealPoint3d { x: p.i, y: p.j, z: p.k },
+        texcoord: RealPoint2d { x: uv.x * uv_scale[0], y: uv.y * uv_scale[1] },
+        normal: v.read_vec3("normal"),
+        tangent: RealVector3d { i: 0.0, j: 0.0, k: 0.0 },
+        binormal: RealVector3d { i: 0.0, j: 0.0, k: 0.0 },
+        node_indices: [0; 4],
+        node_weights: [1.0, 0.0, 0.0, 0.0],
+        lightmap_texcoord: RealPoint2d { x: 0.0, y: 0.0 },
+        vert_color: RealVector3d { i: 0.0, j: 0.0, k: 0.0 },
+    }
 }
 
 fn read_instance_placements(root: &TagStruct<'_>) -> Vec<InstancePlacement> {
@@ -1106,8 +1507,11 @@ fn read_materials(root: &TagStruct<'_>) -> Result<Vec<Material>, RenderModelErro
     let mut out = Vec::with_capacity(block.len());
     for i in 0..block.len() {
         let m = block.element(i).unwrap();
+        // H3 references the shader via `render method`; H2 via `shader`.
         let (group, path) = m
             .read_tag_ref_with_group("render method")
+            .filter(|(_, p)| !p.is_empty())
+            .or_else(|| m.read_tag_ref_with_group("shader"))
             .unwrap_or((0, String::new()));
         let mut properties = Vec::new();
         if let Some(props) = m.field("properties").and_then(|f| f.as_block()) {
@@ -2144,6 +2548,7 @@ fn decode_render_vertex(
 mod tests {
     use super::*;
     use crate::math::{RealOrientation, RealPoint3d, RealQuaternion};
+
 
     fn node(tx: RealPoint3d, rot: RealQuaternion) -> Node {
         Node {
