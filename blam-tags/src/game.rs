@@ -26,6 +26,45 @@ pub enum Game {
     Halo3,
 }
 
+/// A specific MCC title / loaded editing kit, identified by its game-id
+/// (the kit folder name, e.g. `"halo4_mcc"`).
+///
+/// This is a *different axis* from [`Game`]: [`Game`] is the tag-format
+/// generation derived from the tag bytes, and H3, ODST, Reach, and H4 all share
+/// `Game::Halo3` because their `render_model`/JMS/ASS structures are identical.
+/// The title captures which of those engines is actually loaded — a distinction
+/// the tag bytes don't encode, but that matters for engine details like the HDR
+/// tonemap (H3/Reach use a cubic curve, H4 a Hable filmic). It comes from the
+/// loading context (the editing kit), not the tag, so it's parsed from the
+/// game-id string rather than `of(tag)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Title {
+    HaloCe,
+    Halo2,
+    Halo2A,
+    Halo3,
+    Halo3Odst,
+    HaloReach,
+    Halo4,
+}
+
+impl Title {
+    /// Parse an MCC game-id / editing-kit folder name (e.g. `"halo4_mcc"`).
+    /// Returns `None` for an unrecognized id.
+    pub fn from_game_id(id: &str) -> Option<Title> {
+        Some(match id {
+            "haloce_mcc" => Title::HaloCe,
+            "halo2_mcc" => Title::Halo2,
+            "halo2amp_mcc" => Title::Halo2A,
+            "halo3_mcc" => Title::Halo3,
+            "halo3odst_mcc" => Title::Halo3Odst,
+            "haloreach_mcc" => Title::HaloReach,
+            "halo4_mcc" => Title::Halo4,
+            _ => return None,
+        })
+    }
+}
+
 impl Game {
     /// Classify a tag by its container engine: classic Halo CE → Halo1,
     /// classic Halo 2 (any sub-version) → Halo2, MCC self-describing →
