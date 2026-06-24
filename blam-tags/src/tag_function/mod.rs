@@ -1095,23 +1095,34 @@ impl TagFunction {
     /// graphs carry no stops → grayscale (n,n,n). Mirrors the engine's
     /// `c_function_definition::evaluate_color` → `map_to_color_range_legacy`.
     pub fn evaluate_color(&self, input: f32, range: f32) -> RealRgbColor {
+        // The colour gradient is indexed by the scalar curve's normalized output.
+        self.map_to_color_range_legacy(self.evaluate_legacy(input, range))
+    }
+
+    /// Engine `c_function_definition::map_to_color_range_legacy` (0x1804f9af0):
+    /// map an ALREADY-evaluated normalized scalar to an RGB colour through the
+    /// `m_colors[4]` ARGB gradient. Unlike [`Self::evaluate_color`] this does
+    /// NOT re-run the scalar curve — `normalized_output` is used directly as the
+    /// gradient position. Callers that pre-evaluate the property (e.g. particle
+    /// tint, where the engine passes `property.evaluate(states)` in) need this
+    /// to avoid double-evaluating.
+    pub fn map_to_color_range_legacy(&self, normalized_output: f32) -> RealRgbColor {
         let h = self.header();
         let unpack = |c: u32| RealRgbColor {
             red: ((c >> 16) & 0xff) as f32 / 255.0,
             green: ((c >> 8) & 0xff) as f32 / 255.0,
             blue: (c & 0xff) as f32 / 255.0,
         };
-        // Engine `map_to_color_range_legacy @0x1804f9af0` constant short-circuit:
-        // a Constant color function returns colors[0] directly when unranged, or
-        // when the graph is Scalar/OneColor (no gradient to walk).
+        // Constant short-circuit: a Constant color function returns colors[0]
+        // directly when unranged, or when the graph is Scalar/OneColor (no
+        // gradient to walk).
         if h.function_type == FunctionType::Constant
             && (!h.flags.is_ranged()
                 || matches!(h.color_graph_type, ColorGraphType::Scalar | ColorGraphType::OneColor))
         {
             return unpack(h.colors[0]);
         }
-        // Gradient position from the underlying scalar curve.
-        let t = self.evaluate_legacy(input, range).clamp(0.0, 1.0);
+        let t = normalized_output.clamp(0.0, 1.0);
         // Engine indexes the 4-slot m_colors array NON-consecutively: TwoColor
         // interpolates [0]→[3]; ThreeColor uses [0],[1],[3] (skips [2]); FourColor
         // [0..3]. A Scalar graph returns grayscale (n,n,n), NOT white.
