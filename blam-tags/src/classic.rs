@@ -316,6 +316,57 @@ fn h2_classic_block_signature() -> [u8; 4] {
     *b"dfbt"
 }
 
+/// Build the Halo 2 inline-struct header for a freshly-created tagged
+/// struct (one with no preserved `classic_struct_header`). Returns `None`
+/// when no header should be written:
+///   * non-Halo-2 engines (CE has no inline struct headers),
+///   * untagged structs (`struct_tags == 0` — never headered on disk),
+///   * a struct whose resolved variant equals the *headerless* default
+///     (version 0 → `resolve_version_variant(base, 0)`): omitting the
+///     header is exactly how that variant reads back, and writing one
+///     would diverge from a byte-exact headerless round-trip.
+/// Otherwise it stamps the `4cc + version + count(1) + size` header (16
+/// bytes, or the legacy 12-byte `4s2hi` form) whose `version` selects
+/// `child`'s variant via [`infer_struct_version`]. The 4cc is the base
+/// struct's tag (the read path looks it up by base index too), written
+/// little-endian to match on-disk byte order.
+fn synthesize_h2_struct_header(
+    layout: &TagLayout,
+    base_si: u32,
+    child: &TagStructData,
+    engine: ClassicEngine,
+) -> Option<Vec<u8>> {
+    if !engine.is_halo2() {
+        return None;
+    }
+    let tag = layout.struct_tags.get(base_si as usize).copied().unwrap_or(0);
+    if tag == 0 {
+        return None;
+    }
+    let resolved_si = child.struct_index;
+    if resolved_si == resolve_version_variant(layout, base_si, 0) {
+        return None;
+    }
+    let version = infer_struct_version(layout, base_si, resolved_si);
+    let size = layout
+        .struct_layouts
+        .get(resolved_si as usize)
+        .map(|s| s.size)
+        .unwrap_or(0);
+    let mut hdr = Vec::with_capacity(16);
+    hdr.extend_from_slice(&tag.to_le_bytes());
+    if engine.legacy_header() {
+        hdr.extend_from_slice(&(version as i16).to_le_bytes());
+        hdr.extend_from_slice(&1i16.to_le_bytes());
+        hdr.extend_from_slice(&(size as u32).to_le_bytes());
+    } else {
+        hdr.extend_from_slice(&version.to_le_bytes());
+        hdr.extend_from_slice(&1u32.to_le_bytes());
+        hdr.extend_from_slice(&(size as u32).to_le_bytes());
+    }
+    Some(hdr)
+}
+
 /// The struct index to use when statically sizing an inline `<Struct>`
 /// field. An UNTAGGED inline struct is always on-disk version 0 (HABT
 /// picks `version==0`), so it resolves to its v0 variant. A TAGGED inline
@@ -1064,9 +1115,19 @@ fn encode_struct_trailing(
                     | TagSubChunkContent::OldStringId(s) => out.extend_from_slice(s),
                     TagSubChunkContent::Struct(child) => {
                         // H2 tag'd-struct header precedes the struct's
-                        // trailing data (preserved verbatim).
+                        // trailing data. A struct read from disk carries its
+                        // original header verbatim; a freshly-created one has
+                        // none, so synthesize the header that selects its
+                        // on-disk version variant (else the reader defaults to
+                        // version 0 and resolves the wrong FieldSet — e.g. a
+                        // new `mapping_function` decodes as `__v0`, corrupting
+                        // the tag on the next open).
                         if let Some(hdr) = &child.classic_struct_header {
                             out.extend_from_slice(hdr);
+                        } else if let Some(hdr) =
+                            synthesize_h2_struct_header(layout, field.definition, child, engine)
+                        {
+                            out.extend_from_slice(&hdr);
                         }
                         encode_struct_trailing(layout, child, engine, out);
                     }
