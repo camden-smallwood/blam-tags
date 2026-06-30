@@ -173,6 +173,26 @@ impl<'a> TagFieldDefinition<'a> {
         })
     }
 
+    /// For a (non-custom) block-index field, the block definition it indexes
+    /// into — its `definition` holds the target block's layout index. `None`
+    /// for other field types and for `custom_*_block_index` fields (whose
+    /// target search-name isn't carried in the definition data).
+    pub fn block_index_target(&self) -> Option<TagBlockDefinition<'a>> {
+        let record = &self.layout.fields[self.field_index];
+        if !matches!(
+            record.field_type,
+            TagFieldType::CharBlockIndex
+                | TagFieldType::ShortBlockIndex
+                | TagFieldType::LongBlockIndex
+        ) {
+            return None;
+        }
+        Some(TagBlockDefinition {
+            layout: self.layout,
+            block_layout_index: record.definition as usize,
+        })
+    }
+
     /// If this is an `Array` field, return the array definition.
     pub fn as_array(&self) -> Option<TagArrayDefinition<'a>> {
         let record = &self.layout.fields[self.field_index];

@@ -1541,7 +1541,16 @@ pub(crate) fn read_geometry(root: &TagStruct<'_>) -> Result<Geometry, RenderMode
         .field("render geometry")
         .and_then(|f| f.as_struct())
         .ok_or(RenderModelError::MissingField("render geometry"))?;
-    Ok(Geometry {
+    Ok(read_geometry_from(&geo))
+}
+
+/// Decode a `global_render_geometry_struct` from an already-resolved
+/// struct (the caller has navigated to the geometry-bearing field). Used
+/// by `structure_bsp`, whose `render geometry` and `decorator instance
+/// buffer` fields both carry this schema.
+pub(crate) fn read_geometry_from(geo: &TagStruct<'_>) -> Geometry {
+    let geo = geo;
+    Geometry {
         flags: geo.try_read_flags("runtime flags").unwrap_or_default(),
         meshes: read_meshes_schema(&geo),
         compression_info: read_compression_info(&geo),
@@ -1550,7 +1559,7 @@ pub(crate) fn read_geometry(root: &TagStruct<'_>) -> Result<Geometry, RenderMode
         per_mesh_node_map: read_per_mesh_node_map(&geo),
         per_mesh_prt_data: read_per_mesh_prt_data(&geo),
         per_instance_lightmap_texcoords: read_per_instance_lightmap_texcoords(&geo),
-    })
+    }
 }
 
 fn read_meshes_schema(geo: &TagStruct<'_>) -> Vec<Mesh> {

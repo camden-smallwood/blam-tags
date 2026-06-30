@@ -630,6 +630,13 @@ fn build_layout_from_schema(
             let info = field_type_info(&field.ty)
                 .ok_or_else(|| TagSchemaError::UnknownFieldType(field.ty.clone()))?;
 
+            // Strip explanation fields entirely — shipped MCC tags carry none in
+            // their embedded layout (the documentation text lives only in the
+            // JSON schema, not in tag files).
+            if matches!(info.ty, TagFieldType::Explanation) {
+                continue;
+            }
+
             let type_index = intern_field_type(
                 info.canonical,
                 info.size,
@@ -637,8 +644,11 @@ fn build_layout_from_schema(
                 &mut strings,
             );
 
+            // Clean the field name to its bare display form (drop `:units`,
+            // `#help`, `{alias}`, and trailing `*`/`!` markers) so the embedded
+            // layout matches shipped tags rather than the verbose JSON schema.
             let field_name_offset = match &field.name {
-                Some(n) => strings.intern(n),
+                Some(n) => strings.intern(&clean_blay_field_name(n)),
                 None => 0,
             };
 
@@ -838,6 +848,23 @@ fn build_layout_from_schema(
 /// - `explanation`: string → stored as a string offset into
 ///   string_data.
 /// - primitives / `terminator`: 0.
+/// Reduce a schema field name to the bare display name shipped tags store in
+/// their embedded layout: cut at the first `:` (units) or `#` (help/tooltip),
+/// drop `{alias}` annotations (keeping the base name, as shipped tags do), and
+/// strip trailing `*`/`!` markers. Keeps `[range]` hints, matching real tags.
+fn clean_blay_field_name(name: &str) -> String {
+    let cut = name.find([':', '#']).unwrap_or(name.len());
+    let mut s = name[..cut].to_string();
+    while let (Some(open), Some(close)) = (s.find('{'), s.find('}')) {
+        if open < close {
+            s.replace_range(open..=close, "");
+        } else {
+            break;
+        }
+    }
+    s.trim_end_matches(['*', '!', '^', ' ']).trim().to_string()
+}
+
 fn resolve_field_definition(
     field: &TagFieldSchema,
     ty: TagFieldType,

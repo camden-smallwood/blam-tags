@@ -691,6 +691,19 @@ impl<'a> TagField<'a> {
         self.layout.get_string(field.name_offset).unwrap_or("")
     }
 
+    /// For an `explanation` field, its body text (the schema `definition`
+    /// string), or `None` for non-explanation fields / empty bodies. The body
+    /// is interned into `string_data`, so this is a cheap lookup.
+    pub fn explanation(&self) -> Option<&'a str> {
+        let field = &self.layout.fields[self.field_index];
+        if field.field_type != TagFieldType::Explanation {
+            return None;
+        }
+        self.layout
+            .get_string(field.definition)
+            .filter(|text| !text.is_empty())
+    }
+
     /// The schema type's display name (e.g. `"short_integer"`).
     pub fn type_name(&self) -> &'a str {
         let field = &self.layout.fields[self.field_index];
@@ -1016,6 +1029,22 @@ impl<'a> TagArray<'a> {
         let end = (start + size).min(self.array_raw.len());
         let struct_raw = &self.array_raw[start..end];
         Some(TagStruct { layout: self.layout, struct_data, struct_raw, endian: self.endian })
+    }
+
+    /// Take an owned snapshot of element `index` for copy/paste. Mirrors
+    /// [`TagBlock::element_snapshot`] — the result can be pasted (in-place
+    /// replace) into another array with the same element struct.
+    pub fn element_snapshot(&self, index: usize) -> Option<TagBlockElement> {
+        let struct_data = self.elements.get(index)?;
+        let size = self.layout.struct_layouts[self.element_struct_index() as usize].size;
+        let start = index * size;
+        let raw = self.array_raw.get(start..start + size)?;
+        Some(TagBlockElement {
+            struct_index: self.element_struct_index(),
+            endian: self.endian,
+            raw: raw.to_vec(),
+            data: struct_data.clone(),
+        })
     }
 
     /// Iterate every element in declaration order.
@@ -1642,6 +1671,37 @@ impl<'a> TagArrayMut<'a> {
         buf.copy_from_slice(&self.array_raw[lo_start..lo_start + size]);
         self.array_raw.copy_within(hi_start..hi_start + size, lo_start);
         self.array_raw[hi_start..hi_start + size].copy_from_slice(&buf);
+        Ok(())
+    }
+
+    /// Overwrite element `index` in place with `element` (copy/paste replace).
+    /// Arrays are fixed-count, so this is the only paste available — it never
+    /// changes the element count. The source must share this array's element
+    /// struct, endian, and size.
+    pub fn replace_element(
+        &mut self,
+        index: usize,
+        element: &TagBlockElement,
+    ) -> Result<(), TagPasteError> {
+        let len = self.elements.len();
+        if index >= len {
+            return Err(TagPasteError::OutOfRange { index, len });
+        }
+        let element_struct_index =
+            self.layout.array_layouts[self.array_layout_index as usize].struct_index;
+        if element.struct_index != element_struct_index {
+            return Err(TagPasteError::Incompatible);
+        }
+        if element.endian != self.endian {
+            return Err(TagPasteError::EndianMismatch);
+        }
+        let size = element_struct_size(self.layout, self.array_layout_index);
+        if element.raw.len() != size {
+            return Err(TagPasteError::Incompatible);
+        }
+        let start = index * size;
+        self.array_raw[start..start + size].copy_from_slice(&element.raw);
+        self.elements[index] = element.data.clone();
         Ok(())
     }
 

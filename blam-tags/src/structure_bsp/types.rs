@@ -291,6 +291,60 @@ pub struct StructureBsp {
     ///
     /// Ares: `structure_bsp_definitions.h:180`. 4 bytes per entry.
     pub structure_surface_to_triangle_mappings: Vec<StructureSurfaceTriangleMapping>,
+
+    // ---- maximal coverage: the remaining root blocks ----
+    pub import_info_checksum: i32,
+    pub import_version: i32,
+    pub visible_name: String,
+    pub seam_identifiers: Vec<super::StructureSeamMapping>,
+    pub edge_to_seam_edges: Vec<super::EdgeToSeamEdge>,
+    pub large_structure_surfaces: Vec<super::StructureSurfaceLarge>,
+    pub weather_polyhedra: Vec<super::WeatherPolyhedron>,
+    pub detail_objects: Vec<super::DetailObjectData>,
+    pub conveyor_surfaces: Vec<super::ConveyorSurface>,
+    pub breakable_surface_sets: Vec<super::BreakableSurfaceSet>,
+    pub pathfinding_data: Vec<super::PathfindingData>,
+    /// `pathfinding edges` — packed midpoint bytes.
+    pub pathfinding_edges: Vec<i8>,
+    pub acoustics_palette: Vec<super::AcousticsPalette>,
+    pub background_sound_palette: Vec<super::BackgroundSoundPalette>,
+    pub sound_environment_palette: Vec<super::SoundEnvironmentPalette>,
+    /// `sound PAS data` — opaque encoded cluster PAS blob.
+    pub sound_pas_data: Vec<u8>,
+    pub marker_light_palette: Vec<super::MarkerLightPalette>,
+    /// `marker light palette index` — per-marker palette indices.
+    pub marker_light_palette_indices: Vec<i16>,
+    pub runtime_decals: Vec<super::RuntimeDecal>,
+    pub environment_object_palette: Vec<super::EnvironmentObjectPalette>,
+    pub environment_objects: Vec<super::EnvironmentObject>,
+    pub leaf_map_leaves: Vec<super::MapLeaf>,
+    pub leaf_map_connections: Vec<super::LeafConnection>,
+    pub errors: Vec<super::ErrorReportCategory>,
+    /// `decorator sets` — referenced `decorator_set` (dctr) tag paths.
+    pub decorator_sets: Vec<String>,
+    pub acoustics_sound_clusters: Vec<super::SoundCluster>,
+    pub ambience_sound_clusters: Vec<super::SoundCluster>,
+    pub reverb_sound_clusters: Vec<super::SoundCluster>,
+    pub transparent_planes: Vec<super::TransparentPlane>,
+    /// `debug info` — 0-or-1 element (block, max_count 1).
+    pub debug_info: Vec<super::DebugInfo>,
+    /// `audibility` — 0-or-1 element (block).
+    pub audibility: Vec<super::Audibility>,
+    /// `object fake lightprobes` — placed-object identifiers.
+    pub fake_lightprobes: Vec<super::ScenarioObjectId>,
+    /// `widget references` — (marker index, widget tag path) pairs.
+    pub widget_references: Vec<(i16, String)>,
+    /// `structure_physics` — Havok world MOPP + breakable-surface data.
+    pub structure_physics: super::StructurePhysics,
+    /// `render geometry` — the full renderable mesh data (vertex/index
+    /// buffers + compression info), reusing the `render_model` reader.
+    /// `meshes_metadata` is the lightweight per-mesh subset of this.
+    pub render_geometry: Option<crate::render_model::Geometry>,
+    /// `decorator instance buffer` — packed decorator (grass) instance
+    /// geometry, same `global_render_geometry_struct` schema.
+    pub decorator_instance_buffer: Option<crate::render_model::Geometry>,
+    /// `use resource items` — resource-interface paging flag.
+    pub use_resource_items: i32,
 }
 
 impl StructureBsp {
@@ -370,6 +424,68 @@ impl StructureBsp {
                 "structure surface to triangle mapping",
                 StructureSurfaceTriangleMapping::from_struct,
             ),
+
+            import_info_checksum: s.read_int_any("import info checksum").unwrap_or(0) as i32,
+            import_version: s.read_int_any("import version").unwrap_or(0) as i32,
+            visible_name: s.read_string_id("visible name").unwrap_or_default(),
+            seam_identifiers: read_block(s, "seam identifiers", super::StructureSeamMapping::from_struct),
+            edge_to_seam_edges: read_block(s, "edge to seam edge", super::EdgeToSeamEdge::from_struct),
+            large_structure_surfaces: read_block(s, "large structure surfaces", super::StructureSurfaceLarge::from_struct),
+            weather_polyhedra: read_block(s, "weather polyhedra", super::WeatherPolyhedron::from_struct),
+            detail_objects: read_block(s, "detail objects", super::DetailObjectData::from_struct),
+            conveyor_surfaces: read_block(s, "conveyor surfaces", super::ConveyorSurface::from_struct),
+            breakable_surface_sets: read_block(s, "breakable surface sets", super::BreakableSurfaceSet::from_struct),
+            pathfinding_data: read_block(s, "pathfinding data", super::PathfindingData::from_struct),
+            pathfinding_edges: read_block(s, "pathfinding edges", |e| e.read_int_any("midpoint").unwrap_or(0) as i8),
+            acoustics_palette: read_block(s, "acoustics palette", super::AcousticsPalette::from_struct),
+            background_sound_palette: read_block(s, "background sound palette", super::BackgroundSoundPalette::from_struct),
+            sound_environment_palette: read_block(s, "sound environment palette", super::SoundEnvironmentPalette::from_struct),
+            sound_pas_data: super::common::read_data(s, "sound PAS data"),
+            marker_light_palette: read_block(s, "marker light palette", super::MarkerLightPalette::from_struct),
+            marker_light_palette_indices: read_block(s, "marker light palette index", |e| e.read_int_any("palette index").unwrap_or(-1) as i16),
+            runtime_decals: read_block(s, "runtime decals", super::RuntimeDecal::from_struct),
+            environment_object_palette: read_block(s, "environment object palette", super::EnvironmentObjectPalette::from_struct),
+            environment_objects: read_block(s, "environment objects", super::EnvironmentObject::from_struct),
+            leaf_map_leaves: read_block(s, "leaf map leaves", super::MapLeaf::from_struct),
+            leaf_map_connections: read_block(s, "leaf map connections", super::LeafConnection::from_struct),
+            errors: read_block(s, "errors", super::ErrorReportCategory::from_struct),
+            decorator_sets: read_block(s, "decorator sets", |e| e.read_tag_ref_path("decorator set reference").unwrap_or_default()),
+            acoustics_sound_clusters: read_block(s, "acoustics sound clusters", super::SoundCluster::from_struct),
+            ambience_sound_clusters: read_block(s, "ambience sound clusters", super::SoundCluster::from_struct),
+            reverb_sound_clusters: read_block(s, "reverb sound clusters", super::SoundCluster::from_struct),
+            transparent_planes: read_block(s, "transparent planes", super::TransparentPlane::from_struct),
+            debug_info: read_block(s, "debug info", super::DebugInfo::from_struct),
+            audibility: read_block(s, "audibility", super::Audibility::from_struct),
+            fake_lightprobes: read_block(s, "object fake lightprobes", |e| {
+                super::common::read_struct(e, "object identifier", super::ScenarioObjectId::from_struct)
+            }),
+            widget_references: read_block(s, "widget references", |e| {
+                (
+                    e.read_int_any("marker index").unwrap_or(-1) as i16,
+                    e.read_tag_ref_path("widget ref").unwrap_or_default(),
+                )
+            }),
+            structure_physics: super::common::read_struct(
+                s,
+                "structure_physics",
+                super::StructurePhysics::from_struct,
+            ),
+            render_geometry: s
+                .field("render geometry")
+                .and_then(|f| f.as_struct())
+                .map(|rg| crate::render_model::read_geometry_from(&rg)),
+            decorator_instance_buffer: s
+                .field("decorator instance buffer")
+                .and_then(|f| f.as_struct())
+                .map(|rg| crate::render_model::read_geometry_from(&rg)),
+            use_resource_items: s
+                .field_path("resource interface/use resource items")
+                .and_then(|f| f.value())
+                .and_then(|v| match v {
+                    crate::fields::TagFieldData::LongInteger(n) => Some(n),
+                    _ => None,
+                })
+                .unwrap_or(0),
         }
     }
 }
@@ -1239,6 +1355,29 @@ pub struct BspCluster {
     pub flags: Flags<StructureClusterFlags, u16>,
     /// Portal block indices into [`StructureBsp::cluster_portals`].
     pub portals: Vec<i16>,
+
+    // ---- maximal coverage: cluster sub-fields ----
+    /// `acoustics` — block index into [`StructureBsp::acoustics_palette`].
+    pub acoustics: i16,
+    pub acoustics_sound_cluster_index: i16,
+    /// `background sound` — index into [`StructureBsp::background_sound_palette`].
+    pub background_sound: i16,
+    /// `sound environment` — index into [`StructureBsp::sound_environment_palette`].
+    pub sound_environment: i16,
+    /// `weather` — index into [`StructureBsp::weather_palette`].
+    pub weather: i16,
+    pub background_sound_sound_cluster_index: i16,
+    pub reverb_sound_cluster_index: i16,
+    pub runtime_first_decal_index: i16,
+    /// `runtime decal cound` (sic — schema typo).
+    pub runtime_decal_count: i16,
+    pub collision_instanced_geometry: super::ClusterCollisionInstancedGeometry,
+    /// `seam indices`.
+    pub seam_indices: Vec<i8>,
+    pub decorator_groups: Vec<super::DecoratorRuntimeCluster>,
+    pub pvs_bound_object_identifiers: Vec<super::ScenarioObjectId>,
+    pub pvs_bound_object_references: Vec<super::ScenarioObjectReference>,
+    pub cluster_cubemaps: Vec<super::ClusterCubemap>,
 }
 
 impl BspCluster {
@@ -1252,19 +1391,31 @@ impl BspCluster {
             camera_fx_index: s.read_int_any("camera fx index").unwrap_or(-1) as i8,
             mesh_index: s.read_int_any("mesh index").unwrap_or(-1) as i16,
             flags: s.try_read_flags("flags").unwrap_or_default(),
-            portals: s
-                .field("portals")
-                .and_then(|f| f.as_block())
-                .map(|b| {
-                    let mut out = Vec::with_capacity(b.len());
-                    for i in 0..b.len() {
-                        if let Some(e) = b.element(i) {
-                            out.push(e.read_int_any("portal index").unwrap_or(-1) as i16);
-                        }
-                    }
-                    out
-                })
-                .unwrap_or_default(),
+            portals: read_block(s, "portals", |e| e.read_int_any("portal index").unwrap_or(-1) as i16),
+
+            acoustics: s.read_block_index("acoustics"),
+            acoustics_sound_cluster_index: s.read_int_any("acoustics sound cluster index").unwrap_or(-1) as i16,
+            background_sound: s.read_block_index("background sound"),
+            sound_environment: s.read_block_index("sound environment"),
+            weather: s.read_block_index("weather"),
+            background_sound_sound_cluster_index: s.read_int_any("background sound sound cluster index").unwrap_or(-1) as i16,
+            reverb_sound_cluster_index: s.read_int_any("reverb sound cluster index").unwrap_or(-1) as i16,
+            runtime_first_decal_index: s.read_int_any("runtime first decal index").unwrap_or(-1) as i16,
+            runtime_decal_count: s.read_int_any("runtime decal cound").unwrap_or(0) as i16,
+            collision_instanced_geometry: super::common::read_struct(
+                s,
+                "collision instanced geometry",
+                super::ClusterCollisionInstancedGeometry::from_struct,
+            ),
+            seam_indices: read_block(s, "seam indices", |e| e.read_int_any("seam index").unwrap_or(-1) as i8),
+            decorator_groups: read_block(s, "decorator groups", super::DecoratorRuntimeCluster::from_struct),
+            pvs_bound_object_identifiers: read_block(s, "pvs bound object identifiers", |e| {
+                super::common::read_struct(e, "object ID", super::ScenarioObjectId::from_struct)
+            }),
+            pvs_bound_object_references: read_block(s, "pvs bound object references", |e| {
+                super::common::read_struct(e, "scenario object reference", super::ScenarioObjectReference::from_struct)
+            }),
+            cluster_cubemaps: read_block(s, "cluster cubemaps", super::ClusterCubemap::from_struct),
         }
     }
 }
@@ -1606,4 +1757,61 @@ where
         }
     }
     out
+}
+
+#[cfg(test)]
+mod maximal_walker_tests {
+    use super::StructureBsp;
+    use crate::TagFile;
+
+    /// Parse a real H3 BSP end-to-end and assert the maximal-coverage
+    /// blocks populate as expected. Validates that the schema-derived
+    /// field names resolve against an actual tag.
+    #[test]
+    fn parses_s3d_lockout_bsp() {
+        let path = "/Users/camden/Halo/halo3_mcc/tags/levels/multi/\
+                    s3d_lockout/s3d_lockout.scenario_structure_bsp";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("skipping: {path} not present");
+            return;
+        }
+        let tag = TagFile::read(path).expect("read sbsp");
+        let bsp = StructureBsp::from_struct(&tag.root());
+
+        // populated blocks (counts from a live parse)
+        assert_eq!(bsp.clusters.len(), 18, "lockout has 18 clusters");
+        assert_eq!(bsp.weather_polyhedra.len(), 10, "lockout weather polyhedra");
+        assert_eq!(bsp.large_structure_surfaces.len(), 11271);
+        assert_eq!(bsp.errors.len(), 8);
+        // loose tags leave per-cluster atmosphere unresolved (= -1)
+        assert_eq!(bsp.clusters[0].atmosphere_index, -1);
+
+        // weather polyhedra carry real geometry (sphere + bounding planes)
+        let poly = &bsp.weather_polyhedra[0];
+        assert!(poly.bounding_sphere_radius > 0.0);
+        assert!(!poly.planes.is_empty());
+
+        // full render geometry resolves (vertex/index buffers + meshes)
+        let geom = bsp.render_geometry.as_ref().expect("render geometry present");
+        assert!(!geom.meshes.is_empty(), "render geometry has meshes");
+        // the lightweight metadata mirror has one entry per render mesh
+        assert_eq!(bsp.meshes_metadata.len(), geom.meshes.len());
+    }
+
+    /// A content-rich campaign BSP exercises the environment-object reader.
+    #[test]
+    fn parses_campaign_environment_objects() {
+        let path = "/Users/camden/Halo/halo3_mcc/tags/levels/solo/\
+                    120_halo/120_bsp_110.scenario_structure_bsp";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("skipping: {path} not present");
+            return;
+        }
+        let tag = TagFile::read(path).expect("read sbsp");
+        let bsp = StructureBsp::from_struct(&tag.root());
+        assert_eq!(bsp.clusters.len(), 29);
+        assert_eq!(bsp.environment_objects.len(), 466);
+        // each env object resolves a non-empty name + a palette index
+        assert!(bsp.environment_objects.iter().all(|e| e.palette_index >= 0));
+    }
 }
