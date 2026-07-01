@@ -14,5 +14,14 @@ num-derive = "0.4"
 strum = { version = "0.27", features = ["derive"] }
 flate2 = "1"
 
+# `audio` feature: FSB5 sound-bank parsing + FMOD-Vorbis decode (Halo 3+), plus
+# classic inline codecs — Ogg Vorbis (CE), Opus + Xbox-ADPCM (H2).
+lewton = { version = "0.10", optional = true }
+log = { version = "0.4", optional = true }
+opus = { version = "0.3", optional = true }
+
+[features]
+audio = ["dep:lewton", "dep:log", "dep:opus"]
+
 [dev-dependencies]
 md5 = "0.7"

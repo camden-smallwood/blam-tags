@@ -135,6 +135,12 @@ pub mod wind;
 pub mod paths;
 pub mod typed_enums;
 
+/// Sound-tag audio decoding for every supported game: classic inline codecs
+/// (CE Ogg Vorbis; H2 Opus / Xbox-ADPCM / PCM), FMOD FSB5 banks (Halo 3 /
+/// Reach), and Wwise packages (Halo 4). Gated behind the `audio` feature.
+#[cfg(feature = "audio")]
+pub mod audio;
+
 // Facade re-exports — the recommended surface for editing tags.
 pub use api::{
     TagArray, TagArrayMut, TagBlock, TagBlockElement, TagBlockMut, TagField, TagFieldMut, TagFlag,
