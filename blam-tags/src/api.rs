@@ -1281,6 +1281,44 @@ impl<'a> TagStructMut<'a> {
         })
     }
 
+    /// Resolve the `ordinal`-th field in [`TagStruct::fields`] order (same
+    /// padding/terminator filtering) for mutation. The only way to reach an
+    /// **unnamed** field — e.g. Halo 2's inline sound `data` blobs, which carry
+    /// no field name and so can't be addressed via [`Self::field_mut`].
+    pub fn field_at_mut(&mut self, ordinal: usize) -> Option<TagFieldMut<'_>> {
+        let struct_index = self.struct_data.struct_index as usize;
+        let start = self.layout.struct_layouts[struct_index].first_field_index as usize;
+        let mut i = start;
+        let mut seen = 0usize;
+        loop {
+            let ft = self.layout.fields[i].field_type;
+            if ft == TagFieldType::Terminator {
+                return None;
+            }
+            let is_padding = matches!(
+                ft,
+                TagFieldType::Pad
+                    | TagFieldType::UselessPad
+                    | TagFieldType::Skip
+                    | TagFieldType::Explanation
+                    | TagFieldType::Unknown,
+            );
+            if !is_padding {
+                if seen == ordinal {
+                    return Some(TagFieldMut {
+                        layout: self.layout,
+                        struct_data: &mut *self.struct_data,
+                        struct_raw: &mut *self.struct_raw,
+                        field_index: i,
+                        endian: self.endian,
+                    });
+                }
+                seen += 1;
+            }
+            i += 1;
+        }
+    }
+
     /// Resolve a `/`-separated field path. Mirrors
     /// [`TagStruct::field_path`].
     pub fn field_path_mut(&mut self, path: &str) -> Option<TagFieldMut<'_>> {

@@ -748,3 +748,201 @@ impl WwiseVorbis<'_> {
         Ok((payload, size))
     }
 }
+
+#[cfg(test)]
+mod encode_feasibility {
+    //! Experiment: are the codebooks our Vorbis *encoder* (vorbis_rs / aoTuV
+    //! Lancer) emits the same codebooks Wwise references from the external aoTuV
+    //! 6.03 library? If yes, re-encoding to Wwise-Vorbis is feasible (map each
+    //! emitted codebook back to its library id). If no, it's a dead end.
+    use super::*;
+
+    /// A normalized codebook for identity comparison.
+    #[derive(PartialEq, Eq, Hash, Debug)]
+    struct Cb {
+        dims: u32,
+        entries: u32,
+        lengths: Vec<u8>,
+        lookup: u8,
+        lookup_values: Vec<u32>,
+    }
+
+    /// Parse a *standard* Vorbis codebook (as emitted in a real setup header).
+    fn parse_standard(bis: &mut BitReader) -> Result<Cb, String> {
+        let sync = bis.read(24)?;
+        if sync != 0x564342 {
+            return Err(format!("bad codebook sync {sync:#x}"));
+        }
+        let dims = bis.read(16)?;
+        let entries = bis.read(24)?;
+        let ordered = bis.read(1)?;
+        let mut lengths = Vec::with_capacity(entries as usize);
+        if ordered != 0 {
+            let mut cur = 0u32;
+            let mut len = bis.read(5)? + 1;
+            while cur < entries {
+                let bits = ilog(entries - cur);
+                let num = bis.read(bits)?;
+                for _ in 0..num {
+                    lengths.push(len as u8);
+                }
+                cur += num;
+                len += 1;
+            }
+        } else {
+            let sparse = bis.read(1)?;
+            for _ in 0..entries {
+                let present = if sparse != 0 { bis.read(1)? != 0 } else { true };
+                lengths.push(if present { (bis.read(5)? + 1) as u8 } else { 0 });
+            }
+        }
+        let lookup = bis.read(4)? as u8;
+        let mut lookup_values = Vec::new();
+        if lookup == 1 || lookup == 2 {
+            let _min = bis.read(32)?;
+            let _max = bis.read(32)?;
+            let value_bits = bis.read(4)? + 1;
+            let _seq = bis.read(1)?;
+            let count = if lookup == 1 {
+                book_maptype1_quantvals(entries, dims)
+            } else {
+                entries * dims
+            };
+            for _ in 0..count {
+                lookup_values.push(bis.read(value_bits)?);
+            }
+        } else if lookup != 0 {
+            return Err(format!("unexpected lookup {lookup}"));
+        }
+        Ok(Cb { dims, entries, lengths, lookup, lookup_values })
+    }
+
+    /// Parse a *packed* aoTuV library codebook (4-bit dim / 14-bit entries form).
+    fn parse_packed(bis: &mut BitReader) -> Result<Cb, String> {
+        let dims = bis.read(4)?;
+        let entries = bis.read(14)?;
+        let ordered = bis.read(1)?;
+        let mut lengths = Vec::with_capacity(entries as usize);
+        if ordered != 0 {
+            let mut cur = 0u32;
+            let mut len = bis.read(5)? + 1;
+            while cur < entries {
+                let bits = ilog(entries - cur);
+                let num = bis.read(bits)?;
+                for _ in 0..num {
+                    lengths.push(len as u8);
+                }
+                cur += num;
+                len += 1;
+            }
+        } else {
+            let cll = bis.read(3)?;
+            let sparse = bis.read(1)?;
+            for _ in 0..entries {
+                let present = if sparse != 0 { bis.read(1)? != 0 } else { true };
+                lengths.push(if present { (bis.read(cll)? + 1) as u8 } else { 0 });
+            }
+        }
+        let lookup = bis.read(1)? as u8;
+        let mut lookup_values = Vec::new();
+        if lookup == 1 {
+            let _min = bis.read(32)?;
+            let _max = bis.read(32)?;
+            let value_bits = bis.read(4)? + 1;
+            let _seq = bis.read(1)?;
+            let count = book_maptype1_quantvals(entries, dims);
+            for _ in 0..count {
+                lookup_values.push(bis.read(value_bits)?);
+            }
+        }
+        Ok(Cb { dims, entries, lengths, lookup, lookup_values })
+    }
+
+    /// Split an Ogg bitstream into its packets (segment-lacing).
+    fn ogg_packets(data: &[u8]) -> Vec<Vec<u8>> {
+        let mut packets = Vec::new();
+        let mut cur = Vec::new();
+        let mut pos = 0usize;
+        while pos + 27 <= data.len() && &data[pos..pos + 4] == b"OggS" {
+            let nsegs = data[pos + 26] as usize;
+            if pos + 27 + nsegs > data.len() {
+                break;
+            }
+            let table = &data[pos + 27..pos + 27 + nsegs];
+            let mut body = pos + 27 + nsegs;
+            for &lace in table {
+                let l = lace as usize;
+                if body + l > data.len() {
+                    return packets;
+                }
+                cur.extend_from_slice(&data[body..body + l]);
+                body += l;
+                if lace < 255 {
+                    packets.push(std::mem::take(&mut cur));
+                }
+            }
+            pos = body;
+        }
+        packets
+    }
+
+    #[test]
+    fn encoder_codebooks_vs_aotuv_library() {
+        // 1. Encode a real-ish signal with our Vorbis encoder.
+        let pcm: Vec<i16> = (0..44_100 * 2)
+            .map(|i| {
+                let t = i as f64 / 44_100.0;
+                let s = (2.0 * std::f64::consts::PI * 440.0 * t).sin()
+                    + 0.5 * (2.0 * std::f64::consts::PI * 3000.0 * t).sin();
+                (s * 9000.0) as i16
+            })
+            .collect();
+        let ogg = crate::audio::encode_ogg_vorbis(&pcm, 1, 44_100).expect("encode");
+
+        // 2. Pull the setup header (3rd Vorbis header packet) and parse its books.
+        let packets = ogg_packets(&ogg);
+        assert!(packets.len() >= 3, "expected >=3 header packets, got {}", packets.len());
+        let setup = &packets[2];
+        assert_eq!(setup[0], 5, "3rd packet should be the setup header");
+        assert_eq!(&setup[1..7], b"vorbis");
+        let mut bis = BitReader::new(&setup[7..]);
+        let count = bis.read(8).expect("cb count") + 1;
+        let mut encoder_books = Vec::new();
+        for i in 0..count {
+            encoder_books.push(parse_standard(&mut bis).unwrap_or_else(|e| panic!("enc cb {i}: {e}")));
+        }
+
+        // 3. Rebuild the aoTuV library into normalized codebooks.
+        let lib = CodebookLibrary::load();
+        let mut aotuv: std::collections::HashSet<Cb> = std::collections::HashSet::new();
+        let mut id = 0usize;
+        while let Some(cb) = lib.codebook(id) {
+            let mut b = BitReader::new(cb);
+            if let Ok(c) = parse_packed(&mut b) {
+                aotuv.insert(c);
+            }
+            id += 1;
+        }
+
+        // 4. How many of the encoder's codebooks exist in the aoTuV library?
+        let matched = encoder_books.iter().filter(|c| aotuv.contains(*c)).count();
+        eprintln!(
+            "ENCODER CODEBOOKS: {} | aoTuV LIBRARY: {} | MATCHED: {}/{}",
+            encoder_books.len(),
+            aotuv.len(),
+            matched,
+            encoder_books.len()
+        );
+        for (i, c) in encoder_books.iter().enumerate() {
+            eprintln!(
+                "  enc cb {i}: dims={} entries={} lookup={} inLib={}",
+                c.dims,
+                c.entries,
+                c.lookup,
+                aotuv.contains(c)
+            );
+        }
+        // Not an assertion on the outcome — this test PRINTS the feasibility signal.
+        assert!(!encoder_books.is_empty());
+    }
+}

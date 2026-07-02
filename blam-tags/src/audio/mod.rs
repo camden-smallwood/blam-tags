@@ -22,9 +22,13 @@ pub mod wwise;
 
 pub use banks::SoundBanks;
 pub use wwise::WwiseBanks;
-pub use classic::{decode_opus, decode_pcm, decode_xbox_adpcm};
+pub use classic::{
+    decode_opus, decode_pcm, decode_xbox_adpcm, encode_opus, encode_pcm, encode_xbox_adpcm,
+};
 pub use fsb5::{sound_leaf_name, Fsb5, SubSound};
-pub use vorbis::{decode_ogg_vorbis, decode_subsound, downmix_to_stereo, DecodedPcm};
+pub use vorbis::{
+    decode_ogg_vorbis, decode_subsound, downmix_to_stereo, encode_ogg_vorbis, DecodedPcm,
+};
 
 use std::path::{Path, PathBuf};
 

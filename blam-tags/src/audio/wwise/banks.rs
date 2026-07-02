@@ -34,9 +34,46 @@ pub struct WwiseBanks {
 }
 
 impl WwiseBanks {
-    /// Open every `.pck` under `<game>/sound/pc/` and build the resolution
-    /// index. Errs if the directory has no readable packages.
+    /// Localized languages available beside the tags tree: every subfolder of
+    /// `<game>/sound/pc/` that contains a `.pck`, sorted. Cheap (directory scan).
+    pub fn available_languages(tags_root: &Path) -> Vec<String> {
+        let base = tags_root
+            .parent()
+            .unwrap_or(tags_root)
+            .join("sound")
+            .join("pc");
+        let mut langs = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let has_pck = p.is_dir()
+                    && std::fs::read_dir(&p)
+                        .map(|rd| {
+                            rd.flatten()
+                                .any(|e| e.path().extension().is_some_and(|x| x == "pck"))
+                        })
+                        .unwrap_or(false);
+                if has_pck {
+                    if let Some(name) = p.file_name() {
+                        langs.push(name.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+        langs.sort();
+        langs
+    }
+
+    /// Open every `.pck` under `<game>/sound/pc/` and build the resolution index
+    /// (default dialogue language). Errs if the directory has no readable packages.
     pub fn open_pc(tags_root: &Path) -> Result<Self, String> {
+        Self::open_pc_language(tags_root, None)
+    }
+
+    /// Like [`Self::open_pc`] but opens the given dialogue-language subfolder's
+    /// packages (plus the shared top-level SFX packages). `language = None` uses
+    /// [`PREFERRED_LANGUAGE`].
+    pub fn open_pc_language(tags_root: &Path, language: Option<&str>) -> Result<Self, String> {
         let base = tags_root
             .parent()
             .unwrap_or(tags_root)
@@ -57,7 +94,7 @@ impl WwiseBanks {
                 }
             }
         }
-        if let Some(lang) = pick_language_dir(&base) {
+        if let Some(lang) = pick_language_dir(&base, language) {
             if let Ok(rd) = std::fs::read_dir(&lang) {
                 for entry in rd.flatten() {
                     let p = entry.path();
@@ -167,9 +204,16 @@ impl WwiseBanks {
 const PREFERRED_LANGUAGE: &str = "english(us)";
 
 /// Choose the language subfolder under `sound/pc/` whose dialogue banks to open:
-/// [`PREFERRED_LANGUAGE`] if present, else the first subfolder that contains a
-/// `.pck`. `None` if there are no language subfolders (e.g. SFX-only installs).
-fn pick_language_dir(base: &Path) -> Option<PathBuf> {
+/// the explicit `language` if given and present, else [`PREFERRED_LANGUAGE`],
+/// else the first subfolder that contains a `.pck`. `None` if there are no
+/// language subfolders (e.g. SFX-only installs).
+fn pick_language_dir(base: &Path, language: Option<&str>) -> Option<PathBuf> {
+    if let Some(lang) = language {
+        let explicit = base.join(lang);
+        if explicit.is_dir() {
+            return Some(explicit);
+        }
+    }
     let preferred = base.join(PREFERRED_LANGUAGE);
     if preferred.is_dir() {
         return Some(preferred);

@@ -12,19 +12,64 @@ pub struct SoundBanks {
     paths: Vec<PathBuf>,
 }
 
+/// The `<game>/fmod/pc/` directory beside a tags tree.
+fn fmod_pc_dir(tags_root: &Path) -> PathBuf {
+    tags_root
+        .parent()
+        .unwrap_or(tags_root)
+        .join("fmod")
+        .join("pc")
+}
+
+/// Non-localized bank name (shared across languages).
+const SFX_BANK: &str = "sfx.fsb";
+
 impl SoundBanks {
-    /// Open every `.fsb` present under `<game>/fmod/pc/`, preferring
-    /// dialogue banks before `sfx.fsb` when resolving tag paths.
+    /// Localized languages available beside the tags tree: every `<lang>.fsb`
+    /// under `<game>/fmod/pc/` except the shared `sfx.fsb`, sorted. Cheap (a
+    /// directory scan; no bank is opened).
+    pub fn available_languages(tags_root: &Path) -> Vec<String> {
+        let base = fmod_pc_dir(tags_root);
+        let mut langs = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&base) else {
+            return langs;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(stem) = name.strip_suffix(".fsb") {
+                if !name.eq_ignore_ascii_case(SFX_BANK) {
+                    langs.push(stem.to_owned());
+                }
+            }
+        }
+        langs.sort();
+        langs
+    }
+
+    /// Open the default banks (`english.fsb` + `dialogue.fsb` + `sfx.fsb`).
     pub fn open_pc(tags_root: &Path) -> Result<Self, String> {
-        let base = tags_root
-            .parent()
-            .unwrap_or(tags_root)
-            .join("fmod")
-            .join("pc");
-        let candidates = ["english.fsb", "dialogue.fsb", "sfx.fsb"];
+        Self::open_pc_language(tags_root, None)
+    }
+
+    /// Open the banks for a specific language: `<language>.fsb` (localized
+    /// dialogue/music) plus the shared `sfx.fsb`, the language bank taking
+    /// resolve priority. `language = None` opens the default set
+    /// (`english.fsb` + `dialogue.fsb` + `sfx.fsb`).
+    pub fn open_pc_language(tags_root: &Path, language: Option<&str>) -> Result<Self, String> {
+        let base = fmod_pc_dir(tags_root);
+        // Language bank first so it wins over sfx on a name clash.
+        let candidates: Vec<String> = match language {
+            Some(lang) => vec![format!("{lang}.fsb"), SFX_BANK.to_owned()],
+            None => vec![
+                "english.fsb".to_owned(),
+                "dialogue.fsb".to_owned(),
+                SFX_BANK.to_owned(),
+            ],
+        };
         let mut banks = Vec::new();
         let mut paths = Vec::new();
-        for name in candidates {
+        for name in &candidates {
             let p = base.join(name);
             if !p.exists() {
                 continue;

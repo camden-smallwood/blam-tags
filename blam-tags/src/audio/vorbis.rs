@@ -268,9 +268,77 @@ pub fn decode_ogg_vorbis(bytes: &[u8]) -> Result<DecodedPcm, String> {
     })
 }
 
+/// Encode interleaved 16-bit PCM to a complete Ogg Vorbis stream (inverse of
+/// [`decode_ogg_vorbis`]) for Halo CE's inline `samples` blob. Uses the vendored
+/// aoTuV libvorbis encoder (VBR quality-managed default). Produces a standard
+/// `OggS` file that CE's runtime + [`decode_ogg_vorbis`] read back.
+pub fn encode_ogg_vorbis(samples: &[i16], channels: u16, sample_rate: u32) -> Result<Vec<u8>, String> {
+    use std::num::{NonZeroU32, NonZeroU8};
+    use vorbis_rs::VorbisEncoderBuilder;
+    let ch = channels.max(1) as usize;
+    if samples.len() < ch {
+        return Err("no samples to encode".to_owned());
+    }
+    let freq = NonZeroU32::new(sample_rate).ok_or("invalid sample rate")?;
+    let nch = NonZeroU8::new(ch as u8).ok_or("invalid channel count")?;
+    // Deinterleave to per-channel f32 in [-1, 1].
+    let frames = samples.len() / ch;
+    let mut planar: Vec<Vec<f32>> = vec![Vec::with_capacity(frames); ch];
+    for (i, &s) in samples.iter().enumerate() {
+        planar[i % ch].push(s as f32 / 32768.0);
+    }
+    let mut out = Vec::new();
+    {
+        let mut encoder = VorbisEncoderBuilder::new(freq, nch, &mut out)
+            .map_err(|e| format!("vorbis init: {e}"))?
+            .build()
+            .map_err(|e| format!("vorbis build: {e}"))?;
+        let mut start = 0usize;
+        while start < frames {
+            let end = (start + 8192).min(frames);
+            let block: Vec<&[f32]> = planar.iter().map(|c| &c[start..end]).collect();
+            encoder
+                .encode_audio_block(&block)
+                .map_err(|e| format!("vorbis encode: {e}"))?;
+            start = end;
+        }
+        encoder
+            .finish()
+            .map_err(|e| format!("vorbis finish: {e}"))?;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `encode_ogg_vorbis` → `decode_ogg_vorbis` reproduces a sine (lossy) with
+    /// matching channels/rate and preserved energy.
+    #[test]
+    fn ogg_vorbis_encode_decode_roundtrip() {
+        for (ch, rate) in [(1u16, 22_050u32), (2, 44_100)] {
+            let frames = rate as usize / 2; // 0.5 s
+            let mut input = Vec::with_capacity(frames * ch as usize);
+            for i in 0..frames {
+                let t = i as f64 / rate as f64;
+                let s = ((2.0 * std::f64::consts::PI * 330.0 * t).sin() * 9000.0) as i16;
+                for _ in 0..ch {
+                    input.push(s);
+                }
+            }
+            let ogg = encode_ogg_vorbis(&input, ch, rate).expect("encode");
+            assert!(ogg.starts_with(b"OggS"), "output should be an Ogg stream");
+            let pcm = decode_ogg_vorbis(&ogg).expect("decode");
+            assert_eq!(pcm.channels, ch);
+            assert_eq!(pcm.sample_rate, rate);
+            let rms = |s: &[i16]| {
+                (s.iter().map(|&x| (x as f64).powi(2)).sum::<f64>() / s.len().max(1) as f64).sqrt()
+            };
+            let (a, b) = (rms(&input), rms(&pcm.samples));
+            assert!(a > 0.0 && (a - b).abs() / a < 0.25, "ch{ch}: rms {a} vs {b}");
+        }
+    }
 
     /// Decode a real Halo CE inline Ogg blob (skip-if-absent). Extract with:
     /// `blam-tag-shell extract-data --game haloce_mcc <tag> "pitch ranges[0]/permutations[0]/samples" --output /tmp/ce.ogg`
@@ -387,5 +455,87 @@ mod tests {
                 expect_ch, pcm.sample_rate, samples.len() / ch as usize
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod fmod_feasibility {
+    //! Experiment: FMOD keys Vorbis decoding on a CRC32 of the stored setup and
+    //! only decodes setups it already has (mirrored in `vorbis_books.bin`). So
+    //! FMOD re-encode needs our encoder's setup to byte-match one of those. This
+    //! checks whether any (channels, rate) config reproduces a stored setup.
+    use super::*;
+
+    fn ogg_packets(data: &[u8]) -> Vec<Vec<u8>> {
+        let mut packets = Vec::new();
+        let mut cur = Vec::new();
+        let mut pos = 0usize;
+        while pos + 27 <= data.len() && &data[pos..pos + 4] == b"OggS" {
+            let nsegs = data[pos + 26] as usize;
+            if pos + 27 + nsegs > data.len() {
+                break;
+            }
+            let table = &data[pos + 27..pos + 27 + nsegs];
+            let mut body = pos + 27 + nsegs;
+            for &lace in table {
+                let l = lace as usize;
+                if body + l > data.len() {
+                    return packets;
+                }
+                cur.extend_from_slice(&data[body..body + l]);
+                body += l;
+                if lace < 255 {
+                    packets.push(std::mem::take(&mut cur));
+                }
+            }
+            pos = body;
+        }
+        packets
+    }
+
+    #[test]
+    fn encoder_setup_vs_fmod_books() {
+        let map = books();
+        assert!(!map.is_empty(), "no FMOD setups loaded");
+        let mut lens: Vec<usize> = map.values().map(|s| s.len()).collect();
+        lens.sort_unstable();
+        let (min, max) = (*lens.first().unwrap(), *lens.last().unwrap());
+        eprintln!("FMOD stored setups: {} | setup byte-lengths: min {min}, max {max}", map.len());
+
+        let configs = [
+            (1u16, 44_100u32),
+            (2, 44_100),
+            (1, 48_000),
+            (2, 48_000),
+            (1, 22_050),
+            (1, 32_000),
+        ];
+        let mut any_match = false;
+        for (ch, rate) in configs {
+            let n = rate as usize;
+            let mut inter = Vec::with_capacity(n * ch as usize);
+            for i in 0..n {
+                let t = i as f64 / rate as f64;
+                let s = ((2.0 * std::f64::consts::PI * 440.0 * t).sin() * 9000.0) as i16;
+                for _ in 0..ch {
+                    inter.push(s);
+                }
+            }
+            let ogg = encode_ogg_vorbis(&inter, ch, rate).expect("encode");
+            let packets = ogg_packets(&ogg);
+            let setup = &packets[2];
+            let body = &setup[7..]; // after 0x05"vorbis"
+            let exact = map.values().any(|s| s.as_ref() == setup.as_slice());
+            let body_match = map
+                .values()
+                .any(|s| s.as_ref() == body || (s.len() >= 7 && &s[7..] == body));
+            any_match |= exact || body_match;
+            eprintln!(
+                "cfg {ch}ch {rate}Hz: our setup {} bytes | exact_match={exact} body_match={body_match}",
+                setup.len()
+            );
+        }
+        eprintln!("ANY FMOD SETUP MATCH: {any_match}");
+        assert!(!map.is_empty());
     }
 }

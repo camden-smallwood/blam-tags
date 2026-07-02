@@ -305,6 +305,58 @@ mod tests {
         );
     }
 
+    /// Scan a real `.pck`: how many events resolve to 1 vs multiple sources?
+    /// (Gauges the "sequence/layered event plays only its first part" risk.)
+    /// `WWISE_PCK=/path/to/sfxbank.pck`.
+    #[test]
+    #[ignore]
+    fn event_source_count_distribution() {
+        use super::super::bnk::Bnk;
+        use super::super::pck::Pck;
+        let Some(path) = std::env::var_os("WWISE_PCK").map(std::path::PathBuf::from) else {
+            eprintln!("WWISE_PCK unset; skipping");
+            return;
+        };
+        let pck = Pck::open(&path).expect("open pck");
+        let mut index = HircIndex::new();
+        for entry in &pck.banks {
+            let bytes = pck.read_entry(entry).expect("read bank");
+            let Ok(bnk) = Bnk::parse(bytes) else { continue };
+            if let Some(hirc) = bnk.hirc_bytes() {
+                index.add_hirc(hirc);
+            }
+        }
+        index.finalize();
+
+        let event_ids: Vec<u32> = index
+            .types
+            .iter()
+            .filter(|&(_, &t)| t == T_EVENT)
+            .map(|(&id, _)| id)
+            .collect();
+        let (mut one, mut multi, mut zero, mut max) = (0u32, 0u32, 0u32, 0usize);
+        let mut multi_examples = Vec::new();
+        for id in &event_ids {
+            let n = index.resolve_event_id(*id).len();
+            max = max.max(n);
+            match n {
+                0 => zero += 1,
+                1 => one += 1,
+                _ => {
+                    multi += 1;
+                    if multi_examples.len() < 8 {
+                        multi_examples.push((*id, n));
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "events={} | 0-src={zero} 1-src={one} MULTI-src={multi} | max sources on one event={max}",
+            event_ids.len()
+        );
+        eprintln!("multi-source examples (id, count): {multi_examples:?}");
+    }
+
     fn push_object(hirc: &mut Vec<u8>, obj_type: u8, body: &[u8]) {
         hirc.push(obj_type);
         hirc.extend_from_slice(&(body.len() as u32).to_le_bytes());

@@ -19,9 +19,10 @@ flate2 = "1"
 lewton = { version = "0.10", optional = true }
 log = { version = "0.4", optional = true }
 opus = { version = "0.3", optional = true }
+vorbis_rs = { version = "0.5", optional = true }
 
 [features]
-audio = ["dep:lewton", "dep:log", "dep:opus"]
+audio = ["dep:lewton", "dep:log", "dep:opus", "dep:vorbis_rs"]
 
 [dev-dependencies]
 md5 = "0.7"

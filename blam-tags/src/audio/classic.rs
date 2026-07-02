@@ -206,6 +206,163 @@ pub fn decode_pcm(
     })
 }
 
+/// Encode interleaved 16-bit PCM to H2's length-prefixed Opus stream (inverse of
+/// [`decode_opus`]): `[u16 le len][opus packet]…`, 20 ms frames at 48 kHz. Input
+/// must already be 48 kHz (Opus is always 48 kHz; the extractor writes 48 kHz).
+pub fn encode_opus(samples: &[i16], channels: u16) -> Result<Vec<u8>, String> {
+    use opus::{Application, Channels, Encoder};
+    let (opus_channels, nch) = if channels >= 2 {
+        (Channels::Stereo, 2usize)
+    } else {
+        (Channels::Mono, 1usize)
+    };
+    let mut encoder = Encoder::new(OPUS_SAMPLE_RATE, opus_channels, Application::Audio)
+        .map_err(|e| format!("opus init: {e}"))?;
+    const FRAME: usize = 960; // 20 ms per channel @ 48 kHz
+    let frame_samples = FRAME * nch;
+    let mut out = Vec::new();
+    let mut packet = vec![0u8; 4000];
+    for chunk in samples.chunks(frame_samples) {
+        let frame: Vec<i16> = if chunk.len() == frame_samples {
+            chunk.to_vec()
+        } else {
+            let mut f = chunk.to_vec();
+            f.resize(frame_samples, 0); // pad the final short frame with silence
+            f
+        };
+        let n = encoder
+            .encode(&frame, &mut packet)
+            .map_err(|e| format!("opus encode: {e}"))?;
+        out.extend_from_slice(&(n as u16).to_le_bytes());
+        out.extend_from_slice(&packet[..n]);
+    }
+    if out.is_empty() {
+        return Err("no samples to encode".to_owned());
+    }
+    Ok(out)
+}
+
+/// Choose the IMA nibble for `sample` given the running predictor/step, then
+/// advance the state via the *same* [`ima_expand`] the decoder uses — so an
+/// encode→decode round-trip stays bit-synchronised.
+fn encode_ima_nibble(predictor: &mut i32, index: &mut i32, sample: i16) -> u8 {
+    let step = IMA_STEP[*index as usize];
+    let mut diff = sample as i32 - *predictor;
+    let mut nibble = 0u8;
+    if diff < 0 {
+        nibble = 8;
+        diff = -diff;
+    }
+    if diff >= step {
+        nibble |= 4;
+        diff -= step;
+    }
+    if diff >= step >> 1 {
+        nibble |= 2;
+        diff -= step >> 1;
+    }
+    if diff >= step >> 2 {
+        nibble |= 1;
+    }
+    ima_expand(predictor, index, nibble); // reconstruct exactly as decode does
+    nibble
+}
+
+/// Encode 1–2 per-channel buffers into an Xbox IMA stream (inverse of
+/// [`decode_xbox_pair`]): per `36*ch` block, a 4-byte header/ch (predictor `le16`
+/// = the block's first sample, `i8` step index, reserved 0), then 8×(4-byte/ch)
+/// data chunks. Each block spans 64 samples/ch (first verbatim + 63 nibbles + 1
+/// padding nibble, matching the decoder's drop-last). Step index carries across
+/// blocks for quality.
+fn encode_xbox_pair(per_channel: &[Vec<i16>], ch: usize) -> Vec<u8> {
+    let frames = per_channel.iter().map(Vec::len).min().unwrap_or(0);
+    let mut out = Vec::new();
+    let mut predictor = vec![0i32; ch];
+    let mut index = vec![0i32; ch];
+    let mut start = 0usize;
+    while start < frames {
+        // Header: predictor = sample 0 (verbatim); step index carries over.
+        for c in 0..ch {
+            let sample0 = per_channel[c][start];
+            predictor[c] = sample0 as i32;
+            out.extend_from_slice(&sample0.to_le_bytes());
+            out.push(index[c].clamp(0, 88) as u8);
+            out.push(0); // reserved
+        }
+        // 64 nibbles/ch: nibbles 0..62 encode samples start+1..=start+63, 63 = pad.
+        let mut nibbles = vec![[0u8; 64]; ch];
+        for c in 0..ch {
+            for (j, slot) in nibbles[c].iter_mut().enumerate() {
+                let sidx = start + 1 + j;
+                *slot = if j < 63 && sidx < frames {
+                    encode_ima_nibble(&mut predictor[c], &mut index[c], per_channel[c][sidx])
+                } else {
+                    0
+                };
+            }
+        }
+        for it in 0..8 {
+            for c in 0..ch {
+                for b in 0..4 {
+                    let lo = nibbles[c][it * 8 + b * 2] & 0x0f;
+                    let hi = nibbles[c][it * 8 + b * 2 + 1] & 0x0f;
+                    out.push(lo | (hi << 4));
+                }
+            }
+        }
+        start += 64;
+    }
+    out
+}
+
+/// Encode interleaved 16-bit PCM to an Xbox IMA-ADPCM stream (inverse of
+/// [`decode_xbox_adpcm`]). 1–2 ch = one interleaved stream; >2 ch = per-channel
+/// mono streams interleaved one 16-bit word at a time (matching the decoder).
+pub fn encode_xbox_adpcm(samples: &[i16], channels: u16, sample_rate: u32) -> Result<Vec<u8>, String> {
+    let _ = sample_rate; // rate is carried by the tag, not the ADPCM stream
+    let ch = channels.max(1) as usize;
+    if samples.len() < ch {
+        return Err("no samples to encode".to_owned());
+    }
+    let mut per_channel: Vec<Vec<i16>> = vec![Vec::with_capacity(samples.len() / ch); ch];
+    for (i, &s) in samples.iter().enumerate() {
+        per_channel[i % ch].push(s);
+    }
+    if ch <= 2 {
+        return Ok(encode_xbox_pair(&per_channel, ch));
+    }
+    // >2 channels: encode each as mono, interleave words round-robin.
+    let streams: Vec<Vec<u8>> = per_channel
+        .iter()
+        .map(|c| encode_xbox_pair(std::slice::from_ref(c), 1))
+        .collect();
+    let words = streams.iter().map(|s| s.len() / 2).max().unwrap_or(0);
+    let mut out = Vec::with_capacity(words * ch * 2);
+    for w in 0..words {
+        for s in &streams {
+            match s.get(w * 2..w * 2 + 2) {
+                Some(word) => out.extend_from_slice(word),
+                None => out.extend_from_slice(&[0, 0]),
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Encode interleaved 16-bit PCM back to raw bytes (inverse of [`decode_pcm`])
+/// for H2 "none" compression. `big_endian` matches the tag's compression variant.
+pub fn encode_pcm(samples: &[i16], big_endian: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(samples.len() * 2);
+    for &sample in samples {
+        if big_endian {
+            out.extend_from_slice(&sample.to_be_bytes());
+        } else {
+            out.extend_from_slice(&sample.to_le_bytes());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,5 +598,80 @@ mod tests {
             pcm.duration_secs()
         );
         assert!(pcm.frame_count() > 0);
+    }
+
+    /// `encode_opus` → `decode_opus` reproduces a sine within lossy tolerance
+    /// (proves the length-prefixed framing round-trips through libopus).
+    #[test]
+    fn opus_encode_decode_roundtrip() {
+        // 1 s mono 440 Hz sine at 48 kHz.
+        let n = 48_000;
+        let input: Vec<i16> = (0..n)
+            .map(|i| {
+                let t = i as f64 / 48_000.0;
+                (( (2.0 * std::f64::consts::PI * 440.0 * t).sin()) * 12000.0) as i16
+            })
+            .collect();
+        let encoded = encode_opus(&input, 1).expect("encode");
+        // Framed as [u16 len][packet]…
+        assert!(encoded.len() > 4);
+        let pcm = decode_opus(&encoded, 1).expect("decode");
+        assert_eq!(pcm.channels, 1);
+        assert_eq!(pcm.sample_rate, 48_000);
+        // Within ~50 ms of the original length (Opus lookahead + frame padding).
+        assert!(
+            (pcm.samples.len() as i64 - n as i64).abs() < 2400,
+            "len {} vs {}",
+            pcm.samples.len(),
+            n
+        );
+        // Energy preserved (lossy, so compare RMS, not samples).
+        let rms = |s: &[i16]| (s.iter().map(|&x| (x as f64).powi(2)).sum::<f64>() / s.len() as f64).sqrt();
+        let (a, b) = (rms(&input), rms(&pcm.samples));
+        assert!((a - b).abs() / a < 0.2, "rms {a} vs {b}");
+    }
+
+    /// `encode_xbox_adpcm` → `decode_xbox_adpcm` reproduces a sine within IMA
+    /// tolerance for mono and stereo (proves block framing + encoder/decoder sync).
+    #[test]
+    fn xbox_adpcm_encode_decode_roundtrip() {
+        let rms = |s: &[i16]| {
+            (s.iter().map(|&x| (x as f64).powi(2)).sum::<f64>() / s.len().max(1) as f64).sqrt()
+        };
+        for ch in [1u16, 2] {
+            let frames = 4096;
+            let mut input = Vec::with_capacity(frames * ch as usize);
+            for i in 0..frames {
+                let t = i as f64 / 22_050.0;
+                let s = ((2.0 * std::f64::consts::PI * 300.0 * t).sin() * 10000.0) as i16;
+                for c in 0..ch {
+                    input.push(if c == 0 { s } else { s / 2 });
+                }
+            }
+            let enc = encode_xbox_adpcm(&input, ch, 22_050).expect("encode");
+            let pcm = decode_xbox_adpcm(&enc, ch, 22_050).expect("decode");
+            assert_eq!(pcm.channels, ch);
+            // Length within a block of the original (padding at the tail).
+            assert!(
+                (pcm.samples.len() as i64 - input.len() as i64).abs() <= 64 * ch as i64,
+                "ch{ch}: len {} vs {}",
+                pcm.samples.len(),
+                input.len()
+            );
+            let (a, b) = (rms(&input), rms(&pcm.samples));
+            assert!((a - b).abs() / a < 0.15, "ch{ch}: rms {a} vs {b}");
+        }
+    }
+
+    /// `encode_pcm` is the exact inverse of `decode_pcm` (both endiannesses).
+    #[test]
+    fn pcm_encode_decode_roundtrip() {
+        let samples: Vec<i16> = vec![0, 1, -1, 32767, -32768, 12345, -6789, 100];
+        for big_endian in [false, true] {
+            let bytes = encode_pcm(&samples, big_endian);
+            assert_eq!(bytes.len(), samples.len() * 2);
+            let pcm = decode_pcm(&bytes, 2, 44_100, big_endian).unwrap();
+            assert_eq!(pcm.samples, samples, "big_endian={big_endian}");
+        }
     }
 }
