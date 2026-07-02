@@ -35,7 +35,9 @@
 
 use crate::api::TagStruct;
 use crate::file::TagFile;
-use crate::render_model::{read_geometry, Geometry, RenderModelError};
+use crate::render_model::{
+    extract_render_geometry_meshes, read_geometry, Geometry, RenderMesh, RenderModelError,
+};
 
 const PMDF_GROUP: [u8; 4] = *b"pmdf";
 
@@ -85,6 +87,13 @@ pub struct ParticleModel {
     /// Shared render geometry (meshes, parts, compression, vertex/index
     /// buffers) decoded by the same path render_model uses.
     pub render_geometry: Geometry,
+    /// Render-ready meshes (vertices decompressed through the compression
+    /// bounds, strips decoded to triangle lists) — the same layer render_model
+    /// / decorators consume. One mesh-particle instance is the union of all of
+    /// these. Consumers reconstruct the GPU particle-model vertex stream + the
+    /// per-variant `vertices_per_particle` (`variant.end_index`, a tool.exe
+    /// cache output absent off-disk) from this. Empty on a decode error.
+    pub render_meshes: Vec<RenderMesh>,
     /// Per-authored-variant packed GPU registers. One entry per
     /// `m_gpu_data/m_variants` element; `registers` empty in source tags.
     pub variants: Vec<GpuVariant>,
@@ -100,8 +109,15 @@ impl ParticleModel {
     }
 
     pub fn from_struct(s: &TagStruct<'_>) -> Result<Self, ParticleModelError> {
+        // Reconstruct the render-ready meshes from the `render geometry` root
+        // (the same path render_model / decorators use). A decode failure leaves
+        // it empty — the particle simply has no drawable model geometry.
+        let render_meshes = Self::render_geometry_root(s)
+            .and_then(|root| extract_render_geometry_meshes(&root).ok())
+            .unwrap_or_default();
         Ok(Self {
             render_geometry: read_geometry(s)?,
+            render_meshes,
             variants: read_gpu_variants(s),
         })
     }

@@ -962,11 +962,18 @@ impl TagFunction {
 
     pub fn header(&self) -> &TagFunctionHeader { self.kind.header() }
 
-    /// The primary per-type curve. Consumers that read the raw compact
-    /// (e.g. the GPU particle property compiler) match on this. The
-    /// optional RANGE second curve is intentionally not exposed here —
-    /// it only affects scalar `evaluate*`.
+    /// The primary per-type curve (graph 0 / green). Consumers that read the raw
+    /// compact (e.g. the GPU particle property compiler) match on this. For the
+    /// RANGE second curve (graph 1 / red) see [`Self::ranged_second`].
     pub fn kind(&self) -> &FunctionKind { &self.kind }
+
+    /// The RANGE second curve — the engine's `function_array[1]` that
+    /// `c_function_definition::get_gpu_data(array_index = 1)` bakes as the red
+    /// graph, and that scalar `evaluate_scalar_ranged` interpolates toward.
+    /// `None` for unranged or Constant functions.
+    pub fn ranged_second(&self) -> Option<&FunctionKind> {
+        self.ranged_second.as_deref()
+    }
 
     pub fn function_type(&self)    -> FunctionType    { self.header().function_type }
     pub fn flags(&self)            -> FunctionFlags   { self.header().flags }
