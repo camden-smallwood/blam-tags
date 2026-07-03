@@ -297,6 +297,17 @@ pub enum EffectFlags {
     #[strum(serialize = "force use own lightprobe")] ForceUseOwnLightprobe = 7,
     #[strum(serialize = "heavy performance")] HeavyPerformance = 8,
     #[strum(serialize = "half resolution")] HalfResolution = 9,
+    // --- runtime flags (Ares `e_effect_definition_flags` bits 10+) ---
+    // Not authored in the tag (absent from the schema JSON, which ends at
+    // `half resolution`); set by `effect_postprocess` at load. Included here so
+    // the runtime `Flags<EffectFlags, u32>` word can carry them, matching the
+    // engine's single flags enum spanning on-disk (0-9) + runtime (10+).
+    /// `_effect_samples_lightmap_bit` — any of the effect's particles tint from
+    /// the lightmap. Gates `effect_create_lighting_samples` (dllcache 0x400).
+    #[strum(disabled)] SamplesLightmap = 10,
+    /// `_effect_samples_diffuse_texture_bit` — any particle tints from the
+    /// diffuse texture. Gates `effect_create_lighting_samples` (dllcache 0x800).
+    #[strum(disabled)] SamplesDiffuseTexture = 11,
 }
 
 /// `event_flags` (long_flags).
