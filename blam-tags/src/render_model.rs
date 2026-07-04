@@ -1274,13 +1274,19 @@ fn read_gbxmodel_nodes(root: &TagStruct<'_>) -> Vec<Node> {
     for i in 0..block.len() {
         let n = block.element(i).unwrap();
         let t = n.read_vec3("default translation");
+        // CE stores each node's `default rotation` as the INVERSE of its
+        // parent-relative bind rotation (General-101's toolset applies
+        // `.inverted()` on Halo 1 only — H2/H3 use it directly). Conjugate
+        // it here so forward-chaining reproduces the object-space bind pose
+        // the vertices are baked in.
+        let r = n.read_quat("default rotation");
         out.push(Node {
             name: n.read_string("name").unwrap_or_default(),
             parent_node: n.read_int_any("parent node").unwrap_or(-1) as i16,
             first_child_node: n.read_int_any("first child node").unwrap_or(-1) as i16,
             next_sibling_node: n.read_int_any("next sibling node").unwrap_or(-1) as i16,
             default_translation: RealPoint3d { x: t.i, y: t.j, z: t.k },
-            default_rotation: n.read_quat("default rotation"),
+            default_rotation: RealQuaternion { i: -r.i, j: -r.j, k: -r.k, w: r.w },
             inverse_forward: RealVector3d { i: 0.0, j: 0.0, k: 0.0 },
             inverse_left: RealVector3d { i: 0.0, j: 0.0, k: 0.0 },
             inverse_up: RealVector3d { i: 0.0, j: 0.0, k: 0.0 },
