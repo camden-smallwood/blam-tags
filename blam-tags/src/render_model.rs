@@ -896,11 +896,11 @@ impl RenderModel {
             regions: read_gbxmodel_regions(&root, geometry_count)?,
             instance_placements: Vec::new(),
             // CE nodes use a different layout (`default translation` is a
-            // real_vector_3d, not real_point_3d) so the H3 `read_nodes` panics on
-            // them. Nodes are only needed for markers, which CE doesn't surface in
-            // the preview yet — leave empty.
-            nodes: Vec::new(),
-            marker_groups: Vec::new(),
+            // real_vector_3d, not real_point_3d) and carry none of the H3
+            // inverse-bind fields, so they need their own reader. They provide
+            // the bind pose that places markers.
+            nodes: read_gbxmodel_nodes(&root),
+            marker_groups: read_gbxmodel_markers(&root),
             materials: read_gbxmodel_materials(&root),
             render_geometry: Geometry::default(),
             sky_lights: Vec::new(),
@@ -1260,6 +1260,81 @@ fn read_gbxmodel_regions(
         out.push(Region { name, permutations });
     }
     Ok(out)
+}
+
+/// CE `gbxmodel` nodes → [`Node`]s. CE stores `default translation` as a
+/// `real_vector_3d` (H3 uses `real_point_3d`) and carries none of the H3
+/// inverse-bind fields; only the hierarchy + default pose are needed to place
+/// markers, so the inverse-bind fields are left zeroed.
+fn read_gbxmodel_nodes(root: &TagStruct<'_>) -> Vec<Node> {
+    let Some(block) = root.field("nodes").and_then(|f| f.as_block()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(block.len());
+    for i in 0..block.len() {
+        let n = block.element(i).unwrap();
+        let t = n.read_vec3("default translation");
+        out.push(Node {
+            name: n.read_string("name").unwrap_or_default(),
+            parent_node: n.read_int_any("parent node").unwrap_or(-1) as i16,
+            first_child_node: n.read_int_any("first child node").unwrap_or(-1) as i16,
+            next_sibling_node: n.read_int_any("next sibling node").unwrap_or(-1) as i16,
+            default_translation: RealPoint3d { x: t.i, y: t.j, z: t.k },
+            default_rotation: n.read_quat("default rotation"),
+            inverse_forward: RealVector3d { i: 0.0, j: 0.0, k: 0.0 },
+            inverse_left: RealVector3d { i: 0.0, j: 0.0, k: 0.0 },
+            inverse_up: RealVector3d { i: 0.0, j: 0.0, k: 0.0 },
+            inverse_position: RealPoint3d { x: 0.0, y: 0.0, z: 0.0 },
+            inverse_scale: 1.0,
+            distance_from_parent: n.read_real("node distance from parent").unwrap_or(0.0),
+        });
+    }
+    out
+}
+
+/// CE `gbxmodel` markers → [`MarkerGroup`]s. CE has no top-level marker block;
+/// each marker lives under `regions[i]/permutations[j]/markers[k]` (name, node
+/// index, local transform). Walk the region/permutation grid and group
+/// instances by marker name into the H3 `marker groups` shape the preview
+/// consumes, stamping each instance with its region/permutation indices.
+fn read_gbxmodel_markers(root: &TagStruct<'_>) -> Vec<MarkerGroup> {
+    let Some(regions) = root.field("regions").and_then(|f| f.as_block()) else {
+        return Vec::new();
+    };
+    let mut groups: Vec<MarkerGroup> = Vec::new();
+    for ri in 0..regions.len() {
+        let region = regions.element(ri).unwrap();
+        let Some(perms) = region.field("permutations").and_then(|f| f.as_block()) else {
+            continue;
+        };
+        for pi in 0..perms.len() {
+            let perm = perms.element(pi).unwrap();
+            let Some(markers) = perm.field("markers").and_then(|f| f.as_block()) else {
+                continue;
+            };
+            for mi in 0..markers.len() {
+                let m = markers.element(mi).unwrap();
+                let name = m.read_string("name").unwrap_or_default();
+                let t = m.read_vec3("translation");
+                let marker = Marker {
+                    region_index: ri as i8,
+                    permutation_index: pi as i8,
+                    node_index: m.read_int_any("node index").unwrap_or(-1) as i8,
+                    translation: RealPoint3d { x: t.i, y: t.j, z: t.k },
+                    rotation: m.read_quat("rotation"),
+                    scale: 1.0,
+                };
+                match groups.iter_mut().find(|g| g.name == name) {
+                    Some(g) => g.markers.push(marker),
+                    None => groups.push(MarkerGroup {
+                        name,
+                        markers: vec![marker],
+                    }),
+                }
+            }
+        }
+    }
+    groups
 }
 
 /// CE `gbxmodel` `shaders[]` → [`Material`]s. Material `i` ↔ `shaders[i]`; a
