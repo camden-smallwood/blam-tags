@@ -28,9 +28,9 @@ use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use blam_tags::{AssFile, AssObjectPayload, JmsFile, TagFieldData, TagFile};
+use blam_tags::{AssFile, JmsFile, TagFieldData, TagFile};
 
-use crate::context::CliContext;
+use crate::context::{CliContext, CtxResolver};
 use blam_tags::paths::{tag_ref_path, tag_stem};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -378,138 +378,33 @@ fn ass_summary(ass: &AssFile) -> String {
     )
 }
 
-/// Walk a scenario's `structure_bsps[]`, pair each entry with its
-/// stli, and emit one ASS per BSP.
-///
-/// Output layout:
+/// Walk a scenario's `structure_bsps[]` and emit one ASS (H2/H3) or
+/// render + collision JMS (Halo CE) per BSP, via the shared
+/// [`blam_tags::extract::geometry`] orchestration. Output layout:
 /// - default: `<DIR>/<scenario_stem>/structure/<bsp_stem>.ASS`
 /// - `--flat`: `<DIR>/<scenario_stem>.<bsp_stem>.ass`
 fn run_scenario(ctx: &mut CliContext, output: Option<&str>, flat: bool) -> Result<()> {
-    use blam_tags::game::Game;
     let loaded = ctx.loaded("extract-geometry")?;
     let scenario_stem = tag_stem(&loaded.path, "scenario");
     let out_root = output.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    let is_ce = Game::of(&loaded.tag) == Game::Halo1;
-
-    let bsps_block = loaded.tag.root().field_path("structure bsps").and_then(|f| f.as_block())
-        .context("scenario has no `structure bsps` block")?;
-    if bsps_block.is_empty() {
-        anyhow::bail!("scenario has zero structure_bsps entries — nothing to extract");
+    let resolver = CtxResolver { ctx: &*ctx };
+    let summary = blam_tags::extract::geometry::scenario_geometry(
+        &loaded.tag,
+        &resolver,
+        &out_root,
+        &scenario_stem,
+        flat,
+    )?;
+    for emitted in &summary.emitted {
+        println!(
+            "{}: [bsp{}] {}",
+            emitted.path.display(),
+            emitted.bsp_index,
+            emitted.summary,
+        );
     }
-
-    let mut emitted = Vec::new();
-    let mut warnings = Vec::new();
-
-    for bi in 0..bsps_block.len() {
-        let entry = bsps_block.element(bi).unwrap();
-        let bsp_ref_path = tag_ref_path(&entry, "structure bsp");
-        let lighting_ref_path = tag_ref_path(&entry, "structure lighting_info");
-
-        let Some(bsp_rel) = bsp_ref_path else {
-            warnings.push(format!("structure_bsps[{bi}]: no structure_bsp ref — skipped"));
-            continue;
-        };
-
-        // Halo CE: emit render + collision JMS per BSP (no ASS, no stli).
-        if is_ce {
-            let bsp_tag = match ctx.load_referenced_tag(&bsp_rel, "scenario_structure_bsp") {
-                Ok(t) => t,
-                Err(e) => {
-                    warnings.push(format!("structure_bsps[{bi}]: read `{bsp_rel}` failed — {e}"));
-                    continue;
-                }
-            };
-            let bsp_stem = bsp_rel.rsplit('\\').next().unwrap_or("bsp").to_owned();
-            let bsp_root = if flat {
-                out_root.clone()
-            } else {
-                out_root.join(&scenario_stem).join("structure")
-            };
-            let prefix = if flat { format!("{scenario_stem}.{bsp_stem}") } else { bsp_stem.clone() };
-            match emit_ce_bsp_jms(&bsp_tag, &bsp_root, &prefix, flat) {
-                Ok(lines) => for l in lines { emitted.push((bi, PathBuf::from(""), l)); }
-                Err(e) => warnings.push(format!("structure_bsps[{bi}]: `{bsp_rel}` — {e}")),
-            }
-            continue;
-        }
-        let bsp_tag = match ctx.load_referenced_tag(&bsp_rel, "scenario_structure_bsp") {
-            Ok(t) => t,
-            Err(e) => {
-                warnings.push(format!("structure_bsps[{bi}]: read `{bsp_rel}` failed — {e}"));
-                continue;
-            }
-        };
-
-        // Halo 2 BSPs use the section-format reader + ASS v2 and carry
-        // no re-extractable structure lights (H2 baked lighting into
-        // lightmaps; there is no stli/generic-light block to recover).
-        // Halo 3 uses the gen3 reader + v2-vs-v7... v7, and layers in
-        // the paired stli's GENERIC_LIGHTs.
-        let is_h2 = Game::of(&loaded.tag) == Game::Halo2;
-        let ass_version: u32 = if is_h2 { 2 } else { 7 };
-        let mut ass = if is_h2 {
-            AssFile::from_scenario_structure_bsp_h2(&bsp_tag)
-                .with_context(|| format!("structure_bsps[{bi}]: build H2 ASS from `{bsp_rel}`"))?
-        } else {
-            AssFile::from_scenario_structure_bsp(&bsp_tag)
-                .with_context(|| format!("structure_bsps[{bi}]: build ASS from `{bsp_rel}`"))?
-        };
-
-        if is_h2 {
-            // H2 has no stli; nothing to layer in.
-        } else if let Some(lighting_rel) = lighting_ref_path {
-            match ctx.load_referenced_tag(&lighting_rel, "scenario_structure_lighting_info") {
-                Ok(stli) => {
-                    if let Err(e) = ass.add_lights_from_stli(&stli) {
-                        warnings.push(format!("structure_bsps[{bi}]: lighting layer failed — {e}"));
-                    }
-                }
-                Err(e) => warnings.push(format!(
-                    "structure_bsps[{bi}]: lighting tag `{lighting_rel}` unreadable — {e}"
-                )),
-            }
-        } else {
-            warnings.push(format!("structure_bsps[{bi}]: no lighting_info ref — emitting without lights"));
-        }
-
-        let bsp_stem = bsp_rel.rsplit('\\').next().unwrap_or("bsp").to_owned();
-        let path = if flat {
-            out_root.join(format!("{scenario_stem}.{bsp_stem}.ass"))
-        } else {
-            out_root.join(&scenario_stem).join("structure").join(format!("{bsp_stem}.ASS"))
-        };
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
-        }
-        let mut writer = BufWriter::new(File::create(&path)
-            .with_context(|| format!("create {}", path.display()))?);
-        ass.write_version(&mut writer, ass_version)?;
-        let total_verts: usize = ass.objects.iter().map(|o| o.vertices_len()).sum();
-        let total_tris: usize = ass.objects.iter().map(|o| o.triangles_len()).sum();
-        let light_count = ass.objects.iter()
-            .filter(|o| matches!(&o.payload, AssObjectPayload::GenericLight(_))).count();
-        emitted.push((bi, path, format!(
-            "{} mats, {} objects ({} lights), {} instances, {} verts, {} tris",
-            ass.materials.len(), ass.objects.len(), light_count,
-            ass.instances.len(), total_verts, total_tris,
-        )));
-    }
-
-    for (bi, path, summary) in &emitted {
-        // CE lines are self-contained (path already embedded); ASS lines
-        // carry their path in `path` and need the `[bspN]` prefix.
-        if path.as_os_str().is_empty() {
-            println!("{summary}");
-        } else {
-            println!("{}: [bsp{bi}] {}", path.display(), summary);
-        }
-    }
-    for w in &warnings {
+    for w in &summary.warnings {
         eprintln!("warning: {w}");
-    }
-    if emitted.is_empty() {
-        anyhow::bail!("no geometry emitted — all structure_bsps entries failed to load");
     }
     Ok(())
 }
@@ -593,35 +488,6 @@ fn run_physics(ctx: &mut CliContext, output: Option<&str>, flat: bool) -> Result
     Ok(())
 }
 
-/// Emit a Halo CE structure BSP as JMS. CE compiles levels from JMS
-/// (not ASS — that's H2+), so this emits a render JMS and a collision
-/// JMS per BSP. `stem` names the output files; returns a one-line
-/// summary per file written.
-fn emit_ce_bsp_jms(
-    tag: &TagFile,
-    out_root: &Path,
-    stem: &str,
-    flat: bool,
-) -> Result<Vec<String>> {
-    use blam_tags::game::Game;
-    let version = Game::Halo1.jms_version();
-    let mut lines = Vec::new();
-
-    let render = JmsFile::from_scenario_structure_bsp_ce(tag)
-        .context("build CE structure BSP render JMS")?;
-    let rpath = output_path_for(out_root, stem, Kind::Render, flat, "jms");
-    write_to(&rpath, |w| Ok(render.write(w, version)?))?;
-    lines.push(format!("{}: [render: JMS] {}", rpath.display(), jms_summary(&render)));
-
-    let coll = JmsFile::from_scenario_structure_bsp_ce_collision(tag)
-        .context("build CE structure BSP collision JMS")?;
-    let cpath = output_path_for(out_root, stem, Kind::Collision, flat, "jms");
-    write_to(&cpath, |w| Ok(coll.write(w, version)?))?;
-    lines.push(format!("{}: [collision] {}", cpath.display(), jms_summary(&coll)));
-
-    Ok(lines)
-}
-
 fn run_sbsp(ctx: &mut CliContext, output: Option<&str>) -> Result<()> {
     use blam_tags::game::Game;
     let loaded = ctx.loaded("extract-geometry")?;
@@ -632,8 +498,10 @@ fn run_sbsp(ctx: &mut CliContext, output: Option<&str>) -> Result<()> {
 
     // Halo CE level geometry compiles from JMS, not ASS — dispatch by engine.
     if game == Game::Halo1 {
-        for line in emit_ce_bsp_jms(&loaded.tag, &out_root, &stem, false)? {
-            println!("{line}");
+        for (path, summary) in
+            blam_tags::extract::geometry::emit_ce_bsp_jms(&loaded.tag, &out_root, &stem, false)?
+        {
+            println!("{}: {summary}", path.display());
         }
         return Ok(());
     }

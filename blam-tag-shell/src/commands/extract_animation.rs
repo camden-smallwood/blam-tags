@@ -62,10 +62,14 @@ use anyhow::{Context, Result};
 use serde_json::json;
 
 use blam_tags::animation::classic::{CeAnimation, CeAnimations};
-use blam_tags::{Animation, AnimationGraph, AnimationGroup, JmaKind, NodeTransform, Skeleton, TagFile};
+use blam_tags::extract::animation::{
+    additional_node_data_is_object_space, build_defaults, jma_kind_for, resolve_animation_inputs,
+    sanitize, write_ce_group_jma, write_group_jma,
+};
+use blam_tags::{Animation, AnimationGraph, AnimationGroup, JmaKind, Skeleton, TagFile};
 
-use crate::context::CliContext;
-use blam_tags::paths::{derive_tags_root, resolve_tag_path, tag_ref_path, tag_stem};
+use crate::context::{CliContext, CtxResolver};
+use blam_tags::paths::tag_stem;
 
 /// Output format selector for [`run`]. `Jma` writes a JMA-family
 /// text file (kind picked from the animation's metadata); `Json`
@@ -93,13 +97,12 @@ pub fn run(
         return run_ce(&loaded.tag, &loaded.path, anim, output, flat, format);
     }
 
-    let tags_root = derive_tags_root(&loaded.path)
-        .context("failed to derive tags root from input path — input must live under a `tags/` directory")?;
-
-    // Resolve the input to an owned (jmad, optional render_model) pair.
-    // For a direct jmad input, we don't load a fresh copy — we reuse
-    // `loaded.tag` via the `Option::None` branch.
-    let resolved = resolve_inputs(&loaded.tag, &tags_root)?;
+    // Resolve the input to an owned (jmad, optional render_model) pair via
+    // the shared orchestration, using the CLI's filesystem/cache loader.
+    // For a direct jmad input no fresh copy is loaded — `resolved.jmad` is
+    // `None` and we reuse `loaded.tag`.
+    let resolver = CtxResolver { ctx: &*ctx };
+    let resolved = resolve_animation_inputs(&loaded.tag, &resolver)?;
     let jmad_tag: &TagFile = resolved.jmad.as_ref().unwrap_or(&loaded.tag);
     let render_model: Option<&TagFile> = resolved.render_model.as_ref();
 
@@ -188,16 +191,28 @@ pub fn run(
         match format {
             Format::Json if json_to_stdout => write_json_stdout(group, &clip)?,
             Format::Json => write_json_file(group, &clip, &destinations[i])?,
-            Format::Jma => write_jma(
-                group,
-                &clip,
-                &animation,
-                &graph,
-                &skeleton,
-                &defaults,
-                &stem,
-                &destinations[i],
-            )?,
+            Format::Jma => {
+                write_group_jma(
+                    group,
+                    &clip,
+                    &animation,
+                    &graph,
+                    &skeleton,
+                    &defaults,
+                    &stem,
+                    &destinations[i],
+                )?;
+                let kind = jma_kind_for(group);
+                println!(
+                    "{}: {} frames ({}+1) × {} bones [{}]  movement={:?}",
+                    destinations[i].display(),
+                    clip.frame_count.saturating_add(1),
+                    clip.frame_count,
+                    skeleton.len(),
+                    kind.extension(),
+                    clip.movement.kind,
+                );
+            }
         }
     }
     if skipped > 0 {
@@ -281,22 +296,9 @@ fn run_ce(
 
         // Base kinds pose against the rest defaults; overlay/replacement
         // compose deltas onto the rest pose (CE base resolution is N/A).
-        let (pose, leading) = match kind {
-            JmaKind::Jmo => {
-                let (reference, body) = clip.overlay_pose(&skeleton, &defaults);
-                (body, reference)
-            }
-            JmaKind::Jmr => (clip.replacement_pose(&skeleton, &defaults), defaults.clone()),
-            _ => (clip.pose(&skeleton, Some(&defaults)), defaults.clone()),
-        };
-
-        ensure_parent_dir(&dest)?;
-        let mut w = BufWriter::new(
-            File::create(&dest).with_context(|| format!("create {}", dest.display()))?);
-        pose.write_jma(&mut w, &skeleton, &leading, group.node_list_checksum, kind, &stem, Some(&clip.movement))?;
-        w.flush().ok();
+        write_ce_group_jma(group, &clip, &skeleton, &defaults, &stem, &dest)?;
         println!("{}: {} frames × {} bones [{}]  movement={:?}",
-            dest.display(), pose.frames.len(), skeleton.len(), kind.extension(), clip.movement.kind);
+            dest.display(), clip.frame_count, skeleton.len(), kind.extension(), clip.movement.kind);
     }
     Ok(())
 }
@@ -312,169 +314,6 @@ fn ce_destination(target: &OutputTarget, stem: &str, filename: &str, flat: bool)
         (OutputTarget::Default, true) => PathBuf::from(flat_filename),
         (OutputTarget::Default, false) => PathBuf::from(stem).join("animations").join(filename),
     }
-}
-
-/// Owned tags resolved from the input. Direct-jmad inputs leave
-/// `jmad` as `None` and the caller reuses the `loaded.tag` borrow;
-/// .model / object-inheriting inputs populate both `jmad` (loaded
-/// from the `animation` ref) and optionally `render_model` (from the
-/// `render model` ref).
-struct ResolvedInputs {
-    jmad: Option<TagFile>,
-    render_model: Option<TagFile>,
-}
-
-/// Dispatch on input group_tag to find the jmad + (optional)
-/// render_model. Three accepted shapes:
-///   - `jmad` → use loaded tag as-is; no render_model.
-///   - `hlmt` → follow `animation` + `render model` refs.
-///   - any other tag with a `model` field (object-inheriting bipd /
-///     vehi / scen / weap / eqip / …) → follow `model` to a hlmt,
-///     then recurse the hlmt case.
-fn resolve_inputs(tag: &TagFile, tags_root: &Path) -> Result<ResolvedInputs> {
-    let group = tag.header.group_tag.to_be_bytes();
-    match &group {
-        b"jmad" => Ok(ResolvedInputs { jmad: None, render_model: None }),
-        b"hlmt" => resolve_from_model(tag, tags_root),
-        _ => {
-            let model_rel = find_object_model_ref(tag).with_context(|| format!(
-                "input group `{}` has no `model` ref — pass a .model_animation_graph, a .model, \
-                 or any object-inheriting tag (.biped, .scenery, .weapon, …)",
-                std::str::from_utf8(&group).unwrap_or("?"),
-            ))?;
-            let model_path = resolve_tag_path(tags_root, &model_rel, "model");
-            let model_tag = TagFile::read(&model_path)
-                .with_context(|| format!("read .model {}", model_path.display()))?;
-            resolve_from_model(&model_tag, tags_root)
-        }
-    }
-}
-
-/// Find the inherited `model` tag_reference on an object-inheriting
-/// tag. The path depends on the inheritance chain — every
-/// object-inheriting group uses one of these four:
-///   - `unit/object/model` — biped, vehicle, giant
-///     (extends unit extends object).
-///   - `item/object/model` — weapon, equipment
-///     (extends item extends object).
-///   - `device/object/model` — device_control, device_machine,
-///     device_terminal (extends device extends object).
-///   - `object/model` — scenery, crate, creature, projectile,
-///     effect_scenery, sound_scenery, item, unit, device
-///     (extends object directly, or is itself an abstract base).
-/// We probe in that order and use the first match.
-fn find_object_model_ref(tag: &TagFile) -> Option<String> {
-    use blam_tags::TagFieldData;
-    const PATHS: &[&str] = &[
-        "unit/object/model",
-        "item/object/model",
-        "device/object/model",
-        "object/model",
-    ];
-    let root = tag.root();
-    PATHS.iter().find_map(|p| match root.field_path(p)?.value()? {
-        TagFieldData::TagReference(r) => r.group_tag_and_name
-            .map(|(_, name)| name)
-            .filter(|s| !s.is_empty()),
-        _ => None,
-    })
-}
-
-/// Pull `animation` + `render model` refs off a hlmt tag. The
-/// render_model ref may be null/missing on tags that ship without a
-/// rendered representation (rare); in that case we drop back to
-/// additional_node_data only.
-fn resolve_from_model(model_tag: &TagFile, tags_root: &Path) -> Result<ResolvedInputs> {
-    let jmad_rel = tag_ref_path(&model_tag.root(), "animation")
-        .context("`.model` has no `animation` ref — nothing to extract")?;
-    let jmad_path = resolve_tag_path(tags_root, &jmad_rel, "model_animation_graph");
-    let jmad = TagFile::read(&jmad_path)
-        .with_context(|| format!("read model_animation_graph {}", jmad_path.display()))?;
-
-    let render_model = if let Some(render_rel) = tag_ref_path(&model_tag.root(), "render model") {
-        let path = resolve_tag_path(tags_root, &render_rel, "render_model");
-        Some(TagFile::read(&path)
-            .with_context(|| format!("read render_model {}", path.display()))?)
-    } else {
-        None
-    };
-
-    Ok(ResolvedInputs { jmad: Some(jmad), render_model })
-}
-
-/// Build a per-skeleton-bone defaults table. Render_model entries
-/// (when supplied) take priority; gaps fall through to the jmad's
-/// `additional node data` block; bones absent from both fall back
-/// to identity. Per Foundry maintainer: render_model values are
-/// authoritative; additional_node_data is a denormalized cache that
-/// can drift on rare occasions but is the only source available
-/// when extracting from a jmad directly.
-fn build_defaults(
-    skeleton: &Skeleton,
-    jmad: &TagFile,
-    render_model: Option<&TagFile>,
-    object_space_anim_data: bool,
-) -> Vec<NodeTransform> {
-    // Lower priority: jmad's `additional node data`, indexed per skeleton
-    // node. Reach/H4 store these in object/model space; H2/H3 store them
-    // parent-local. Build the per-node table first so we can convert the
-    // whole object-space set to local in one parent-aware pass.
-    let mut anim_by_name: HashMap<String, NodeTransform> = HashMap::new();
-    if let Some(block) = jmad.root().field_path("additional node data").and_then(|f| f.as_block()) {
-        for i in 0..block.len() {
-            let Some(elem) = block.element(i) else { continue };
-            let Some(name) = elem.read_string_id("node name") else { continue };
-            if name.is_empty() { continue; }
-            anim_by_name.insert(name, NodeTransform {
-                translation: elem.read_point3d("default translation"),
-                rotation: elem.read_quat("default rotation"),
-                scale: elem.read_real("default scale").unwrap_or(1.0),
-            });
-        }
-    }
-    let mut anim: Vec<NodeTransform> = skeleton.nodes.iter()
-        .map(|n| anim_by_name.get(&n.name).copied().unwrap_or(NodeTransform::IDENTITY))
-        .collect();
-    // Reach/H4 `additional node data` is object-space → convert to local
-    // (Foundry's world_to_local). H2/H3 are already local — leave as-is.
-    if object_space_anim_data {
-        anim = skeleton.object_to_local(&anim);
-    }
-
-    // Higher priority: render_model `nodes[]` (always parent-local). Build
-    // a name lookup and overlay it on top of the (now-local) anim defaults.
-    let mut rm_by_name: HashMap<String, NodeTransform> = HashMap::new();
-    if let Some(rm) = render_model
-        && let Some(block) = rm.root().field_path("nodes").and_then(|f| f.as_block())
-    {
-        for i in 0..block.len() {
-            let Some(elem) = block.element(i) else { continue };
-            let Some(name) = elem.read_string_id("name") else { continue };
-            if name.is_empty() { continue; }
-            rm_by_name.insert(name, NodeTransform {
-                translation: elem.read_point3d("default translation"),
-                rotation: elem.read_quat("default rotation"),
-                // Render_model's `default scale` is buried inside the
-                // inverse matrix per the schema's "Old Mistakes Die Hard"
-                // warning. Animation rest poses have scale=1.0 in practice.
-                scale: 1.0,
-            });
-        }
-    }
-
-    skeleton.nodes.iter().enumerate()
-        .map(|(i, node)| rm_by_name.get(&node.name).copied().unwrap_or(anim[i]))
-        .collect()
-}
-
-/// Whether a jmad's `additional node data` rest pose is in object/model
-/// space (Reach/H4) rather than parent-local (H2/H3). Detected by the
-/// Reach-style packed-data-sizes layout, which Reach and Halo 4 share.
-fn additional_node_data_is_object_space(animation: &Animation<'_>) -> bool {
-    use blam_tags::animation::SizeLayout;
-    animation.iter().any(|g| {
-        g.data_sizes.as_ref().map(|d| d.layout()) == Some(SizeLayout::Reach)
-    })
 }
 
 /// Resolved meaning of the `--output` argument. The CLI is overloaded:
@@ -542,14 +381,6 @@ fn resolve_destination(
         (OutputTarget::Default, true) => PathBuf::from(flat_filename),
         (OutputTarget::Default, false) => PathBuf::from(stem).join("animations").join(nested_filename),
     }
-}
-
-fn jma_kind_for(group: &AnimationGroup<'_>) -> JmaKind {
-    JmaKind::from_metadata(
-        group.animation_type.as_deref(),
-        group.frame_info_type.as_deref(),
-        group.world_relative,
-    )
 }
 
 /// Bail with a clear listing if any two animations resolved to the
@@ -630,92 +461,6 @@ fn json_payload(group: &AnimationGroup<'_>, clip: &blam_tags::AnimationClip) -> 
     })
 }
 
-#[allow(clippy::too_many_arguments)] // each arg is load-bearing for composition + naming
-fn write_jma(
-    group: &AnimationGroup<'_>,
-    clip: &blam_tags::AnimationClip,
-    animation: &Animation<'_>,
-    graph: &AnimationGraph,
-    skeleton: &Skeleton,
-    defaults: &[NodeTransform],
-    actor_name: &str,
-    path: &Path,
-) -> Result<()> {
-    let kind = jma_kind_for(group);
-    // Overlay/replacement codec values are deltas authored against a
-    // *base* pose — the matching locomotion/idle stance, not the bind
-    // pose. Resolve that base's first frame (Foundry/TagTool both do
-    // this); fall back to the rest pose when no base is found. Composing
-    // onto rest instead is what makes extracted overlays explode.
-    let base = match kind {
-        JmaKind::Jmo | JmaKind::Jmr => animation
-            .overlay_base_pose(graph, group, skeleton, defaults)
-            .unwrap_or_else(|| defaults.to_vec()),
-        _ => defaults.to_vec(),
-    };
-    let (pose, leading): (blam_tags::Pose, Vec<NodeTransform>) = match kind {
-        // Overlay: deltas composed onto the static-or-base reference.
-        JmaKind::Jmo => {
-            let (mut reference, mut body) = clip.overlay_pose(skeleton, &base);
-            // 3D pose overlays (Reach/H4) pin object-space parent nodes —
-            // re-orient them + descendants after composition (Foundry's
-            // _apply_object_space_base_corrections). No-op for H3.
-            body.apply_object_space_corrections(
-                &mut reference,
-                skeleton,
-                &base,
-                &group.object_space_parents,
-            );
-            (body, reference)
-        }
-        // Replacement: animated nodes take the codec value, every other
-        // node (incl. static-flagged) takes the base pose — matching
-        // Foundry's `compose_replacement_animation` and TagTool's
-        // `Replace()`. Leading frame is the base pose.
-        JmaKind::Jmr => {
-            let mut body = clip.replacement_pose(skeleton, &base);
-            let mut reference = base.clone();
-            body.apply_object_space_corrections(
-                &mut reference,
-                skeleton,
-                &base,
-                &group.object_space_parents,
-            );
-            (body, reference)
-        }
-        // Base kinds / JMW: full pose against the render_model defaults.
-        _ => (clip.pose(skeleton, Some(defaults)), defaults.to_vec()),
-    };
-
-    ensure_parent_dir(path)?;
-    let mut writer = BufWriter::new(
-        File::create(path).with_context(|| format!("create {}", path.display()))?,
-    );
-    pose.write_jma(
-        &mut writer,
-        skeleton,
-        &leading,
-        group.node_list_checksum,
-        kind,
-        actor_name,
-        Some(&clip.movement),
-    )?;
-    writer.flush()?;
-
-    let codec_count = clip.frame_count;
-    let on_disk = codec_count.saturating_add(1);
-    println!(
-        "{}: {} frames ({}+1) × {} bones [{}]  movement={:?}",
-        path.display(),
-        on_disk,
-        codec_count,
-        skeleton.len(),
-        kind.extension(),
-        clip.movement.kind,
-    );
-    Ok(())
-}
-
 /// `<anim_name>.<ext>` for a group, falling back to `anim_<index>`
 /// when the animation has no resolvable string-id name.
 fn default_filename(group: &AnimationGroup<'_>, ext: &str) -> String {
@@ -732,31 +477,6 @@ fn display_name(group: &AnimationGroup<'_>) -> String {
         .name
         .clone()
         .unwrap_or_else(|| format!("[{}]", group.index))
-}
-
-/// Map a tag-internal animation name to its on-disk file stem so the
-/// result re-imports to the same graph name.
-///
-/// Halo uses `:` as the animation-name **token separator** and `_`
-/// *within* a token. Tool.exe / HABT (`build_scene.py`) take the file
-/// basename **verbatim** as the animation name, and Foundry's
-/// `data_name` is `name.replace(":", " ")` — so the importable stem
-/// replaces every `:` with a space and keeps underscores. TagTool
-/// writes the raw colon name (an invalid Windows path / ADS); the older
-/// blam behavior replaced `:`→`_`, which collapsed the token boundary
-/// and would round-trip to the wrong name. Only genuinely
-/// path-/filename-illegal characters are scrubbed to `_`; spaces and
-/// underscores are preserved.
-fn sanitize(name: &str) -> String {
-    name.chars()
-        .map(|c| match c {
-            ':' => ' ',
-            '/' | '\\' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            // Control chars aren't valid in filenames either.
-            c if c.is_control() => '_',
-            c => c,
-        })
-        .collect()
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<()> {

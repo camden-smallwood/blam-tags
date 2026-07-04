@@ -293,3 +293,26 @@ pub struct Commit {
     pub redirected: bool,
 }
 
+
+/// Adapts a [`CliContext`] into a [`blam_tags::extract::TagResolver`] so
+/// the shared extraction orchestration (`blam_tags::extract`) can resolve
+/// child tag references through the CLI's filesystem-or-cache loader —
+/// which, unlike a bare `TagFile::read`, also handles classic (Halo CE /
+/// Halo 2) tags and monolithic-cache mode.
+pub struct CtxResolver<'a> {
+    /// The context whose loader resolves references.
+    pub ctx: &'a CliContext,
+}
+
+impl blam_tags::extract::TagResolver for CtxResolver<'_> {
+    fn resolve(
+        &self,
+        reference: &str,
+        group_ext: &str,
+        _group_tag: u32,
+    ) -> std::result::Result<TagFile, blam_tags::extract::ExtractError> {
+        self.ctx
+            .load_referenced_tag(reference, group_ext)
+            .map_err(|e| blam_tags::extract::ExtractError::resolve(e.to_string()))
+    }
+}

@@ -81,6 +81,7 @@ pub mod geometry;
 pub mod game;
 pub mod jms;
 pub mod ass;
+pub mod extract;
 pub mod render_geometry;
 pub mod render_model;
 pub mod monolithic;
