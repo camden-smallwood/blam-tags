@@ -231,14 +231,24 @@ impl TagReferenceData {
     }
 
     /// Serialize back to a `tgrf` payload (caller writes the header). The
+    /// group FOURCC is emitted in the file's wire `endian`, mirroring
+    /// [`Self::from_bytes`], so a re-serialized reference round-trips instead
+    /// of reversing the tag class. Halo CE tags are big-endian and store the
+    /// reference group forward on disk (`mod2`); a hardcoded little-endian
+    /// write turned it into `2dom` the moment a reference was edited, which
+    /// corrupted the on-disk tag and made reverse-dependency lookups miss. The
     /// path is re-emitted NUL-terminated (the terminator stripped by
     /// [`Self::from_bytes`]).
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self, endian: Endian) -> Vec<u8> {
         match &self.group_tag_and_name {
             None => Vec::new(),
             Some((group_tag, name)) => {
                 let mut bytes = Vec::with_capacity(5 + name.len());
-                bytes.extend_from_slice(&group_tag.to_le_bytes());
+                let group = match endian {
+                    Endian::Le => group_tag.to_le_bytes(),
+                    Endian::Be => group_tag.to_be_bytes(),
+                };
+                bytes.extend_from_slice(&group);
                 bytes.extend_from_slice(name.as_bytes());
                 bytes.push(0);
                 bytes
@@ -1175,8 +1185,40 @@ pub(crate) fn serialize_field(
         // Sub-chunk leaves — produce a new TagSubChunkContent.
         TagFieldData::StringId(s) => Some(TagSubChunkContent::StringId(s.to_bytes())),
         TagFieldData::OldStringId(s) => Some(TagSubChunkContent::OldStringId(s.to_bytes())),
-        TagFieldData::TagReference(r) => Some(TagSubChunkContent::TagReference(r.to_bytes())),
+        TagFieldData::TagReference(r) => {
+            Some(TagSubChunkContent::TagReference(r.to_bytes(endian)))
+        }
         TagFieldData::Data(bytes) => Some(TagSubChunkContent::Data(bytes.clone())),
         TagFieldData::ApiInterop(i) => Some(TagSubChunkContent::ApiInterop(i.to_bytes())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A tag_reference's group FOURCC must survive a read -> edit -> write
+    // round-trip in the file's wire endian. Halo CE tags are big-endian and
+    // store the group forward on disk (`mod2`); serializing it little-endian
+    // reversed it to `2dom` on the first edit, corrupting the tag and breaking
+    // reverse-dependency lookups. H2 / modern tags are little-endian.
+    #[test]
+    fn tag_reference_group_round_trips_in_both_endians() {
+        let mode = u32::from_be_bytes(*b"mod2");
+        for (endian, on_disk_group) in
+            [(Endian::Be, *b"mod2"), (Endian::Le, *b"2dom")]
+        {
+            // On-disk payload: group (in wire endian) + NUL-terminated path.
+            let mut payload = on_disk_group.to_vec();
+            payload.extend_from_slice(b"weapons\\pistol\\pistol\0");
+
+            let parsed = TagReferenceData::from_bytes(&payload, endian);
+            let (group, name) = parsed.group_tag_and_name.clone().expect("resolved");
+            assert_eq!(group, mode, "group must decode to logical `mod2` ({endian:?})");
+            assert_eq!(name, "weapons\\pistol\\pistol");
+
+            // Re-serializing must reproduce the original on-disk bytes exactly.
+            assert_eq!(parsed.to_bytes(endian), payload, "byte-exact round-trip ({endian:?})");
+        }
     }
 }
