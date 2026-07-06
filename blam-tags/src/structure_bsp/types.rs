@@ -1156,6 +1156,21 @@ fn populate_collision_subblocks(entry: &TagStruct<'_>, bsp: &mut Bsp3d, is_small
         }
     };
 
+    // Collision-BSP topology indices (`first_edge`, `forward/reverse_edge`,
+    // `start/end_vertex`, `left/right_surface`) are `u16` with `0xFFFF` = NONE —
+    // the engine reads them as `unsigned __int16` (e.g. `build_mesh_fragment_
+    // recursive @ 0x18039C2D0`). `read_int_any` returns the schema's SIGNED
+    // int16, so any index >= 0x8000 (BSPs with > 32767 edges, e.g. s3d_turf's
+    // 47814) comes out negative and indexes out of bounds — collapsing the
+    // decal-mesh edge-ring walk to an empty polygon (the s3d_turf bunker snow
+    // that fell back to a flat quad). Reinterpret the low 16 bits as unsigned;
+    // `0xFFFF` stays NONE (`-1`). Small BSPs (cyberdyne, 10216 edges) are
+    // unaffected — no index reaches the sign bit — so existing tests hold.
+    let collision_index = |raw: Option<i128>| -> i32 {
+        let v = raw.unwrap_or(0xFFFF) as u16;
+        if v == 0xFFFF { -1 } else { v as i32 }
+    };
+
     bsp.leaves = entry
         .field("leaves")
         .and_then(|f| f.as_block())
@@ -1232,7 +1247,7 @@ fn populate_collision_subblocks(entry: &TagStruct<'_>, bsp: &mut Bsp3d, is_small
                         plane_designator: to_canonical_31(
                             e.read_int_any("plane").unwrap_or(0),
                         ),
-                        first_edge: e.read_int_any("first edge").unwrap_or(0) as i32,
+                        first_edge: collision_index(e.read_int_any("first edge")),
                         material: e.read_int_any("material").unwrap_or(-1) as i16,
                         breakable_surface_set: e
                             .read_int_any("breakable surface set")
@@ -1259,12 +1274,12 @@ fn populate_collision_subblocks(entry: &TagStruct<'_>, bsp: &mut Bsp3d, is_small
             for i in 0..b.len() {
                 if let Some(e) = b.element(i) {
                     out.push(CollisionEdge {
-                        start_vertex: e.read_int_any("start vertex").unwrap_or(0) as i32,
-                        end_vertex: e.read_int_any("end vertex").unwrap_or(0) as i32,
-                        forward_edge: e.read_int_any("forward edge").unwrap_or(0) as i32,
-                        reverse_edge: e.read_int_any("reverse edge").unwrap_or(0) as i32,
-                        left_surface: e.read_int_any("left surface").unwrap_or(-1) as i32,
-                        right_surface: e.read_int_any("right surface").unwrap_or(-1) as i32,
+                        start_vertex: collision_index(e.read_int_any("start vertex")),
+                        end_vertex: collision_index(e.read_int_any("end vertex")),
+                        forward_edge: collision_index(e.read_int_any("forward edge")),
+                        reverse_edge: collision_index(e.read_int_any("reverse edge")),
+                        left_surface: collision_index(e.read_int_any("left surface")),
+                        right_surface: collision_index(e.read_int_any("right surface")),
                     });
                 }
             }
@@ -1282,7 +1297,7 @@ fn populate_collision_subblocks(entry: &TagStruct<'_>, bsp: &mut Bsp3d, is_small
                     let point = e.read_point3d("point");
                     out.push(CollisionVertex {
                         point,
-                        first_edge: e.read_int_any("first edge").unwrap_or(0) as i32,
+                        first_edge: collision_index(e.read_int_any("first edge")),
                     });
                 }
             }
