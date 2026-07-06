@@ -1,4 +1,4 @@
-use blam_tags::effect::{EffectDefinition, EffectFlags, EffectEventFlags};
+use blam_tags::effect::{EffectDefinition, EffectDefinitionFlags, EffectEventFlags};
 use blam_tags::TagFile;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -8,9 +8,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tag = TagFile::read(&path)?;
         let def = EffectDefinition::from_tag(&tag)?;
         println!("\n#### {eff}.effect ####");
-        println!("  parallel_events           = {}", def.flags.contains(EffectFlags::RunEventsInParallel));
-        println!("  do_not_reuse_when_looping = {}", def.flags.contains(EffectFlags::DoNotReusePartsWhenLooping));
-        println!("  cannot_be_restarted       = {}", def.flags.contains(EffectFlags::CannotBeRestarted));
+        println!("  parallel_events           = {}", def.flags.contains(EffectDefinitionFlags::RunEventsInParallel));
+        println!("  do_not_reuse_when_looping = {}", def.flags.contains(EffectDefinitionFlags::DoNotReusePartsWhenLooping));
+        println!("  cannot_be_restarted       = {}", def.flags.contains(EffectDefinitionFlags::CannotBeRestarted));
         println!("  loop_start_event          = {}", def.loop_start_event);
         println!("  events                    = {}", def.events.len());
         for (ei, ev) in def.events.iter().enumerate() {

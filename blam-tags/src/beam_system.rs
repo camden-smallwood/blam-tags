@@ -70,6 +70,12 @@ pub enum BeamProfileShape {
 #[repr(u16)]
 pub enum BeamAppearanceFlags {
     #[strum(serialize = "double-sided")] DoubleSided = 0,
+    /// Runtime-reconstructed (Ares `c_beam_definition::get_fogged` tests bit 3):
+    /// the beam is fogged. Set by the beam effect-postprocess at load; absent
+    /// (0) in loose MCC tags, so `get_fogged` reads `false` until that
+    /// reconstruction lands — never authored on disk.
+    #[strum(disabled)]
+    Fogged = 3,
 }
 
 /// One beam definition entry (520B `c_beam_definition`).
@@ -108,6 +114,57 @@ pub struct BeamDefinition {
     pub runtime_constant_per_profile_properties: i32,
     pub runtime_used_states: i32,
     pub runtime_max_profile_count: i32,
+    /// `runtime m_gpu_data!` (`gpu_property_function_color_struct`) — the baked
+    /// per-profile GPU LUT triad. Stripped to empty in loose MCC tags
+    /// (reconstructed at load); populated in cached `.map` tags.
+    pub gpu_data: BeamGpuData,
+}
+
+/// `gpu_property_function_color_struct` (36B) — the beam's baked GPU
+/// evaluation LUTs: property rows (`[f32;4]`), function rows (`[f32;16]`), and
+/// color rows (`[f32;4]`). Shared shape with contrail / light_volume gpu_data.
+#[derive(Debug, Clone, Default)]
+pub struct BeamGpuData {
+    /// `runtime gpu_property_block!` — one `[f32;4]` per baked property.
+    pub properties: Vec<[f32; 4]>,
+    /// `runtime gpu_functions_block!` — one `[f32;16]` per baked function.
+    pub functions: Vec<[f32; 16]>,
+    /// `runtime gpu_colors_block!` — one `[f32;4]` per baked color.
+    pub colors: Vec<[f32; 4]>,
+}
+
+impl BeamGpuData {
+    pub fn from_struct(s: &TagStruct<'_>) -> Self {
+        Self {
+            properties: read_gpu_rows::<4>(s, "runtime gpu_property_block"),
+            functions: read_gpu_rows::<16>(s, "runtime gpu_functions_block"),
+            colors: read_gpu_rows::<4>(s, "runtime gpu_colors_block"),
+        }
+    }
+}
+
+/// Read a `runtime gpu_*_block!` block: each element carries one inline
+/// `runtime gpu_*_sub_array!` of `N` reals. Empty when the block is absent
+/// (loose tags). Mirrors the particle `ParticleGpuData` sprite-corner read.
+fn read_gpu_rows<const N: usize>(s: &TagStruct<'_>, block_name: &str) -> Vec<[f32; N]> {
+    let block = match s.field(block_name).and_then(|f| f.as_block()) {
+        Some(b) => b,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::with_capacity(block.len());
+    for i in 0..block.len() {
+        let Some(elem) = block.element(i) else { continue };
+        let mut row = [0.0f32; N];
+        if let Some(arr) = elem.fields_all().find_map(|f| f.as_struct()) {
+            for (j, field) in arr.fields_all().enumerate().take(N) {
+                if let Some(crate::fields::TagFieldData::Real(v)) = field.value() {
+                    row[j] = v;
+                }
+            }
+        }
+        out.push(row);
+    }
+    out
 }
 
 /// Walked `beam_system` tag.
@@ -187,6 +244,11 @@ impl BeamDefinition {
             runtime_max_profile_count: s
                 .read_int_any("runtime m_max_profile_count")
                 .unwrap_or(0) as i32,
+            gpu_data: s
+                .field("runtime m_gpu_data")
+                .and_then(|f| f.as_struct())
+                .map(|sub| BeamGpuData::from_struct(&sub))
+                .unwrap_or_default(),
         })
     }
 }

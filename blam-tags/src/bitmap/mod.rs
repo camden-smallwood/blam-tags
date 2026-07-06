@@ -33,7 +33,7 @@ use flate2::read::ZlibDecoder;
 
 use crate::api::{TagBlock, TagStruct};
 use crate::file::TagFile;
-use crate::typed_enums::SchemaEnum;
+use crate::typed_enums::{Enum, Flags, SchemaEnum};
 
 pub mod dds;
 pub mod decode;
@@ -44,7 +44,11 @@ pub use p8::P8Palette;
 pub mod tiff;
 pub mod xbox360;
 
-pub use format::{BitmapCurve, BitmapFormat};
+pub use format::{
+    BitmapCurve, BitmapCurveOverride, BitmapDataFlags, BitmapDicerFlags, BitmapDownsampleFilter,
+    BitmapDownsampleFlags, BitmapForceFormat, BitmapFormat, BitmapGroupFlags, BitmapMoreFlags,
+    BitmapPacker, BitmapSlicer, BitmapSwizzle, BitmapType, BitmapUsage, BitmapUsageFlags,
+};
 
 use dds::{needs_decode_for_dds, write_dds, write_dds_dx10};
 
@@ -310,6 +314,199 @@ pub struct BitmapSprite {
     pub top: f32,
     pub bottom: f32,
     pub registration_point: [f32; 2],
+}
+
+// ===========================================================================
+// Strongly-typed bitmap-group walker (Ares `bitmap_group_v2` / `bitmap_data`).
+//
+// An owned metadata tree in the `render_model::RenderModel` style, SEPARATE
+// from the lazy pixel decoder [`Bitmap`] (which stays the path for extracting
+// image data). Field order + names mirror Ares `bitmaps/bitmap_group.h`
+// (`bitmap_group_v2`) and `bitmaps/bitmaps.h` (`bitmap_data`). Reads are
+// by-schema-name (fold-matched), so cross-game field-order deltas are tolerated
+// and the struct order is purely for readability.
+// ===========================================================================
+
+/// Ares `bitmap_group_v2` — the authored bitmap-group definition.
+#[derive(Debug, Clone, Default)]
+pub struct BitmapDefinition {
+    /// `usage_index` — how the bitmap is used (drives the cache-build format,
+    /// e.g. [`BitmapUsage::WarpMap`] = EMBM distortion). Engine stores it raw.
+    pub usage: Enum<BitmapUsage, i32>,
+    pub flags: Flags<BitmapGroupFlags, u16>,
+    pub sprite_spacing: i16,
+    /// `bump_height` — apparent bump height, in texture repeats.
+    pub bump_height: f32,
+    /// `detail_fade_factor` — detail/illum-map mip fade, `[0,1]`.
+    pub detail_fade_factor: f32,
+    pub curve_override: Enum<BitmapCurveOverride, i8>,
+    /// `mipmap_limit` — max authored mip level (0 = usage default).
+    pub mipmap_limit: i8,
+    pub force_format: Enum<BitmapForceFormat, i16>,
+    /// `usage_override` block — per-usage import overrides (authoring tooling).
+    pub usage_overrides: Vec<BitmapUsageOverride>,
+    pub sequences: Vec<BitmapSequence>,
+    /// `bitmaps` block — the per-image metadata (pixels via [`Bitmap`]).
+    pub images: Vec<BitmapImageDef>,
+}
+
+/// Ares `bitmap_data` — one image's authored metadata (a `bitmaps[]` element).
+#[derive(Debug, Clone, Default)]
+pub struct BitmapImageDef {
+    pub width: u16,
+    pub height: u16,
+    pub depth: u8,
+    pub more_flags: Flags<BitmapMoreFlags, u8>,
+    pub bitmap_type: Enum<BitmapType, i16>,
+    /// Pixel format (Ares `e_bitmap_format`). `None` if unrecognized.
+    pub format: Option<BitmapFormat>,
+    pub flags: Flags<BitmapDataFlags, u16>,
+    /// Integer `point2d` — the bitmap "center" (e.g. for particles).
+    pub registration_point: crate::math::Point2d,
+    /// `mipmap_count_excluding_highest` — total mips is this `+ 1`.
+    pub mipmap_count_excluding_highest: i8,
+    pub curve: Enum<BitmapCurve, i8>,
+    pub interleaved_interop_index: i8,
+    pub interleaved_texture_index: i8,
+    pub pixels_offset: i32,
+    pub pixels_size: i32,
+    pub high_res_pixels_offset: i32,
+    pub high_res_pixels_size: i32,
+}
+
+/// Ares `bitmap_usage_block` — a per-usage import override.
+#[derive(Debug, Clone, Default)]
+pub struct BitmapUsageOverride {
+    /// `source gamma` — 0.0 uses the Xenon-curve default.
+    pub source_gamma: f32,
+    pub bitmap_curve: Enum<BitmapCurve, i32>,
+    pub flags: Flags<BitmapUsageFlags, u8>,
+    pub slicer: Enum<BitmapSlicer, i8>,
+    pub dicer_flags: Flags<BitmapDicerFlags, u16>,
+    pub packer: Enum<BitmapPacker, i8>,
+    pub bitmap_type: Enum<BitmapType, i8>,
+    pub mipmap_limit: i16,
+    pub downsample_filter: Enum<BitmapDownsampleFilter, i16>,
+    pub downsample_flags: Flags<BitmapDownsampleFlags, u16>,
+    pub sprite_background_color: crate::math::RealRgbColor,
+    pub swizzle_red: Enum<BitmapSwizzle, i8>,
+    pub swizzle_green: Enum<BitmapSwizzle, i8>,
+    pub swizzle_blue: Enum<BitmapSwizzle, i8>,
+    pub swizzle_alpha: Enum<BitmapSwizzle, i8>,
+    pub bitmap_format: Enum<BitmapForceFormat, i32>,
+}
+
+impl BitmapDefinition {
+    /// Walk a parsed `bitmap` (bitm) tag into the strongly-typed metadata tree.
+    /// By-name reads tolerate cross-game field-order deltas; pixel data is
+    /// delivered separately by [`Bitmap`].
+    pub fn from_tag(tag: &TagFile) -> Self {
+        let root = tag.root();
+        Self {
+            usage: root.try_read_enum("Usage").unwrap_or_default(),
+            flags: root.try_read_flags("Flags").unwrap_or_default(),
+            sprite_spacing: root.read_int_any("sprite spacing").unwrap_or(0) as i16,
+            bump_height: root.read_real("bump map height").unwrap_or(0.0),
+            detail_fade_factor: root.read_real("fade factor").unwrap_or(0.0),
+            curve_override: root.try_read_enum("curve mode").unwrap_or_default(),
+            mipmap_limit: root.read_int_any("max mipmap level").unwrap_or(0) as i8,
+            force_format: root.try_read_enum("force bitmap format").unwrap_or_default(),
+            usage_overrides: read_usage_overrides(&root),
+            sequences: read_sequences(&root),
+            images: read_image_defs(&root),
+        }
+    }
+}
+
+fn read_sequences(root: &TagStruct<'_>) -> Vec<BitmapSequence> {
+    let Some(block) = root.field("sequences").and_then(|f| f.as_block()) else { return Vec::new() };
+    let mut out = Vec::with_capacity(block.len());
+    for i in 0..block.len() {
+        let Some(seq) = block.element(i) else { continue };
+        let sprites = seq
+            .field("sprites")
+            .and_then(|f| f.as_block())
+            .map(|sb| {
+                (0..sb.len())
+                    .filter_map(|j| sb.element(j))
+                    .map(|sp| {
+                        let reg = sp.read_point2d("registration point");
+                        BitmapSprite {
+                            bitmap_index: sp.read_int_any("bitmap index").unwrap_or(0) as i16,
+                            left: sp.read_real("left").unwrap_or(0.0),
+                            right: sp.read_real("right").unwrap_or(1.0),
+                            top: sp.read_real("top").unwrap_or(0.0),
+                            bottom: sp.read_real("bottom").unwrap_or(1.0),
+                            registration_point: [reg.x, reg.y],
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push(BitmapSequence {
+            first_bitmap_index: seq.read_int_any("first bitmap index").unwrap_or(0) as i16,
+            bitmap_count: seq.read_int_any("bitmap count").unwrap_or(0) as i16,
+            sprites,
+        });
+    }
+    out
+}
+
+fn read_image_defs(root: &TagStruct<'_>) -> Vec<BitmapImageDef> {
+    let Some(block) = root.field("bitmaps").and_then(|f| f.as_block()) else { return Vec::new() };
+    let mut out = Vec::with_capacity(block.len());
+    for i in 0..block.len() {
+        let Some(e) = block.element(i) else { continue };
+        out.push(BitmapImageDef {
+            width: e.read_int_any("width").unwrap_or(0).max(0) as u16,
+            height: e.read_int_any("height").unwrap_or(0).max(0) as u16,
+            depth: e.read_int_any("depth").unwrap_or(1).max(0) as u8,
+            more_flags: e.try_read_flags("more flags").unwrap_or_default(),
+            bitmap_type: e.try_read_enum("type").unwrap_or_default(),
+            format: e.read_enum_name("format").and_then(|n| BitmapFormat::from_schema_name(&n)),
+            flags: e.try_read_flags("flags").unwrap_or_default(),
+            registration_point: match e.field("registration point").and_then(|f| f.value()) {
+                Some(crate::fields::TagFieldData::Point2d(p)) => p,
+                _ => crate::math::Point2d::default(),
+            },
+            mipmap_count_excluding_highest: e.read_int_any("mipmap count").unwrap_or(0) as i8,
+            curve: e.try_read_enum("curve").unwrap_or_default(),
+            interleaved_interop_index: e.read_int_any("interleaved interop").unwrap_or(-1) as i8,
+            interleaved_texture_index: e.read_int_any("interleaved texture index").unwrap_or(0) as i8,
+            pixels_offset: e.read_int_any("pixels offset").unwrap_or(0) as i32,
+            pixels_size: e.read_int_any("pixels size").unwrap_or(0) as i32,
+            high_res_pixels_offset: e.read_int_any("high res pixels offset offset").unwrap_or(0) as i32,
+            high_res_pixels_size: e.read_int_any("high res pixels size").unwrap_or(0) as i32,
+        });
+    }
+    out
+}
+
+fn read_usage_overrides(root: &TagStruct<'_>) -> Vec<BitmapUsageOverride> {
+    let Some(block) = root.field("usage override").and_then(|f| f.as_block()) else { return Vec::new() };
+    let mut out = Vec::with_capacity(block.len());
+    for i in 0..block.len() {
+        let Some(e) = block.element(i) else { continue };
+        out.push(BitmapUsageOverride {
+            source_gamma: e.read_real("source gamma").unwrap_or(0.0),
+            bitmap_curve: e.try_read_enum("bitmap curve").unwrap_or_default(),
+            flags: e.try_read_flags("flags").unwrap_or_default(),
+            slicer: e.try_read_enum("slicer").unwrap_or_default(),
+            dicer_flags: e.try_read_flags("dicer flags").unwrap_or_default(),
+            packer: e.try_read_enum("packer").unwrap_or_default(),
+            bitmap_type: e.try_read_enum("type").unwrap_or_default(),
+            mipmap_limit: e.read_int_any("mipmap limit").unwrap_or(0) as i16,
+            downsample_filter: e.try_read_enum("downsample filter").unwrap_or_default(),
+            downsample_flags: e.try_read_flags("downsample flags").unwrap_or_default(),
+            sprite_background_color: e.read_rgb("sprite background color"),
+            swizzle_red: e.try_read_enum("swizzle red").unwrap_or_default(),
+            swizzle_green: e.try_read_enum("swizzle green").unwrap_or_default(),
+            swizzle_blue: e.try_read_enum("swizzle blue").unwrap_or_default(),
+            swizzle_alpha: e.try_read_enum("swizzle alpha").unwrap_or_default(),
+            bitmap_format: e.try_read_enum("bitmap format").unwrap_or_default(),
+        });
+    }
+    out
 }
 
 /// Resolve one image's pixel byte slice plus an optional mip-count

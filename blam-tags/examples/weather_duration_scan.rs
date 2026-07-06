@@ -3,7 +3,7 @@
 //! and dump every effect event's delay/duration bounds + parallel flag.
 //! Answers: is the ash `0..0` duration universal across weather effects?
 use blam_tags::api::TagStruct;
-use blam_tags::effect::{EffectDefinition, EffectFlags};
+use blam_tags::effect::{EffectDefinition, EffectDefinitionFlags};
 use blam_tags::fields::{TagFieldData, TagFieldType};
 use blam_tags::TagFile;
 use std::collections::BTreeSet;
@@ -109,7 +109,7 @@ fn main() {
             EffectDefinition::from_tag(&tag).ok()
         }));
         let Ok(Some(def)) = res else { println!("  {eff}: <parse failed>"); continue; };
-        let parallel = def.flags.contains(EffectFlags::RunEventsInParallel);
+        let parallel = def.flags.contains(EffectDefinitionFlags::RunEventsInParallel);
         let zero = def.events.iter().all(|e| {
             e.delay_bounds.lower == 0.0 && e.delay_bounds.upper == 0.0
                 && e.duration_bounds.lower == 0.0 && e.duration_bounds.upper == 0.0

@@ -148,6 +148,38 @@ pub enum BitmapFormat {
 }
 
 impl BitmapFormat {
+    /// Ares `bitmap_format_is_default_srgb` (dllcache 0x1804E9100) — whether a
+    /// texture of this format is sRGB-decoded by the hardware when the bitmap's
+    /// `curve` is `Unknown`. TRUE for all color/alpha/mono LDR formats; FALSE
+    /// for float, signed (`u`/`v`), high-precision (10/16-bit), and normal-map
+    /// (DXN/CTX1/DXT5nm) formats — those are always linear. The H3 engine keys
+    /// on the discriminants {20,22,24,25,26,27,28,29,33,34}; mapped here by
+    /// meaning so the multi-game superset (float16/L16/R16g16/signed16/Dxt5nm)
+    /// stays consistent. Used together with `curve` by `get_pc_d3d_format`:
+    /// `is_srgb = curve!=Unknown ? curve∈{xRGB,sRGB} : format.is_default_srgb()`.
+    pub fn is_default_srgb(self) -> bool {
+        use BitmapFormat::*;
+        !matches!(
+            self,
+            SoftwareRgbfp32
+                | V8u8
+                | Abgrfp32
+                | Abgrfp16
+                | F16Mono
+                | F16Red
+                | Q8w8v8u8
+                | A2r10g10b10
+                | A16b16g16r16
+                | V16u16
+                | L16
+                | R16g16
+                | Signedr16g16b16a16
+                | Dxn
+                | Ctx1
+                | Dxt5nm
+        )
+    }
+
     /// Resolve the schema's `bitmap_formats` enum option name. Names
     /// match those in `definitions/<game>/bitmap.json` and are stable
     /// across halo3_mcc and haloreach_mcc.
@@ -396,4 +428,294 @@ pub enum BitmapCurve {
     #[strum(serialize = "linear")] Linear = 3,
     #[strum(serialize = "offset log")] OffsetLog = 4,
     #[strum(serialize = "sRGB")] Srgb = 5,
+}
+
+// ===========================================================================
+// Tag-metadata enums — the authored bitmap-group fields.
+//
+// Field/enum names mirror Ares `bitmaps/bitmap_group.h` + `bitmap_types.h`
+// (`e_bitmap_type`, `bitmap_group_v2::e_flags` / `e_curve_override`, tag
+// `e_bitmap_flags`). `Usage` has NO runtime enum in Ares (`usage_index` is a
+// raw `unsigned long`); the 25-value list is authoring-only (guerilla schema),
+// surfaced here typed. `#[strum(serialize)]` strings are the canonical schema
+// option names — the `SchemaEnum` fold matches them drift-proof by name.
+// ===========================================================================
+
+/// `bitmap_usage_global_enum` — the authoring "how are you using this bitmap"
+/// selector. Engine stores it as the raw `usage_index` (`unsigned long`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default,
+         num_derive::FromPrimitive, num_derive::ToPrimitive,
+         strum::EnumString, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(ascii_case_insensitive)]
+#[repr(i32)]
+pub enum BitmapUsage {
+    #[default]
+    #[strum(serialize = "Diffuse Map")] DiffuseMap = 0,
+    #[strum(serialize = "Specular Map")] SpecularMap = 1,
+    #[strum(serialize = "Bump Map (from Height Map)")] BumpMap = 2,
+    #[strum(serialize = "Detail Bump Map (from Height Map - fades out)")] DetailBumpMap = 3,
+    #[strum(serialize = "Detail Map")] DetailMap = 4,
+    #[strum(serialize = "Self-Illum Map")] SelfIllumMap = 5,
+    #[strum(serialize = "Change Color Map")] ChangeColorMap = 6,
+    #[strum(serialize = "Cube Map (Reflection Map)")] CubeMap = 7,
+    #[strum(serialize = "Sprite (Additive, Black Background)")] SpriteAdditive = 8,
+    #[strum(serialize = "Sprite (Blend, White Background)")] SpriteBlend = 9,
+    #[strum(serialize = "Sprite (Double Multiply, Gray Background)")] SpriteDoubleMultiply = 10,
+    #[strum(serialize = "Interface Bitmap")] InterfaceBitmap = 11,
+    /// EMBM warp/displacement map (distortion particles, e.g. `distortion_shimmer`).
+    #[strum(serialize = "Warp Map (EMBM)")] WarpMap = 12,
+    #[strum(serialize = "Vector Map")] VectorMap = 13,
+    #[strum(serialize = "3D Texture")] Texture3d = 14,
+    #[strum(serialize = "Float Map (WARNING: HUGE)")] FloatMap = 15,
+    #[strum(serialize = "Height Map (for Parallax)")] HeightMap = 16,
+    #[strum(serialize = "ZBrush Bump Map (from Bump Map)")] ZBrushBumpMap = 17,
+    #[strum(serialize = "Blend Map (linear for terrains)")] BlendMap = 18,
+    #[strum(serialize = "Palettized --- effects only")] Palettized = 19,
+    #[strum(serialize = "CHUD related bitmap")] Chud = 20,
+    #[strum(serialize = "Lightmap Array")] LightmapArray = 21,
+    #[strum(serialize = "Water Array")] WaterArray = 22,
+    #[strum(serialize = "Interface Sprite")] InterfaceSprite = 23,
+    #[strum(serialize = "Interface Gradient")] InterfaceGradient = 24,
+}
+
+/// Ares `e_bitmap_type` (`bitmap_types.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default,
+         num_derive::FromPrimitive, num_derive::ToPrimitive,
+         strum::EnumString, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(ascii_case_insensitive)]
+#[repr(i16)]
+pub enum BitmapType {
+    #[default]
+    #[strum(serialize = "2D texture")] TwoDimensional = 0,
+    #[strum(serialize = "3D texture")] ThreeDimensional = 1,
+    #[strum(serialize = "cube map")] CubeMap = 2,
+    #[strum(serialize = "array")] Array = 3,
+}
+
+/// Ares `bitmap_group_v2::e_curve_override` — the "curve mode" import selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default,
+         num_derive::FromPrimitive, num_derive::ToPrimitive,
+         strum::EnumString, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(ascii_case_insensitive)]
+#[repr(i8)]
+pub enum BitmapCurveOverride {
+    #[default]
+    #[strum(serialize = "choose best")] ChooseBest = 0,
+    #[strum(serialize = "force FAST")] ForceFast = 1,
+    #[strum(serialize = "force PRETTY")] ForcePretty = 2,
+}
+
+/// `bitmap_group_v2::e_flags` — the authored bitmap-group flag word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq,
+         num_derive::FromPrimitive, num_derive::ToPrimitive,
+         strum::EnumString, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(ascii_case_insensitive)]
+#[repr(u16)]
+pub enum BitmapGroupFlags {
+    #[strum(serialize = "bitmap is TILED")] Tiled = 0,
+    #[strum(serialize = "use less blurry bump map")] UseSharpBumpFilter = 1,
+    #[strum(serialize = "dither when compressing")] DitherWhenCompressing = 2,
+    #[strum(serialize = "generate random sprites")] GenerateRandomSprites = 3,
+    #[strum(serialize = "using tag_interop and tag_resource")] UsingInteropResource = 4,
+    #[strum(serialize = "alpha channel stores TRANSPARENCY")] AlphaIsTransparency = 5,
+    #[strum(serialize = "can be sampled")] CanBeSampled = 6,
+}
+
+/// `bitmap_data` tag flags — Ares `e_bitmap_flags` bits 0-2
+/// (`k_tag_bitmap_flags_count`; bits 3+ are runtime-only, not authored).
+#[derive(Debug, Clone, Copy, PartialEq, Eq,
+         num_derive::FromPrimitive, num_derive::ToPrimitive,
+         strum::EnumString, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(ascii_case_insensitive)]
+#[repr(u16)]
+pub enum BitmapDataFlags {
+    #[strum(serialize = "power of two dimensions")] PowerOfTwo = 0,
+    #[strum(serialize = "compressed")] Compressed = 1,
+    #[strum(serialize = "swap axes")] SwapAxes = 2,
+}
+
+/// `bitmap_data::more_flags` — Xbox-360 layout markers (`bitmap_more_flags_definition`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq,
+         num_derive::FromPrimitive, num_derive::ToPrimitive,
+         strum::EnumString, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(ascii_case_insensitive)]
+#[repr(u8)]
+pub enum BitmapMoreFlags {
+    #[strum(serialize = "delete from cache file")] DeleteFromCache = 0,
+    #[strum(serialize = "xbox360 pitch (memory spacing)")] X360Pitch = 1,
+    #[strum(serialize = "xbox360 byte order")] X360ByteOrder = 2,
+    #[strum(serialize = "xbox360 tiled texture")] X360Tiled = 3,
+    #[strum(serialize = "xbox360 created correctly (hack for bumpmaps)")] X360CreatedCorrectly = 4,
+    #[strum(serialize = "xbox360 high resolution offset is valid")] X360HighResOffsetValid = 5,
+    #[strum(serialize = "xbox360 use interleaved textures")] X360Interleaved = 6,
+}
+
+/// `bitmap_usage_format_def` — the "force bitmap format" / usage-override
+/// format override. Reserved/unused/separator slots kept so `FromPrimitive`
+/// is total and by-name decode is exact; `Enum<_,i16>` keeps any raw value it
+/// can't name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default,
+         num_derive::FromPrimitive, num_derive::ToPrimitive,
+         strum::EnumString, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(ascii_case_insensitive)]
+#[repr(i16)]
+pub enum BitmapForceFormat {
+    #[default]
+    #[strum(serialize = "Use Default (defined by usage)")] UseDefault = 0,
+    #[strum(serialize = "Best Compressed Color Format")] BestCompressedColor = 1,
+    #[strum(serialize = "Best Uncompressed Color Format")] BestUncompressedColor = 2,
+    #[strum(serialize = "Best Compressed Bump Format")] BestCompressedBump = 3,
+    #[strum(serialize = "Best Uncompressed Bump Format")] BestUncompressedBump = 4,
+    #[strum(serialize = "Best Compressed Monochrome Format")] BestCompressedMono = 5,
+    #[strum(serialize = "Best Uncompressed Monochrome Format")] BestUncompressedMono = 6,
+    #[strum(serialize = "unused2")] Unused2 = 7,
+    #[strum(serialize = "unused3")] Unused3 = 8,
+    #[strum(serialize = "unused4")] Unused4 = 9,
+    #[strum(serialize = "unused5")] Unused5 = 10,
+    #[strum(serialize = "unused6")] Unused6 = 11,
+    #[strum(serialize = "--- Color and Alpha formats ---")] SepColorAlpha = 12,
+    #[strum(serialize = "DXT1 (Compressed Color + Color-Key Alpha)")] Dxt1 = 13,
+    #[strum(serialize = "DXT3 (Compressed Color + 4-bit Alpha)")] Dxt3 = 14,
+    #[strum(serialize = "DXT5 (Compressed Color + Compressed 8-bit Alpha)")] Dxt5 = 15,
+    #[strum(serialize = "24-bit Color + 8-bit Alpha")] Color24Alpha8 = 16,
+    #[strum(serialize = "8-bit Monochrome + 8-bit Alpha")] Mono8Alpha8 = 17,
+    #[strum(serialize = "Channel Mask (3-bit Color + 1-bit Alpha)")] ChannelMask = 18,
+    #[strum(serialize = "30-bit Color + 2-bit Alpha")] Color30Alpha2 = 19,
+    #[strum(serialize = "48-bit Color + 16-bit Alpha")] Color48Alpha16 = 20,
+    #[strum(serialize = "HALF Color + Alpha")] HalfColorAlpha = 21,
+    #[strum(serialize = "FLOAT Color + Alpha")] FloatColorAlpha = 22,
+    #[strum(serialize = "AY8 (8-bit Intensity replicated to ARGB)")] Ay8 = 23,
+    #[strum(serialize = "DXT3A (4-bit Intensity replicated to ARGB)")] Dxt3aIntensity = 24,
+    #[strum(serialize = "DXT5A (DXT-compressed Intensity replicated to ARGB)")] Dxt5aIntensity = 25,
+    #[strum(serialize = "Compressed Monochrome + Alpha")] CompressedMonoAlpha = 26,
+    #[strum(serialize = "A4R4G4B4 (12-bit color + 4-bit alpha)")] A4r4g4b4 = 27,
+    #[strum(serialize = "--- Color only formats ---")] SepColorOnly = 28,
+    #[strum(serialize = "8-bit Monochrome")] Mono8 = 29,
+    #[strum(serialize = "Compressed 24-bit Color")] Compressed24 = 30,
+    #[strum(serialize = "32-bit Color (R11G11B10)")] R11g11b10 = 31,
+    #[strum(serialize = "16-bit Monochrome")] Mono16 = 32,
+    #[strum(serialize = "16-bit Red + Green Only")] Rg16 = 33,
+    #[strum(serialize = "HALF Red Only")] HalfR = 34,
+    #[strum(serialize = "FLOAT Red Only")] FloatR = 35,
+    #[strum(serialize = "HALF Red + Green Only")] HalfRg = 36,
+    #[strum(serialize = "FLOAT Red + Green Only")] FloatRg = 37,
+    #[strum(serialize = "Compressed 4-bit Monochrome")] Compressed4Mono = 38,
+    #[strum(serialize = "Compressed Interpolated Monochrome")] CompressedInterpMono = 39,
+    #[strum(serialize = "unused12")] Unused12 = 40,
+    #[strum(serialize = "--- Alpha only formats ---")] SepAlphaOnly = 41,
+    #[strum(serialize = "DXT3A (4-bit Alpha)")] Dxt3aAlpha = 42,
+    #[strum(serialize = "DXT5A (8-bit Compressed Alpha)")] Dxt5aAlpha = 43,
+    #[strum(serialize = "8-bit Alpha")] Alpha8 = 44,
+    #[strum(serialize = "unused13")] Unused13 = 45,
+    #[strum(serialize = "unused14")] Unused14 = 46,
+    #[strum(serialize = "unused15")] Unused15 = 47,
+    #[strum(serialize = "--- Normal map formats ---")] SepNormal = 48,
+    #[strum(serialize = "DXN Compressed Normals (better)")] Dxn = 49,
+    #[strum(serialize = "CTX1 Compressed Normals (smaller)")] Ctx1 = 50,
+    #[strum(serialize = "16-bit Normals")] Normals16 = 51,
+    #[strum(serialize = "32-bit Normals")] Normals32 = 52,
+}
+
+// --- usage-override sub-block enums (import-tooling; `bitmap_usage_block`) ---
+
+/// `bitmap_usage_flags_def`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq,
+         num_derive::FromPrimitive, num_derive::ToPrimitive,
+         strum::EnumString, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(ascii_case_insensitive)]
+#[repr(u8)]
+pub enum BitmapUsageFlags {
+    #[strum(serialize = "Ignore Curve Override")] IgnoreCurveOverride = 0,
+    #[strum(serialize = "Dont Allow Size Optimization")] DontAllowSizeOptimization = 1,
+    #[strum(serialize = "Swap Axes")] SwapAxes = 2,
+}
+
+/// `bitmap_usage_slicer_def`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default,
+         num_derive::FromPrimitive, num_derive::ToPrimitive,
+         strum::EnumString, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(ascii_case_insensitive)]
+#[repr(i8)]
+pub enum BitmapSlicer {
+    #[default]
+    #[strum(serialize = "Automatically Determine Slicer")] Automatic = 0,
+    #[strum(serialize = "No Slicing (each source bitmap generates one element)")] NoSlicing = 1,
+    #[strum(serialize = "Color Plate Slicer")] ColorPlate = 2,
+    #[strum(serialize = "Cube Map Slicer")] CubeMap = 3,
+}
+
+/// `bitmap_usage_dicer_flags_def`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq,
+         num_derive::FromPrimitive, num_derive::ToPrimitive,
+         strum::EnumString, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(ascii_case_insensitive)]
+#[repr(u16)]
+pub enum BitmapDicerFlags {
+    #[strum(serialize = "Convert Plate Color Key to Alpha Channel")] ColorKeyToAlpha = 0,
+    #[strum(serialize = "Rotate Cube Map to Match DirectX Format")] RotateCubeMap = 1,
+    #[strum(serialize = "Sprites- Shrink Elements to Smallest Non-Zero Alpha Region")] ShrinkToAlpha = 2,
+    #[strum(serialize = "Sprites- Shrink Elements to Smallest Non-Zero Color And Alpha Region")] ShrinkToColorAlpha = 3,
+    #[strum(serialize = "Unsigned -> Signed Scale and Bias")] UnsignedToSigned = 4,
+}
+
+/// `bitmap_usage_packer_def`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default,
+         num_derive::FromPrimitive, num_derive::ToPrimitive,
+         strum::EnumString, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(ascii_case_insensitive)]
+#[repr(i8)]
+pub enum BitmapPacker {
+    #[default]
+    #[strum(serialize = "No packing")] None = 0,
+    #[strum(serialize = "Sprite Pack (packs elements into as few bitmaps as possible)")] SpritePack = 1,
+    #[strum(serialize = "Sprite Pack if needed (packs elements into as few bitmaps as possible)")] SpritePackIfNeeded = 2,
+    #[strum(serialize = "3D Pack (packs elements into a 3D bitmap)")] Pack3d = 3,
+}
+
+/// `bitmap_usage_downsample_filter_def`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default,
+         num_derive::FromPrimitive, num_derive::ToPrimitive,
+         strum::EnumString, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(ascii_case_insensitive)]
+#[repr(i16)]
+pub enum BitmapDownsampleFilter {
+    #[default]
+    #[strum(serialize = "Point Sampled")] Point = 0,
+    #[strum(serialize = "Box Filter")] Box = 1,
+    #[strum(serialize = "Gaussian Filter")] Gaussian = 2,
+}
+
+/// `bitmap_usage_downsample_flags_def`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq,
+         num_derive::FromPrimitive, num_derive::ToPrimitive,
+         strum::EnumString, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(ascii_case_insensitive)]
+#[repr(u16)]
+pub enum BitmapDownsampleFlags {
+    #[strum(serialize = "Sprites - Color Bleed in Zero Alpha Regions")] SpriteColorBleed = 0,
+    #[strum(serialize = "Pre-Multiply Alpha (before downsampling)")] PremultiplyAlpha = 1,
+    #[strum(serialize = "Post-Divide Alpha (after downsampling)")] PostDivideAlpha = 2,
+    #[strum(serialize = "Height Map - Convert to Bump Map")] HeightToBump = 3,
+    #[strum(serialize = "Detail Map - Fade to Gray")] DetailFadeGray = 4,
+    #[strum(serialize = "Signed -> Unsigned Scale and Bias")] SignedToUnsigned = 5,
+    #[strum(serialize = "Illum Map - Fade to Black")] IllumFadeBlack = 6,
+    #[strum(serialize = "ZBump - Scale by height and renormalize")] ZBumpScale = 7,
+}
+
+/// `bitmap_usage_swizzle_def` — per-channel source selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default,
+         num_derive::FromPrimitive, num_derive::ToPrimitive,
+         strum::EnumString, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(ascii_case_insensitive)]
+#[repr(i8)]
+pub enum BitmapSwizzle {
+    #[default]
+    #[strum(serialize = "Default")] Default = 0,
+    #[strum(serialize = "Source Red Channel")] SourceRed = 1,
+    #[strum(serialize = "Source Green Channel")] SourceGreen = 2,
+    #[strum(serialize = "Source Blue Channel")] SourceBlue = 3,
+    #[strum(serialize = "Source Alpha Channel")] SourceAlpha = 4,
+    #[strum(serialize = "Set to 1.0")] SetOne = 5,
+    #[strum(serialize = "Set to 0.0")] SetZero = 6,
+    #[strum(serialize = "Set to 0.5")] SetHalf = 7,
 }

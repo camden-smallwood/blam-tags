@@ -19,8 +19,9 @@ fn main() {
                     sys.particle_tag_path.rsplit('/').next().unwrap_or(""),
                     flags_raw(&sys.flags));
                 for (mi, em) in sys.emitters.iter().enumerate() {
-                    println!("    emitter{mi} flags(u8)={:#04x} = {:08b}  [bit0(can_be_gpu)={}]",
-                        em.flags, em.flags, em.flags & 1);
+                    use blam_tags::effect::EmitterDefinitionFlags as EF;
+                    println!("    emitter{mi} flags={:?}  [can_be_gpu={}]",
+                        em.flags, em.flags.contains(EF::CanBeGpu));
                 }
             }
         }

@@ -81,9 +81,12 @@ impl EditableProperty {
     }
 }
 
-/// Read a typed property's interpolant vector. Handles both forms:
+/// Read a typed property's interpolant vector. Handles these forms:
 /// - `real_point_3d` / `real_vector_3d` (translational_offset,
 ///   self_acceleration) — read directly.
+/// - `real_point_2d` / `real_vector_2d` (contrail `profile offset`) —
+///   read as `{x, y}` into `{i, j, k=0}` (the shared interpolant slot is
+///   a `RealVector3d`; the 2D consumer uses `.i`/`.j`).
 /// - the spherical struct `{Radius, Euler angles 2d (yaw, pitch)}`
 ///   (relative_direction) — convert to a vector
 ///   `Radius · (cos pitch cos yaw, cos pitch sin yaw, sin pitch)`
@@ -120,6 +123,14 @@ fn read_interpolant(parent: &TagStruct<'_>, name: &str) -> Option<crate::math::R
             Some(RealVector3d { i: p.x, j: p.y, k: p.z })
         }
         Some(TagFieldType::RealVector3d) => Some(parent.read_vec3(name)),
+        Some(TagFieldType::RealPoint2d) => {
+            let p = parent.read_point2d(name);
+            Some(RealVector3d { i: p.x, j: p.y, k: 0.0 })
+        }
+        Some(TagFieldType::RealVector2d) => {
+            let v = parent.read_vec2(name);
+            Some(RealVector3d { i: v.i, j: v.j, k: 0.0 })
+        }
         _ => None,
     }
 }

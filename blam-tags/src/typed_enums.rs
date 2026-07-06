@@ -60,7 +60,7 @@ use strum::VariantArray;
 /// canonical integer indices. Blanket-implemented; you never write this
 /// by hand — deriving `FromPrimitive`, `ToPrimitive`, `EnumString`,
 /// `IntoStaticStr`, and `VariantArray` is enough.
-pub trait SchemaEnum: Copy + 'static + fmt::Debug {
+pub trait SchemaEnum: Copy + 'static + fmt::Debug + FromPrimitive + ToPrimitive {
     /// Resolve a schema option/bit name to a variant. Tries an exact
     /// (case-insensitive) match first, then a normalized match that
     /// folds away spaces / dashes / underscores / case so cosmetic
@@ -179,52 +179,66 @@ impl_tag_int!(i8, i16, i32, u8, u16, u32);
 // Enum<T, U> — a single-choice enum field.
 // ---------------------------------------------------------------------------
 
-/// A decoded single-choice enum field: the resolved canonical variant
-/// `T`, plus the raw storage value `U` as authored.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct Enum<T, U> {
-    variant: T,
-    raw: U,
+/// The canonical discriminant of a variant as a `u64` (its bit/option index).
+#[inline]
+fn discriminant<T: ToPrimitive>(v: T) -> u64 {
+    v.to_u64().expect("enum discriminant must fit in u64")
 }
 
-impl<T: SchemaEnum, U: TagInt> Enum<T, U> {
+/// A decoded single-choice enum field. Stores ONLY the canonical discriminant
+/// of the resolved variant in the field's storage int — `#[repr(transparent)]`
+/// over `U`, so it is `Copy` and layout-identical to `U` (usable as a runtime
+/// datum member). The integer is never exposed publicly.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct Enum<T, U> {
+    /// `resolved_variant.to_index()` in the storage int. By-name schema
+    /// resolution is baked in at [`Self::resolve`], so positional `from_u64`
+    /// here is drift-safe.
+    raw: U,
+    _t: PhantomData<T>,
+}
+
+impl<T: FromPrimitive + ToPrimitive + Copy, U: TagInt> Enum<T, U> {
     /// The resolved canonical variant.
     #[inline]
     pub fn get(self) -> T {
-        self.variant
+        T::from_u64(self.raw.to_u64()).expect("Enum holds a valid canonical discriminant")
     }
     /// Set the variant (e.g. for synthesized / overridden values).
     #[inline]
     pub fn set(&mut self, variant: T) {
-        self.variant = variant;
-        self.raw = U::from_i128(variant.to_index() as i128);
+        self.raw = U::from_i128(discriminant(variant) as i128);
     }
-    /// The canonical schema name of the resolved variant.
-    #[inline]
-    pub fn name(self) -> &'static str {
-        self.variant.schema_name()
-    }
-
     /// Build directly from a variant (for synthesized/overridden values).
     pub fn from_variant(variant: T) -> Self {
         Enum {
-            variant,
-            raw: U::from_i128(variant.to_index() as i128),
+            raw: U::from_i128(discriminant(variant) as i128),
+            _t: PhantomData,
         }
     }
-
-    /// The raw storage value as authored in the tag. `pub(crate)` —
+    /// The raw storage value (the canonical discriminant). `pub(crate)` —
     /// callers operate on the typed variant, not the integer.
     #[inline]
     pub(crate) fn raw(self) -> U {
         self.raw
+    }
+}
+
+impl<T: SchemaEnum, U: TagInt> Enum<T, U> {
+    /// The canonical schema name of the resolved variant.
+    #[inline]
+    pub fn name(self) -> &'static str {
+        self.get().schema_name()
     }
 
     /// Resolve a raw value + its embedded name into a typed `Enum`.
     /// `name` is the embedded schema option name (`None` if the decoder
     /// couldn't resolve it). Panics on an unresolved value — a tag whose
     /// enum value has no embedded name, or a name with no matching `T`
-    /// variant, is a real decode error we want surfaced, not buried.
+    /// variant, is a real decode error we want surfaced, not buried. The
+    /// resolved variant's CANONICAL discriminant is stored (not the wire
+    /// value), folding away bit-order drift.
     pub(crate) fn resolve(field: &str, raw: U, name: Option<&str>) -> Self {
         let variant = match name {
             Some(n) => T::from_schema_name(n).unwrap_or_else(|| {
@@ -245,13 +259,13 @@ impl<T: SchemaEnum, U: TagInt> Enum<T, U> {
                 std::any::type_name::<T>()
             ),
         };
-        Enum { variant, raw }
+        Enum::from_variant(variant)
     }
 }
 
-impl<T: SchemaEnum, U: TagInt> fmt::Debug for Enum<T, U> {
+impl<T: FromPrimitive + ToPrimitive + Copy + fmt::Debug, U: TagInt> fmt::Debug for Enum<T, U> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self.variant)
+        write!(f, "{:?}", self.get())
     }
 }
 
@@ -260,7 +274,7 @@ impl<T: SchemaEnum, U: TagInt> fmt::Debug for Enum<T, U> {
 /// directly with `{}`.
 impl<T: SchemaEnum, U: TagInt> fmt::Display for Enum<T, U> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.variant.schema_name())
+        f.write_str(self.get().schema_name())
     }
 }
 
@@ -274,12 +288,16 @@ impl<T: SchemaEnum + Default, U: TagInt> Default for Enum<T, U> {
     }
 }
 
-impl<T: SchemaEnum, U: TagInt> PartialEq<T> for Enum<T, U>
-where
-    T: PartialEq,
-{
+impl<T, U: TagInt> PartialEq for Enum<T, U> {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+    }
+}
+impl<T, U: TagInt> Eq for Enum<T, U> {}
+
+impl<T: FromPrimitive + ToPrimitive + Copy + PartialEq, U: TagInt> PartialEq<T> for Enum<T, U> {
     fn eq(&self, other: &T) -> bool {
-        self.variant == *other
+        self.get() == *other
     }
 }
 
@@ -292,22 +310,36 @@ where
 /// A decoded flags field: the set of canonical variants whose bits are
 /// set, re-expressed in `T`'s canonical bit order. The raw authored
 /// value is retained for round-tripping / diagnostics.
-#[derive(Clone)]
+///
+/// Stores ONLY the canonical bit pattern (bits at `T` discriminant
+/// positions). `#[repr(transparent)]` over the storage int, so it is `Copy`,
+/// heap-free, and layout-identical to `U` — usable both for decoded tag
+/// fields AND as a runtime bitfield member of a byte-laid-out struct. The
+/// integer is never exposed publicly; callers use the typed flag API.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
 pub struct Flags<T, U> {
-    set: Vec<T>,
-    raw: U,
-    _u: PhantomData<U>,
+    /// Canonical bits — bit `i` set ⇔ the `T` variant with `to_index() == i`
+    /// is present. By-name schema resolution is baked in at [`Self::resolve`].
+    bits: U,
+    _t: PhantomData<T>,
 }
 
-impl<T: SchemaEnum + PartialEq, U: TagInt> Flags<T, U> {
-    /// The set flags, in canonical order.
+impl<T: FromPrimitive + ToPrimitive + Copy, U: TagInt> Flags<T, U> {
+    /// The set flags, in canonical (bit-index) order. Recovers each set bit's
+    /// variant via `from_u64` — a set bit with no matching variant (runtime /
+    /// over-range) is skipped.
     pub fn get(&self) -> Vec<T> {
-        self.set.clone()
+        let bits = self.bits.to_u64();
+        (0..U::BITS)
+            .filter(|&i| bits & (1u64 << i) != 0)
+            .filter_map(|i| T::from_u64(i as u64))
+            .collect()
     }
     /// Is `flag` set?
     #[inline]
     pub fn contains(&self, flag: T) -> bool {
-        self.set.iter().any(|f| *f == flag)
+        self.bits.to_u64() & (1u64 << discriminant(flag)) != 0
     }
     /// Are ALL of `flags` set?
     pub fn test(&self, flags: &[T]) -> bool {
@@ -319,13 +351,17 @@ impl<T: SchemaEnum + PartialEq, U: TagInt> Flags<T, U> {
     }
     /// Set or clear a flag.
     pub fn set(&mut self, flag: T, on: bool) {
-        let present = self.contains(flag);
-        if on && !present {
-            self.set.push(flag);
-            self.set.sort_by_key(|f| f.to_index());
-        } else if !on && present {
-            self.set.retain(|f| *f != flag);
-        }
+        let mask = 1u64 << discriminant(flag);
+        let bits = if on {
+            self.bits.to_u64() | mask
+        } else {
+            self.bits.to_u64() & !mask
+        };
+        self.bits = U::from_i128(bits as i128);
+    }
+    /// Flip a flag (Ares `c_flags::toggle`).
+    pub fn toggle(&mut self, flag: T) {
+        self.set(flag, !self.contains(flag));
     }
     /// Build directly from a set of flags (synthesized values).
     pub fn from_slice(flags: &[T]) -> Self {
@@ -333,91 +369,139 @@ impl<T: SchemaEnum + PartialEq, U: TagInt> Flags<T, U> {
         for &flag in flags {
             f.set(flag, true);
         }
-        f.raw = U::from_i128(f.canonical_bits() as i128);
         f
+    }
+
+    /// Build from a raw canonical bit pattern (bit `i` set ⇔ the variant with
+    /// discriminant `i` is present). For runtime-computed bit summaries that are
+    /// not schema-decoded (e.g. a mask indexed by an index enum).
+    pub const fn from_bits(bits: U) -> Self {
+        Self { bits, _t: PhantomData }
+    }
+
+    /// The raw canonical bit pattern (bit `i` set ⇔ variant with discriminant
+    /// `i`). Inverse of [`Self::from_bits`], for interop with runtime mask math.
+    pub const fn bits(&self) -> U {
+        self.bits
     }
     /// Iterate the set flags (canonical order).
     pub fn iter(&self) -> impl Iterator<Item = T> + '_ {
-        self.set.iter().copied()
-    }
-    /// Schema names of the set flags.
-    pub fn names(&self) -> Vec<&'static str> {
-        self.set.iter().map(|f| f.schema_name()).collect()
+        self.get().into_iter()
     }
     /// No flags set.
     pub fn is_empty(&self) -> bool {
-        self.set.is_empty()
+        self.bits == U::ZERO
     }
 
-    /// The raw authored value. `pub(crate)` — callers operate on the
-    /// typed flag set, not the integer.
-    #[inline]
-    pub(crate) fn raw(&self) -> U {
-        self.raw
-    }
     /// Canonical bit pattern (bits at `T` discriminants). `pub(crate)` —
-    /// internal/serialization use only.
+    /// internal/serialization use only; callers use the typed flag API.
     pub(crate) fn canonical_bits(&self) -> u64 {
-        self.set.iter().fold(0u64, |acc, f| acc | (1u64 << f.to_index()))
+        self.bits.to_u64()
+    }
+}
+
+// --- typed bitset arithmetic: for runtime dirty-tracking masks (e.g. the
+// particle-state `used`/`updated` words) that combine flag sets with &/|/^/! ---
+impl<T, U: TagInt> std::ops::BitAnd for Flags<T, U> {
+    type Output = Self;
+    fn bitand(self, rhs: Self) -> Self {
+        Flags { bits: U::from_i128((self.bits.to_u64() & rhs.bits.to_u64()) as i128), _t: PhantomData }
+    }
+}
+impl<T, U: TagInt> std::ops::BitOr for Flags<T, U> {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Flags { bits: U::from_i128((self.bits.to_u64() | rhs.bits.to_u64()) as i128), _t: PhantomData }
+    }
+}
+impl<T, U: TagInt> std::ops::BitXor for Flags<T, U> {
+    type Output = Self;
+    fn bitxor(self, rhs: Self) -> Self {
+        Flags { bits: U::from_i128((self.bits.to_u64() ^ rhs.bits.to_u64()) as i128), _t: PhantomData }
+    }
+}
+impl<T, U: TagInt> std::ops::Not for Flags<T, U> {
+    type Output = Self;
+    /// Complement within `U`'s bit width (bits above `U::BITS` stay clear).
+    fn not(self) -> Self {
+        let mask = if U::BITS >= 64 { u64::MAX } else { (1u64 << U::BITS) - 1 };
+        Flags { bits: U::from_i128((!self.bits.to_u64() & mask) as i128), _t: PhantomData }
+    }
+}
+impl<T, U: TagInt> std::ops::BitAndAssign for Flags<T, U> {
+    fn bitand_assign(&mut self, rhs: Self) {
+        self.bits = U::from_i128((self.bits.to_u64() & rhs.bits.to_u64()) as i128);
+    }
+}
+impl<T, U: TagInt> std::ops::BitOrAssign for Flags<T, U> {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.bits = U::from_i128((self.bits.to_u64() | rhs.bits.to_u64()) as i128);
+    }
+}
+impl<T, U: TagInt> std::ops::BitXorAssign for Flags<T, U> {
+    fn bitxor_assign(&mut self, rhs: Self) {
+        self.bits = U::from_i128((self.bits.to_u64() ^ rhs.bits.to_u64()) as i128);
+    }
+}
+
+impl<T: SchemaEnum, U: TagInt> Flags<T, U> {
+    /// Schema names of the set flags.
+    pub fn names(&self) -> Vec<&'static str> {
+        self.get().iter().map(|f| f.schema_name()).collect()
     }
 
     /// Resolve a raw value + its embedded set-bit names into a typed
     /// `Flags`. `names` are the embedded `(bit, name)` pairs of the SET
-    /// bits (from the decoder). Panics if any set, named bit fails to
-    /// map to a `T` variant. A set bit with NO embedded name (past the
-    /// schema's string list) is preserved in `raw` but cannot be typed —
-    /// that is tolerated (runtime/over-range bits), unlike enums.
-    pub(crate) fn resolve(_field: &str, raw: U, names: &[(u32, String)]) -> Self {
-        // Tolerate set bits whose schema name has no matching variant — newer
-        // or runtime-only flags past this walker's enum. They stay in `raw`
-        // (nothing lost) but can't be typed; skip them rather than panicking,
-        // mirroring how unnamed over-range bits are already handled.
-        let set = names
-            .iter()
-            .filter_map(|(_bit, n)| T::from_schema_name(n))
-            .collect();
+    /// bits (from the decoder); each is mapped to its canonical `T`
+    /// discriminant and OR'd into `bits`, so wire bit-order drift is folded
+    /// away at read time. A set bit with NO embedded name (past the schema's
+    /// string list — a runtime/over-range bit) cannot be typed and is dropped;
+    /// that is tolerated, unlike enums.
+    pub(crate) fn resolve(_field: &str, _raw: U, names: &[(u32, String)]) -> Self {
+        let mut bits = 0u64;
+        for (_bit, n) in names {
+            if let Some(v) = T::from_schema_name(n) {
+                bits |= 1u64 << v.to_index();
+            }
+        }
         Flags {
-            set,
-            raw,
-            _u: PhantomData,
+            bits: U::from_i128(bits as i128),
+            _t: PhantomData,
         }
     }
 }
 
-impl<T: SchemaEnum + PartialEq, U: TagInt> Default for Flags<T, U> {
+impl<T, U: TagInt> Default for Flags<T, U> {
     fn default() -> Self {
         Flags {
-            set: Vec::new(),
-            raw: U::ZERO,
-            _u: PhantomData,
+            bits: U::ZERO,
+            _t: PhantomData,
         }
     }
 }
 
-impl<T: SchemaEnum + PartialEq, U: TagInt> PartialEq for Flags<T, U> {
+impl<T, U: TagInt> PartialEq for Flags<T, U> {
     fn eq(&self, other: &Self) -> bool {
-        self.canonical_bits() == other.canonical_bits()
+        self.bits == other.bits
     }
 }
 
-impl<T: SchemaEnum + PartialEq, U: TagInt> fmt::Debug for Flags<T, U> {
+impl<T: FromPrimitive + ToPrimitive + Copy + fmt::Debug, U: TagInt> fmt::Debug for Flags<T, U> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_set().entries(self.set.iter()).finish()
+        f.debug_set().entries(self.get().iter()).finish()
     }
 }
 
-/// Hex display forwards to the retained raw authored value — for the
-/// round-tripping / diagnostics use the struct doc-comment calls out
-/// (`Debug` already prints the resolved variant names). Lets dump tools
-/// keep `{:x}` / `{:#x}` on a flags field.
+/// Hex display forwards to the canonical bit pattern — lets dump tools keep
+/// `{:x}` / `{:#x}` on a flags field (`Debug` already prints variant names).
 impl<T, U: fmt::LowerHex> fmt::LowerHex for Flags<T, U> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::LowerHex::fmt(&self.raw, f)
+        fmt::LowerHex::fmt(&self.bits, f)
     }
 }
 impl<T, U: fmt::UpperHex> fmt::UpperHex for Flags<T, U> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::UpperHex::fmt(&self.raw, f)
+        fmt::UpperHex::fmt(&self.bits, f)
     }
 }
 
@@ -498,9 +582,9 @@ mod tests {
         assert!(f.test_any(&[ContentFlags::Subtractive, ContentFlags::Additive]));
         assert!(!f.test_any(&[ContentFlags::Subtractive]));
         assert_eq!(f.names(), vec!["double-sided", "additive"]);
-        // canonical re-pack uses T discriminants (0 and 1), NOT the embedded bit 5.
+        // canonical re-pack uses T discriminants (0 and 1), NOT the embedded bit 5:
+        // only the canonical bits are stored (the wire pattern is not retained).
         assert_eq!(f.canonical_bits(), 0b11);
-        assert_eq!(f.raw(), 0b100001u16); // raw preserves the authored pattern
     }
 
     #[test]

@@ -280,13 +280,14 @@ pub enum CoordinateSystem {
     #[strum(serialize = "local")] Local = 1,
 }
 
-/// `effect_flags` (long_flags).
+/// `effect_flags` (long_flags) — Ares `e_effect_definition_flags`, the effect
+/// DEFINITION authoring flags (distinct from the runtime `e_effect_flags`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq,
          num_derive::FromPrimitive, num_derive::ToPrimitive,
          strum::EnumString, strum::IntoStaticStr, strum::VariantArray)]
 #[strum(ascii_case_insensitive)]
 #[repr(u32)]
-pub enum EffectFlags {
+pub enum EffectDefinitionFlags {
     #[strum(serialize = "deleted when attachment deactivates")] DeletedWhenAttachmentDeactivates = 0,
     #[strum(serialize = "run events in parallel")] RunEventsInParallel = 1,
     #[strum(serialize = "do not re-use parts when looping")] DoNotReusePartsWhenLooping = 2,
@@ -300,7 +301,7 @@ pub enum EffectFlags {
     // --- runtime flags (Ares `e_effect_definition_flags` bits 10+) ---
     // Not authored in the tag (absent from the schema JSON, which ends at
     // `half resolution`); set by `effect_postprocess` at load. Included here so
-    // the runtime `Flags<EffectFlags, u32>` word can carry them, matching the
+    // the runtime `Flags<EffectDefinitionFlags, u32>` word can carry them, matching the
     // engine's single flags enum spanning on-disk (0-9) + runtime (10+).
     /// `_effect_samples_lightmap_bit` — any of the effect's particles tint from
     /// the lightmap. Gates `effect_create_lighting_samples` (dllcache 0x400).
@@ -422,6 +423,33 @@ pub enum EmissionShape {
     #[strum(serialize = "debris")] Debris = 8,
     #[strum(serialize = "line")] Line = 9,
     #[strum(serialize = "breakable surface")] BreakableSurface = 10,
+}
+
+/// `emission_axis_enum` (char_enum) — the particle-model spawn axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default,
+         num_derive::FromPrimitive, num_derive::ToPrimitive,
+         strum::EnumString, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(ascii_case_insensitive)]
+#[repr(i8)]
+pub enum EmissionAxis {
+    #[default]
+    #[strum(serialize = "constant")] Constant = 0,
+    #[strum(serialize = "cone")] Cone = 1,
+    #[strum(serialize = "disc")] Disc = 2,
+    #[strum(serialize = "globe")] Globe = 3,
+}
+
+/// `emission_reference_axis_enum` (char_enum) — reference axis for emission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default,
+         num_derive::FromPrimitive, num_derive::ToPrimitive,
+         strum::EnumString, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(ascii_case_insensitive)]
+#[repr(i8)]
+pub enum EmissionReferenceAxis {
+    #[default]
+    #[strum(serialize = "x")] X = 0,
+    #[strum(serialize = "y")] Y = 1,
+    #[strum(serialize = "z")] Z = 2,
 }
 
 // ---------------------------------------------------------------------------
@@ -736,6 +764,54 @@ impl EffectAcceleration {
 use crate::effects_properties::EditableProperty;
 use crate::particle_physics::ParticlePhysics;
 
+/// `c_particle_emitter_definition::e_emitter_flags` — the runtime
+/// CPU/GPU-classification bitfield. The schema option list is empty
+/// (these bits are not authored: the cache compiler / runtime
+/// `decide_whether_cpu_or_gpu` + `postprocess_block_proc` set them, and
+/// loose tags ship them stripped to 0). Kept as named variants so the
+/// runtime port sets/tests them through the typed `Flags` wrapper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq,
+         num_derive::FromPrimitive, num_derive::ToPrimitive,
+         strum::EnumString, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(ascii_case_insensitive)]
+#[repr(u8)]
+pub enum EmitterDefinitionFlags {
+    #[strum(serialize = "can be gpu")] CanBeGpu = 0,
+    #[strum(serialize = "is cpu")] IsCpu = 1,
+    #[strum(serialize = "is gpu")] IsGpu = 2,
+    #[strum(serialize = "becomes gpu when at rest")] BecomesGpuWhenAtRest = 3,
+    #[strum(serialize = "using black point")] UsingBlackPoint = 4,
+}
+
+/// `c_particle_emitter_definition::e_property` — the 18 per-emitter editable
+/// property slots, used as bit indices into the runtime
+/// `constant_per_particle_properties` / `constant_over_time_properties`
+/// summaries. An index enum (no schema names), so `Flags<EmitterProperty, i32>`
+/// carries those masks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug,
+         num_derive::FromPrimitive, num_derive::ToPrimitive)]
+#[repr(u32)]
+pub enum EmitterProperty {
+    EmitterOffset = 0,
+    EmitterDirection = 1,
+    EmissionRadius = 2,
+    EmissionAngle = 3,
+    ParticleAxisAngle = 4,
+    EmitterStartingCount = 5,
+    EmitterMaxCount = 6,
+    EmissionRate = 7,
+    ParticleLifespan = 8,
+    ParticleSelfAcceleration = 9,
+    ParticleVelocity = 10,
+    ParticleRotation = 11,
+    ParticleRotationRate = 12,
+    ParticleSize = 13,
+    ParticleScale = 14,
+    ParticleTint = 15,
+    ParticleAlpha = 16,
+    ParticleBlackPoint = 17,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ParticleSystemEmitter {
     pub name: String,
@@ -743,12 +819,15 @@ pub struct ParticleSystemEmitter {
     /// impact_contour/impact_area/debris/line/breakable_surface.
     /// Raw integer until P3 ports the full enum.
     pub emission_shape: Enum<EmissionShape, i8>,
-    /// `emitter_flags` — empty option list in the schema, kept raw.
-    pub flags: u8,
+    /// `emitter_flags` (`c_particle_emitter_definition::e_emitter_flags`)
+    /// — runtime CPU/GPU-classification bits, reconstructed at postprocess
+    /// (loose tags ship them 0). Typed `Flags` so the runtime port
+    /// sets/tests through the wrapper.
+    pub flags: Flags<EmitterDefinitionFlags, u8>,
     /// `emission_axis_enum` — constant/cone/disc/globe.
-    pub particle_axis_for_models: i8,
+    pub particle_axis_for_models: Enum<EmissionAxis, i8>,
     /// `emission_reference_axis_enum` — x/y/z.
-    pub particle_reference_axis: i8,
+    pub particle_reference_axis: Enum<EmissionReferenceAxis, i8>,
     pub bounding_radius_estimate: f32,
     pub bounding_radius_override: f32,
     pub uv_scrolling: crate::math::RealVector2d,
@@ -789,8 +868,12 @@ pub struct ParticleSystemEmitter {
     pub particle_alpha_black_point: EditableProperty,
 
     // ---- runtime-resolved gpu_data summary ----
-    pub runtime_constant_per_particle_properties: i32,
-    pub runtime_constant_over_time_properties: i32,
+    /// Bit `p` set ⇔ property `p` (`EmitterProperty`) is constant per particle.
+    pub runtime_constant_per_particle_properties: Flags<EmitterProperty, i32>,
+    /// Bit `p` set ⇔ property `p` (`EmitterProperty`) is constant over time.
+    pub runtime_constant_over_time_properties: Flags<EmitterProperty, i32>,
+    /// Particle-state bit accumulator (indexed by particle-state, OR'd across
+    /// the postprocess seed pass) — kept a raw mask, not a named-flag set.
     pub runtime_used_particle_states: i32,
 }
 
@@ -798,12 +881,12 @@ impl ParticleSystemEmitter {
     pub fn from_struct(s: &TagStruct<'_>) -> Self {
         let name = s.read_string_id("emitter name").unwrap_or_default();
         let emission_shape = s.try_read_enum("emission shape").unwrap_or_default();
-        // flags!: layout may strip. Defaults to 0.
-        let flags = s.read_int_any("flags").unwrap_or(0) as u8;
+        // `emitter_flags`: runtime bits, stripped in loose tags → empty.
+        let flags = s.try_read_flags("flags").unwrap_or_default();
         let particle_axis_for_models =
-            s.read_int_any("particle axis (for models)").unwrap_or(0) as i8;
+            s.try_read_enum("particle axis (for models)").unwrap_or_default();
         let particle_reference_axis =
-            s.read_int_any("particle reference axis").unwrap_or(0) as i8;
+            s.try_read_enum("particle reference axis").unwrap_or_default();
         let bounding_radius_estimate = s
             .read_real("bounding radius estimate")
             .unwrap_or(0.0);
@@ -847,12 +930,14 @@ impl ParticleSystemEmitter {
             particle_tint: read_property(s, "particle tint"),
             particle_alpha: read_property(s, "particle alpha"),
             particle_alpha_black_point: read_property(s, "particle alpha black point"),
-            runtime_constant_per_particle_properties: s
-                .read_int_any("runtime m_constant_per_particle_properties")
-                .unwrap_or(0) as i32,
-            runtime_constant_over_time_properties: s
-                .read_int_any("runtime m_constant_over_time_properties")
-                .unwrap_or(0) as i32,
+            runtime_constant_per_particle_properties: Flags::from_bits(
+                s.read_int_any("runtime m_constant_per_particle_properties")
+                    .unwrap_or(0) as i32,
+            ),
+            runtime_constant_over_time_properties: Flags::from_bits(
+                s.read_int_any("runtime m_constant_over_time_properties")
+                    .unwrap_or(0) as i32,
+            ),
             runtime_used_particle_states: s
                 .read_int_any("runtime m_used_particle_states")
                 .unwrap_or(0) as i32,
@@ -1065,7 +1150,7 @@ impl EffectConicalDistribution {
 #[derive(Debug, Clone, Default)]
 pub struct EffectDefinition {
     /// `effect_flags`.
-    pub flags: Flags<EffectFlags, u32>,
+    pub flags: Flags<EffectDefinitionFlags, u32>,
     /// `fixed random seed` — non-zero ⇒ deterministic effect.
     pub fixed_random_seed: i32,
     /// `restart if within{overlap threshold}:world units` — engine

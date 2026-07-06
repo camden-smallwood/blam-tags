@@ -16,7 +16,7 @@ fn main() {
         match r {
             Ok(Ok(def)) => {
                 println!("  parallel={} loop_start={} events={}",
-                    def.flags.contains(blam_tags::effect::EffectFlags::RunEventsInParallel),
+                    def.flags.contains(blam_tags::effect::EffectDefinitionFlags::RunEventsInParallel),
                     def.loop_start_event, def.events.len());
                 for (i, ev) in def.events.iter().enumerate() {
                     println!("  event[{i}]: delay={:.4}..{:.4} duration={:.4}..{:.4}",
