@@ -1048,13 +1048,27 @@ fn sync_fixed_counts(
                 // group + the path length (excluding the NUL).
                 if p.len() >= 4 {
                     raw[*off..*off + 4].copy_from_slice(&p[0..4]);
-                }
-                // Only rewrite the length when a path is present; null
-                // references preserve their original length field (H2
-                // stores -1 there, not 0).
-                if p.len() > 4 {
-                    let path_len = p.len() - 5; // minus 4 group + 1 NUL
-                    wr_u32(raw, *off + 8, path_len as u32, endian);
+                    // Only rewrite the length when a path is present; a null
+                    // reference read from disk keeps its 4-byte (group-only)
+                    // payload and its original length field (H2 stores -1
+                    // there, not 0), so leave the inline word alone.
+                    if p.len() > 4 {
+                        let path_len = p.len() - 5; // minus 4 group + 1 NUL
+                        wr_u32(raw, *off + 8, path_len as u32, endian);
+                    }
+                } else if *off + 12 <= raw.len() {
+                    // Empty payload: the reference was *edited* to null
+                    // (`TagReferenceData::to_bytes(None)` yields no bytes),
+                    // unlike an originally-null ref whose decoded payload is
+                    // the 4 group bytes. Neither the group nor the length was
+                    // touched above, so the stale on-disk group + path length
+                    // would survive while no trailing path is emitted — the
+                    // decoder then tries to read a phantom path and hits EOF
+                    // ("need N bytes, have M"), corrupting the saved tag.
+                    // Write a canonical null: group = -1 and length = 0, which
+                    // the decoder treats as NONE for both CE and H2.
+                    raw[*off..*off + 4].copy_from_slice(&[0xFF; 4]);
+                    wr_u32(raw, *off + 8, 0, endian);
                 }
             }
             (TagFieldType::StringId, Some(TagSubChunkContent::StringId(s)))

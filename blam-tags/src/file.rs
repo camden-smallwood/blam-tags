@@ -384,8 +384,9 @@ impl TagFile {
         self.write_to(&mut writer)
     }
 
-    /// Write to a temporary file, replace `path`, then verify the saved tag
-    /// can be parsed again. Leaves the original untouched on any failure.
+    /// Write to a temporary file, verify it can be parsed again, then replace
+    /// `path` only once verification succeeds. Leaves the original untouched on
+    /// any failure (a bad encode never clobbers the tag already on disk).
     pub fn write_atomic<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
         let path = path.as_ref();
         let (temp_path, file) = create_save_temp_file(path)?;
@@ -395,9 +396,11 @@ impl TagFile {
             writer.flush()?;
             let file = writer.into_inner().map_err(|error| error.into_error())?;
             file.sync_all()?;
-            commit_temp_file(&temp_path, path)?;
+            // Verify the freshly-written TEMP file parses before replacing the
+            // original. A bad encode must never clobber the user's tag on disk,
+            // so the commit happens only after verification succeeds.
             if let TagContainer::Classic { engine, .. } = self.container {
-                let bytes = std::fs::read(path)?;
+                let bytes = std::fs::read(&temp_path)?;
                 crate::classic::ClassicHeader::parse(&bytes).ok_or_else(|| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -405,21 +408,21 @@ impl TagFile {
                     )
                 })?;
                 crate::classic::read_classic_body(&bytes[64..], &self.tag_stream.layout, engine)
-                    .map(|_| ())
                     .map_err(|error| {
                         std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             format!("saved classic tag failed verification: {error}"),
                         )
-                    })
+                    })?;
             } else {
-                Self::read(path).map(|_| ()).map_err(|error| {
+                Self::read(&temp_path).map_err(|error| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!("saved tag failed verification: {error}"),
                     )
-                })
+                })?;
             }
+            commit_temp_file(&temp_path, path)
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(&temp_path);
