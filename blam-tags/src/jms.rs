@@ -2017,6 +2017,12 @@ fn rotation_from_basis(cts: &TagStruct<'_>) -> RealQuaternion {
 }
 
 fn read_markers(root: &TagStruct<'_>) -> Result<Vec<JmsMarker>, JmsError> {
+    // The modern JMS (8205+) has no separate region/permutation columns for
+    // markers — that scoping is encoded IN the marker name as
+    // `(<permutation> <region>)<name>` (e.g. `(base l_pod)fx_boost`). Global
+    // markers (region index -1) keep the plain group name. Build a name table
+    // so we can reconstruct that prefix the way tool.exe / the H3 exporter does.
+    let region_perms = read_region_permutation_names(root);
     let block = root.field_path("marker groups").and_then(|f| f.as_block())
         .ok_or(JmsError::MissingField("marker groups"))?;
     let mut out = Vec::new();
@@ -2028,8 +2034,10 @@ fn read_markers(root: &TagStruct<'_>) -> Result<Vec<JmsMarker>, JmsError> {
         };
         for j in 0..inner.len() {
             let m = inner.element(j).unwrap();
+            let region_index = m.read_int_any("region index").unwrap_or(-1);
+            let permutation_index = m.read_int_any("permutation index").unwrap_or(-1);
             out.push(JmsMarker {
-                name: group_name.clone(),
+                name: marker_display_name(&group_name, region_index, permutation_index, &region_perms),
                 node_index: m.read_int_any("node index").unwrap_or(-1) as i16,
                 rotation: m.read_quat("rotation"),
                 translation: m.read_point3d("translation") * SCALE,
@@ -2038,6 +2046,54 @@ fn read_markers(root: &TagStruct<'_>) -> Result<Vec<JmsMarker>, JmsError> {
         }
     }
     Ok(out)
+}
+
+/// Region → (region name, permutation names) table, indexed by region /
+/// permutation index. Markers reference their scope via these indices.
+fn read_region_permutation_names(root: &TagStruct<'_>) -> Vec<(String, Vec<String>)> {
+    let mut regions = Vec::new();
+    let Some(rblock) = root.field_path("regions").and_then(|f| f.as_block()) else {
+        return regions;
+    };
+    for ri in 0..rblock.len() {
+        let region = rblock.element(ri).unwrap();
+        let region_name = region.read_string_id("name").unwrap_or_default();
+        let mut perms = Vec::new();
+        if let Some(pblock) = region.field("permutations").and_then(|f| f.as_block()) {
+            for pi in 0..pblock.len() {
+                perms.push(pblock.element(pi).unwrap().read_string_id("name").unwrap_or_default());
+            }
+        }
+        regions.push((region_name, perms));
+    }
+    regions
+}
+
+/// Compose a marker's JMS name from its group name and region/permutation
+/// scope. Mirrors the H3 exporter convention: `(<permutation> <region>)<name>`
+/// for scoped markers, plain `<name>` for global ones (region index < 0).
+fn marker_display_name(
+    group_name: &str,
+    region_index: i128,
+    permutation_index: i128,
+    region_perms: &[(String, Vec<String>)],
+) -> String {
+    if region_index < 0 {
+        return group_name.to_string();
+    }
+    let Some((region_name, perms)) = region_perms.get(region_index as usize) else {
+        return group_name.to_string();
+    };
+    let perm_name = if permutation_index >= 0 {
+        perms.get(permutation_index as usize).map(String::as_str)
+    } else {
+        None
+    };
+    match perm_name {
+        Some(perm) => format!("({perm} {region_name}){group_name}"),
+        // Region-scoped but applies to every permutation.
+        None => format!("({region_name}){group_name}"),
+    }
 }
 
 /// Region × permutation walker that builds:
@@ -2542,3 +2598,42 @@ const EMPTY_SECTIONS_TRAILING: &[(&str, &[&str])] = &[
     ("BOUNDING SPHERE", &["<translation <x,y,z>>", "<radius>"]),
     ("SKYLIGHT", &["<direction <x,y,z>>", "<radiant intensity <x,y,z>>", "<solid angle>"]),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::marker_display_name;
+
+    fn regions() -> Vec<(String, Vec<String>)> {
+        vec![
+            ("l_pod".into(), vec!["base".into(), "medium".into(), "major".into()]),
+            ("r_pod".into(), vec!["base".into(), "medium".into(), "major".into()]),
+        ]
+    }
+
+    #[test]
+    fn global_marker_keeps_plain_name() {
+        // region index < 0 => no scope prefix (matches `fx_boost_rear`).
+        assert_eq!(marker_display_name("fx_boost_rear", -1, -1, &regions()), "fx_boost_rear");
+        assert_eq!(marker_display_name("fx_boost_rear", -1, 0, &regions()), "fx_boost_rear");
+    }
+
+    #[test]
+    fn scoped_marker_gets_permutation_region_prefix() {
+        // `(<permutation> <region>)<name>` — the H3 exporter convention.
+        assert_eq!(marker_display_name("fx_boost", 0, 0, &regions()), "(base l_pod)fx_boost");
+        assert_eq!(marker_display_name("fx_boost_damaged", 1, 2, &regions()), "(major r_pod)fx_boost_damaged");
+    }
+
+    #[test]
+    fn region_scoped_but_all_permutations() {
+        // region valid, permutation -1 => region-only prefix.
+        assert_eq!(marker_display_name("fx_boost", 0, -1, &regions()), "(l_pod)fx_boost");
+    }
+
+    #[test]
+    fn out_of_range_indices_fall_back_to_plain_name() {
+        assert_eq!(marker_display_name("m", 9, 0, &regions()), "m");
+        // Region ok, permutation out of range => region-only.
+        assert_eq!(marker_display_name("m", 0, 9, &regions()), "(l_pod)m");
+    }
+}
