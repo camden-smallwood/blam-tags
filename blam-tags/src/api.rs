@@ -685,6 +685,17 @@ impl<'a> TagField<'a> {
         crate::TagFieldDefinition::new(self.layout, self.field_index)
     }
 
+    /// The field's 0-based ordinal position among its containing struct's
+    /// direct fields (`field_index - first_field_index`). This is a stable,
+    /// unambiguous positional identity — pass it as the `#N` token in a field
+    /// path (`name#N`) to target this exact field even when siblings share its
+    /// name/type (Foundation-style `tagFields[fieldIndex]` addressing).
+    pub fn ordinal(&self) -> usize {
+        let first =
+            self.layout.struct_layouts[self.struct_data.struct_index as usize].first_field_index;
+        self.field_index - first as usize
+    }
+
     /// Field display name (e.g. `"jump velocity"`).
     pub fn name(&self) -> &'a str {
         let field = &self.layout.fields[self.field_index];
