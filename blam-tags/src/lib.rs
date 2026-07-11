@@ -181,6 +181,11 @@ pub use tag_function::{
     ColorGraphType, FunctionFlags, FunctionKind, FunctionType, TagFunction, TagFunctionError,
     TagFunctionHeader,
 };
+pub use tag_function::curve::{CurvePointMode, CurveSegmentType};
+pub use tag_function::editor::{
+    ExponentParams, FoundationMasterType, FunctionEditError, PeriodicParams, TagFunctionEditor,
+    TransitionParams, PERIODIC_FUNCTIONS, TRANSITION_FUNCTIONS,
+};
 pub use animation::{
     Animation, AnimationClip, AnimationError, AnimationGraph, AnimationGroup, AnimationName,
     AnimationStateType, AnimationTracks, AnimatedStreamStatus, BitArray, Codec, JmaKind,
