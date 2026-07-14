@@ -1653,6 +1653,16 @@ impl<'a> TagBlockMut<'a> {
             return Err(TagPasteError::Incompatible);
         }
         let insert_offset = index * size;
+        // Pasting into a previously-empty H2 classic block: it carries no
+        // block header on disk (empty H2 blocks are headerless), but once it
+        // holds an element the encoder needs a `dfbt` header to emit the
+        // authoritative count/size. Synthesize one *before* inserting (the
+        // helper no-ops on an already-populated block), mirroring
+        // `add_element`/`insert_element`. Without this the saved tag has the
+        // element bytes with no leading header, so the reader desyncs and
+        // reports `corrupt block header` on the next open. No-op for MCC/CE.
+        self.block_data
+            .ensure_h2_classic_header_for_nonempty(self.layout, size);
         self.block_data.mark_classic_structural_dirty();
         self.block_data
             .raw_data

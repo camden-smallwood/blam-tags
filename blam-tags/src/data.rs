@@ -1122,7 +1122,11 @@ impl TagBlockData {
     /// becomes non-empty the encoder needs a header to emit the
     /// authoritative count/size, so create one if the layout looks like H2
     /// classic and the block has none yet. No-op for MCC/CE.
-    fn ensure_h2_classic_header_for_nonempty(&mut self, layout: &TagLayout, element_size: usize) {
+    pub(crate) fn ensure_h2_classic_header_for_nonempty(
+        &mut self,
+        layout: &TagLayout,
+        element_size: usize,
+    ) {
         if self.classic_block_header.is_some()
             || !self.elements.is_empty()
             || !looks_like_h2_classic_layout(layout)
