@@ -83,6 +83,10 @@ pub struct Fsb5 {
     name_index: HashMap<String, usize>,
     /// Lowercased `data\sound\...\*.aif` path → index (from `.fsb.info`).
     path_index: HashMap<String, usize>,
+    /// `fmod bank subsound id hash` → index (from `.fsb.info`, offset 0 of each
+    /// record). This is the engine's authoritative, collision-free permutation
+    /// key — see [`fmod_bank_subsound_id_hash`].
+    id_index: HashMap<u32, usize>,
 }
 
 const FSB_INFO_RECORD_BYTES: usize = 280;
@@ -268,7 +272,8 @@ impl Fsb5 {
             }
         }
 
-        let path_index = load_path_index(path.with_extension("fsb.info"), num_subsounds);
+        let (path_index, id_index) =
+            load_info_indexes(path.with_extension("fsb.info"), num_subsounds);
 
         Ok(Self {
             path,
@@ -276,6 +281,7 @@ impl Fsb5 {
             subsounds,
             name_index,
             path_index,
+            id_index,
         })
     }
 
@@ -294,6 +300,15 @@ impl Fsb5 {
     /// Exact subsound-name lookup (case-insensitive).
     pub fn index_of(&self, name: &str) -> Option<usize> {
         self.name_index.get(&name.to_ascii_lowercase()).copied()
+    }
+
+    /// Look up a subsound by its `fmod bank subsound id hash` — the engine's own
+    /// permutation key (see [`fmod_bank_subsound_id_hash`]). Unlike the name/path
+    /// lookups this is collision-free: the hash folds in the full tag path,
+    /// pitch range, and permutation string-id, so it uniquely identifies the
+    /// intended variant even when hundreds of tags share a leaf name.
+    pub fn index_of_id(&self, id: u32) -> Option<usize> {
+        self.id_index.get(&id).copied()
     }
 
     /// Resolve a tag path or leaf name to a subsound index.
@@ -351,24 +366,122 @@ pub fn sound_leaf_name(rel: &str) -> String {
         .to_string()
 }
 
-fn load_path_index(info_path: PathBuf, num_subsounds: usize) -> HashMap<String, usize> {
+/// Parse the `<bank>.fsb.info` sidecar into both lookup maps. Each 280-byte
+/// record is `record[i] ↔ subsound[i]`: a 24-byte header whose first `u32` is
+/// the `fmod bank subsound id hash`, followed by the source path
+/// (`data\sound\...\<perm>.aif`). Returns `(path→index, id→index)`.
+fn load_info_indexes(
+    info_path: PathBuf,
+    num_subsounds: usize,
+) -> (HashMap<String, usize>, HashMap<u32, usize>) {
     let Ok(info) = std::fs::read(&info_path) else {
-        return HashMap::new();
+        return (HashMap::new(), HashMap::new());
     };
-    let mut map = HashMap::new();
+    let mut paths = HashMap::new();
+    let mut ids = HashMap::new();
     let count = info.len() / FSB_INFO_RECORD_BYTES;
     for i in 0..count.min(num_subsounds) {
         let rec = &info[i * FSB_INFO_RECORD_BYTES..(i + 1) * FSB_INFO_RECORD_BYTES];
-        let Some(start) = rec.windows(5).position(|w| w == b"data\\") else {
-            continue;
-        };
-        let end = rec[start..]
-            .iter()
-            .position(|&b| b == 0)
-            .map(|p| start + p)
-            .unwrap_or(rec.len());
-        let path = String::from_utf8_lossy(&rec[start..end]).to_ascii_lowercase();
-        map.insert(path, i);
+        // The subsound id hash is the record's leading u32.
+        ids.insert(rd_u32(rec, 0), i);
+        if let Some(start) = rec.windows(5).position(|w| w == b"data\\") {
+            let end = rec[start..]
+                .iter()
+                .position(|&b| b == 0)
+                .map(|p| start + p)
+                .unwrap_or(rec.len());
+            let path = String::from_utf8_lossy(&rec[start..end]).to_ascii_lowercase();
+            paths.insert(path, i);
+        }
     }
-    map
+    (paths, ids)
+}
+
+/// Compute the `fmod bank subsound id hash` the Halo 3+/MCC engine uses to
+/// resolve a sound permutation to an FMOD-bank subsound — the collision-free key
+/// stored per subsound in `<bank>.fsb.info` (see [`Fsb5::index_of_id`]).
+///
+/// Reverse-engineered from `reach_tag_test.exe` (`sub_140256B00`): the engine
+/// assembles the source path `data\<tag_path>[\<pitch_range>]\<permutation>`
+/// (backslashes, no extension) and runs **djb2** (seed 5381, multiplier 33) over
+/// it starting at byte 11 — skipping the constant `data\sound\` prefix (only when
+/// the assembled string is longer than 11 bytes). We lowercase the inputs so the
+/// result matches the manifest's canonical (lowercase) ids regardless of how the
+/// caller cased the path.
+///
+/// - `tag_path`: the `.sound` tag path without extension, e.g.
+///   `sound\dialog\combat\civilian_1\default\01_contact\ambush`.
+/// - `pitch_range`: the pitch-range folder to fold in, or `None` for the default
+///   single range (decide with [`fmod_pitch_range_folder`]).
+/// - `permutation`: the permutation's raw `name` string-id from the tag.
+pub fn fmod_bank_subsound_id_hash(
+    tag_path: &str,
+    pitch_range: Option<&str>,
+    permutation: &str,
+) -> u32 {
+    fn push_norm(out: &mut String, part: &str) {
+        for ch in part.chars() {
+            out.push(if ch == '/' { '\\' } else { ch.to_ascii_lowercase() });
+        }
+    }
+    let mut s = String::with_capacity(tag_path.len() + permutation.len() + 24);
+    s.push_str("data\\");
+    push_norm(&mut s, tag_path);
+    s.push('\\');
+    if let Some(pr) = pitch_range {
+        push_norm(&mut s, pr);
+        s.push('\\');
+    }
+    push_norm(&mut s, permutation);
+
+    // djb2 over the path minus the constant `data\sound\` prefix (11 bytes).
+    let bytes = s.as_bytes();
+    let tail = if bytes.len() > 11 { &bytes[11..] } else { bytes };
+    let mut hash: u32 = 5381;
+    for &b in tail {
+        hash = (b as u32).wrapping_add(hash.wrapping_mul(33));
+    }
+    hash
+}
+
+/// Whether the pitch-range name should be folded into the FMOD hash/path,
+/// matching the engine: included when the tag has more than one pitch range, or
+/// when the single range's name is not the implicit `|default|`.
+pub fn fmod_pitch_range_folder(pitch_range: &str, multiple_ranges: bool) -> Option<&str> {
+    if multiple_ranges || !pitch_range.eq_ignore_ascii_case("|default|") {
+        Some(pitch_range)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fmod_bank_subsound_id_hash as h;
+
+    // Vectors reverse-engineered from reach_tag_test.exe (sub_140256B00) and
+    // verified against haloreach_mcc/fmod/pc/*.fsb.info id columns.
+    #[test]
+    fn subsound_id_hash_matches_engine() {
+        // Dialogue: civilian_1 ambush permutations (single |default| pitch range).
+        let ambush = r"sound\dialog\combat\civilian_1\default\01_contact\ambush";
+        assert_eq!(h(ambush, None, "ambush_1"), 0x0a77_3133);
+        assert_eq!(h(ambush, None, "ambush_2"), 0x0a77_3134);
+        assert_eq!(h(ambush, None, "ambush_5"), 0x0a77_3137);
+
+        // Length sensitivity: charge1 vs charge10 hash to unrelated regions.
+        let charge = r"sound\dialog\combat\grunt2\default\02_combat\charge";
+        assert_eq!(h(charge, None, "charge1"), 0x3b31_4bb6);
+        assert_eq!(h(charge, None, "charge10"), 0xa15a_c2a6);
+
+        // SFX: the permutation string-id (not the .aif filename) is what's hashed.
+        let dash = r"sound\characters\footsteps\chief\concrete_h3\dash";
+        assert_eq!(h(dash, None, "concrete_dash9"), 0x7d1d_e8af);
+
+        // Case/separator normalization must not change the result.
+        assert_eq!(
+            h("SOUND/dialog/combat/civilian_1/default/01_contact/ambush", None, "AMBUSH_1"),
+            0x0a77_3133
+        );
+    }
 }

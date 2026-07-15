@@ -112,6 +112,18 @@ impl SoundBanks {
         None
     }
 
+    /// Resolve a permutation by its `fmod bank subsound id hash` — the engine's
+    /// collision-free key (see [`super::fmod_bank_subsound_id_hash`]). Returns
+    /// `(bank_index, subsound_index)` from the first bank carrying that id.
+    pub fn resolve_by_id(&self, id: u32) -> Option<(usize, usize)> {
+        for (bi, bank) in self.banks.iter().enumerate() {
+            if let Some(si) = bank.index_of_id(id) {
+                return Some((bi, si));
+            }
+        }
+        None
+    }
+
     pub fn bank(&self, index: usize) -> &Fsb5 {
         &self.banks[index]
     }

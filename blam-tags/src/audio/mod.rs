@@ -25,7 +25,9 @@ pub use wwise::WwiseBanks;
 pub use classic::{
     decode_opus, decode_pcm, decode_xbox_adpcm, encode_opus, encode_pcm, encode_xbox_adpcm,
 };
-pub use fsb5::{sound_leaf_name, Fsb5, SubSound};
+pub use fsb5::{
+    fmod_bank_subsound_id_hash, fmod_pitch_range_folder, sound_leaf_name, Fsb5, SubSound,
+};
 pub use vorbis::{
     decode_ogg_vorbis, decode_subsound, downmix_to_stereo, encode_ogg_vorbis, DecodedPcm,
 };
