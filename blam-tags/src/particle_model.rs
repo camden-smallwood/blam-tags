@@ -109,12 +109,14 @@ impl ParticleModel {
     }
 
     pub fn from_struct(s: &TagStruct<'_>) -> Result<Self, ParticleModelError> {
-        // Reconstruct the render-ready meshes from the `render geometry` root
-        // (the same path render_model / decorators use). A decode failure leaves
-        // it empty — the particle simply has no drawable model geometry.
-        let render_meshes = Self::render_geometry_root(s)
-            .and_then(|root| extract_render_geometry_meshes(&root).ok())
-            .unwrap_or_default();
+        // Reconstruct the render-ready meshes (the same path render_model /
+        // decorators use). `extract_render_geometry_meshes` reads meshes at
+        // `<root>/render geometry/...` — it prepends "render geometry" itself, so
+        // it must be given the TAG ROOT, not the pre-navigated `render geometry`
+        // sub-struct (passing the sub-struct double-nests the path → MissingField
+        // → silently zero meshes). A decode failure leaves it empty — the
+        // particle simply has no drawable model geometry.
+        let render_meshes = extract_render_geometry_meshes(s).ok().unwrap_or_default();
         Ok(Self {
             render_geometry: read_geometry(s)?,
             render_meshes,

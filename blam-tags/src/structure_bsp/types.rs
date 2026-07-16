@@ -18,7 +18,7 @@
 use crate::api::{TagBlock, TagStruct};
 use crate::file::TagFile;
 use crate::fields::TagFieldData;
-use crate::math::{RealBounds, RealPlane2d, RealPlane3d, RealPoint3d, RealVector3d};
+use crate::math::{RealBounds, RealPlane2d, RealPlane3d, RealPoint3d, RealQuaternion, RealVector3d};
 use crate::typed_enums::{Enum, Flags};
 
 /// `structure_bsp_flags_definition` (long_flags).
@@ -1647,6 +1647,11 @@ pub struct BspInstanceDefinition {
     /// `structure_surfaces` → wrong surface → black per-object lighting.
     pub render_bsp: Option<Bsp3d>,
 
+    /// `poopie cutter collision` — the SECOND inline `collision_bsp` in the
+    /// tag-file instanced-geometry-definition struct (the cache strips it).
+    /// Bungie's "cutter" collision, distinct from `collision info` (`bsp`).
+    pub poopie_cutter_bsp: Option<Bsp3d>,
+
     /// Per-instance-definition surface descriptors (schema field
     /// `surfaces*`, `structure_surface_small_block`, 4 B each). Same shape
     /// as the top-level [`StructureBsp::structure_surfaces`] but scoped
@@ -1655,16 +1660,24 @@ pub struct BspInstanceDefinition {
     /// reads these to map a collision surface index → triangle range.
     ///
     /// The MCC schema has BOTH `surfaces*` (small, u16 indices) AND
-    /// `large surfaces*` (u32 indices). Engine code reads the small variant
-    /// (4-byte stride); we follow.
+    /// `large surfaces*` (u32 indices). Tools author ONE or the other per
+    /// definition — some s3d_turf defs populate only `large surfaces`
+    /// (e.g. def 15: 484 large surfaces, 0 small). Prefer whichever is
+    /// non-empty via [`Self::surface_mapping_range`] / [`Self::surface_count`].
     pub structure_surfaces: Vec<StructureSurface>,
+
+    /// `long`-indexed (large) variant of [`Self::structure_surfaces`], schema
+    /// field `large surfaces*`. Same `(first_mapping_index, mapping_count)`
+    /// shape with `i32` widths. Populated when the small block is empty.
+    pub structure_large_surfaces: Vec<super::StructureSurfaceLarge>,
 
     /// Per-instance-definition surface → triangle mapping table (schema
     /// `surface to triangle mapping*`, 4 B each). Mirrors the top-level
     /// [`StructureBsp::structure_surface_to_triangle_mappings`] shape.
     /// `triangle_index` indexes into this definition's render mesh's
     /// index buffer; `section_index` is unused here (instance defs map
-    /// to a single mesh, not multiple clusters).
+    /// to a single mesh, not multiple clusters). Indexed by BOTH the small
+    /// and large surface tables.
     pub structure_surface_to_triangle_mappings: Vec<StructureSurfaceTriangleMapping>,
 }
 
@@ -1682,10 +1695,19 @@ impl BspInstanceDefinition {
             .as_ref()
             .and_then(|b| b.element(0))
             .and_then(|e| Bsp3d::from_inline_struct(&e));
+        let poopie_cutter_bsp = s
+            .field("poopie cutter collision")
+            .and_then(|f| f.as_struct())
+            .and_then(|cs| Bsp3d::from_inline_struct(&cs));
         let structure_surfaces = read_block_named(
             s,
             "surfaces",
             StructureSurface::from_struct,
+        );
+        let structure_large_surfaces = read_block_named(
+            s,
+            "large surfaces",
+            super::StructureSurfaceLarge::from_struct,
         );
         let structure_surface_to_triangle_mappings = read_block_named(
             s,
@@ -1704,8 +1726,38 @@ impl BspInstanceDefinition {
             bsp,
             render_bsp_count,
             render_bsp,
+            poopie_cutter_bsp,
             structure_surfaces,
+            structure_large_surfaces,
             structure_surface_to_triangle_mappings,
+        }
+    }
+
+    /// Number of effective structure surfaces — the small `surfaces` block
+    /// when populated, else the `large surfaces` (u32-index) block.
+    pub fn surface_count(&self) -> usize {
+        if !self.structure_surfaces.is_empty() {
+            self.structure_surfaces.len()
+        } else {
+            self.structure_large_surfaces.len()
+        }
+    }
+
+    /// `(first_mapping_index, mapping_count)` for effective surface `index`,
+    /// preferring the small `surfaces` block and falling back to `large
+    /// surfaces` when it's empty. Both index the same
+    /// [`Self::structure_surface_to_triangle_mappings`]. Mirrors the engine's
+    /// runtime small-vs-large selection (`c_collision_bsp_reference`).
+    pub fn surface_mapping_range(&self, index: usize) -> Option<(usize, usize)> {
+        if !self.structure_surfaces.is_empty() {
+            let s = self.structure_surfaces.get(index)?;
+            Some((s.first_mapping_index as usize, s.mapping_count as usize))
+        } else {
+            let s = self.structure_large_surfaces.get(index)?;
+            if s.first_mapping_index < 0 || s.mapping_count < 0 {
+                return None;
+            }
+            Some((s.first_mapping_index as usize, s.mapping_count as usize))
         }
     }
 }
@@ -1734,6 +1786,10 @@ fn read_block_named<T, F: Fn(&TagStruct<'_>) -> T>(
 pub struct BspMarker {
     pub name: String,
     pub node_index: i16,
+    /// `rotation` (quaternion) — the marker's orientation. Marker LIGHTS use it
+    /// for the spawned light's forward (`q·X`) / up (`q·Y`) basis
+    /// (`lights_add_structure_bsp_marker_lights`).
+    pub rotation: RealQuaternion,
     pub position: RealPoint3d,
 }
 
@@ -1742,6 +1798,7 @@ impl BspMarker {
         Self {
             name: s.read_string_id("name").unwrap_or_default(),
             node_index: s.read_block_index("node index"),
+            rotation: s.read_quat("rotation"),
             position: s.read_point3d("position"),
         }
     }

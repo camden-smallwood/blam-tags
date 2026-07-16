@@ -33,7 +33,9 @@
 
 use crate::api::{TagBlock, TagStruct};
 use crate::file::TagFile;
+use crate::light::LightType;
 use crate::math::{RealEulerAngles3d, RealPoint3d, RealQuaternion, RgbColor};
+use crate::typed_enums::{Enum, Flags};
 
 const SCNR_GROUP: [u8; 4] = *b"scnr";
 
@@ -127,6 +129,11 @@ pub struct Scenario {
 
     pub light_palette: Vec<TagReferencePalette>,
     pub lights: Vec<ObjectPlacement>,
+    /// The `light data` (`s_scenario_light_datum`) sub-struct per `lights[]`
+    /// entry — the light-specific placement fields (lightmap type, target
+    /// point, scenario geometry override) the generic [`ObjectPlacement`] does
+    /// not carry. Index-parallel to [`Self::lights`].
+    pub light_data: Vec<ScenarioLightDatum>,
 
     // ---- Decorators (foliage) ----
     pub decorators: Vec<ScenarioDecoratorBlock>,
@@ -256,6 +263,11 @@ impl Scenario {
                 s,
                 &["light volumes", "lights"],
                 ObjectPlacement::from_struct,
+            ),
+            light_data: read_block_aliased(
+                s,
+                &["light volumes", "lights"],
+                ScenarioLightDatum::from_light_block,
             ),
 
             decorators: read_block(s, "decorators", ScenarioDecoratorBlock::from_struct),
@@ -475,6 +487,93 @@ pub struct ObjectPlacement {
     /// Optional `multiplayer data` sub-struct (multiplayer maps use
     /// this to drive game-mode visibility).
     pub multiplayer_data: Option<PlacementMultiplayerData>,
+}
+
+/// `scenario_light_lightmap_type_enum_definition` — how a scenario light
+/// participates in lighting. `LightmapsOnly` lights are baked into the lightmap
+/// and are NOT created as runtime dynamic lights.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default,
+         num_derive::FromPrimitive, num_derive::ToPrimitive,
+         strum::EnumString, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(ascii_case_insensitive)]
+#[repr(i16)]
+pub enum ScenarioLightLightmapType {
+    #[default]
+    #[strum(serialize = "use light tag setting")] UseLightTagSetting = 0,
+    #[strum(serialize = "dynamic only")] DynamicOnly = 1,
+    #[strum(serialize = "dynamic with lightmaps")] DynamicWithLightmaps = 2,
+    #[strum(serialize = "lightmaps only")] LightmapsOnly = 3,
+}
+
+/// `scenario_light_flags_definition` (`word_flags`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug,
+         num_derive::FromPrimitive, num_derive::ToPrimitive,
+         strum::EnumString, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(ascii_case_insensitive)]
+#[repr(u16)]
+pub enum ScenarioLightFlags {
+    #[strum(serialize = "custom geometry")] CustomGeometry = 0,
+    #[strum(serialize = "unused")] Unused = 1,
+    #[strum(serialize = "cinematic_only")] CinematicOnly = 2,
+}
+
+/// The `light data` (`s_scenario_light_datum`, 48 B) sub-struct of a scenario
+/// `lights[]` placement. Carries the runtime-vs-lightmap policy, the cone aim
+/// target, and the scenario geometry override (used when the scenario light
+/// overrides its `ligh` tag's shape).
+#[derive(Debug, Clone, Default)]
+pub struct ScenarioLightDatum {
+    /// `type` — sphere vs frustum (scenario override of the light tag's type).
+    pub light_type: Enum<LightType, i16>,
+    pub flags: Flags<ScenarioLightFlags, u16>,
+    pub lightmap_type: Enum<ScenarioLightLightmapType, i16>,
+    /// `target point` — the world point a frustum light aims at.
+    pub target_point: RealPoint3d,
+    /// `width` — frustum near width (scenario override).
+    pub width: f32,
+    /// `height scale` — frustum height scale (scenario override).
+    pub height_scale: f32,
+    /// `field of view` in **degrees** (scenario override).
+    pub field_of_view: f32,
+    /// `falloff distance` (scenario override).
+    pub falloff_distance: f32,
+    /// `cutoff distance` (scenario override).
+    pub cutoff_distance: f32,
+}
+
+impl ScenarioLightDatum {
+    /// Read the `light data` sub-struct out of a `scenario_light_block` entry.
+    fn from_light_block(s: &TagStruct<'_>) -> Self {
+        s.field("light data")
+            .and_then(|f| f.as_struct())
+            .map(|light| Self::from_struct(&light))
+            .unwrap_or_default()
+    }
+
+    fn from_struct(s: &TagStruct<'_>) -> Self {
+        Self {
+            light_type: s.try_read_enum("type").unwrap_or_default(),
+            flags: s.try_read_flags("flags").unwrap_or_default(),
+            lightmap_type: s.try_read_enum("lightmap type").unwrap_or_default(),
+            target_point: s.read_point3d("target point"),
+            width: s.read_real("width").unwrap_or(0.0),
+            height_scale: s.read_real("height scale").unwrap_or(1.0),
+            field_of_view: s.read_real("field of view").unwrap_or(0.0),
+            falloff_distance: s.read_real("falloff distance").unwrap_or(0.0),
+            cutoff_distance: s.read_real("cutoff distance").unwrap_or(0.0),
+        }
+    }
+
+    /// True if this light is baked into the lightmap only (not a runtime dynamic
+    /// light). Mirrors the engine `lightmap_type == 3` placement gate.
+    pub fn is_lightmap_only(&self) -> bool {
+        self.lightmap_type == ScenarioLightLightmapType::LightmapsOnly
+    }
+
+    /// True if this light renders only in cinematics (`flags & cinematic_only`).
+    pub fn is_cinematic_only(&self) -> bool {
+        self.flags.contains(ScenarioLightFlags::CinematicOnly)
+    }
 }
 
 impl ObjectPlacement {

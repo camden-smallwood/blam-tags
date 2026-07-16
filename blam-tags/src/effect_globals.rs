@@ -187,7 +187,40 @@ impl EffectHoldback {
                 out
             })
             .unwrap_or_default();
-        Self { holdback_type, overall_budget, priorities }
+        let mut out = Self { holdback_type, overall_budget, priorities };
+        out.compute_budgets();
+        out
+    }
+
+    /// Port of `s_effect_component_holdbacks::postprocess_block_proc`
+    /// (reach `0x82e9f728`). The per-priority runtime budget
+    /// (`s_holdback::m_budget`, our [`EffectPriorityHoldback::available`]) is a
+    /// cache-baked value stored as 0 in authoring/loose tags, so we recompute it
+    /// at parse time via the reservation cascade the engine runs at tag load:
+    ///
+    /// ```text
+    /// consumed = 0
+    /// for p in [essential, high, normal]:        // highest → lowest priority
+    ///     available[p] = overall - min(consumed, overall)   // = max(overall - consumed, 0)
+    ///     consumed    += max(absolute[p], relative_percentage[p]/100 * overall)
+    /// ```
+    ///
+    /// `overall` is the authored `overall budget` — a UI mirror of the engine's
+    /// compile-time per-type constant (`dword_8215C7E0[type]`); they match in
+    /// shipped tags. A priority's budget is thus the overall minus what
+    /// higher-priority items reserve ahead of it.
+    fn compute_budgets(&mut self) {
+        let overall = self.overall_budget.max(0) as f32;
+        let mut consumed: f32 = 0.0;
+        for pv in [EffectPriority::Essential, EffectPriority::High, EffectPriority::Normal] {
+            if let Some(slot) = self.priorities.iter_mut().find(|p| p.priority == pv) {
+                // available = overall - min(consumed, overall), floored at 0.
+                slot.available = (overall - consumed.min(overall)).max(0.0) as i32;
+                // This priority reserves max(absolute, relative% of overall).
+                let relative = (slot.relative_percentage / 100.0) * overall;
+                consumed += (slot.absolute_count as f32).max(relative);
+            }
+        }
     }
 
     /// Available count at the given priority — the runtime budget gate

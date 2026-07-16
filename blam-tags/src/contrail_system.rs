@@ -74,6 +74,18 @@ pub enum ContrailAppearanceFlags {
     #[strum(serialize = "profile opacity from scale a")] ProfileOpacityFromScaleA = 2,
     #[strum(serialize = "random u offset")] RandomUOffset = 3,
     #[strum(serialize = "random v offset")] RandomVOffset = 4,
+    /// Runtime-reconstructed (Ares `c_contrail_definition::get_origin_faded`
+    /// tests bit 5): the trail head fades near its origin. Set by the contrail
+    /// effect-postprocess at load; absent (0) in loose MCC tags, so
+    /// `get_origin_faded` reads `false` until that reconstruction lands.
+    #[strum(disabled)]
+    OriginFaded = 5,
+    /// Runtime-reconstructed (Ares `c_contrail_definition::get_fogged` tests
+    /// bit 7): the contrail is fogged. Set by the contrail effect-postprocess at
+    /// load; absent (0) in loose MCC tags, so `get_fogged` reads `false` until
+    /// that reconstruction lands — never authored on disk.
+    #[strum(disabled)]
+    Fogged = 7,
 }
 
 /// One contrail definition entry (620B `c_contrail_definition`).
