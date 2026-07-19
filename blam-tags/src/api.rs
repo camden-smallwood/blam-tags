@@ -277,6 +277,17 @@ impl<'a> TagStruct<'a> {
         })
     }
 
+    /// Resolve a structured [`crate::TagFieldPath`] to a field. Equivalent to
+    /// rendering it and calling [`field_path`](Self::field_path).
+    pub fn field_path_at(&self, path: &crate::TagFieldPath) -> Option<TagField<'a>> {
+        self.field_path(&path.to_string())
+    }
+
+    /// Descend a structured [`crate::TagFieldPath`] to a nested struct.
+    pub fn descend_path(&self, path: &crate::TagFieldPath) -> Option<TagStruct<'a>> {
+        self.descend(&path.to_string())
+    }
+
     // ---- typed field readers ----
     //
     // Convenience accessors for the common "look up a field by name,
@@ -696,10 +707,36 @@ impl<'a> TagField<'a> {
         self.field_index - first as usize
     }
 
-    /// Field display name (e.g. `"jump velocity"`).
+    /// The field's **raw** name as stored in the layout, markup and all
+    /// (e.g. `"ambient color:[0,255]"`, `"shader flags*"`). For the bare
+    /// addressable name use [`clean_name`](Self::clean_name); for the name to
+    /// show a user use [`display_name`](Self::display_name).
     pub fn name(&self) -> &'a str {
         let field = &self.layout.fields[self.field_index];
         self.layout.get_string(field.name_offset).unwrap_or("")
+    }
+
+    /// The bare, addressable field name — Guerilla markup (`:units`, `#help`,
+    /// `[range]`, `{alias}`, `*`/`!`/`^` flags) stripped. This is what field
+    /// paths use as a segment name. See [`crate::field_name`].
+    pub fn clean_name(&self) -> std::borrow::Cow<'a, str> {
+        crate::field_name::clean_field_name(self.name())
+    }
+
+    /// The name to show a user: the `&`-introduced display override if the raw
+    /// name carries one, otherwise the clean name.
+    pub fn display_name(&self) -> std::borrow::Cow<'a, str> {
+        let info = crate::field_name::parse_field_name(self.name());
+        match info.display_name {
+            Some(display) => std::borrow::Cow::Borrowed(display),
+            None => info.clean_name,
+        }
+    }
+
+    /// Full markup decomposition of the raw name (clean name + units / range /
+    /// description / display override / read-only / hidden / block-label flags).
+    pub fn name_info(&self) -> crate::field_name::FieldNameInfo<'a> {
+        crate::field_name::parse_field_name(self.name())
     }
 
     /// For an `explanation` field, its body text (the schema `definition`
@@ -988,7 +1025,7 @@ pub enum TagPasteError {
     EndianMismatch,
 }
 
-fn block_element_size(layout: &TagLayout, block_data: &TagBlockData) -> usize {
+pub(crate) fn block_element_size(layout: &TagLayout, block_data: &TagBlockData) -> usize {
     // For a populated block the on-disk element size is `raw_data /
     // count` — authoritative for VERSIONED classic blocks whose elements
     // are a FieldSet variant smaller/larger than the block's base/latest
@@ -1343,6 +1380,13 @@ impl<'a> TagStructMut<'a> {
             field_index: cursor.field_index,
             endian: self.endian,
         })
+    }
+
+    /// Resolve a structured [`crate::TagFieldPath`] to a mutable field handle.
+    /// Equivalent to rendering it and calling
+    /// [`field_path_mut`](Self::field_path_mut).
+    pub fn field_path_at_mut(&mut self, path: &crate::TagFieldPath) -> Option<TagFieldMut<'_>> {
+        self.field_path_mut(&path.to_string())
     }
 
     /// Walk the struct's fields in declaration order, yielding a

@@ -90,15 +90,20 @@ pub(crate) fn lookup_from_struct<'a>(
             }
             TagFieldType::Block => {
                 let block = descend_block_data(current_struct, field_index)?;
-                let block_def = &layout.block_layouts[field.definition as usize];
-                let element_def = &layout.struct_layouts[block_def.struct_index as usize];
+                // Use the VERSION-AWARE element size (`raw_data / count`), not the
+                // base struct size: H2 has versioned classic blocks whose on-disk
+                // element is a different size than their base/latest struct (e.g.
+                // `bitmap_data` v1 = 116 vs base 140). Using the base size here
+                // made the bounds check reject the descent. Matches
+                // `TagBlock::element_size`.
+                let element_size = crate::api::block_element_size(layout, block);
                 let element_index = index.unwrap_or(0) as usize;
                 // Bounds check: a block can legitimately be empty
                 // (X360 monolithic tags with pageable resources push
                 // their element data into the cache partition and
                 // leave the on-disk block at 0 elements).
-                let start = element_index * element_def.size;
-                let end = start + element_def.size;
+                let start = element_index * element_size;
+                let end = start + element_size;
                 if end > block.raw_data.len() {
                     return None;
                 }
@@ -172,15 +177,15 @@ pub(crate) fn descend_from_struct<'a>(
             }
             TagFieldType::Block => {
                 let block = descend_block_data(current_struct, field_index)?;
-                let block_def = &layout.block_layouts[field.definition as usize];
-                let element_def = &layout.struct_layouts[block_def.struct_index as usize];
+                // Version-aware element size (see `lookup_from_struct`).
+                let element_size = crate::api::block_element_size(layout, block);
                 let element_index = index.unwrap_or(0) as usize;
                 // Bounds check: a block can legitimately be empty
                 // (X360 monolithic tags with pageable resources push
                 // their element data into the cache partition and
                 // leave the on-disk block at 0 elements).
-                let start = element_index * element_def.size;
-                let end = start + element_def.size;
+                let start = element_index * element_size;
+                let end = start + element_size;
                 if end > block.raw_data.len() {
                     return None;
                 }
@@ -246,10 +251,9 @@ pub(crate) fn lookup_mut_from_struct<'a>(
             }
             TagFieldType::Block => {
                 let block = descend_block_data_mut(current_struct, field_index)?;
-                let block_def = &layout.block_layouts[field.definition as usize];
-                let element_def = &layout.struct_layouts[block_def.struct_index as usize];
+                // Version-aware element size (see `lookup_from_struct`).
+                let element_size = crate::api::block_element_size(layout, block);
                 let element_index = index.unwrap_or(0) as usize;
-                let element_size = element_def.size;
                 let start = element_index * element_size;
                 let end = start + element_size;
                 if end > block.raw_data.len() {
@@ -308,29 +312,69 @@ pub(crate) fn lookup_mut_from_struct<'a>(
 ///   when several fields share a name/type. A stale ordinal self-heals by
 ///   falling back to name resolution.
 /// - `[index]` — optional block/array element index.
-fn parse_segment(segment: &str) -> (Option<&str>, &str, Option<usize>, Option<u32>) {
-    let (type_filter, rest) = match segment.find(':') {
-        Some(colon) => (Some(&segment[..colon]), &segment[colon + 1..]),
-        None => (None, segment),
+///
+/// **`name` is returned raw** (markup and all); [`find_field_in_struct`] matches
+/// it through [`crate::data::field_name_matches`], which cleans both sides. So a
+/// segment built from a raw name like `ambient color:[0,255]#5` still resolves.
+///
+/// Parsing is **tolerant** (matching Foundation's `TagFieldPath.Parse`): each
+/// token is only consumed when it is unambiguously that token, so field-name
+/// markup that happens to reuse a grammar character is left in the name rather
+/// than mis-consumed:
+/// - `[index]` — only a trailing `[…]` whose interior parses as an integer.
+///   A non-trailing or non-numeric `[…]` (e.g. a `[0,255]` range hint) stays in
+///   the name.
+/// - `Type:` — only when the text before the first `:` names a real
+///   [`TagFieldType`]. A `:units` marker (e.g. `ambient color:…`) stays in the
+///   name.
+/// - `#ordinal` — only a trailing `#<digits>`. A `#comment` marker (or a raw
+///   `#help` preceding an appended `#ordinal`) is handled by taking the *last*
+///   `#`, so `name#help#5` still yields ordinal 5.
+pub(crate) fn parse_segment(segment: &str) -> (Option<&str>, &str, Option<usize>, Option<u32>) {
+    // 1. Trailing `[index]` — only if the segment ends `]` and the interior of
+    //    the last `[…]` parses as an integer. (Foundation's `EndsWith("]")`.)
+    let (head, index) = split_trailing_index(segment);
+
+    // 2. `Type:` prefix — only if the text before the first `:` is a real
+    //    field-type name; otherwise the `:` belongs to the name (`:units`).
+    let (type_filter, rest) = match head.find(':') {
+        Some(colon)
+            if TagFieldType::from_name(&head[..colon].to_ascii_lowercase())
+                != TagFieldType::Unknown =>
+        {
+            (Some(&head[..colon]), &head[colon + 1..])
+        }
+        _ => (None, head),
     };
 
-    // Trailing `[index]` element selector.
-    let (name_ord, index) = match rest.find('[') {
-        Some(open) => {
-            let close = rest[open..].find(']').map(|o| open + o).unwrap_or(rest.len());
-            let index = rest[open + 1..close].parse::<u32>().ok();
-            (&rest[..open], index)
-        }
+    // 3. `#ordinal` — only a trailing `#<digits>`. Use the *last* `#` so a raw
+    //    `#help` marker before an appended `#ordinal` doesn't swallow it.
+    let (name, ordinal) = match rest.rfind('#') {
+        Some(hash) => match rest[hash + 1..].parse::<usize>() {
+            Ok(ord) => (&rest[..hash], Some(ord)),
+            Err(_) => (rest, None),
+        },
         None => (rest, None),
     };
 
-    // `#ordinal` field-position token (after the name, before any `[index]`).
-    let (name, ordinal) = match name_ord.find('#') {
-        Some(hash) => (&name_ord[..hash], name_ord[hash + 1..].parse::<usize>().ok()),
-        None => (name_ord, None),
-    };
-
     (type_filter, name, ordinal, index)
+}
+
+/// Split a trailing `[index]` element selector off a segment. Returns
+/// `(name_part, Some(index))` only when `segment` ends with `]` and the interior
+/// of its last `[…]` parses as a `u32`; otherwise `(segment, None)` — so a
+/// bracketed range hint like `max sounds [1,16]` keeps its brackets in the name.
+fn split_trailing_index(segment: &str) -> (&str, Option<u32>) {
+    let Some(inner) = segment.strip_suffix(']') else {
+        return (segment, None);
+    };
+    let Some(open) = inner.rfind('[') else {
+        return (segment, None);
+    };
+    match inner[open + 1..].parse::<u32>() {
+        Ok(index) => (&segment[..open], Some(index)),
+        Err(_) => (segment, None),
+    }
 }
 
 /// Field types a path segment can descend *into*.
@@ -550,8 +594,34 @@ mod tests {
         );
         // A name containing spaces stays intact.
         assert_eq!(parse_segment("Function Type#1"), (None, "Function Type", Some(1), None));
-        // Garbage ordinal is ignored (falls back to name).
-        assert_eq!(parse_segment("foo#x"), (None, "foo", None, None));
+        // A non-numeric `#x` is NOT an ordinal — it's a `#comment` marker, so it
+        // stays in the name (cleaned away later by field_name_matches).
+        assert_eq!(parse_segment("foo#x"), (None, "foo#x", None, None));
+    }
+
+    #[test]
+    fn parse_segment_is_tolerant_of_field_name_markup() {
+        // `:units` before a bracket range — `ambient color` is not a field type,
+        // so the `:` stays in the name; the `#5` is still read as the ordinal.
+        assert_eq!(
+            parse_segment("ambient color:[0,255]#5"),
+            (None, "ambient color:[0,255]", Some(5), None)
+        );
+        // A bare `[range]` is not a trailing integer index → stays in the name.
+        assert_eq!(
+            parse_segment("max sounds [1,16]"),
+            (None, "max sounds [1,16]", None, None)
+        );
+        assert_eq!(
+            parse_segment("max sounds [1,16]#5"),
+            (None, "max sounds [1,16]", Some(5), None)
+        );
+        // A raw `#help` marker before the appended `#ordinal`: take the last `#`.
+        assert_eq!(parse_segment("foo#help#5"), (None, "foo#help", Some(5), None));
+        // Known ambiguity, documented: a field literally named like a type with a
+        // `:units` marker parses the type as a filter. Clean-name path emission
+        // (which never carries markup) avoids ever producing this.
+        assert_eq!(parse_segment("angle:degrees"), (Some("angle"), "degrees", None, None));
     }
 
     /// Integration: `name#ordinal` positional resolution on a real H2 particle
@@ -597,5 +667,22 @@ mod tests {
         assert!(root.field_path("color/Mapping/Function Type").is_some());
         // A stale ordinal self-heals via name fallback.
         assert!(root.field_path("color#99/Mapping#99/Function Type").is_some());
+
+        // The reported bug, on real tag data: a segment carrying field-name
+        // markup that reuses a grammar character still resolves. The resolver
+        // must NOT read `[0,1]` as an element index or `:` as a type filter — it
+        // cleans the name and matches. (A raw-name path producer would emit these
+        // for a field like `intensity:[0,1]`.)
+        assert!(
+            root.field_path("color/Mapping/Function Type:[0,1]").is_some(),
+            "range-hint markup on a segment must not be read as an index"
+        );
+        assert!(
+            root.field_path("color/Mapping/Function Type#dynamic range comment").is_some(),
+            "`#comment` markup must not break resolution"
+        );
+        // …and combined with a (correct) positional ordinal.
+        let path = format!("color#{color_ord}/Mapping#{map_ord}/Function Type:[0,1]");
+        assert!(root.field_path(&path).is_some(), "positional + markup path {path} failed");
     }
 }

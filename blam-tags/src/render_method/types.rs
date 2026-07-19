@@ -1063,21 +1063,15 @@ impl RenderMethod {
             .map(|e| RenderMethodPostprocessDefinition::from_struct(&e))
             .transpose()?;
 
-        // Schema names carry `*`/`!` markers; tags store the clean name,
-        // but try both forms defensively. All three are name-resolved.
-        let flags = s.try_read_flags("shader flags")
-            .or_else(|| s.try_read_flags("shader flags*"))
-            .unwrap_or_default();
-        let sort_layer = s.try_read_enum("sort layer")
-            .or_else(|| s.try_read_enum("sort layer*"))
-            .unwrap_or_default();
-        let runtime_flags = s.try_read_flags("runtime flags")
-            .or_else(|| s.try_read_flags("runtime flags!"))
-            .unwrap_or_default();
+        // Field-name lookups are markup-insensitive (field_name_matches cleans
+        // both sides), so the bare name matches whether a tag stored the clean
+        // form or kept a `*`/`!` marker — no need to try both forms.
+        let flags = s.try_read_flags("shader flags").unwrap_or_default();
+        let sort_layer = s.try_read_enum("sort layer").unwrap_or_default();
+        let runtime_flags = s.try_read_flags("runtime flags").unwrap_or_default();
         let custom_fog_setting_index = s.read_int_any("Custom fog setting index")
             .unwrap_or(0) as i32;
         let prediction_atom_index = s.read_int_any("prediction atom index")
-            .or_else(|| s.read_int_any("prediction atom index!"))
             .unwrap_or(-1) as i32;
 
         Ok(Self {

@@ -66,10 +66,12 @@ pub mod math;
 pub mod io;
 pub mod error;
 pub mod fields;
+pub mod field_name;
 pub mod layout;
 pub mod schema;
 pub mod data;
 pub mod path;
+pub mod field_path;
 pub mod stream;
 pub mod file;
 pub mod classic;
@@ -158,6 +160,8 @@ pub use fields::{
     format_group_tag, parse_group_tag, ApiInteropData, StringIdData, TagFieldData, TagFieldType,
     TagReferenceData,
 };
+pub use field_name::{clean_field_name, parse_field_name, FieldNameInfo};
+pub use field_path::{TagFieldPath, TagFieldPathSegment};
 pub use error::TagReadError;
 pub use typed_enums::{Enum, Flags, SchemaEnum, TagInt};
 pub use file::TagFile;

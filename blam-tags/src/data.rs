@@ -142,21 +142,21 @@ pub(crate) enum TagResourceChunk {
     Xsync { version: u32, payload: Vec<u8> },
 }
 
-/// Match a struct field's stored name against a lookup query, tolerating
-/// a trailing `|<code>` suffix on the stored name.
+/// Match a struct field's stored name against a lookup query, comparing the
+/// *clean* (markup-free) form of both sides.
 ///
-/// Some definitions (notably the Halo 2 `model_animation_graph`) carry a
-/// dumper artifact on block field names — e.g. `animations|ABCDCC` — where
-/// the portion after `|` is a name-code, not part of the addressable field
-/// name. Callers look the field up as plain `animations`, so we compare the
-/// stored name's pre-`|` segment. An exact match (no `|` present) still
-/// works because `split('|').next()` returns the whole string. Verified
-/// collision-free across the H2/H2A/H3 jmad definitions.
+/// Field names embed markup — `:units`, `#help`, `[range]`, `{alias}`,
+/// `*`/`!`/`^` flags, and the Halo 2 `model_animation_graph` `|<code>` dumper
+/// suffix (see [`crate::field_name`]). Different tag sources store a name at
+/// different stages of cleaning (classic `from_json` keeps `[range]`; some
+/// modern blays keep `*`; jmad blocks keep `|<code>`), and callers may query
+/// with either the clean or a marked-up name. Cleaning both sides makes lookups
+/// markup-insensitive regardless of source — this is what lets a path segment
+/// built from a raw name like `ambient color:[0,255]` or `animations|ABCDCC`
+/// still resolve.
 pub(crate) fn field_name_matches(stored: Option<&str>, query: &str) -> bool {
-    match stored {
-        Some(s) => s.split('|').next() == Some(query),
-        None => false,
-    }
+    let Some(stored) = stored else { return false };
+    crate::field_name::clean_field_name(stored) == crate::field_name::clean_field_name(query)
 }
 
 /// Heuristic: does this layout describe a Halo 2 classic tag? H2 classic
@@ -166,6 +166,28 @@ pub(crate) fn field_name_matches(stored: Option<&str>, query: &str) -> bool {
 fn looks_like_h2_classic_layout(layout: &TagLayout) -> bool {
     layout.struct_tags.iter().any(|tag| *tag != 0)
         || layout.struct_version_table.iter().any(Option::is_some)
+}
+
+#[cfg(test)]
+mod field_name_match_tests {
+    use super::field_name_matches;
+
+    #[test]
+    fn matches_are_markup_insensitive_on_both_sides() {
+        // The reported bug: a range-hint stored name matches its clean query.
+        assert!(field_name_matches(Some("ambient color:[0,255]"), "ambient color"));
+        assert!(field_name_matches(Some("max sounds [1,16]"), "max sounds"));
+        // Symmetric: a marked-up query matches a clean stored name.
+        assert!(field_name_matches(Some("ambient color"), "ambient color:[0,255]"));
+        // Trailing `*`/`!` flags don't defeat the match (the render_method case).
+        assert!(field_name_matches(Some("shader flags*"), "shader flags"));
+        assert!(field_name_matches(Some("shader flags"), "shader flags*"));
+        // The jmad `|code` dumper suffix is still trimmed (stored side).
+        assert!(field_name_matches(Some("animations|ABCDCC"), "animations"));
+        // Genuinely different names still don't match.
+        assert!(!field_name_matches(Some("ambient color"), "diffuse color"));
+        assert!(!field_name_matches(None, "anything"));
+    }
 }
 
 #[cfg(test)]
