@@ -433,13 +433,27 @@ for entry in archive.ublock_entries() {
 }
 ```
 
-For **modding**, the module writes higher-priority *override containers* the game loads on top of the base without modifying it:
+For **modding**, the module can either overwrite a tag inside its own pak *in place*, or write higher-priority *override containers* the game loads on top of the base:
 
 ```rust
-use blam_tags::iostore::writer::{write_tag_override, write_new_tag_container};
+use blam_tags::iostore::writer::{
+    overwrite_tag_in_place, write_mod_container, write_tag_override, write_new_tag_container,
+};
 
-// Same-name override: replace one tag's bytes, reusing its original chunk id
-// (patches the paired .uasset's bulk size automatically on a size change).
+// In-place overwrite (destructive): append the edited chunk to the container's
+// .ucas and repoint its .utoc, preserving the perfect-hash seeds. Patches the
+// paired .uasset's bulk size on a length change. Modifies the shipped pak.
+overwrite_tag_in_place(utoc_path, ubulk_path, &edited_tag_bytes)?;
+
+// Bundle several edited tags into ONE portable overlay mod (base untouched);
+// tags may come from different source paks (chunk ids are globally unique).
+write_mod_container(
+    &[(&archive, ubulk_path, &edited_tag_bytes)],
+    "mymod-WinGDK_P.utoc".as_ref(),
+)?;
+
+// Single same-name override: replace one tag's bytes, reusing its original chunk
+// id (patches the paired .uasset's bulk size automatically on a size change).
 write_tag_override(&archive, ubulk_path, &edited_tag_bytes, "mymod-WinGDK_P.utoc".as_ref())?;
 
 // New or renamed tag: mutate a template .uasset's identity, write a container

@@ -386,6 +386,167 @@ pub fn write_new_tag_container(
     w.write(out_utoc)
 }
 
+/// Bundle several edited tags into ONE override (mod) container — a portable,
+/// non-destructive overlay the game loads on top of the base. Each tag is a
+/// same-name override: `(source_archive, ubulk_rel_path, new_tag_bytes)`. The
+/// paired `.uasset` is included with its bulk size patched when an edit changed
+/// the tag's length. Tags may come from different source paks (chunk ids are
+/// globally unique).
+pub fn write_mod_container(
+    tags: &[(&IoStoreArchive, &str, &[u8])],
+    out_utoc: &std::path::Path,
+) -> Result<()> {
+    let mut w = OverrideContainerWriter::new("../../../");
+    for &(archive, ubulk_path, new_bytes) in tags {
+        let ub_id = archive.chunk_id_for(ubulk_path)?;
+        let old_len = archive.uncompressed_len(ubulk_path)?;
+        if new_bytes.len() as u64 != old_len {
+            let ua_path = ubulk_path
+                .strip_suffix(".ubulk")
+                .map(|s| format!("{s}.uasset"))
+                .ok_or(IoStoreError::Package("path is not a .ubulk"))?;
+            if !archive.contains(&ua_path) {
+                return Err(IoStoreError::Package(
+                    "size-changing edit but no paired .uasset to patch",
+                ));
+            }
+            let ua_id = archive.chunk_id_for(&ua_path)?;
+            let mut ua = archive.read(&ua_path)?;
+            patch_uasset_serial_size(&mut ua, old_len, new_bytes.len() as u64)?;
+            w.add_chunk(ua_id, ua);
+        }
+        w.add_chunk(ub_id, new_bytes.to_vec());
+    }
+    w.write(out_utoc)
+}
+
+/// Overwrite a tag INSIDE an existing container, in place — **destructive**:
+/// this modifies the game's own pak files. Appends the edited `.ubulk` (and the
+/// paired `.uasset` with its bulk size patched, on a size change) to the `.ucas`
+/// and rewrites the `.utoc` to point at the new bytes; the original chunk bytes
+/// become dead space. Chunk ids/indices are unchanged, so the perfect-hash
+/// tables stay valid and are preserved verbatim. Callers should confirm with the
+/// user and recommend a backup first.
+pub fn overwrite_tag_in_place(
+    utoc_path: &std::path::Path,
+    ubulk_rel_path: &str,
+    new_tag_bytes: &[u8],
+) -> Result<()> {
+    // Resolve chunk indices + the paired .uasset via a fresh read-only handle.
+    let updates: Vec<(u32, Vec<u8>)> = {
+        let archive = IoStoreArchive::open(utoc_path)?;
+        let ub_idx = archive.chunk_index_for(ubulk_rel_path)?;
+        let old_len = archive.uncompressed_len(ubulk_rel_path)?;
+        let mut updates = vec![(ub_idx, new_tag_bytes.to_vec())];
+        if new_tag_bytes.len() as u64 != old_len {
+            let ua_path = ubulk_rel_path
+                .strip_suffix(".ubulk")
+                .map(|s| format!("{s}.uasset"))
+                .ok_or(IoStoreError::Package("path is not a .ubulk"))?;
+            if !archive.contains(&ua_path) {
+                return Err(IoStoreError::Package(
+                    "size-changing edit but no paired .uasset to patch",
+                ));
+            }
+            let ua_idx = archive.chunk_index_for(&ua_path)?;
+            let mut ua = archive.read(&ua_path)?;
+            patch_uasset_serial_size(&mut ua, old_len, new_tag_bytes.len() as u64)?;
+            updates.push((ua_idx, ua));
+        }
+        updates
+        // archive (and its mmap) dropped here, before we touch the files.
+    };
+    overwrite_chunks_in_place(utoc_path, &updates)
+}
+
+/// Core in-place surgery: append each `(chunk_index, new_bytes)` to the `.ucas`
+/// and rewrite the `.utoc` to repoint those chunks at the appended data. Every
+/// other section (chunk ids, perfect-hash seeds, method names, directory index)
+/// is preserved verbatim. The `.utoc` is written atomically (temp + rename).
+pub fn overwrite_chunks_in_place(
+    utoc_path: &std::path::Path,
+    updates: &[(u32, Vec<u8>)],
+) -> Result<()> {
+    let mut toc = std::fs::read(utoc_path)?;
+    if toc.len() < HEADER_SIZE || &toc[..16] != b"-==--==--==--==-" {
+        return Err(IoStoreError::BadMagic);
+    }
+    let rd = |t: &[u8], o: usize| u32::from_le_bytes(t[o..o + 4].try_into().unwrap());
+    let entry_count = rd(&toc, 24);
+    let cblock_count = rd(&toc, 28);
+    let cmeth_count = rd(&toc, 36);
+    let cmeth_len = rd(&toc, 40);
+    let cbs = rd(&toc, 44) as u64;
+    let diridx_size = rd(&toc, 48) as usize;
+    let flags = rd(&toc, 80);
+    let seeds = rd(&toc, 84);
+    let without_hash = rd(&toc, 96);
+
+    let offlen_off = HEADER_SIZE + entry_count as usize * 12;
+    let cblock_off = offlen_off
+        + entry_count as usize * 10
+        + seeds as usize * 4
+        + without_hash as usize * 4;
+    let cblocks_end = cblock_off + cblock_count as usize * 12;
+    let mut p = cblocks_end + cmeth_count as usize * cmeth_len as usize;
+    if flags & 0x04 != 0 {
+        let hash_size = i32::from_le_bytes(toc[p..p + 4].try_into().unwrap()) as usize;
+        p += 4 + hash_size * 2 + cblock_count as usize * 20;
+    }
+    let meta_off = p + diridx_size;
+    if meta_off + entry_count as usize * 24 > toc.len() {
+        return Err(IoStoreError::Truncated("meta section past end of .utoc"));
+    }
+
+    // Append the new chunk data to the .ucas and plan the new block entries.
+    let ucas_path = utoc_path.with_extension("ucas");
+    let mut ucas = std::fs::OpenOptions::new().append(true).open(&ucas_path)?;
+    let mut phys = ucas.metadata()?.len();
+    let mut appended: Vec<[u8; 12]> = Vec::new();
+    for (chunk_index, bytes) in updates {
+        if *chunk_index >= entry_count {
+            return Err(IoStoreError::Truncated("chunk index out of range"));
+        }
+        let start_block = cblock_count as usize + appended.len();
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let end = (off + cbs as usize).min(bytes.len());
+            let block = &bytes[off..end];
+            ucas.write_all(block)?;
+            appended.push(encode_block(phys, block.len() as u32, block.len() as u32, 0));
+            phys += block.len() as u64;
+            off = end;
+        }
+        // Repoint offset/length (logical, block-aligned) + refresh the meta hash.
+        let ol = offlen_off + *chunk_index as usize * 10;
+        toc[ol..ol + 10]
+            .copy_from_slice(&encode_offset_length(start_block as u64 * cbs, bytes.len() as u64));
+        let m = meta_off + *chunk_index as usize * 24;
+        let hash = blake3::hash(bytes);
+        toc[m..m + 20].copy_from_slice(&hash.as_bytes()[..20]);
+        toc[m + 20] = 0;
+        toc[m + 21..m + 24].copy_from_slice(&[0u8; 3]);
+    }
+    ucas.flush()?;
+    drop(ucas);
+
+    // Bump the block count and splice the appended blocks in after the originals.
+    let new_block_count = cblock_count + appended.len() as u32;
+    toc[28..32].copy_from_slice(&new_block_count.to_le_bytes());
+    let mut new_toc = Vec::with_capacity(toc.len() + appended.len() * 12);
+    new_toc.extend_from_slice(&toc[..cblocks_end]);
+    for b in &appended {
+        new_toc.extend_from_slice(b);
+    }
+    new_toc.extend_from_slice(&toc[cblocks_end..]);
+
+    // Atomic .utoc replace.
+    let tmp = utoc_path.with_extension("utoc.tmp");
+    std::fs::write(&tmp, &new_toc)?;
+    std::fs::rename(&tmp, utoc_path)?;
+    Ok(())
+}
+
 /// `FIoContainerId::from_name`: CityHash64 of the lowercased container name
 /// encoded as UTF-16LE.
 pub fn container_id_from_name(name: &str) -> u64 {
@@ -802,6 +963,33 @@ mod tests {
             return; // one success is enough
         }
         panic!("no tag with a root block found to test");
+    }
+
+    /// In-place chunk overwrite: append + repoint, other chunks untouched.
+    #[test]
+    fn overwrite_chunk_in_place_roundtrips() {
+        use super::super::IoStoreArchive;
+        let utoc = std::env::temp_dir().join("blamtags_inplace_test.utoc");
+        let id0 = make_chunk_id(0x1111, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA);
+        let id1 = make_chunk_id(0x1111, 0, CHUNK_TYPE_BULK_DATA);
+        let mut w = OverrideContainerWriter::new("../../../");
+        w.add_chunk(id0, vec![0xAA; 100]);
+        w.add_chunk(id1, vec![0xBB; 200]);
+        w.write(&utoc).unwrap();
+
+        // Overwrite chunk 1 with different-size bytes.
+        let new_bytes = vec![0xCC; 500];
+        overwrite_chunks_in_place(&utoc, &[(1, new_bytes.clone())]).unwrap();
+
+        let a = IoStoreArchive::open(&utoc).unwrap();
+        assert_eq!(a.chunk_count(), 2);
+        assert_eq!(a.chunk_id(0).unwrap(), id0);
+        assert_eq!(a.chunk_id(1).unwrap(), id1);
+        assert_eq!(a.read_chunk(0).unwrap(), vec![0xAA; 100], "chunk 0 untouched");
+        assert_eq!(a.read_chunk(1).unwrap(), new_bytes, "chunk 1 overwritten");
+
+        let _ = std::fs::remove_file(&utoc);
+        let _ = std::fs::remove_file(utoc.with_extension("ucas"));
     }
 
     /// Native create/rename: mutate a template `.uasset`'s identity, write a

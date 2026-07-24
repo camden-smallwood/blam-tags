@@ -314,6 +314,15 @@ impl IoStoreArchive {
         self.chunk_id(self.entries[idx].chunk_index)
     }
 
+    /// The chunk's index into the TOC arrays for a directory-index path.
+    pub fn chunk_index_for(&self, path: &str) -> Result<u32> {
+        let &idx = self
+            .by_path
+            .get(path)
+            .ok_or_else(|| IoStoreError::NotFound(path.to_string()))?;
+        Ok(self.entries[idx].chunk_index)
+    }
+
     /// The uncompressed byte length of a path's chunk, without decompressing it
     /// (from the TOC offset/length table). For a `.ubulk` this is the tag's
     /// byte length.
