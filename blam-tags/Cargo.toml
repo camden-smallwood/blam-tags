@@ -21,8 +21,24 @@ log = { version = "0.4", optional = true }
 opus = { version = "0.3", optional = true }
 vorbis_rs = { version = "0.5", optional = true }
 
+# `iostore` feature: read UE5 IoStore containers (.utoc/.ucas) as a virtual
+# filesystem, used to mount Halo: Campaign Evolved tags (Reach `.ubulk` tags
+# packed into UE5 paks). `oozextract` is a pure-Rust, decode-only Oodle
+# (Kraken/Mermaid/…) decompressor; `memmap2` maps the large .ucas partition
+# without loading it into memory. The decode+encode `oodle_loader` backend is
+# added on top of the same `OodleCodec` trait later, for the write/repack path.
+oozextract = { version = "0.5", optional = true }
+memmap2 = { version = "0.9", optional = true }
+blake3 = { version = "1", optional = true }
+# Zen-package (.uasset) serialization ported from trumank/retoc (MIT). `anyhow`
+# for the ported error handling; `byteorder` for the ported endian read/write
+# trait layer.
+anyhow = { version = "1", optional = true }
+byteorder = { version = "1", optional = true }
+
 [features]
 audio = ["dep:lewton", "dep:log", "dep:opus", "dep:vorbis_rs"]
+iostore = ["dep:oozextract", "dep:memmap2", "dep:blake3", "dep:anyhow", "dep:byteorder"]
 
 [dev-dependencies]
 md5 = "0.7"

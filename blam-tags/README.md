@@ -414,6 +414,46 @@ cargo run --release -p blam-tags --example ass_corpus_sweep -- \
     /path/to/halo3_mcc/tags
 ```
 
+### Halo: Campaign Evolved (UE5 IoStore containers)
+
+Behind the `iostore` feature, [`blam_tags::iostore`](src/iostore/) mounts UE5 IoStore paks (`.utoc`/`.ucas`, TOC version 8, Oodle-compressed) as a read-only tag filesystem. Campaign Evolved cooks each Reach tag into an IoStore package whose `.ubulk` payload *is* a byte-complete MCC tag — so reading is just decode-the-chunk + `TagFile::read_from_bytes`.
+
+```rust
+use blam_tags::iostore::{IoStoreArchive, parse_ublock_stem, is_tag_payload};
+use blam_tags::TagFile;
+
+let archive = IoStoreArchive::open("…/Meteorite/Content/Paks/pakchunk0-WinGDK.utoc")?;
+for entry in archive.ublock_entries() {
+    if parse_ublock_stem(&entry.path).is_none() { continue; } // skip non-tag .ubulk
+    let bytes = archive.read(&entry.path)?;                    // Oodle-decoded chunk
+    if is_tag_payload(&bytes) {
+        let tag = TagFile::read_from_bytes(&bytes)?;           // a normal Reach tag
+        let _ = tag.group();
+    }
+}
+```
+
+For **modding**, the module writes higher-priority *override containers* the game loads on top of the base without modifying it:
+
+```rust
+use blam_tags::iostore::writer::{write_tag_override, write_new_tag_container};
+
+// Same-name override: replace one tag's bytes, reusing its original chunk id
+// (patches the paired .uasset's bulk size automatically on a size change).
+write_tag_override(&archive, ubulk_path, &edited_tag_bytes, "mymod-WinGDK_P.utoc".as_ref())?;
+
+// New or renamed tag: mutate a template .uasset's identity, write a container
+// with a package-store entry (+ a redirect for a rename).
+write_new_tag_container(
+    &template_uasset, &tag_bytes,
+    "/Game/Tags/objects/foo/foo-biped",     // new package path
+    Some("/Game/Tags/objects/foo/oldfoo-biped"), // redirect old refs (rename); None = duplicate
+    "newtag-WinGDK_P.utoc".as_ref(),
+)?;
+```
+
+The `.uasset` mutation uses a byte-exact port of UE5's Zen-package (de)serializer ([`iostore::zen`](src/iostore/zen.rs)); all ids/hashes derive from names via `CityHash64` ([`iostore::writer::container_id_from_name`](src/iostore/writer.rs)), matching the game's own hashing.
+
 ### Optional streams (want / info / assd)
 
 Three optional streams can hang off the tag file — `want` (dependency list), `info` (import info), `assd` (asset-depot icon storage). They're off by default on freshly created tags; attach as needed:

@@ -146,6 +146,12 @@ pub mod typed_enums;
 #[cfg(feature = "audio")]
 pub mod audio;
 
+/// Read-only reader for UE5 IoStore containers (`.utoc`/`.ucas`), used to mount
+/// Halo: Campaign Evolved's packaged Reach `.ubulk` tags as a virtual
+/// filesystem. Gated behind the `iostore` feature.
+#[cfg(feature = "iostore")]
+pub mod iostore;
+
 // Facade re-exports — the recommended surface for editing tags.
 pub use api::{
     TagArray, TagArrayMut, TagBlock, TagBlockElement, TagBlockMut, TagField, TagFieldMut, TagFlag,
