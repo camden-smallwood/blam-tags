@@ -7,6 +7,12 @@
 //! `ContainerHeader` — the base game already supplies the package-store entry;
 //! serving raw chunks by id is sufficient (this mirrors retoc's `pack-raw`).
 //!
+//! Every override is written as the standard IoStore **triplet**: `.utoc` +
+//! `.ucas` + a `.pak` stub. The stock UE loader (`FPakPlatformFile`) discovers
+//! containers by scanning `Paks/*.pak` and derives the `.utoc`/`.ucas` from that
+//! path, so the (empty) `.pak` is required for the container to be mounted at
+//! all — see [`empty_pak_stub`].
+//!
 //! All chunks are stored uncompressed (compression method 0), so no Oodle
 //! *encoder* is needed. Layout matches [`super::IoStoreArchive`] exactly and is
 //! validated by round-tripping through it.
@@ -185,8 +191,89 @@ impl OverrideContainerWriter {
         let _ = &self.mount_point;
 
         std::fs::write(utoc_path, &toc)?;
+
+        // Emit the sibling `.pak` stub. The stock-UE loader discovers containers
+        // by scanning `Paks/*.pak` and derives the `.utoc`/`.ucas` from that
+        // path, so without a `.pak` next to us the override is never mounted.
+        std::fs::write(utoc_path.with_extension("pak"), empty_pak_stub())?;
         Ok(())
     }
+}
+
+/// Build a minimal, empty UE5 `.pak` stub to sit beside an override container.
+///
+/// Campaign Evolved (stock UE5 `FPakPlatformFile`) discovers containers by
+/// scanning `Paks/*.pak` and derives the sibling `.utoc`/`.ucas` from the `.pak`
+/// path — so an IoStore override is only ever mounted when a `.pak` exists next
+/// to it. The game's own IoStore-only chunks ship exactly this: a 339-byte pak
+/// carrying zero file entries (all real data lives in the `.ucas`). We generate
+/// the same thing clean-room.
+///
+/// `PakFileVersion 11`, unencrypted, mount point `/`, zero entries, with the
+/// present-but-empty PathHash + FullDirectory sub-indexes UnrealPak emits. The
+/// pak encodes nothing about the mod (its name or chunks), so a single stub
+/// serves every override; only the on-disk filename (`<stem>_P.pak`) matters for
+/// discovery. Layout matches the shipped stubs byte-for-byte apart from the
+/// (arbitrary) `PathHashSeed` and the index hash that depends on it.
+fn empty_pak_stub() -> Vec<u8> {
+    use sha1::{Digest, Sha1};
+    fn sha1(bytes: &[u8]) -> [u8; 20] {
+        let mut h = Sha1::new();
+        h.update(bytes);
+        h.finalize().into()
+    }
+
+    const MAGIC: u32 = 0x5A6F_12E1;
+    const VERSION: i32 = 11; // PakFileVersion matching the game's own stubs
+
+    // Empty secondary indexes: the path-hash index is a single u64 count (0),
+    // the full-directory index a single i32 count (0).
+    let path_hash_index = 0u64.to_le_bytes().to_vec(); // 8 bytes
+    let full_dir_index = 0i32.to_le_bytes().to_vec(); // 4 bytes
+
+    // Primary index. Its tail after `PathHashSeed` is a fixed 88 bytes:
+    //   hasPHI(4) + PHIOffset(8) + PHISize(8) + PHIHash(20)
+    // + hasFDI(4) + FDIOffset(8) + FDISize(8) + FDIHash(20)
+    // + EncodedEntriesSize(4) + NumFiles(4)
+    let mount: &[u8] = b"/\0"; // FString: 2 chars incl. null terminator
+    let mut primary = Vec::new();
+    primary.extend_from_slice(&(mount.len() as i32).to_le_bytes()); // MountPoint len
+    primary.extend_from_slice(mount);
+    primary.extend_from_slice(&0i32.to_le_bytes()); // NumEntries
+    primary.extend_from_slice(&0u64.to_le_bytes()); // PathHashSeed (arbitrary)
+    let primary_size = primary.len() + 88;
+    // PHI/FDI offsets are absolute; the primary index sits at file offset 0.
+    let phi_offset = primary_size as i64;
+    let fdi_offset = (primary_size + path_hash_index.len()) as i64;
+    primary.extend_from_slice(&1i32.to_le_bytes()); // bReaderHasPathHashIndex
+    primary.extend_from_slice(&phi_offset.to_le_bytes());
+    primary.extend_from_slice(&(path_hash_index.len() as i64).to_le_bytes());
+    primary.extend_from_slice(&sha1(&path_hash_index));
+    primary.extend_from_slice(&1i32.to_le_bytes()); // bReaderHasFullDirectoryIndex
+    primary.extend_from_slice(&fdi_offset.to_le_bytes());
+    primary.extend_from_slice(&(full_dir_index.len() as i64).to_le_bytes());
+    primary.extend_from_slice(&sha1(&full_dir_index));
+    primary.extend_from_slice(&0i32.to_le_bytes()); // EncodedPakEntries size
+    primary.extend_from_slice(&0i32.to_le_bytes()); // NumFiles
+    debug_assert_eq!(primary.len(), primary_size);
+
+    let index_hash = sha1(&primary);
+
+    let mut pak =
+        Vec::with_capacity(primary.len() + path_hash_index.len() + full_dir_index.len() + 221);
+    pak.extend_from_slice(&primary);
+    pak.extend_from_slice(&path_hash_index);
+    pak.extend_from_slice(&full_dir_index);
+    // Footer (`FPakInfo`), 221 bytes.
+    pak.extend_from_slice(&[0u8; 16]); // EncryptionKeyGuid (unencrypted)
+    pak.push(0); // bEncryptedIndex
+    pak.extend_from_slice(&MAGIC.to_le_bytes());
+    pak.extend_from_slice(&VERSION.to_le_bytes());
+    pak.extend_from_slice(&0i64.to_le_bytes()); // IndexOffset
+    pak.extend_from_slice(&(primary.len() as i64).to_le_bytes()); // IndexSize
+    pak.extend_from_slice(&index_hash);
+    pak.extend_from_slice(&[0u8; 5 * 32]); // compression method names (none)
+    pak
 }
 
 /// Write the fixed 144-byte `FIoStoreTocHeader`.
@@ -291,7 +378,8 @@ pub fn patch_uasset_serial_size(uasset: &mut [u8], old_len: u64, new_len: u64) -
 /// `SerialSize` patched to the new length (UE reads the tag length from there).
 /// The base container is only read, never modified. `out_utoc` should be named
 /// with a `_P` suffix (e.g. `mymod-WinGDK_P.utoc`) for patch priority; the
-/// sibling `.ucas` is written alongside.
+/// sibling `.ucas` and a `.pak` stub are written alongside (the game only mounts
+/// containers it discovers via a `Paks/*.pak` scan).
 pub fn write_tag_override(
     base: &IoStoreArchive,
     ubulk_path: &str,
@@ -391,7 +479,7 @@ pub fn write_new_tag_container(
 /// same-name override: `(source_archive, ubulk_rel_path, new_tag_bytes)`. The
 /// paired `.uasset` is included with its bulk size patched when an edit changed
 /// the tag's length. Tags may come from different source paks (chunk ids are
-/// globally unique).
+/// globally unique). Writes the `.utoc`/`.ucas`/`.pak` triplet at `out_utoc`.
 pub fn write_mod_container(
     tags: &[(&IoStoreArchive, &str, &[u8])],
     out_utoc: &std::path::Path,
@@ -816,6 +904,58 @@ mod tests {
 
         let _ = std::fs::remove_file(&utoc);
         let _ = std::fs::remove_file(utoc.with_extension("ucas"));
+    }
+
+    /// The clean-room empty pak stub matches the shipped 339-byte layout: right
+    /// size, `FPakInfo` footer (magic, version 11, IndexOffset 0, IndexSize 106),
+    /// and — since they hash only the empty sub-index payloads — PathHashIndex /
+    /// FullDirectoryIndex hashes identical to the game's own stubs. Needs no game
+    /// files.
+    #[test]
+    fn empty_pak_stub_structure() {
+        let b = empty_pak_stub();
+        assert_eq!(b.len(), 339, "shipped stub size");
+
+        let magic = 0x5A6F_12E1u32.to_le_bytes();
+        let mi = b.windows(4).rposition(|w| w == magic).expect("footer magic");
+        assert_eq!(&b[mi + 4..mi + 8], &11i32.to_le_bytes(), "PakFileVersion");
+        let idx_off = i64::from_le_bytes(b[mi + 8..mi + 16].try_into().unwrap());
+        let idx_size = i64::from_le_bytes(b[mi + 16..mi + 24].try_into().unwrap());
+        assert_eq!((idx_off, idx_size), (0, 106), "primary index offset/size");
+        assert_eq!(b[mi - 17], 0, "bEncryptedIndex = 0 (unencrypted)");
+
+        // Seed-independent sub-index hashes (primary index: PHIHash @0x26,
+        // FDIHash @0x4e) — ground truth from the game's shipped level stubs.
+        let phi_hash: [u8; 20] = [
+            0x05, 0xfe, 0x40, 0x57, 0x53, 0x16, 0x6f, 0x12, 0x55, 0x59, 0xe7, 0xc9, 0xac, 0x55,
+            0x86, 0x54, 0xf1, 0x07, 0xc7, 0xe9,
+        ];
+        let fdi_hash: [u8; 20] = [
+            0x90, 0x69, 0xca, 0x78, 0xe7, 0x45, 0x0a, 0x28, 0x51, 0x73, 0x43, 0x1b, 0x3e, 0x52,
+            0xc5, 0xc2, 0x52, 0x99, 0xe4, 0x73,
+        ];
+        assert_eq!(&b[0x26..0x3a], &phi_hash, "PathHashIndex hash matches game stub");
+        assert_eq!(&b[0x4e..0x62], &fdi_hash, "FullDirectoryIndex hash matches game stub");
+    }
+
+    /// Writing any override drops the discovery `.pak` stub beside the
+    /// `.utoc`/`.ucas`, and the stub is the valid empty pak. No game files.
+    #[test]
+    fn write_emits_pak_stub_sibling() {
+        let utoc = std::env::temp_dir().join("blamtags_pakstub-WinGDK_P.utoc");
+        let mut w = OverrideContainerWriter::new("../../../");
+        w.add_chunk(make_chunk_id(0x1234_5678, 0, CHUNK_TYPE_BULK_DATA), vec![1, 2, 3, 4]);
+        w.write(&utoc).expect("write override");
+
+        for ext in ["utoc", "ucas", "pak"] {
+            assert!(utoc.with_extension(ext).exists(), "{ext} written");
+        }
+        let pak = std::fs::read(utoc.with_extension("pak")).expect("read pak");
+        assert_eq!(pak, empty_pak_stub(), "sibling is the empty stub");
+
+        for ext in ["utoc", "ucas", "pak"] {
+            let _ = std::fs::remove_file(utoc.with_extension(ext));
+        }
     }
 
     /// Patch `.uasset` SerialSize to a new length, confirm it changed, patch

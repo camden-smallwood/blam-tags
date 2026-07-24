@@ -30,6 +30,8 @@ vorbis_rs = { version = "0.5", optional = true }
 oozextract = { version = "0.5", optional = true }
 memmap2 = { version = "0.9", optional = true }
 blake3 = { version = "1", optional = true }
+# SHA-1 for the empty `.pak` stub's index hashes (UnrealPak footer/index format).
+sha1 = { version = "0.10", optional = true }
 # Zen-package (.uasset) serialization ported from trumank/retoc (MIT). `anyhow`
 # for the ported error handling; `byteorder` for the ported endian read/write
 # trait layer.
@@ -38,7 +40,7 @@ byteorder = { version = "1", optional = true }
 
 [features]
 audio = ["dep:lewton", "dep:log", "dep:opus", "dep:vorbis_rs"]
-iostore = ["dep:oozextract", "dep:memmap2", "dep:blake3", "dep:anyhow", "dep:byteorder"]
+iostore = ["dep:oozextract", "dep:memmap2", "dep:blake3", "dep:anyhow", "dep:byteorder", "dep:sha1"]
 
 [dev-dependencies]
 md5 = "0.7"
