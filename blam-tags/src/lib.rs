@@ -69,6 +69,7 @@ pub mod fields;
 pub mod field_name;
 pub mod layout;
 pub mod schema;
+pub mod schema_compare;
 pub mod data;
 pub mod path;
 pub mod field_path;
@@ -174,6 +175,9 @@ pub use file::TagFile;
 pub use io::Endian;
 pub use layout::TagLayout;
 pub use schema::{TagGroupMeta, TagSchemaError};
+pub use schema_compare::{
+    compare_root_layout, field_key, FieldDiff, FieldKey, LayoutComparison, LayoutSeverity,
+};
 pub use bitmap::{Bitmap, BitmapError, BitmapFormat, BitmapImage};
 pub use jms::{
     JmsBox, JmsCapsule, JmsConvex, JmsError, JmsFile, JmsHinge, JmsMarker, JmsMaterial,

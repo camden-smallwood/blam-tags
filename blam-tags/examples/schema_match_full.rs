@@ -13,6 +13,9 @@
 //! *every* tag (a real bug) without rejecting schemas that simply
 //! drifted past some older tags.
 //!
+//! The size/field-count/field-diff comparison is the shared
+//! [`blam_tags::compare_root_layout`] API.
+//!
 //! Usage:
 //!
 //! ```text
@@ -24,7 +27,7 @@ use std::error::Error;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use blam_tags::{TagFile, TagFieldDefinition, TagFieldType, TagStructDefinition};
+use blam_tags::{compare_root_layout, FieldDiff, TagFile};
 
 fn collect_tags_with_ext(root: &Path, ext: &str, out: &mut Vec<PathBuf>) {
     let Ok(read) = std::fs::read_dir(root) else { return };
@@ -52,51 +55,6 @@ fn list_group_schemas(defs_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     Ok(out)
 }
 
-/// One field as a (type, normalized_name) tuple — used for set-style
-/// diffing between schema and tag. Names are normalized to strip
-/// runtime markers ('!', '*'), unit/description suffixes (':units',
-/// '#description'), and leading/trailing whitespace, so cosmetic
-/// drift between dumper passes doesn't fire false diffs.
-type FieldKey = (String, String);
-
-/// Wire-significant fields only — drops editor sentinels whose names
-/// aren't reliably preserved across dumper / serializer pairings:
-///   * `custom`       — editor group markers (fgrb/fgre) and function
-///                       descriptors. 0 bytes on disk, tag blays often
-///                       store empty names.
-///   * `explanation`  — 0-byte editor text.
-///   * `terminator`   — implicit list end.
-/// Kept (and contribute to size deltas): pad / useless_pad / skip and
-/// every real wire-data type.
-fn collect_fields(s: TagStructDefinition<'_>) -> Vec<FieldKey> {
-    s.fields()
-        .filter(|f| !matches!(
-            f.field_type(),
-            TagFieldType::Custom | TagFieldType::Explanation | TagFieldType::Terminator,
-        ))
-        .map(field_key)
-        .collect()
-}
-
-fn field_key(f: TagFieldDefinition<'_>) -> FieldKey {
-    let name = f.name();
-    // Strip in this order: '#description' / ':units' / '{alt-name}' /
-    // '&flag-name' / runtime markers ('!', '*'). Each is a known
-    // dumper convention for annotating fields beyond the canonical
-    // name; tags written from older dumps may omit any of them.
-    let mut base = name.split('#').next().unwrap_or("").to_owned();
-    base = base.split(':').next().unwrap_or("").to_owned();
-    if let Some(brace) = base.find('{') {
-        base.truncate(brace);
-    }
-    if let Some(amp) = base.find('&') {
-        base.truncate(amp);
-    }
-    let base = base.trim().trim_end_matches(['!', '*']).trim().to_owned();
-    (f.type_name().to_owned(), base)
-}
-
-
 struct GroupResult {
     group: String,
     schema_size: usize,
@@ -113,57 +71,9 @@ struct ClosestMiss {
     tag_size: usize,
     tag_fields_count: usize,
     delta: isize,
-    /// LCS-aligned rows: each row is `(schema_field, tag_field)` where
-    /// either side is `None` when that side has no field at this point
-    /// in the alignment. Unchanged rows have both sides populated and
-    /// equal; insertions/deletions have a single side.
-    aligned: Vec<(Option<FieldKey>, Option<FieldKey>)>,
-}
-
-/// Produce an LCS-aligned merge of two ordered sequences. Result is a
-/// sequence of `(left, right)` rows where matched items appear on both
-/// sides (Some/Some, equal keys) and unmatched items appear on a single
-/// side (Some/None or None/Some). Preserves relative order on each side.
-fn align_lcs(a: &[FieldKey], b: &[FieldKey]) -> Vec<(Option<FieldKey>, Option<FieldKey>)> {
-    let n = a.len();
-    let m = b.len();
-    // dp[i][j] = LCS length of a[..i] vs b[..j]
-    let mut dp = vec![vec![0u32; m + 1]; n + 1];
-    for i in 0..n {
-        for j in 0..m {
-            dp[i + 1][j + 1] = if a[i] == b[j] {
-                dp[i][j] + 1
-            } else {
-                dp[i + 1][j].max(dp[i][j + 1])
-            };
-        }
-    }
-    let mut out = Vec::with_capacity(n + m);
-    let mut i = n;
-    let mut j = m;
-    while i > 0 && j > 0 {
-        if a[i - 1] == b[j - 1] {
-            out.push((Some(a[i - 1].clone()), Some(b[j - 1].clone())));
-            i -= 1;
-            j -= 1;
-        } else if dp[i - 1][j] >= dp[i][j - 1] {
-            out.push((Some(a[i - 1].clone()), None));
-            i -= 1;
-        } else {
-            out.push((None, Some(b[j - 1].clone())));
-            j -= 1;
-        }
-    }
-    while i > 0 {
-        out.push((Some(a[i - 1].clone()), None));
-        i -= 1;
-    }
-    while j > 0 {
-        out.push((None, Some(b[j - 1].clone())));
-        j -= 1;
-    }
-    out.reverse();
-    out
+    /// Differing rows of the root-struct field alignment (from
+    /// `compare_root_layout`); a matched field yields no row.
+    diffs: Vec<FieldDiff>,
 }
 
 fn check_group(schema_path: &Path, tags_root: &Path) -> GroupResult {
@@ -191,7 +101,6 @@ fn check_group(schema_path: &Path, tags_root: &Path) -> GroupResult {
     let schema_root = schema_tag.definitions().root_struct();
     let schema_size = schema_root.size();
     let schema_fields_count = schema_root.fields().count();
-    let schema_keys: Vec<FieldKey> = collect_fields(schema_root);
 
     let mut tags: Vec<PathBuf> = Vec::new();
     collect_tags_with_ext(tags_root, &group, &mut tags);
@@ -208,28 +117,24 @@ fn check_group(schema_path: &Path, tags_root: &Path) -> GroupResult {
                 continue;
             }
         };
-        let real_root = real.definitions().root_struct();
-        let tag_size = real_root.size();
-        let tag_fields_count = real_root.fields().count();
+        let cmp = compare_root_layout(&schema_tag, &real);
 
-        if tag_size == schema_size && tag_fields_count == schema_fields_count {
+        if cmp.root_size_match && cmp.field_count_match {
             matching_tags += 1;
         } else {
-            let delta = schema_size as isize - tag_size as isize;
+            let delta = cmp.expected_root_size as isize - cmp.actual_root_size as isize;
             let abs = delta.unsigned_abs();
             let take = match &closest_miss {
                 None => true,
                 Some(prev) => abs < prev.delta.unsigned_abs(),
             };
             if take {
-                let tag_keys: Vec<FieldKey> = collect_fields(real_root);
-                let aligned = align_lcs(&schema_keys, &tag_keys);
                 closest_miss = Some(ClosestMiss {
                     path: tag_path.clone(),
-                    tag_size,
-                    tag_fields_count,
+                    tag_size: cmp.actual_root_size,
+                    tag_fields_count: cmp.actual_field_count,
                     delta,
-                    aligned,
+                    diffs: cmp.field_diffs,
                 });
             }
         }
@@ -329,29 +234,26 @@ fn main() -> Result<(), Box<dyn Error>> {
                 col_w = col_w,
             );
             println!("   {0:─<col_w$}──┼──{0:─<col_w$}", "", col_w = col_w);
-            let mut any_diff = false;
-            for (left, right) in &miss.aligned {
-                let l_str = match left {
+            if miss.diffs.is_empty() {
+                println!("   (no field-list drift on wire-significant fields; size still differs by {} — primitive type drift)", miss.delta);
+            }
+            for diff in &miss.diffs {
+                let l_str = match &diff.expected {
                     Some((ty, name)) => format!("{ty} '{name}'"),
                     None => String::new(),
                 };
-                let r_str = match right {
+                let r_str = match &diff.actual {
                     Some((ty, name)) => format!("{ty} '{name}'"),
                     None => String::new(),
                 };
-                let mark = match (left, right) {
+                let mark = match (&diff.expected, &diff.actual) {
                     (Some(_), None) => '<',
                     (None, Some(_)) => '>',
                     _ => ' ',
                 };
-                if mark != ' ' { any_diff = true; }
-                // Truncate long names so columns stay aligned.
                 let l_disp: String = l_str.chars().take(col_w).collect();
                 let r_disp: String = r_str.chars().take(col_w).collect();
                 println!("   {l_disp:<col_w$} {mark}│ {mark}{r_disp:<col_w$}", col_w = col_w);
-            }
-            if !any_diff {
-                println!("   (no field-list drift on wire-significant fields; size still differs by {} — primitive type drift)", miss.delta);
             }
             if r.tag_errors > 0 {
                 println!("   ({} tag(s) failed to read)", r.tag_errors);

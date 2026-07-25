@@ -21,7 +21,7 @@ use std::error::Error;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use blam_tags::TagFile;
+use blam_tags::{compare_root_layout, TagFile};
 
 fn find_one_tag_with_ext(root: &Path, ext: &str) -> Option<PathBuf> {
     let read = std::fs::read_dir(root).ok()?;
@@ -83,26 +83,22 @@ fn check_group(schema_path: &Path, tags_root: &Path) -> (String, Option<PathBuf>
         Err(e) => return (group_name, Some(tag_path), Outcome::TagReadErr(format!("{e}"))),
     };
 
-    let schema_root = schema_tag.definitions().root_struct();
-    let real_root = real_tag.definitions().root_struct();
-
-    let schema_size = schema_root.size();
-    let tag_size = real_root.size();
-    if schema_size != tag_size {
+    let cmp = compare_root_layout(&schema_tag, &real_tag);
+    if !cmp.root_size_match {
         return (
             group_name,
             Some(tag_path),
-            Outcome::SizeMismatch { schema: schema_size, tag: tag_size },
+            Outcome::SizeMismatch { schema: cmp.expected_root_size, tag: cmp.actual_root_size },
         );
     }
-
-    let schema_fields = schema_root.fields().count();
-    let tag_fields = real_root.fields().count();
-    if schema_fields != tag_fields {
+    if !cmp.field_count_match {
         return (
             group_name,
             Some(tag_path),
-            Outcome::FieldCountMismatch { schema: schema_fields, tag: tag_fields },
+            Outcome::FieldCountMismatch {
+                schema: cmp.expected_field_count,
+                tag: cmp.actual_field_count,
+            },
         );
     }
 
