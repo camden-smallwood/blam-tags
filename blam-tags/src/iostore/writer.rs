@@ -421,36 +421,74 @@ pub fn write_tag_override(
 /// old `/Game/Tags/...` package path) adds a rename redirect so existing
 /// references resolve to the renamed tag. All hashing/ids derive from the
 /// names; nothing depends on retoc at runtime.
-pub fn write_new_tag_container(
-    template_uasset: &[u8],
-    tag_bytes: &[u8],
-    new_package_path: &str,
-    redirect_from: Option<&str>,
-    out_utoc: &std::path::Path,
+/// A brand-new tag package to add to an override container: the source `.uasset`
+/// template (typically an existing same-group tag's), the new tag `.ubulk` bytes,
+/// the target UE package path (`/Game/Tags/<rel>-<group>`), and an optional
+/// old→new package redirect for renames.
+pub struct NewPackage<'a> {
+    pub template_uasset: &'a [u8],
+    pub tag_bytes: &'a [u8],
+    pub new_package_path: &'a str,
+    pub redirect_from: Option<&'a str>,
+}
+
+/// Add one same-name override (edited tag, patching the paired `.uasset` on a
+/// size change) to an in-progress override container writer.
+fn add_override_to_writer(
+    w: &mut OverrideContainerWriter,
+    archive: &IoStoreArchive,
+    ubulk_path: &str,
+    new_bytes: &[u8],
 ) -> Result<()> {
+    let ub_id = archive.chunk_id_for(ubulk_path)?;
+    let old_len = archive.uncompressed_len(ubulk_path)?;
+    if new_bytes.len() as u64 != old_len {
+        let ua_path = ubulk_path
+            .strip_suffix(".ubulk")
+            .map(|s| format!("{s}.uasset"))
+            .ok_or(IoStoreError::Package("path is not a .ubulk"))?;
+        if !archive.contains(&ua_path) {
+            return Err(IoStoreError::Package(
+                "size-changing edit but no paired .uasset to patch",
+            ));
+        }
+        let ua_id = archive.chunk_id_for(&ua_path)?;
+        let mut ua = archive.read(&ua_path)?;
+        patch_uasset_serial_size(&mut ua, old_len, new_bytes.len() as u64)?;
+        w.add_chunk(ua_id, ua);
+    }
+    w.add_chunk(ub_id, new_bytes.to_vec());
+    Ok(())
+}
+
+/// Add one brand-new tag package (mutating the template `.uasset`'s identity to
+/// `new_package_path`, setting the `.ubulk` content, plus an optional redirect)
+/// to an in-progress override container writer.
+fn add_new_package_to_writer(w: &mut OverrideContainerWriter, pkg: &NewPackage) -> Result<()> {
     use super::ue_types::EIoStoreTocVersion;
     use super::zen::FZenPackageHeader;
     const HV: EIoContainerHeaderVersion = EIoContainerHeaderVersion::SoftPackageReferences;
     let cv = EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash;
 
     // Parse the template package and mutate its identity.
-    let mut cur = std::io::Cursor::new(template_uasset);
+    let mut cur = std::io::Cursor::new(pkg.template_uasset);
     let mut hdr = FZenPackageHeader::deserialize(&mut cur, None, cv, HV, None)
         .map_err(|_| IoStoreError::Package("failed to parse template .uasset"))?;
     if hdr.export_map.is_empty() {
         return Err(IoStoreError::Package("template .uasset has no export"));
     }
-    let export_data = template_uasset[hdr.summary.header_size as usize..].to_vec();
+    let export_data = pkg.template_uasset[hdr.summary.header_size as usize..].to_vec();
 
-    let new_obj = new_package_path
+    let new_obj = pkg
+        .new_package_path
         .rsplit('/')
         .next()
-        .unwrap_or(new_package_path);
-    hdr.summary.name = hdr.name_map.store(new_package_path);
+        .unwrap_or(pkg.new_package_path);
+    hdr.summary.name = hdr.name_map.store(pkg.new_package_path);
     hdr.export_map[0].object_name = hdr.name_map.store(new_obj);
     hdr.export_map[0].public_export_hash = container_id_from_name(new_obj);
     if let Some(entry) = hdr.bulk_data.first_mut() {
-        entry.serial_size = tag_bytes.len() as i64;
+        entry.serial_size = pkg.tag_bytes.len() as i64;
     }
 
     let mut store = StoreEntry::default();
@@ -461,16 +499,35 @@ pub fn write_new_tag_container(
     new_uasset.extend_from_slice(&export_data);
 
     // Compute new chunk ids from the new package path.
-    let new_pid = container_id_from_name(new_package_path);
+    let new_pid = container_id_from_name(pkg.new_package_path);
     let uasset_id = make_chunk_id(new_pid, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA);
     let ubulk_id = make_chunk_id(new_pid, 0, CHUNK_TYPE_BULK_DATA);
 
-    let mut w = OverrideContainerWriter::new("../../../");
     w.add_package(uasset_id, new_uasset, FPackageId(new_pid), store);
-    w.add_chunk(ubulk_id, tag_bytes.to_vec());
-    if let Some(old) = redirect_from {
+    w.add_chunk(ubulk_id, pkg.tag_bytes.to_vec());
+    if let Some(old) = pkg.redirect_from {
         w.add_redirect(old, FPackageId(new_pid));
     }
+    Ok(())
+}
+
+pub fn write_new_tag_container(
+    template_uasset: &[u8],
+    tag_bytes: &[u8],
+    new_package_path: &str,
+    redirect_from: Option<&str>,
+    out_utoc: &std::path::Path,
+) -> Result<()> {
+    let mut w = OverrideContainerWriter::new("../../../");
+    add_new_package_to_writer(
+        &mut w,
+        &NewPackage {
+            template_uasset,
+            tag_bytes,
+            new_package_path,
+            redirect_from,
+        },
+    )?;
     w.write(out_utoc)
 }
 
@@ -484,26 +541,23 @@ pub fn write_mod_container(
     tags: &[(&IoStoreArchive, &str, &[u8])],
     out_utoc: &std::path::Path,
 ) -> Result<()> {
+    write_mod_container_ex(tags, &[], out_utoc)
+}
+
+/// Like [`write_mod_container`] but also bundles brand-new tag packages
+/// (`new_packages`) alongside same-name `overrides`, into one override
+/// container. Lets a mod contain both edited base-game tags and net-new tags.
+pub fn write_mod_container_ex(
+    overrides: &[(&IoStoreArchive, &str, &[u8])],
+    new_packages: &[NewPackage],
+    out_utoc: &std::path::Path,
+) -> Result<()> {
     let mut w = OverrideContainerWriter::new("../../../");
-    for &(archive, ubulk_path, new_bytes) in tags {
-        let ub_id = archive.chunk_id_for(ubulk_path)?;
-        let old_len = archive.uncompressed_len(ubulk_path)?;
-        if new_bytes.len() as u64 != old_len {
-            let ua_path = ubulk_path
-                .strip_suffix(".ubulk")
-                .map(|s| format!("{s}.uasset"))
-                .ok_or(IoStoreError::Package("path is not a .ubulk"))?;
-            if !archive.contains(&ua_path) {
-                return Err(IoStoreError::Package(
-                    "size-changing edit but no paired .uasset to patch",
-                ));
-            }
-            let ua_id = archive.chunk_id_for(&ua_path)?;
-            let mut ua = archive.read(&ua_path)?;
-            patch_uasset_serial_size(&mut ua, old_len, new_bytes.len() as u64)?;
-            w.add_chunk(ua_id, ua);
-        }
-        w.add_chunk(ub_id, new_bytes.to_vec());
+    for &(archive, ubulk_path, new_bytes) in overrides {
+        add_override_to_writer(&mut w, archive, ubulk_path, new_bytes)?;
+    }
+    for pkg in new_packages {
+        add_new_package_to_writer(&mut w, pkg)?;
     }
     w.write(out_utoc)
 }
