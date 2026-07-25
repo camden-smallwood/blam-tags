@@ -46,7 +46,7 @@ use crate::geometry::{
     read_compression_bounds, strip_to_list, strip_to_list_u32, walk_surface_ring,
     CompressionBounds, EdgeRow, SCALE,
 };
-use crate::math::{RealPoint3d, RealQuaternion, RealVector3d};
+use crate::math::{Matrix4, RealPoint3d, RealQuaternion, RealVector3d};
 
 /// JMS export errors. Most failures during a corpus sweep land in
 /// `MissingField` (schema-shape variation) or `Io` (write-out).
@@ -128,6 +128,94 @@ pub struct JmsTriangle {
     pub material: i32,
     pub v: [u32; 3],
     pub region: i32,
+}
+
+/// One mesh piece of a combined character variant for
+/// [`JmsFile::from_ue_skeletal_meshes`].
+#[cfg(feature = "iostore")]
+pub struct UeMeshPart<'a> {
+    pub mesh: &'a crate::iostore::skeletal_mesh::SkeletalMesh,
+    /// Region name (e.g. `body`, `head`) — a hint; the render-model
+    /// synthesis re-derives the region/permutation from the mesh name against
+    /// the skeleton_model's taxonomy.
+    pub region: String,
+    /// Permutation/variant name (e.g. `base`, `minor`, `major`).
+    pub permutation: String,
+    /// The UE mesh asset basename (e.g. `SK_Marine_Torso_01_Ragtag`), used to
+    /// match the mesh to a skeleton_model region/permutation by name.
+    pub name: String,
+    /// UE material names, indexed by section `material_index`.
+    pub material_names: Vec<String>,
+}
+
+/// One rigid `UStaticMesh` piece of a combined variant, attached to a skeleton
+/// bone (e.g. a vehicle wing, a weapon magazine). Baked to object space at the
+/// bone's rest transform by [`crate::render_model::RenderModel::from_ue_meshes`].
+#[cfg(feature = "iostore")]
+pub struct UeStaticPart<'a> {
+    pub mesh: &'a crate::iostore::static_mesh::StaticMesh,
+    /// Skeleton node the piece rides on (`RuntimeStaticMesh.ParentBoneName`).
+    pub bone_name: String,
+    pub region: String,
+    pub permutation: String,
+    pub name: String,
+    pub material_names: Vec<String>,
+    /// The component's transform relative to `bone_name` (from
+    /// `RuntimeStaticMesh.Transform`); [`MeshTransform::default`] = identity.
+    pub rel_transform: crate::iostore::unversioned::MeshTransform,
+    /// When `Some(anchor)`, the piece is a MetaHuman hat/helmet authored
+    /// **world-aligned** at a head socket, in the local frame of the MetaHuman
+    /// face rig's `head` bone (NOT the classic skeleton). `anchor` is that bone's
+    /// world position in UE cm (from [`ue_bind_world`] on the face mesh). Each
+    /// vertex is placed at `X · (anchor + local)` — upright, at the correct head
+    /// height — bypassing the classic bone's transform entirely (whose position
+    /// and orientation needn't match the MetaHuman head socket). The `bone_name`
+    /// is still used, only to pick the rigid binding node. `None` = an ordinary
+    /// bone-local static piece (mesh-sync vehicle/weapon part).
+    pub world_anchor: Option<[f32; 3]>,
+}
+
+/// A skeletal mesh authored in **component/world space** on a *foreign*
+/// skeleton — a MetaHuman `Face`/hair mesh whose 800+-bone facial rig shares no
+/// bone names with the classic skeleton, but whose vertices are already posed at
+/// their world location (a Campaign Evolved head sits at ~140–180 cm, right
+/// where the classic `head` node is). It can't be bind-pose skinned like a body
+/// part (no shared bones) and it isn't bone-local like a static part; instead
+/// each vertex is baked straight to tag space (UE cm → JMS, Y-negated) and bound
+/// rigidly to a single classic node. The MetaHuman skin weights are irrelevant
+/// (and, for these meshes, not reliably decodable), so they are ignored.
+#[cfg(feature = "iostore")]
+pub struct UeWorldPart<'a> {
+    pub mesh: &'a crate::iostore::skeletal_mesh::SkeletalMesh,
+    /// Classic skeleton node to bind every vertex to (e.g. `head`).
+    pub node_name: String,
+    /// The MetaHuman rig's `head` bone world position in UE cm (its anatomical
+    /// head reference). The mesh is placed so this point coincides with
+    /// `node_name`'s classic-skeleton position, i.e. the head is put where the
+    /// skeleton's head node is (fixing a MetaHuman rig whose head sits lower than
+    /// the classic neck). Zero = bake at the raw component position.
+    pub head_anchor: [f32; 3],
+    pub region: String,
+    pub permutation: String,
+    pub name: String,
+    pub material_names: Vec<String>,
+}
+
+/// Apply a component-relative [`MeshTransform`] to a local-space (UE cm)
+/// position: `scale`, then `rotate`, then `translate`. Identity → unchanged.
+#[cfg(feature = "iostore")]
+pub(crate) fn apply_rel_transform(
+    t: &crate::iostore::unversioned::MeshTransform,
+    p: [f32; 3],
+) -> [f32; 3] {
+    let scaled = RealVector3d {
+        i: p[0] * t.scale[0],
+        j: p[1] * t.scale[1],
+        k: p[2] * t.scale[2],
+    };
+    let q = RealQuaternion { i: t.rotation[0], j: t.rotation[1], k: t.rotation[2], w: t.rotation[3] };
+    let r = q.rotate(scaled);
+    [r.i + t.translation[0], r.j + t.translation[1], r.k + t.translation[2]]
 }
 
 /// JMS sphere collision primitive. `parent` is a node index, `material`
@@ -271,6 +359,422 @@ impl JmsFile {
         // run it for every render_model that has placements.
         append_instance_geometry(&root, &mut materials, &mut vertices, &mut triangles, &bounds)?;
         Ok(Self { nodes: world_nodes, materials, markers, vertices, triangles, ..Default::default() })
+    }
+
+    /// Build a JMS from a Campaign Evolved UE5 `USkeletalMesh`
+    /// ([`crate::iostore::skeletal_mesh::SkeletalMesh`]) fused with the
+    /// classic `skeleton_model` (`skel`) that supplies the node skeleton
+    /// (bind pose) and markers. The UE render geometry provides
+    /// positions/normals/UVs/skin weights; each UE bone is matched to a
+    /// skeleton_model node by name (case-insensitive), so weights bind to
+    /// the same skeleton the animations and collision use. UE's extra
+    /// `World` root (and any UE bone absent from the tag) falls back to the
+    /// tag's root node. UE is left-handed (Y right); the classic pipeline is
+    /// right-handed (Y left), so positions and normals are Y-negated.
+    #[cfg(feature = "iostore")]
+    pub fn from_ue_skeletal_mesh(
+        mesh: &crate::iostore::skeletal_mesh::SkeletalMesh,
+        skeleton_model: &TagFile,
+        region: i32,
+    ) -> Result<Self, JmsError> {
+        // UE stores geometry in centimeters; the classic pipeline stores
+        // world units and JMS scales those by SCALE(=100). 1 Halo world
+        // unit = 10 ft = 304.8 cm, so cm → JMS units = ×100/304.8.
+        const CM_TO_JMS: f32 = 100.0 / 304.8;
+        use std::collections::HashMap;
+        let root = skeleton_model.root();
+        let local_nodes = read_nodes(&root)?;
+        let world_nodes = chain_local_to_world(&local_nodes);
+        let markers = read_markers(&root)?;
+
+        // UE bone name → skeleton_model node index (case-insensitive).
+        let name_to_node: HashMap<String, i16> = local_nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.name.to_ascii_lowercase(), i as i16))
+            .collect();
+        let ue_to_jms: Vec<i16> = mesh
+            .bones
+            .iter()
+            .map(|b| name_to_node.get(&b.name.to_ascii_lowercase()).copied().unwrap_or(0))
+            .collect();
+
+        // One JMS material per distinct section material index.
+        let mut mat_indices: Vec<u16> = mesh.sections.iter().map(|s| s.material_index).collect();
+        mat_indices.sort_unstable();
+        mat_indices.dedup();
+        let materials: Vec<JmsMaterial> = mat_indices
+            .iter()
+            .enumerate()
+            .map(|(i, &mi)| JmsMaterial {
+                // The modern JMS material's second line must be non-empty (the
+                // importer skips blank lines and would desync); mirror the
+                // `(<1-based slot>) <label>` convention of the render_model paths.
+                name: format!("material_{mi}"),
+                material_name: format!("({}) material_{mi}", i + 1),
+            })
+            .collect();
+        let mat_slot: HashMap<u16, i32> =
+            mat_indices.iter().enumerate().map(|(i, &mi)| (mi, i as i32)).collect();
+
+        let vertices: Vec<JmsVertex> = mesh
+            .vertices
+            .iter()
+            .map(|v| {
+                let node_sets: Vec<(i16, f32)> = v
+                    .influences
+                    .iter()
+                    .map(|inf| (ue_to_jms.get(inf.bone as usize).copied().unwrap_or(0), inf.weight))
+                    .collect();
+                JmsVertex {
+                    position: RealPoint3d {
+                        x: v.position[0] * CM_TO_JMS,
+                        y: -v.position[1] * CM_TO_JMS,
+                        z: v.position[2] * CM_TO_JMS,
+                    },
+                    normal: RealVector3d { i: v.normal[0], j: -v.normal[1], k: v.normal[2] },
+                    tangent: None,
+                    binormal: None,
+                    node_sets,
+                    uvs: vec![crate::math::RealPoint2d { x: v.uv[0], y: v.uv[1] }],
+                }
+            })
+            .collect();
+
+        // Triangles: each section's index range binds to its material slot.
+        let mut triangles = Vec::with_capacity(mesh.indices.len() / 3);
+        for sec in &mesh.sections {
+            let slot = mat_slot.get(&sec.material_index).copied().unwrap_or(0);
+            let start = sec.base_index as usize;
+            let end = (start + sec.num_triangles as usize * 3).min(mesh.indices.len());
+            for t in mesh.indices[start..end].chunks_exact(3) {
+                triangles.push(JmsTriangle { material: slot, v: [t[0], t[1], t[2]], region });
+            }
+        }
+
+        Ok(Self { nodes: world_nodes, materials, markers, vertices, triangles, ..Default::default() })
+    }
+
+    /// Combine several UE5 `USkeletalMesh`es — a character's body/head/armor
+    /// pieces for one variant — into a single multi-region JMS sharing the
+    /// `skeleton_model` skeleton. Region/permutation is encoded in each
+    /// material slot name as `(<permutation> <region>)<material>`, the modern
+    /// JMS convention that tool.exe / the H3 exporter use.
+    #[cfg(feature = "iostore")]
+    pub fn from_ue_skeletal_meshes(
+        parts: &[UeMeshPart<'_>],
+        skeleton_model: &TagFile,
+    ) -> Result<Self, JmsError> {
+        Self::from_ue_meshes(parts, &[], &[], skeleton_model)
+    }
+
+    /// As [`Self::from_ue_skeletal_meshes`], but also fuses rigid `UStaticMesh`
+    /// pieces (`static_parts`) — CE vehicle/weapon parts attached to a bone.
+    /// Each piece is baked to object space at its bone's world rest transform
+    /// (in world units, exactly like
+    /// [`crate::render_model::RenderModel::from_ue_meshes`]) and bound rigidly
+    /// to that bone (weight 1). The static geometry is the full-resolution
+    /// Nanite mesh when the caller loads it via
+    /// [`crate::iostore::static_mesh::StaticMesh::from_package_preferring_nanite`].
+    #[cfg(feature = "iostore")]
+    pub fn from_ue_meshes(
+        parts: &[UeMeshPart<'_>],
+        static_parts: &[UeStaticPart<'_>],
+        world_parts: &[UeWorldPart<'_>],
+        skeleton_model: &TagFile,
+    ) -> Result<Self, JmsError> {
+        use std::collections::HashMap;
+        const CM_TO_JMS: f32 = 100.0 / 304.8;
+        let root = skeleton_model.root();
+        let local_nodes = read_nodes(&root)?;
+        let world_nodes = chain_local_to_world(&local_nodes);
+        let markers = read_markers(&root)?;
+        let name_to_node: HashMap<String, i16> = local_nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.name.to_ascii_lowercase(), i as i16))
+            .collect();
+
+        let mut materials: Vec<JmsMaterial> = Vec::new();
+        let mut material_slot: HashMap<String, i32> = HashMap::new();
+        let mut vertices: Vec<JmsVertex> = Vec::new();
+        let mut triangles: Vec<JmsTriangle> = Vec::new();
+
+        // Tag skeleton world transforms as matrices (already in JMS units).
+        let tag_world: Vec<Matrix4> = world_nodes
+            .iter()
+            .map(|n| Matrix4::from_loc_rot_scale(n.translation, n.rotation, 1.0))
+            .collect();
+        // UE (cm, left-handed) → JMS units + Y-flip: the space conversion the
+        // old direct bake did per vertex. Kept as a matrix so it composes.
+        let x = Matrix4 {
+            m: [
+                [CM_TO_JMS, 0.0, 0.0, 0.0],
+                [0.0, -CM_TO_JMS, 0.0, 0.0],
+                [0.0, 0.0, CM_TO_JMS, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        };
+        // MetaHuman head/hat pieces (world + world-anchored static) share one
+        // landmark-derived retarget: align the face rig's shoulder line to the
+        // classic skeleton's (see `metahuman_face_transform`). Derived from the
+        // first world part's rig (all head pieces share the character's rig);
+        // falls back to plain `x` when no world parts / landmarks.
+        let classic_sh_l = classic_node_pos(&world_nodes, "shoulder_l");
+        let classic_sh_r = classic_node_pos(&world_nodes, "shoulder_r");
+        let face_xform = world_parts
+            .first()
+            .map(|p| metahuman_face_transform(&p.mesh.bones, classic_sh_l, classic_sh_r, &x))
+            .unwrap_or(x);
+
+        for part in parts {
+            let ue_to_jms: Vec<i16> = part
+                .mesh
+                .bones
+                .iter()
+                .map(|b| name_to_node.get(&b.name.to_ascii_lowercase()).copied().unwrap_or(0))
+                .collect();
+            // Per-bone skin matrix that re-targets this mesh's OWN bind pose onto
+            // the tag skeleton: `tagWorld[node] · X · inverse(ueBindWorld)`.
+            // When a mesh's UE bind matches the tag skeleton (the body/head/arms —
+            // verified handedness-only), the two cancel and this reduces to `X`
+            // (the old direct bake). When a mesh is authored on a different bind
+            // (e.g. a `*ShieldMesh` whose root is 180°-rotated), it places the
+            // vertices correctly instead of baking the raw bind-pose positions.
+            let ue_bind = ue_bind_world(&part.mesh.bones);
+            let full: Vec<Matrix4> = (0..part.mesh.bones.len())
+                .map(|b| {
+                    let node = ue_to_jms.get(b).copied().unwrap_or(0) as usize;
+                    let tw = tag_world.get(node).copied().unwrap_or(Matrix4::IDENTITY);
+                    tw * x * ue_bind[b].inverse()
+                })
+                .collect();
+            let vbase = vertices.len() as u32;
+            for v in &part.mesh.vertices {
+                let node_sets: Vec<(i16, f32)> = v
+                    .influences
+                    .iter()
+                    .map(|inf| (ue_to_jms.get(inf.bone as usize).copied().unwrap_or(0), inf.weight))
+                    .collect();
+                // Linear-blend skin the vertex + normal onto the tag skeleton.
+                let (mut p, mut n, mut wsum) = ([0.0f32; 3], [0.0f32; 3], 0.0f32);
+                for inf in &v.influences {
+                    let m = full.get(inf.bone as usize).copied().unwrap_or(x);
+                    let w = inf.weight;
+                    wsum += w;
+                    let pp = xform_point(&m, v.position);
+                    let nn = xform_dir(&m, v.normal);
+                    for k in 0..3 {
+                        p[k] += w * pp[k];
+                        n[k] += w * nn[k];
+                    }
+                }
+                if wsum < 1e-6 {
+                    // Unweighted vertex — fall back to the plain space conversion.
+                    p = xform_point(&x, v.position);
+                    n = xform_dir(&x, v.normal);
+                }
+                let nl = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-8);
+                vertices.push(JmsVertex {
+                    position: RealPoint3d { x: p[0], y: p[1], z: p[2] },
+                    normal: RealVector3d { i: n[0] / nl, j: n[1] / nl, k: n[2] / nl },
+                    tangent: None,
+                    binormal: None,
+                    node_sets,
+                    uvs: vec![crate::math::RealPoint2d { x: v.uv[0], y: v.uv[1] }],
+                });
+            }
+            for sec in &part.mesh.sections {
+                let matname = part
+                    .material_names
+                    .get(sec.material_index as usize)
+                    .cloned()
+                    .unwrap_or_else(|| format!("material_{}", sec.material_index));
+                // Modern JMS convention (matches `from_h2_render_model`): line 1
+                // is the shader/material basename, line 2 is `(<1-based slot>)
+                // <permutation> <region>` — which is how tool.exe assigns
+                // region/permutation. Line 2 must be non-empty or the importer
+                // (which skips blank lines) desyncs.
+                let cell_label = format!("{} {}", part.permutation, part.region);
+                let slot = *material_slot
+                    .entry(format!("{matname}\u{1}{cell_label}"))
+                    .or_insert_with(|| {
+                        let slot_num = materials.len() + 1;
+                        materials.push(JmsMaterial {
+                            name: matname.clone(),
+                            material_name: format!("({slot_num}) {cell_label}"),
+                        });
+                        (materials.len() - 1) as i32
+                    });
+                let start = sec.base_index as usize;
+                let end = (start + sec.num_triangles as usize * 3).min(part.mesh.indices.len());
+                for t in part.mesh.indices[start..end].chunks_exact(3) {
+                    // UE index buffers carry occasional degenerate (collapsed)
+                    // triangles; emitting them corrupts Blender's custom-normal
+                    // encoder (a zero-area face sharing verts with real faces →
+                    // out-of-bounds write → crash). Drop them — they contribute
+                    // no surface anyway.
+                    if t[0] == t[1] || t[1] == t[2] || t[0] == t[2] {
+                        continue;
+                    }
+                    triangles.push(JmsTriangle {
+                        material: slot,
+                        v: [t[0] + vbase, t[1] + vbase, t[2] + vbase],
+                        region: 0,
+                    });
+                }
+            }
+        }
+
+        // Rigid UStaticMesh parts: bake at the classic skeleton_model bone (JMS
+        // units). The UE skeleton is this tag skeleton Y-flipped (verified
+        // handedness-only across every CE model), so Y-negating each UE-space
+        // vertex to classic BEFORE the tag bone transform yields the in-game
+        // placement — no UE skeletal-mesh bind pose needed.
+        for part in static_parts {
+            let bone = name_to_node.get(&part.bone_name.to_ascii_lowercase()).copied().unwrap_or(0);
+            let bnode = &world_nodes[bone as usize];
+            let brot = bnode.rotation;
+            let bpos = RealVector3d { i: bnode.translation.x, j: bnode.translation.y, k: bnode.translation.z };
+            let vbase = vertices.len() as u32;
+            let rt = &part.rel_transform;
+            let rq = RealQuaternion { i: rt.rotation[0], j: rt.rotation[1], k: rt.rotation[2], w: rt.rotation[3] };
+            for v in &part.mesh.vertices {
+                let (obj, n) = if part.world_anchor.is_some() {
+                    // MetaHuman hat: its verts are head-socket-relative, so the
+                    // socket is placed at the classic node's position (`bpos`),
+                    // then the SAME yaw-corrected conversion as the face so the
+                    // brim aligns. The classic bone's orientation is bypassed.
+                    let fv = xform_point(&face_xform, v.position);
+                    let n = xform_dir(&face_xform, v.normal);
+                    (
+                        RealVector3d { i: bpos.i + fv[0], j: bpos.j + fv[1], k: bpos.k + fv[2] },
+                        RealVector3d { i: n[0], j: n[1], k: n[2] },
+                    )
+                } else {
+                    let lp = apply_rel_transform(rt, v.position);
+                    // Y-negate to classic convention, scale to JMS, then bake.
+                    let vp = RealVector3d {
+                        i: lp[0] * CM_TO_JMS,
+                        j: -lp[1] * CM_TO_JMS,
+                        k: lp[2] * CM_TO_JMS,
+                    };
+                    let obj = bpos + brot.rotate(vp);
+                    // Normal: rel rotation in UE space, THEN Y-negate, THEN bone —
+                    // same handedness order as the position path.
+                    let ln = rq.rotate(RealVector3d { i: v.normal[0], j: v.normal[1], k: v.normal[2] });
+                    let n = brot.rotate(RealVector3d { i: ln.i, j: -ln.j, k: ln.k });
+                    (obj, n)
+                };
+                vertices.push(JmsVertex {
+                    position: RealPoint3d { x: obj.i, y: obj.j, z: obj.k },
+                    normal: RealVector3d { i: n.i, j: n.j, k: n.k },
+                    tangent: None,
+                    binormal: None,
+                    node_sets: vec![(bone, 1.0)],
+                    uvs: vec![crate::math::RealPoint2d { x: v.uv[0], y: v.uv[1] }],
+                });
+            }
+            let matname = part
+                .material_names
+                .first()
+                .cloned()
+                .unwrap_or_else(|| format!("static_{}", part.name));
+            let cell_label = format!("{} {}", part.permutation, part.region);
+            let slot = *material_slot
+                .entry(format!("{matname}\u{1}{cell_label}"))
+                .or_insert_with(|| {
+                    let slot_num = materials.len() + 1;
+                    materials.push(JmsMaterial {
+                        name: matname.clone(),
+                        material_name: format!("({slot_num}) {cell_label}"),
+                    });
+                    (materials.len() - 1) as i32
+                });
+            for t in part.mesh.indices.chunks_exact(3) {
+                if t[0] == t[1] || t[1] == t[2] || t[0] == t[2] {
+                    continue; // drop degenerate UE triangles (see skeletal loop)
+                }
+                triangles.push(JmsTriangle {
+                    material: slot,
+                    v: [t[0] + vbase, t[1] + vbase, t[2] + vbase],
+                    region: 0,
+                });
+            }
+        }
+
+        // World-space rigid parts: MetaHuman `Face`/hair meshes on a *foreign*
+        // rig that shares no bone names with the classic skeleton. Placement:
+        // `p = classic_node_pos + face_xform · (v - head_anchor)`. The yaw-
+        // corrected `face_xform` (see `metahuman_face_transform`) fixes the
+        // orientation; anchoring the rig's own `head` bone (`head_anchor`) onto
+        // the classic node's *position* fixes the height (the MetaHuman rig's
+        // head sits lower than the classic neck otherwise → sunk-in head). Only
+        // the node's position is used, not its Halo-style bone orientation, which
+        // would tip the face.
+        for part in world_parts {
+            let node = name_to_node.get(&part.node_name.to_ascii_lowercase()).copied().unwrap_or(0);
+            let full = &face_xform;
+            let node_pos = tag_world.get(node as usize).map(Matrix4::translation).unwrap_or([0.0; 3]);
+            let anchor = xform_point(full, part.head_anchor);
+            let vbase = vertices.len() as u32;
+            for v in &part.mesh.vertices {
+                let fv = xform_point(full, v.position);
+                let p = [node_pos[0] + fv[0] - anchor[0], node_pos[1] + fv[1] - anchor[1], node_pos[2] + fv[2] - anchor[2]];
+                let n = xform_dir(full, v.normal);
+                let nl = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-8);
+                vertices.push(JmsVertex {
+                    position: RealPoint3d { x: p[0], y: p[1], z: p[2] },
+                    normal: RealVector3d { i: n[0] / nl, j: n[1] / nl, k: n[2] / nl },
+                    tangent: None,
+                    binormal: None,
+                    node_sets: vec![(node, 1.0)],
+                    uvs: vec![crate::math::RealPoint2d { x: v.uv[0], y: v.uv[1] }],
+                });
+            }
+            for sec in &part.mesh.sections {
+                let matname = part
+                    .material_names
+                    .get(sec.material_index as usize)
+                    .cloned()
+                    .unwrap_or_else(|| format!("material_{}", sec.material_index));
+                let cell_label = format!("{} {}", part.permutation, part.region);
+                let slot = *material_slot
+                    .entry(format!("{matname}\u{1}{cell_label}"))
+                    .or_insert_with(|| {
+                        let slot_num = materials.len() + 1;
+                        materials.push(JmsMaterial {
+                            name: matname.clone(),
+                            material_name: format!("({slot_num}) {cell_label}"),
+                        });
+                        (materials.len() - 1) as i32
+                    });
+                let start = sec.base_index as usize;
+                let end = (start + sec.num_triangles as usize * 3).min(part.mesh.indices.len());
+                for t in part.mesh.indices[start..end].chunks_exact(3) {
+                    if t[0] == t[1] || t[1] == t[2] || t[0] == t[2] {
+                        continue;
+                    }
+                    triangles.push(JmsTriangle {
+                        material: slot,
+                        v: [t[0] + vbase, t[1] + vbase, t[2] + vbase],
+                        region: 0,
+                    });
+                }
+            }
+        }
+
+        // Rebuild the EMITTED rest skeleton so each bone points down local +X at
+        // its child (see `ce_reorient_rest` / `halo_bone_reorientation`), giving a
+        // clean Halo-style armature from CE's UE-derived rig, and matching the JMA
+        // (`jmad` extraction applies the identical per-bone correction). The
+        // geometry above is baked with the ORIGINAL `world_nodes`, so it still
+        // skins to the correct place at rest and animates correctly under the
+        // identically-reoriented JMA — only how the bones DRAW changes.
+        // `from_ue_meshes` is CE-only, so this is inherently gated to CE content.
+        let nodes = ce_reorient_rest(&local_nodes, &world_nodes, skeleton_model);
+
+        Ok(Self { nodes, materials, markers, vertices, triangles, ..Default::default() })
     }
 
     /// Walk a Halo 2 `render_model` and reconstruct the JMS scene.
@@ -1508,6 +2012,39 @@ fn read_nodes(root: &TagStruct<'_>) -> Result<Vec<JmsNode>, JmsError> {
     Ok(out)
 }
 
+/// Rebuild the world-space rest skeleton for JMS emission into a clean Halo-style
+/// armature — every bone pointing down local +X at its child — from Campaign
+/// Evolved's UE-derived rig, matching the JMA. The per-bone correction comes from
+/// [`crate::extract::animation::halo_bone_reorientation`] (computed on the same
+/// skeleton the JMA uses, so the two share it) and is applied as
+/// `world'ᵢ = worldᵢ · Cᵢ` — world-preserving (positions unchanged), so geometry
+/// baked against the ORIGINAL world nodes still skins correctly.
+fn ce_reorient_rest(
+    local_nodes: &[JmsNode],
+    world_nodes: &[JmsNode],
+    skeleton_model: &TagFile,
+) -> Vec<JmsNode> {
+    use crate::animation::pose::{NodeTransform, Skeleton};
+    let skeleton = Skeleton::from_tag(skeleton_model);
+    let rest: Vec<NodeTransform> = local_nodes
+        .iter()
+        .map(|n| NodeTransform { rotation: n.rotation, translation: n.translation, scale: 1.0 })
+        .collect();
+    match crate::extract::animation::halo_bone_reorientation(&skeleton, &rest) {
+        Some(corr) if corr.len() == world_nodes.len() => world_nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| JmsNode {
+                name: n.name.clone(),
+                parent: n.parent,
+                rotation: (n.rotation * corr[i]).normalized(),
+                translation: n.translation,
+            })
+            .collect(),
+        _ => world_nodes.to_vec(),
+    }
+}
+
 /// Convert per-node local transforms (parent-relative, as the tag
 /// stores them) to world transforms (root-relative, as JMS expects).
 /// Forward-iteration works because the tag stores nodes
@@ -1516,6 +2053,112 @@ fn read_nodes(root: &TagStruct<'_>) -> Result<Vec<JmsNode>, JmsError> {
 /// `connected_geometry.py:621-645`, just expressed with quaternions
 /// directly instead of via 4×4 matrices: same composition rule
 /// `world = parent_world * local`.
+/// The bake transform for a MetaHuman `Face`/hair mesh (component space). The
+/// game poses the face onto a skeleton aligned with the body (`BPC_MetaHumanCreator`
+/// snap-attaches via sockets; there is **no** hardcoded rotation in its bytecode
+/// — verified by disassembly). The equivalent for extraction is to align the
+/// MetaHuman rig to the classic skeleton by a shared anatomical landmark: the
+/// **shoulder line**. Both rigs stand upright (spine ≈ +Z), so the only real
+/// difference is a yaw about the vertical — the MetaHuman rig's shoulders run one
+/// way, the Halo skeleton's another. This derives that yaw from the two shoulder
+/// lines (no magic angle): after `x` (UE→tag, cm-scale + Y-negate) converts the
+/// face rig's `clavicle_l→r` into tag space, rotate about Z to line it up with
+/// the classic `Shoulder_L→R`. Falls back to plain `x` if either shoulder pair is
+/// unavailable. (For CE humans this derives ~+90°, matching every character.)
+#[cfg(feature = "iostore")]
+pub(crate) fn metahuman_face_transform(
+    face_bones: &[crate::iostore::skeletal_mesh::SkelBone],
+    classic_shoulder_l: Option<[f32; 3]>,
+    classic_shoulder_r: Option<[f32; 3]>,
+    x: &Matrix4,
+) -> Matrix4 {
+    let bone = |n: &str| face_bones.iter().position(|b| b.name.eq_ignore_ascii_case(n));
+    let (Some(cl), Some(cr), Some(sl), Some(sr)) =
+        (bone("clavicle_l"), bone("clavicle_r"), classic_shoulder_l, classic_shoulder_r)
+    else {
+        return *x;
+    };
+    let w = ue_bind_world(face_bones);
+    let (fl, fr) = (w[cl].translation(), w[cr].translation());
+    // Face shoulder line (UE) → tag space via `x`; classic shoulder line is
+    // already tag space. Compare only their horizontal (XY) components.
+    let rf = xform_dir(x, [fr[0] - fl[0], fr[1] - fl[1], fr[2] - fl[2]]);
+    let rc = [sr[0] - sl[0], sr[1] - sl[1], sr[2] - sl[2]];
+    let n2 = |a: f32, b: f32| {
+        let l = (a * a + b * b).sqrt().max(1e-8);
+        (a / l, b / l)
+    };
+    let (fx, fy) = n2(rf[0], rf[1]);
+    let (cx, cy) = n2(rc[0], rc[1]);
+    // Signed yaw rotating the face line onto the classic line (about +Z).
+    let yaw = (fx * cy - fy * cx).atan2(fx * cx + fy * cy);
+    let (s, c) = ((yaw * 0.5).sin(), (yaw * 0.5).cos());
+    let rz = Matrix4::from_loc_rot_scale(
+        RealPoint3d { x: 0.0, y: 0.0, z: 0.0 },
+        RealQuaternion { i: 0.0, j: 0.0, k: s, w: c },
+        1.0,
+    );
+    rz * *x
+}
+
+/// The tag-space position of a classic skeleton node by name (case-insensitive),
+/// for landmark alignment.
+#[cfg(feature = "iostore")]
+fn classic_node_pos(world_nodes: &[JmsNode], name: &str) -> Option<[f32; 3]> {
+    world_nodes
+        .iter()
+        .find(|n| n.name.eq_ignore_ascii_case(name))
+        .map(|n| [n.translation.x, n.translation.y, n.translation.z])
+}
+
+/// Chain a UE skeletal mesh's reference-skeleton bind pose (parent-local `rest`
+/// transforms) to world, in UE space (cm, left-handed). Used to re-target a
+/// mesh's skinned vertices from its own bind pose onto the tag skeleton.
+#[cfg(feature = "iostore")]
+pub fn ue_bind_world(bones: &[crate::iostore::skeletal_mesh::SkelBone]) -> Vec<Matrix4> {
+    let mut out: Vec<Matrix4> = Vec::with_capacity(bones.len());
+    for b in bones {
+        let local = Matrix4::from_loc_rot_scale(
+            RealPoint3d { x: b.rest_translation[0], y: b.rest_translation[1], z: b.rest_translation[2] },
+            RealQuaternion {
+                i: b.rest_rotation[0],
+                j: b.rest_rotation[1],
+                k: b.rest_rotation[2],
+                w: b.rest_rotation[3],
+            },
+            1.0,
+        );
+        let world = if b.parent >= 0 && (b.parent as usize) < out.len() {
+            out[b.parent as usize] * local
+        } else {
+            local
+        };
+        out.push(world);
+    }
+    out
+}
+
+/// Transform a point by a 4×4 affine matrix (`m · [p, 1]`).
+#[cfg(feature = "iostore")]
+pub(crate) fn xform_point(m: &Matrix4, p: [f32; 3]) -> [f32; 3] {
+    [
+        m.m[0][0] * p[0] + m.m[0][1] * p[1] + m.m[0][2] * p[2] + m.m[0][3],
+        m.m[1][0] * p[0] + m.m[1][1] * p[1] + m.m[1][2] * p[2] + m.m[1][3],
+        m.m[2][0] * p[0] + m.m[2][1] * p[1] + m.m[2][2] * p[2] + m.m[2][3],
+    ]
+}
+
+/// Transform a direction by a 4×4 matrix's upper-left 3×3 (`m · [d, 0]`); the
+/// caller renormalizes, so the uniform scale in `X` washes out.
+#[cfg(feature = "iostore")]
+pub(crate) fn xform_dir(m: &Matrix4, d: [f32; 3]) -> [f32; 3] {
+    [
+        m.m[0][0] * d[0] + m.m[0][1] * d[1] + m.m[0][2] * d[2],
+        m.m[1][0] * d[0] + m.m[1][1] * d[1] + m.m[1][2] * d[2],
+        m.m[2][0] * d[0] + m.m[2][1] * d[1] + m.m[2][2] * d[2],
+    ]
+}
+
 fn chain_local_to_world(local: &[JmsNode]) -> Vec<JmsNode> {
     let mut out: Vec<JmsNode> = Vec::with_capacity(local.len());
     for (i, n) in local.iter().enumerate() {

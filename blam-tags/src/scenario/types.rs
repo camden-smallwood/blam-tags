@@ -189,6 +189,24 @@ pub struct Scenario {
     /// `scenario_zone_set_pvs_get_row @ 0x180333630` and
     /// `structure_bsp_compute_cluster_active_pvs @ 0x180334F80`.
     pub zone_set_pvs: Vec<ZoneSetPvs>,
+
+    /// `atmosphere` block — the scenario's atmosphere PALETTE. Each entry
+    /// names an atmosphere zone (e.g. `indoor`/`outdoor`) and carries an
+    /// `Atmosphere Setting Index` into the `.sky_atm_parameters`
+    /// `atmosphere_settings[]` table. The runtime bakes this into the BSP's
+    /// `atmosphere_palette` (empty in loose tags), which `BspCluster::
+    /// atmosphere_index` then indexes. Used with [`scenario_cluster_data`]
+    /// to derive per-cluster weather/fog (`c_atmosphere_fog_interface::
+    /// change_pvs @ 0x1803AF550`).
+    pub atmosphere_palette: Vec<AtmospherePaletteEntry>,
+
+    /// `scenario cluster data` block — one entry per structure BSP. Holds the
+    /// authored per-cluster properties (atmosphere/weather/camera-fx palette
+    /// indices) plus each cluster's centroid. Loose tags carry this but the
+    /// BSP's own per-cluster `atmosphere_index` is runtime-only (`-1`), so the
+    /// runtime re-derives it by spatially matching each `cluster_centroids[i]`
+    /// to the current BSP cluster and stamping `atmospheric_properties[i]`.
+    pub scenario_cluster_data: Vec<ScenarioClusterData>,
 }
 
 impl Scenario {
@@ -212,6 +230,8 @@ impl Scenario {
             skies: read_block(s, "skies", SkyReference::from_struct),
             object_names: read_block(s, "object names", ObjectName::from_struct),
 
+            atmosphere_palette: read_block(s, "atmosphere", AtmospherePaletteEntry::from_struct),
+            scenario_cluster_data: read_block(s, "scenario cluster data", ScenarioClusterData::from_struct),
             zone_sets: read_block(s, "zone sets", ZoneSet::from_struct),
 
             scenery_palette: read_block(s, "scenery palette", TagReferencePalette::from_struct),
@@ -1023,6 +1043,48 @@ impl CubemapEntry {
 // =============================================================================
 // Helpers
 // =============================================================================
+
+/// `scenario_atmosphere_palette_block` — one atmosphere zone (indoor/outdoor).
+/// `atmosphere_setting_index` selects the `.sky_atm_parameters`
+/// `atmosphere_settings[]` entry (which carries the weather `effe` tag).
+#[derive(Debug, Clone, Default)]
+pub struct AtmospherePaletteEntry {
+    pub atmosphere_setting_index: i16,
+}
+
+impl AtmospherePaletteEntry {
+    fn from_struct(s: &TagStruct<'_>) -> Self {
+        Self {
+            atmosphere_setting_index: s
+                .read_int_any("Atmosphere Setting Index")
+                .unwrap_or(-1) as i16,
+        }
+    }
+}
+
+/// `scenario_cluster_data_block` — per-structure-BSP authored cluster data.
+/// The runtime spatially matches each `cluster_centroids[i]` to a current BSP
+/// cluster and stamps `atmospheric_properties[i]` (an index into the scenario
+/// `atmosphere` palette) onto that cluster's `atmosphere_index`.
+#[derive(Debug, Clone, Default)]
+pub struct ScenarioClusterData {
+    /// `cluster centroids` — the `centroid` point of each authored cluster.
+    pub cluster_centroids: Vec<RealPoint3d>,
+    /// `atmospheric properties` — the `type` (scenario `atmosphere`-palette
+    /// index) of each authored cluster. `-1` = none.
+    pub atmospheric_properties: Vec<i16>,
+}
+
+impl ScenarioClusterData {
+    fn from_struct(s: &TagStruct<'_>) -> Self {
+        Self {
+            cluster_centroids: read_block(s, "cluster centroids", |e| e.read_point3d("centroid")),
+            atmospheric_properties: read_block(s, "atmospheric properties", |e| {
+                e.read_int_any("type").unwrap_or(-1) as i16
+            }),
+        }
+    }
+}
 
 fn read_block<T, F>(s: &TagStruct<'_>, name: &str, mut f: F) -> Vec<T>
 where

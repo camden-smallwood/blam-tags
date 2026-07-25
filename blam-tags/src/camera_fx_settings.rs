@@ -601,7 +601,27 @@ impl CameraFxSettings {
         // Generic readers for the parameter shapes. Each parameter
         // sub-struct has the same shape — flags + named-value field
         // (+ max_change + blend_speed for blend-mode parameters).
-        let read_scalar_param = |struct_name: &str, value_field: &str| -> ScalarParameter {
+        //
+        // `absent` is the value used when the parameter's sub-struct is not
+        // present in the tag at all (`s.field(name)` is `None`). OLD-SCHEMA
+        // cfxs tags (H3 `globals\default`, H3 scenario cfxs) omit several
+        // fields the engine's `c_camera_fx_settings::set_defaults` still
+        // populates; the engine keeps those set_defaults values, so an absent
+        // field must resolve to its engine default, NOT zero. Zero-defaulting
+        // silently broke bloom (absent tint color 0 makes the bloom pyramid
+        // tint decay to black — the riverworld "sun has no glow" bug) and
+        // self-illum exposure tracking (absent self_illum_scale 0 decouples
+        // self-illum from exposure vs the engine's scale 1). Present-but-
+        // `use default` sources are untouched here (the runtime chooser +
+        // `effective_color()` handle those); this only backfills true absence.
+        // `absent` is the WHOLE set_defaults parameter (value + max_change +
+        // blend_speed) used when the sub-struct is missing. The blend fields
+        // matter: the runtime `update_real` velocity-clamped lerp
+        // (`calc_new_value`) never converges toward the target when
+        // blend_speed is 0, so a value-only backfill would parse as 1.0 yet
+        // stay stuck at the runtime struct-default. Engine `set_defaults`
+        // gives self_illum_scale = (1.0, max_change 0.05, blend_speed 0.1).
+        let read_scalar_param = |struct_name: &str, value_field: &str, absent: ScalarParameter| -> ScalarParameter {
             s.field(struct_name)
                 .and_then(|f| f.as_struct())
                 .map(|sub| ScalarParameter {
@@ -610,25 +630,25 @@ impl CameraFxSettings {
                     max_change: sub.read_real("maximum change").unwrap_or(0.0),
                     blend_speed: sub.read_real("blend speed (0-1)").unwrap_or(0.0),
                 })
-                .unwrap_or_default()
+                .unwrap_or(absent)
         };
-        let read_instant_param = |struct_name: &str, value_field: &str| -> InstantScalarParameter {
+        let read_instant_param = |struct_name: &str, value_field: &str, absent: f32| -> InstantScalarParameter {
             s.field(struct_name)
                 .and_then(|f| f.as_struct())
                 .map(|sub| InstantScalarParameter {
                     flags: sub.try_read_flags("flags").unwrap_or_default(),
                     value: sub.read_real(value_field).unwrap_or(0.0),
                 })
-                .unwrap_or_default()
+                .unwrap_or(InstantScalarParameter { value: absent, ..Default::default() })
         };
-        let read_color_param = |struct_name: &str, value_field: &str| -> ColorParameter {
+        let read_color_param = |struct_name: &str, value_field: &str, absent: RealRgbColor| -> ColorParameter {
             s.field(struct_name)
                 .and_then(|f| f.as_struct())
                 .map(|sub| ColorParameter {
                     flags: sub.try_read_flags("flags").unwrap_or_default(),
                     color: sub.read_rgb(value_field),
                 })
-                .unwrap_or_default()
+                .unwrap_or(ColorParameter { color: absent, ..Default::default() })
         };
         let read_word_param = |struct_name: &str, value_field: &str| -> WordParameter {
             s.field(struct_name)
@@ -659,31 +679,48 @@ impl CameraFxSettings {
             blur_radius: sub.read_real("blur radius").unwrap_or(0.0),
         });
 
+        // Engine `c_camera_fx_settings::set_defaults` white for bloom tint.
+        let white = RealRgbColor { red: 1.0, green: 1.0, blue: 1.0 };
         Self {
             exposure,
             auto_exposure_sensitivity: read_instant_param(
                 "auto_exposure_sensitivity",
                 "sensitivity (0-1)",
+                0.0, // set_defaults sensitivity default
             ),
             auto_exposure_anti_bloom: read_instant_param(
                 "auto_exposure_anti_bloom",
                 "anti-bloom (0-1)",
+                1.0, // set_defaults anti_bloom default (absent must NOT read 0)
             ),
-            bloom_point: read_scalar_param("bloom_point", "bloom point"),
-            bloom_inherent: read_scalar_param("bloom_inherent", "inherent bloom"),
-            bloom_intensity: read_scalar_param("bloom_intensity", "bloom intensity"),
-            bloom_large_color: read_color_param("bloom_large_color", "large color"),
-            bloom_medium_color: read_color_param("bloom_medium_color", "medium color"),
-            bloom_small_color: read_color_param("bloom_small_color", "small color"),
-            bling_intensity: read_scalar_param("bling_intensity", "bling intensity"),
-            bling_size: read_scalar_param("bling_size", "bling length"),
-            bling_angle_deg: read_scalar_param("bling_angle", "bling angle"),
+            // These bloom/bling scalars are present in every tag we load; the
+            // engine set_defaults values differ from 0 but keep 0 here to leave
+            // behavior unchanged for the absent-in-practice edge (out of scope).
+            bloom_point: read_scalar_param("bloom_point", "bloom point", ScalarParameter::default()),
+            bloom_inherent: read_scalar_param("bloom_inherent", "inherent bloom", ScalarParameter::default()),
+            bloom_intensity: read_scalar_param("bloom_intensity", "bloom intensity", ScalarParameter::default()),
+            bloom_large_color: read_color_param("bloom_large_color", "large color", white),
+            bloom_medium_color: read_color_param("bloom_medium_color", "medium color", white),
+            bloom_small_color: read_color_param("bloom_small_color", "small color", white),
+            bling_intensity: read_scalar_param("bling_intensity", "bling intensity", ScalarParameter::default()),
+            bling_size: read_scalar_param("bling_size", "bling length", ScalarParameter::default()),
+            bling_angle_deg: read_scalar_param("bling_angle", "bling angle", ScalarParameter::default()),
             bling_count: read_word_param("bling_count", "bling spikes"),
+            // set_defaults self_illum_preferred = (0, .05, .4); value 0 already
+            // == the struct-default read, so blend params are moot (0→0).
             self_illum_preferred: read_scalar_param(
                 "self_illum_preferred",
                 "preferred exposure",
+                ScalarParameter::default(),
             ),
-            self_illum_scale: read_scalar_param("self_illum_scale", "exposure change"),
+            // set_defaults self_illum_scale = (1.0, max_change .05, blend .1).
+            // Absent must NOT read 0 (that decouples self-illum from exposure);
+            // the blend params let the runtime converge 0→1 (else it sticks).
+            self_illum_scale: read_scalar_param(
+                "self_illum_scale",
+                "exposure change",
+                ScalarParameter { value: 1.0, max_change: 0.05, blend_speed: 0.1, ..Default::default() },
+            ),
             ssao,
             lightshafts,
             color_grading,

@@ -63,8 +63,8 @@ use serde_json::json;
 
 use blam_tags::animation::classic::{CeAnimation, CeAnimations};
 use blam_tags::extract::animation::{
-    additional_node_data_is_object_space, build_defaults, jma_kind_for, resolve_animation_inputs,
-    sanitize, write_ce_group_jma, write_group_jma,
+    additional_node_data_is_object_space, build_defaults, halo_bone_reorientation, jma_kind_for,
+    resolve_animation_inputs, sanitize, write_ce_group_jma, write_group_jma,
 };
 use blam_tags::{Animation, AnimationGraph, AnimationGroup, JmaKind, Skeleton, TagFile};
 
@@ -127,6 +127,11 @@ pub fn run(
     // in object space, so convert it to parent-local first.
     let object_space = additional_node_data_is_object_space(&animation);
     let defaults = build_defaults(&skeleton, jmad_tag, render_model, object_space);
+    // Only Campaign Evolved needs bone reorientation (MetaHuman rig); gate on it.
+    let reorient = resolved
+        .campaign_evolved
+        .then(|| halo_bone_reorientation(&skeleton, &defaults))
+        .flatten();
 
     // Graph tree (`content/modes[]`) drives overlay/replacement base
     // resolution — see `Animation::overlay_base_pose`.
@@ -199,6 +204,7 @@ pub fn run(
                     &graph,
                     &skeleton,
                     &defaults,
+                    reorient.as_deref(),
                     &stem,
                     &destinations[i],
                 )?;
@@ -245,7 +251,8 @@ fn run_ce(
     if matches!(format, Format::Jma) && skeleton.is_empty() {
         anyhow::bail!("model_animations has no nodes — JMA export needs a skeleton");
     }
-    // Halo CE `additional node data` is parent-local (no conversion).
+    // Halo 1 `antr` — a classic Bungie X-down rig, never Campaign Evolved — so
+    // no bone-convention reorientation applies.
     let defaults = build_defaults(&skeleton, tag, None, false);
 
     let target = OutputTarget::from_args(output);
@@ -296,7 +303,7 @@ fn run_ce(
 
         // Base kinds pose against the rest defaults; overlay/replacement
         // compose deltas onto the rest pose (CE base resolution is N/A).
-        write_ce_group_jma(group, &clip, &skeleton, &defaults, &stem, &dest)?;
+        write_ce_group_jma(group, &clip, &skeleton, &defaults, None, &stem, &dest)?;
         println!("{}: {} frames × {} bones [{}]  movement={:?}",
             dest.display(), clip.frame_count, skeleton.len(), kind.extension(), clip.movement.kind);
     }

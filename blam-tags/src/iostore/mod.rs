@@ -25,6 +25,11 @@ pub mod ser;
 pub mod name_map;
 pub mod zen;
 pub mod container_header;
+pub mod usmap;
+pub mod unversioned;
+pub mod skeletal_mesh;
+pub mod static_mesh;
+pub mod nanite;
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -337,6 +342,75 @@ impl IoStoreArchive {
     /// Whether a directory-index path exists in this container.
     pub fn contains(&self, path: &str) -> bool {
         self.by_path.contains_key(path)
+    }
+
+    /// Find a chunk's TOC index by its raw `FIoChunkId` (linear scan).
+    pub fn find_chunk(&self, id: &FIoChunkId) -> Option<u32> {
+        (0..self.entry_count).find(|&i| {
+            let o = self.chunkid_off + i as usize * 12;
+            self.toc[o..o + 12] == id.0
+        })
+    }
+
+    /// The sibling **bulk-data** (`.ubulk`) chunk for a package chunk index, if
+    /// present. In IoStore, bulk data shares the package id but uses chunk-type
+    /// `2` (`BulkData`) and a bulk chunk index (usually 0). Returns the
+    /// decompressed bulk bytes.
+    pub fn read_bulk_for(&self, package_chunk_index: u32, bulk_chunk_index: u16) -> Result<Vec<u8>> {
+        let pkg = self.chunk_id(package_chunk_index)?;
+        let mut id = pkg.0;
+        // [8..10] = big-endian bulk chunk index; [10] = 0; [11] = BulkData (2).
+        id[8] = (bulk_chunk_index >> 8) as u8;
+        id[9] = (bulk_chunk_index & 0xff) as u8;
+        id[10] = 0;
+        id[11] = 2;
+        let bulk_id = FIoChunkId(id);
+        let ci = self
+            .find_chunk(&bulk_id)
+            .ok_or(IoStoreError::Truncated("no BulkData chunk for package"))?;
+        self.read_chunk(ci)
+    }
+
+    /// Read and decompress only the first `max_bytes` of a path's chunk,
+    /// decompressing just the compression blocks that cover that prefix. Used to
+    /// cheaply inspect a package's Zen header (name map + import/export tables +
+    /// imported-package names all live at the front, before the bulky export
+    /// data) without decompressing the whole mesh/Blueprint chunk. Returns fewer
+    /// than `max_bytes` when the chunk itself is shorter.
+    pub fn read_prefix(&self, path: &str, max_bytes: usize) -> Result<Vec<u8>> {
+        let &idx = self
+            .by_path
+            .get(path)
+            .ok_or_else(|| IoStoreError::NotFound(path.to_string()))?;
+        let (offset, length) = self.offset_length(self.entries[idx].chunk_index)?;
+        let want = (length as usize).min(max_bytes) as u64;
+        if want == 0 {
+            return Ok(Vec::new());
+        }
+        let cbs = self.cblock_size;
+        let first = offset / cbs;
+        let last = (offset + want - 1) / cbs;
+
+        let mut out: Vec<u8> = Vec::with_capacity(want as usize + cbs as usize);
+        for bi in first..=last {
+            let blk = self.block(bi as usize)?;
+            let start = blk.offset as usize;
+            let end = start + blk.comp_size as usize;
+            let comp = self
+                .ucas
+                .get(start..end)
+                .ok_or(IoStoreError::Truncated("block past end of .ucas"))?;
+            if blk.method == 0 {
+                out.extend_from_slice(comp);
+            } else {
+                let mut dst = vec![0u8; blk.raw_size as usize];
+                self.codec.decompress(comp, &mut dst)?;
+                out.extend_from_slice(&dst);
+            }
+        }
+        let in_block = (offset % cbs) as usize;
+        let end = (in_block + want as usize).min(out.len());
+        Ok(out[in_block.min(out.len())..end].to_vec())
     }
 
     /// Read and decompress a chunk by its TOC index.

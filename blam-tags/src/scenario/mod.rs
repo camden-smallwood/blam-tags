@@ -11,6 +11,7 @@
 mod types;
 
 pub use types::{
+    AtmospherePaletteEntry, ScenarioClusterData,
     CubemapEntry, DecalPaletteEntry, DecalPlacement, DecoratorPalette, DecoratorSetEntry,
     DevicePortalAssociation, GamePortalToPortalMapping, ObjectName, ObjectPlacement, ParentId,
     PlacementMultiplayerData, PlacementObjectData, PlacementPermutationData, Scenario,

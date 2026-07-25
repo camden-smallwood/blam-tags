@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use crate::animation::classic::{CeAnimation, CeAnimations};
 use crate::animation::SizeLayout;
+use crate::math::{RealPoint3d, RealQuaternion, RealVector3d};
 use crate::paths::tag_ref_path;
 use crate::{
     Animation, AnimationClip, AnimationGraph, AnimationGroup, JmaKind, NodeTransform, Pose,
@@ -50,8 +51,16 @@ pub struct ResolvedAnimation {
     /// The model_animation_graph tag, when loaded from a reference. `None`
     /// means "the input tag is itself the jmad".
     pub jmad: Option<TagFile>,
-    /// The render_model tag, when the owning `.model` referenced one.
+    /// The render_model tag, when the owning `.model` referenced one. For
+    /// Campaign Evolved this instead holds the `skeleton_model` (its
+    /// render_model-minus-geometry), used for the rest pose.
     pub render_model: Option<TagFile>,
+    /// Whether the source is Campaign Evolved — detected by the `.model`
+    /// carrying a `skeleton model` ref in place of a `render model`. CE
+    /// re-rigged on MetaHuman skeletons whose bone basis is 90° off Halo's, so
+    /// its JMA export needs [`halo_bone_reorientation`]. Every other game leaves
+    /// this `false`.
+    pub campaign_evolved: bool,
 }
 
 /// Extract every animation in `input` to `<out_dir>/<actor_name>/animations/`.
@@ -93,6 +102,12 @@ pub fn animations_to_dir(
 
     let object_space = additional_node_data_is_object_space(&animation);
     let defaults = build_defaults(&skeleton, jmad_tag, render_model, object_space);
+    // Reorient MetaHuman-convention rigs to Halo X-down-bone so bones don't
+    // import splayed — ONLY for Campaign Evolved; every other game is untouched.
+    let reorient = resolved
+        .campaign_evolved
+        .then(|| halo_bone_reorientation(&skeleton, &defaults))
+        .flatten();
     let graph = AnimationGraph::from_tag(jmad_tag);
 
     let dir = out_dir.join(actor_name).join("animations");
@@ -127,7 +142,8 @@ pub fn animations_to_dir(
 
         let clip = group.decode()?;
         write_group_jma(
-            group, &clip, &animation, &graph, &skeleton, &defaults, actor_name, &dest,
+            group, &clip, &animation, &graph, &skeleton, &defaults, reorient.as_deref(),
+            actor_name, &dest,
         )?;
         summary.written += 1;
     }
@@ -157,6 +173,8 @@ fn ce_animations_to_dir(
         ));
     }
     // Halo CE `additional node data` is parent-local (no conversion).
+    // (This is Halo 1 `antr` — a classic Bungie X-down rig, never Campaign
+    // Evolved — so no bone-convention reorientation applies.)
     let defaults = build_defaults(&skeleton, tag, None, false);
 
     let dir = out_dir.join(actor_name).join("animations");
@@ -185,7 +203,7 @@ fn ce_animations_to_dir(
         }
 
         let clip = group.decode();
-        write_ce_group_jma(group, &clip, &skeleton, &defaults, actor_name, &dest)?;
+        write_ce_group_jma(group, &clip, &skeleton, &defaults, None, actor_name, &dest)?;
         summary.written += 1;
     }
 
@@ -206,6 +224,7 @@ pub fn resolve_animation_inputs(
         b"jmad" => Ok(ResolvedAnimation {
             jmad: None,
             render_model: None,
+            campaign_evolved: false,
         }),
         b"hlmt" => resolve_from_model(input, resolver),
         _ => {
@@ -223,14 +242,18 @@ pub fn resolve_animation_inputs(
     }
 }
 
-/// Pull `animation` + `render model` refs off a hlmt tag. The
-/// render_model ref may be null/missing on tags that ship without a
-/// rendered representation; then we drop back to additional_node_data only.
+/// Pull `animation` + rest-pose refs off a hlmt tag. The rest pose comes from
+/// the `render model` ref; when it's null/missing we drop back to
+/// additional_node_data only — except Campaign Evolved, which keeps rendering
+/// geometry in Unreal and instead carries a `skeleton model` (a render_model
+/// minus geometry) whose `nodes` block is the same shape and drops into the
+/// same overlay.
 fn resolve_from_model(
     model_tag: &TagFile,
     resolver: &dyn TagResolver,
 ) -> Result<ResolvedAnimation, ExtractError> {
-    let jmad_rel = tag_ref_path(&model_tag.root(), "animation")
+    let root = model_tag.root();
+    let jmad_rel = tag_ref_path(&root, "animation")
         .ok_or_else(|| ExtractError::msg("`.model` has no `animation` ref — nothing to extract"))?;
     let jmad = resolver.resolve(
         &jmad_rel,
@@ -238,15 +261,26 @@ fn resolve_from_model(
         u32::from_be_bytes(*b"jmad"),
     )?;
 
-    let render_model = if let Some(render_rel) = tag_ref_path(&model_tag.root(), "render model") {
-        Some(resolver.resolve(&render_rel, "render_model", u32::from_be_bytes(*b"mode"))?)
-    } else {
-        None
+    let render_ref = tag_ref_path(&root, "render model");
+    let skel_ref = tag_ref_path(&root, "skeleton model");
+    // Campaign Evolved is exactly the case with a skeleton_model and no
+    // render_model — the tag-intrinsic signal that the rig is MetaHuman-convention.
+    let campaign_evolved = render_ref.is_none() && skel_ref.is_some();
+
+    let render_model = match render_ref {
+        Some(render_rel) => {
+            Some(resolver.resolve(&render_rel, "render_model", u32::from_be_bytes(*b"mode"))?)
+        }
+        // CE has no render_model; use the skeleton_model rest pose if present.
+        // Tolerant (`.ok()`): a missing skel is just no overlay, not a failure.
+        None => skel_ref
+            .and_then(|r| resolver.resolve(&r, "skeleton_model", u32::from_be_bytes(*b"skel")).ok()),
     };
 
     Ok(ResolvedAnimation {
         jmad: Some(jmad),
         render_model,
+        campaign_evolved,
     })
 }
 
@@ -362,6 +396,128 @@ pub fn build_defaults(
         .collect()
 }
 
+/// Forward-kinematic object-space rotation + position of each node from a set
+/// of parent-local transforms.
+fn forward_kinematics(
+    skeleton: &Skeleton,
+    local: &[NodeTransform],
+) -> (Vec<RealQuaternion>, Vec<RealVector3d>) {
+    let n = skeleton.nodes.len();
+    let mut oq = vec![RealQuaternion::IDENTITY; n];
+    let mut op = vec![RealVector3d::ZERO; n];
+    for i in 0..n {
+        let t = local[i].translation;
+        let lt = RealVector3d { i: t.x, j: t.y, k: t.z };
+        let lr = local[i].rotation.normalized();
+        match skeleton.nodes[i].parent {
+            p if p < 0 => {
+                oq[i] = lr;
+                op[i] = lt;
+            }
+            p => {
+                let pi = p as usize;
+                oq[i] = (oq[pi] * lr).normalized();
+                op[i] = op[pi] + oq[pi].rotate(lt);
+            }
+        }
+    }
+    (oq, op)
+}
+
+/// Reconstruct a clean bind-pose orientation for every bone directly from the
+/// skeleton HIERARCHY, returned as a per-bone correction so it composes with
+/// [`apply_reorientation`]. **Only call this for Campaign Evolved content** (gate
+/// on [`ResolvedAnimation::campaign_evolved`]); other games ship correctly-
+/// oriented Halo rigs and must never be touched.
+///
+/// Campaign Evolved's `skeleton_model`s are UE-derived: characters sit on
+/// MetaHuman skeletons (bones down local Y), and vehicle/prop rigs carry UE's
+/// per-bone/mirrored bone bases (left bones 180°-flipped). Neither draws down
+/// local X the way Halo tooling (Blender toolset, `tool.exe`) expects, so bones
+/// import splayed. There is no mirror flag in the tag or the UE skeleton to key
+/// off, and the flips are entangled with real joint rotations — so rather than
+/// *detect* anything, we rebuild each bone's orientation from the joint
+/// positions: point its local **+X down-the-bone** (toward its first child; a
+/// leaf continues its parent's direction) with a stable roll (local +Z toward
+/// world up). This is ordinary armature construction — convention-independent,
+/// clean for any rig — and it drops into the existing pipeline: the geometry is
+/// baked against the ORIGINAL node transforms and only the emitted skeleton is
+/// re-oriented, so the correction `Cᵢ = worldᵢ⁻¹·world'ᵢ` preserves every joint
+/// POSITION (and therefore the skinned result) exactly.
+pub fn halo_bone_reorientation(
+    skeleton: &Skeleton,
+    rest: &[NodeTransform],
+) -> Option<Vec<RealQuaternion>> {
+    let n = skeleton.nodes.len();
+    if n == 0 || rest.len() != n {
+        return None;
+    }
+    let (oq, op) = forward_kinematics(skeleton, rest);
+
+    // Object-space "down-bone" direction: toward the first child, or — for a
+    // leaf — continuing the direction of the bone leading into it.
+    let down_dir = |i: usize| -> Option<RealVector3d> {
+        let fc = skeleton.nodes[i].first_child;
+        let d = if fc >= 0 {
+            op[fc as usize] - op[i]
+        } else {
+            let p = skeleton.nodes[i].parent;
+            if p < 0 {
+                return None;
+            }
+            op[i] - op[p as usize]
+        };
+        let v = d.normalized();
+        (v != RealVector3d::ZERO).then_some(v)
+    };
+
+    let world_up = RealVector3d { i: 0.0, j: 0.0, k: 1.0 };
+    let alt_up = RealVector3d { i: 0.0, j: 1.0, k: 0.0 };
+    let mut corr = Vec::with_capacity(n);
+    for i in 0..n {
+        // Target world orientation: local +X along the bone, +Z toward world up
+        // (falling back to +Y when the bone is near-vertical so the roll stays
+        // well-defined). Bones with no direction (root, coincident joints) keep
+        // their authored orientation.
+        let new_world = match down_dir(i) {
+            Some(x) => {
+                let up = if x.dot(world_up).abs() < 0.99 { world_up } else { alt_up };
+                let y = up.cross(x).normalized();
+                if y == RealVector3d::ZERO {
+                    oq[i]
+                } else {
+                    let z = x.cross(y).normalized();
+                    RealQuaternion::from_basis_columns(x, y, z)
+                }
+            }
+            None => oq[i],
+        };
+        corr.push(oq[i].conjugate() * new_world);
+    }
+    Some(corr)
+}
+
+/// Apply a reorientation (from [`halo_bone_reorientation`]) to one frame of
+/// parent-local transforms in place: `L'_i = C_parent⁻¹ · L_i · C_i`, with the
+/// local translation rotated by `C_parent⁻¹`. World transforms are unchanged.
+pub fn apply_reorientation(
+    frame: &mut [NodeTransform],
+    skeleton: &Skeleton,
+    corr: &[RealQuaternion],
+) {
+    for i in 0..frame.len() {
+        let cp_inv = match skeleton.nodes[i].parent {
+            p if p < 0 => RealQuaternion::IDENTITY,
+            p => corr[p as usize].conjugate(),
+        };
+        let new_rot = (cp_inv * frame[i].rotation * corr[i]).normalized();
+        let t = frame[i].translation;
+        let nt = cp_inv.rotate(RealVector3d { i: t.x, j: t.y, k: t.z });
+        frame[i].rotation = new_rot;
+        frame[i].translation = RealPoint3d { x: nt.i, y: nt.j, z: nt.k };
+    }
+}
+
 /// Whether a jmad's `additional node data` rest pose is in object/model
 /// space (Reach/H4) rather than parent-local (H2/H3).
 pub fn additional_node_data_is_object_space(animation: &Animation<'_>) -> bool {
@@ -381,6 +537,7 @@ pub fn jma_kind_for(group: &AnimationGroup<'_>) -> JmaKind {
 
 /// Compose and write one gen3 animation group as a JMA-family file at
 /// `dest`. `defaults` is the per-bone rest pose from [`build_defaults`].
+#[allow(clippy::too_many_arguments)]
 pub fn write_group_jma(
     group: &AnimationGroup<'_>,
     clip: &AnimationClip,
@@ -388,6 +545,7 @@ pub fn write_group_jma(
     graph: &AnimationGraph,
     skeleton: &Skeleton,
     defaults: &[NodeTransform],
+    reorient: Option<&[RealQuaternion]>,
     actor_name: &str,
     dest: &Path,
 ) -> Result<(), ExtractError> {
@@ -401,7 +559,7 @@ pub fn write_group_jma(
             .unwrap_or_else(|| defaults.to_vec()),
         _ => defaults.to_vec(),
     };
-    let (pose, leading): (Pose, Vec<NodeTransform>) = match kind {
+    let (mut pose, mut leading): (Pose, Vec<NodeTransform>) = match kind {
         JmaKind::Jmo => {
             let (mut reference, mut body) = clip.overlay_pose(skeleton, &base);
             body.apply_object_space_corrections(
@@ -426,6 +584,15 @@ pub fn write_group_jma(
         _ => (clip.pose(skeleton, Some(defaults)), defaults.to_vec()),
     };
 
+    // Reorient to Halo bone convention (CE MetaHuman rigs), post-composition so
+    // every written frame + the leading reference share the correction.
+    if let Some(corr) = reorient {
+        for frame in &mut pose.frames {
+            apply_reorientation(frame, skeleton, corr);
+        }
+        apply_reorientation(&mut leading, skeleton, corr);
+    }
+
     ensure_parent_dir(dest)?;
     let mut writer = BufWriter::new(File::create(dest)?);
     pose.write_jma(
@@ -442,11 +609,13 @@ pub fn write_group_jma(
 }
 
 /// Compose and write one Halo CE animation group as a JMA-family file.
+#[allow(clippy::too_many_arguments)]
 pub fn write_ce_group_jma(
     group: &CeAnimation<'_>,
     clip: &AnimationClip,
     skeleton: &Skeleton,
     defaults: &[NodeTransform],
+    reorient: Option<&[RealQuaternion]>,
     actor_name: &str,
     dest: &Path,
 ) -> Result<(), ExtractError> {
@@ -457,7 +626,7 @@ pub fn write_ce_group_jma(
     );
     // CE has no per-graph base resolution; overlays/replacements compose
     // onto the skeleton rest pose (aim/look overlays are the common case).
-    let (pose, leading) = match kind {
+    let (mut pose, mut leading) = match kind {
         JmaKind::Jmo => {
             let (reference, body) = clip.overlay_pose(skeleton, defaults);
             (body, reference)
@@ -465,6 +634,13 @@ pub fn write_ce_group_jma(
         JmaKind::Jmr => (clip.replacement_pose(skeleton, defaults), defaults.to_vec()),
         _ => (clip.pose(skeleton, Some(defaults)), defaults.to_vec()),
     };
+
+    if let Some(corr) = reorient {
+        for frame in &mut pose.frames {
+            apply_reorientation(frame, skeleton, corr);
+        }
+        apply_reorientation(&mut leading, skeleton, corr);
+    }
 
     ensure_parent_dir(dest)?;
     let mut writer = BufWriter::new(File::create(dest)?);

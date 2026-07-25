@@ -37,10 +37,34 @@ sha1 = { version = "0.10", optional = true }
 # trait layer.
 anyhow = { version = "1", optional = true }
 byteorder = { version = "1", optional = true }
+# Pure-Rust, decode-only Zstd — decompresses `.usmap` mappings payloads (the
+# UE5 reflection schema needed to skip cooked objects' unversioned property
+# blocks). Same CI-friendly, no-native-blob philosophy as `oozextract`.
+ruzstd = { version = "0.7", optional = true }
 
 [features]
 audio = ["dep:lewton", "dep:log", "dep:opus", "dep:vorbis_rs"]
-iostore = ["dep:oozextract", "dep:memmap2", "dep:blake3", "dep:anyhow", "dep:byteorder", "dep:sha1"]
+iostore = ["dep:oozextract", "dep:memmap2", "dep:blake3", "dep:anyhow", "dep:byteorder", "dep:sha1", "dep:ruzstd"]
 
 [dev-dependencies]
 md5 = "0.7"
+
+[[example]]
+name = "ce_schema_sweep"
+required-features = ["iostore"]
+
+[[example]]
+name = "ce_schema_selfdrift"
+required-features = ["iostore"]
+
+[[example]]
+name = "ce_field_diff"
+required-features = ["iostore"]
+
+[[example]]
+name = "ce_mh_dump"
+required-features = ["iostore"]
+
+[[example]]
+name = "ce_actor_dump"
+required-features = ["iostore"]

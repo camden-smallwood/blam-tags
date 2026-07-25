@@ -811,6 +811,21 @@ impl FZenPackageHeader {
         self.package_name()
     }
 
+    /// True if any export in this package is an instance of the native UClass at
+    /// `class_object_path` (e.g. `/Script/BlamSynchronization.BlamMeshSynchronizationDataAsset`).
+    /// A native class appears in `class_index` as a `ScriptImport` whose value is
+    /// the CityHash64 of the lowercased object path — so this is an O(exports)
+    /// comparison against a precomputed hash, robust to filename conventions.
+    pub fn exports_class(&self, class: FPackageObjectIndex) -> bool {
+        self.export_map.iter().any(|ex| ex.class_index == class)
+    }
+
+    /// The first export whose class is the native UClass `class` (see
+    /// [`Self::exports_class`]), if any.
+    pub fn find_export_of_class(&self, class: FPackageObjectIndex) -> Option<&FExportMapEntry> {
+        self.export_map.iter().find(|ex| ex.class_index == class)
+    }
+
     // Retrieves the package name from the package. Does the bare minimum of package reading to get the name out
     pub fn get_package_name<S: Read + Seek>(s: &mut S, container_header_version: EIoContainerHeaderVersion) -> Result<String> {
         let summary: FZenPackageSummary = FZenPackageSummary::deserialize(s, container_header_version)?;

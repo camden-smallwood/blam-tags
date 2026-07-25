@@ -699,6 +699,11 @@ impl Matrix4 {
         ],
     };
 
+    /// The translation column (`m[*][3]`).
+    pub fn translation(&self) -> [f32; 3] {
+        [self.m[0][3], self.m[1][3], self.m[2][3]]
+    }
+
     /// Build `T * R * S` from a translation, rotation quaternion and a
     /// **uniform** scale — Blender's `Matrix.LocRotScale(loc, rot,
     /// Vector.Fill(3, scale))`.

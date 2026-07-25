@@ -30,7 +30,7 @@ use crate::file::TagFile;
 use crate::game::Game;
 use crate::geometry::{read_compression_bounds, strip_to_list, CompressionBounds};
 use crate::math::{
-    RealOrientation, RealPlane3d, RealPoint2d, RealPoint3d, RealQuaternion, RealVector3d,
+    Matrix4, RealOrientation, RealPlane3d, RealPoint2d, RealPoint3d, RealQuaternion, RealVector3d,
 };
 use crate::typed_enums::{Enum, Flags};
 
@@ -875,6 +875,595 @@ impl RenderModel {
         let root = tag.root();
         let bounds = read_compression_bounds(&root);
         read_meshes_per_mesh(&root, |_| bounds, IndexFormatPolicy::PerMeshSchema)
+    }
+
+    /// Synthesize the cross-game [`RenderModel`] super-type (+ its
+    /// [`RenderMesh`]es) from Halo: Campaign Evolved's UE5 render geometry —
+    /// the CampaignEvolved analog of [`Self::from_gbxmodel_tag`]. Geometry
+    /// (positions/UVs/normals/skin) comes from one or more UE
+    /// [`SkeletalMesh`](crate::iostore::skeletal_mesh::SkeletalMesh)es (a
+    /// character's body/head/armor pieces); the node skeleton, markers, and
+    /// region/permutation names come from the classic `skeleton_model`
+    /// (`skel`) — which reuses the same node/marker readers as a
+    /// `render_model`. Each UE bone binds to a skeleton_model node by name
+    /// (case-insensitive); UE's extra `World` root (and any unmatched bone)
+    /// falls back to node 0. `RenderVertex` caps skinning at 4 influences
+    /// (the classic Halo limit), so the top-4-by-weight are kept and
+    /// renormalized — fine for preview/render (lossless skin export goes
+    /// through [`crate::JmsFile::from_ue_skeletal_meshes`]). UE is
+    /// centimeters + left-handed; the classic pipeline is world-units +
+    /// right-handed, so positions/normals are ×(1/304.8) and Y-negated to
+    /// share space with the tag skeleton.
+    #[cfg(feature = "iostore")]
+    pub fn from_ue_skeletal_meshes(
+        parts: &[crate::jms::UeMeshPart<'_>],
+        skeleton_model: &TagFile,
+    ) -> Result<(Self, Vec<RenderMesh>), RenderModelError> {
+        Self::from_ue_meshes(parts, &[], &[], skeleton_model)
+    }
+
+    /// As [`Self::from_ue_skeletal_meshes`], but also fuses rigid `UStaticMesh`
+    /// pieces (`static_parts`) — vehicle/weapon parts attached to a bone. Each
+    /// piece is baked into object space at its bone's rest transform (the
+    /// preview renders bind-pose positions directly, so no runtime skinning is
+    /// needed). Meshes sharing a `(region, permutation)` are emitted
+    /// consecutively so the permutation's `mesh_count` covers them all.
+    /// `world_parts` are MetaHuman `Face`/hair meshes posed in component space on
+    /// a foreign rig — baked straight to tag space and bound rigidly to one node
+    /// (see [`crate::jms::UeWorldPart`]).
+    #[cfg(feature = "iostore")]
+    pub fn from_ue_meshes(
+        parts: &[crate::jms::UeMeshPart<'_>],
+        static_parts: &[crate::jms::UeStaticPart<'_>],
+        world_parts: &[crate::jms::UeWorldPart<'_>],
+        skeleton_model: &TagFile,
+    ) -> Result<(Self, Vec<RenderMesh>), RenderModelError> {
+        use std::collections::{BTreeMap, HashMap};
+        const CM_TO_WU: f32 = 1.0 / 304.8;
+
+        /// Read the skeleton_model's `regions[]` → `permutations[]` names.
+        fn read_skeleton_regions(root: &TagStruct<'_>) -> Vec<(String, Vec<String>)> {
+            let Some(block) = root.field_path("regions").and_then(|f| f.as_block()) else {
+                return Vec::new();
+            };
+            (0..block.len())
+                .filter_map(|i| {
+                    let e = block.element(i)?;
+                    let name = e.read_string_id("name")?;
+                    let perms = e
+                        .field_path("permutations")
+                        .and_then(|f| f.as_block())
+                        .map(|pb| {
+                            (0..pb.len())
+                                .filter_map(|j| pb.element(j))
+                                .filter_map(|p| p.read_string_id("name"))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Some((name, perms))
+                })
+                .collect()
+        }
+
+        /// Match a UE mesh basename to a skeleton_model (region, permutation):
+        /// region from a body-part token in the name, permutation = the
+        /// longest region-permutation name contained in the mesh name.
+        fn match_region_permutation(
+            name: &str,
+            hint: &str,
+            regions: &[(String, Vec<String>)],
+        ) -> (String, String) {
+            let n = name.to_ascii_lowercase();
+            let token = if n.contains("helmet") {
+                "helmet"
+            } else if n.contains("head") {
+                "head"
+            } else if n.contains("arm") {
+                "arms"
+            } else if n.contains("leg") {
+                "legs"
+            } else if n.contains("armor") {
+                "armor"
+            } else {
+                "body"
+            };
+            let region = regions
+                .iter()
+                .map(|(r, _)| r)
+                .find(|r| r.eq_ignore_ascii_case(token))
+                .or_else(|| regions.iter().map(|(r, _)| r).find(|r| r.eq_ignore_ascii_case(hint)))
+                .cloned()
+                .unwrap_or_else(|| {
+                    regions.first().map(|(r, _)| r.clone()).unwrap_or_else(|| hint.to_string())
+                });
+            let perms =
+                regions.iter().find(|(r, _)| *r == region).map(|(_, p)| p.as_slice()).unwrap_or(&[]);
+            let perm = perms
+                .iter()
+                .filter(|p| !p.is_empty() && n.contains(p.as_str()))
+                .max_by_key(|p| p.len())
+                .cloned()
+                .or_else(|| perms.iter().find(|p| p.eq_ignore_ascii_case("default")).cloned())
+                .or_else(|| perms.first().cloned())
+                .unwrap_or_else(|| "base".to_string());
+            (region, perm)
+        }
+
+        let root = skeleton_model.root();
+        let nodes = read_nodes(&root)?;
+        let marker_groups = read_marker_groups(&root);
+        let node_idx: HashMap<String, u8> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.name.to_ascii_lowercase(), i as u8))
+            .collect();
+
+        // Object-space rest transform of each node (wu), by forward kinematics
+        // over the parent-local `default_translation`/`default_rotation` — used
+        // to place rigid static pieces at their bone.
+        let node_world: Vec<(RealQuaternion, RealVector3d)> = {
+            let mut w = vec![(RealQuaternion::IDENTITY, RealVector3d::ZERO); nodes.len()];
+            for (i, n) in nodes.iter().enumerate() {
+                let lr = n.default_rotation.normalized();
+                let lt = RealVector3d {
+                    i: n.default_translation.x,
+                    j: n.default_translation.y,
+                    k: n.default_translation.z,
+                };
+                let p = n.parent_node;
+                w[i] = if p < 0 || p as usize >= i {
+                    (lr, lt)
+                } else {
+                    let (pr, pt) = w[p as usize];
+                    ((pr * lr).normalized(), pt + pr.rotate(lt))
+                };
+            }
+            w
+        };
+
+        // Authoritative region/permutation taxonomy from the skeleton_model
+        // (names only — the mesh→permutation binding comes from name-matching).
+        let skel_regions = read_skeleton_regions(&root);
+
+        let mut materials: Vec<Material> = Vec::new();
+        let mut material_slot: HashMap<String, u16> = HashMap::new();
+
+        /// Resolve a material name to a slot index, creating it on first use.
+        fn material_of(
+            name: String,
+            materials: &mut Vec<Material>,
+            slot: &mut HashMap<String, u16>,
+        ) -> u16 {
+            *slot.entry(name.clone()).or_insert_with(|| {
+                materials.push(Material {
+                    render_method: name,
+                    render_method_group: 0,
+                    properties: Vec::new(),
+                    imported_material_index: -1,
+                    breakable_surface_index: -1,
+                });
+                (materials.len() - 1) as u16
+            })
+        }
+
+        // One (region, perm, RenderMesh) per part; grouped-emitted below.
+        let mut items: Vec<(String, String, RenderMesh)> = Vec::new();
+
+        // Skinned SkeletalMesh parts.
+        // Skinning setup (mirrors `jms::from_ue_meshes`): re-target each mesh's
+        // own bind pose onto the tag skeleton so meshes authored on a different
+        // bind (e.g. `*ShieldMesh`, 180° root) land correctly rather than being
+        // direct-baked from raw bind-pose positions.
+        let tag_world_mat: Vec<Matrix4> = node_world
+            .iter()
+            .map(|(q, t)| Matrix4::from_loc_rot_scale(RealPoint3d { x: t.i, y: t.j, z: t.k }, *q, 1.0))
+            .collect();
+        let x = Matrix4 {
+            m: [
+                [CM_TO_WU, 0.0, 0.0, 0.0],
+                [0.0, -CM_TO_WU, 0.0, 0.0],
+                [0.0, 0.0, CM_TO_WU, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        };
+        // Yaw-corrected conversion shared by the MetaHuman head + hat pieces.
+        // Landmark-derived MetaHuman face retarget (shoulder-line alignment) —
+        // see `jms::metahuman_face_transform`. Classic shoulder positions from
+        // the tag skeleton's `node_world`.
+        let classic_sh = |name: &str| -> Option<[f32; 3]> {
+            node_idx.get(name).map(|&i| {
+                let t = node_world[i as usize].1;
+                [t.i, t.j, t.k]
+            })
+        };
+        let face_xform = world_parts
+            .first()
+            .map(|p| crate::jms::metahuman_face_transform(&p.mesh.bones, classic_sh("shoulder_l"), classic_sh("shoulder_r"), &x))
+            .unwrap_or(x);
+
+        for part in parts {
+            let ue_to_node: Vec<u8> = part
+                .mesh
+                .bones
+                .iter()
+                .map(|b| node_idx.get(&b.name.to_ascii_lowercase()).copied().unwrap_or(0))
+                .collect();
+            let ue_bind = crate::jms::ue_bind_world(&part.mesh.bones);
+            let full: Vec<Matrix4> = (0..part.mesh.bones.len())
+                .map(|b| {
+                    let node = ue_to_node.get(b).copied().unwrap_or(0) as usize;
+                    let tw = tag_world_mat.get(node).copied().unwrap_or(Matrix4::IDENTITY);
+                    tw * x * ue_bind[b].inverse()
+                })
+                .collect();
+
+            let vertices: Vec<RenderVertex> = part
+                .mesh
+                .vertices
+                .iter()
+                .map(|v| {
+                    // Top-4 influences by weight → [u8;4]/[f32;4], renormalized.
+                    let mut infl: Vec<(u8, f32)> = v
+                        .influences
+                        .iter()
+                        .map(|i| (ue_to_node.get(i.bone as usize).copied().unwrap_or(0), i.weight))
+                        .collect();
+                    infl.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    infl.truncate(4);
+                    let mut node_indices = [0u8; 4];
+                    let mut node_weights = [0.0f32; 4];
+                    for (k, (ni, w)) in infl.iter().enumerate() {
+                        node_indices[k] = *ni;
+                        node_weights[k] = *w;
+                    }
+                    let s: f32 = node_weights.iter().sum();
+                    if s > 0.0 {
+                        for w in &mut node_weights {
+                            *w /= s;
+                        }
+                    }
+                    // Linear-blend skin position + normal onto the tag skeleton.
+                    let (mut p, mut nrm, mut wsum) = ([0.0f32; 3], [0.0f32; 3], 0.0f32);
+                    for inf in &v.influences {
+                        let m = full.get(inf.bone as usize).copied().unwrap_or(x);
+                        let w = inf.weight;
+                        wsum += w;
+                        let pp = crate::jms::xform_point(&m, v.position);
+                        let nn = crate::jms::xform_dir(&m, v.normal);
+                        for k in 0..3 {
+                            p[k] += w * pp[k];
+                            nrm[k] += w * nn[k];
+                        }
+                    }
+                    if wsum < 1e-6 {
+                        p = crate::jms::xform_point(&x, v.position);
+                        nrm = crate::jms::xform_dir(&x, v.normal);
+                    }
+                    let nl = (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]).sqrt().max(1e-8);
+                    RenderVertex {
+                        position: RealPoint3d { x: p[0], y: p[1], z: p[2] },
+                        texcoord: RealPoint2d { x: v.uv[0], y: v.uv[1] },
+                        normal: RealVector3d { i: nrm[0] / nl, j: nrm[1] / nl, k: nrm[2] / nl },
+                        tangent: RealVector3d { i: 0.0, j: 0.0, k: 0.0 },
+                        binormal: RealVector3d { i: 0.0, j: 0.0, k: 0.0 },
+                        node_indices,
+                        node_weights,
+                        lightmap_texcoord: RealPoint2d { x: 0.0, y: 0.0 },
+                        vert_color: RealVector3d { i: 0.0, j: 0.0, k: 0.0 },
+                    }
+                })
+                .collect();
+
+            let mesh_parts: Vec<RenderMeshPart> = part
+                .mesh
+                .sections
+                .iter()
+                .map(|sec| {
+                    let matname = part
+                        .material_names
+                        .get(sec.material_index as usize)
+                        .cloned()
+                        .unwrap_or_else(|| format!("material_{}", sec.material_index));
+                    RenderMeshPart {
+                        material_index: material_of(matname, &mut materials, &mut material_slot),
+                        index_start: sec.base_index,
+                        index_count: sec.num_triangles * 3,
+                        part_type: GeometryPartType::OpaqueNonShadowing,
+                        transparent_sorting_index: -1,
+                        sort_position: None,
+                    }
+                })
+                .collect();
+
+            let mesh = RenderMesh {
+                vertices,
+                indices: part.mesh.indices.clone(),
+                parts: mesh_parts,
+                rigid_node_index: None,
+                water_data: None,
+                prt_vertex_type: Enum::default(),
+                has_prt_vertex_stream: false,
+                prt_ambient_stream: Vec::new(),
+                has_vertex_color: false,
+                use_region_index_for_sorting: false,
+                has_lightmap_uvs: false,
+            };
+            // Prefer the caller's authoritative (region, permutation) — from the
+            // hlmt variant data — falling back to name-matching when unset.
+            let (region, perm) = if part.permutation.is_empty() {
+                match_region_permutation(&part.name, &part.region, &skel_regions)
+            } else {
+                (part.region.clone(), part.permutation.clone())
+            };
+            items.push((region, perm, mesh));
+        }
+
+        // Rigid UStaticMesh parts: bake each vertex to object space at its
+        // bone's rest transform, then to tag space (×CM_TO_WU, Y-negate) like
+        // the skinned path. The preview renders bind-pose positions directly,
+        // so binding all verts to the one bone (weight 1) is correct at rest
+        // and animatable later.
+        for part in static_parts {
+            let bone = node_idx.get(&part.bone_name.to_ascii_lowercase()).copied().unwrap_or(0);
+            // Bake at the classic skeleton_model bone (wu). The UE skeleton is
+            // this tag skeleton Y-flipped (verified handedness-only across every
+            // CE model), so converting each UE-space vertex to classic (Y-negate)
+            // BEFORE applying the tag bone transform yields the in-game placement
+            // exactly — no need to load the UE skeletal-mesh bind pose.
+            let (brot, bpos) = node_world[bone as usize];
+            let rt = &part.rel_transform;
+            let rq = crate::math::RealQuaternion {
+                i: rt.rotation[0],
+                j: rt.rotation[1],
+                k: rt.rotation[2],
+                w: rt.rotation[3],
+            };
+            let vertices: Vec<RenderVertex> = part
+                .mesh
+                .vertices
+                .iter()
+                .map(|v| {
+                    let (obj, n) = if part.world_anchor.is_some() {
+                        // MetaHuman hat: head-socket-relative verts placed at the
+                        // classic node position `bpos`, with the SAME yaw-corrected
+                        // conversion as the face so the brim aligns.
+                        let fv = crate::jms::xform_point(&face_xform, v.position);
+                        let nn = crate::jms::xform_dir(&face_xform, v.normal);
+                        (
+                            RealVector3d { i: bpos.i + fv[0], j: bpos.j + fv[1], k: bpos.k + fv[2] },
+                            RealVector3d { i: nn[0], j: nn[1], k: nn[2] },
+                        )
+                    } else {
+                        // Component-relative transform (UE cm), Y-negate to
+                        // classic, scale to wu, then bake at the tag bone.
+                        let lp = crate::jms::apply_rel_transform(rt, v.position);
+                        let vp = RealVector3d {
+                            i: lp[0] * CM_TO_WU,
+                            j: -lp[1] * CM_TO_WU,
+                            k: lp[2] * CM_TO_WU,
+                        };
+                        let obj = bpos + brot.rotate(vp);
+                        let ln = rq.rotate(RealVector3d { i: v.normal[0], j: v.normal[1], k: v.normal[2] });
+                        let n = brot.rotate(RealVector3d { i: ln.i, j: -ln.j, k: ln.k });
+                        (obj, n)
+                    };
+                    let mut node_indices = [0u8; 4];
+                    node_indices[0] = bone;
+                    let mut node_weights = [0.0f32; 4];
+                    node_weights[0] = 1.0;
+                    RenderVertex {
+                        // Already in classic space (vertex was Y-negated before
+                        // the bone transform) — do NOT negate again.
+                        position: RealPoint3d { x: obj.i, y: obj.j, z: obj.k },
+                        texcoord: RealPoint2d { x: v.uv[0], y: v.uv[1] },
+                        normal: RealVector3d { i: n.i, j: n.j, k: n.k },
+                        tangent: RealVector3d { i: 0.0, j: 0.0, k: 0.0 },
+                        binormal: RealVector3d { i: 0.0, j: 0.0, k: 0.0 },
+                        node_indices,
+                        node_weights,
+                        lightmap_texcoord: RealPoint2d { x: 0.0, y: 0.0 },
+                        vert_color: RealVector3d { i: 0.0, j: 0.0, k: 0.0 },
+                    }
+                })
+                .collect();
+            let matname = part
+                .material_names
+                .first()
+                .cloned()
+                .unwrap_or_else(|| format!("static_{}", part.name));
+            let mesh = RenderMesh {
+                vertices,
+                indices: part.mesh.indices.clone(),
+                parts: vec![RenderMeshPart {
+                    material_index: material_of(matname, &mut materials, &mut material_slot),
+                    index_start: 0,
+                    index_count: part.mesh.indices.len() as u32,
+                    part_type: GeometryPartType::OpaqueNonShadowing,
+                    transparent_sorting_index: -1,
+                    sort_position: None,
+                }],
+                rigid_node_index: Some(bone as i16),
+                water_data: None,
+                prt_vertex_type: Enum::default(),
+                has_prt_vertex_stream: false,
+                prt_ambient_stream: Vec::new(),
+                has_vertex_color: false,
+                use_region_index_for_sorting: false,
+                has_lightmap_uvs: false,
+            };
+            let (region, perm) = if part.permutation.is_empty() {
+                match_region_permutation(&part.name, &part.region, &skel_regions)
+            } else {
+                (part.region.clone(), part.permutation.clone())
+            };
+            items.push((region, perm, mesh));
+        }
+
+        // World-space rigid parts: MetaHuman `Face`/hair on a *foreign* rig.
+        // `p = classic_node_pos + face_xform · (v - head_anchor)`: yaw-corrected
+        // `face_xform` fixes orientation; anchoring the rig's `head` bone onto the
+        // classic node's *position* fixes the height (else the head sits low /
+        // sunk). See `JmsFile::from_ue_meshes` for the derivation.
+        for part in world_parts {
+            let node = node_idx.get(&part.node_name.to_ascii_lowercase()).copied().unwrap_or(0);
+            let full = &face_xform;
+            let node_pos = tag_world_mat.get(node as usize).map(Matrix4::translation).unwrap_or([0.0; 3]);
+            let anchor = crate::jms::xform_point(full, part.head_anchor);
+            let vertices: Vec<RenderVertex> = part
+                .mesh
+                .vertices
+                .iter()
+                .map(|v| {
+                    let fv = crate::jms::xform_point(full, v.position);
+                    let p = [node_pos[0] + fv[0] - anchor[0], node_pos[1] + fv[1] - anchor[1], node_pos[2] + fv[2] - anchor[2]];
+                    let nrm = crate::jms::xform_dir(full, v.normal);
+                    let nl = (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]).sqrt().max(1e-8);
+                    let mut node_indices = [0u8; 4];
+                    node_indices[0] = node;
+                    let mut node_weights = [0.0f32; 4];
+                    node_weights[0] = 1.0;
+                    RenderVertex {
+                        position: RealPoint3d { x: p[0], y: p[1], z: p[2] },
+                        texcoord: RealPoint2d { x: v.uv[0], y: v.uv[1] },
+                        normal: RealVector3d { i: nrm[0] / nl, j: nrm[1] / nl, k: nrm[2] / nl },
+                        tangent: RealVector3d { i: 0.0, j: 0.0, k: 0.0 },
+                        binormal: RealVector3d { i: 0.0, j: 0.0, k: 0.0 },
+                        node_indices,
+                        node_weights,
+                        lightmap_texcoord: RealPoint2d { x: 0.0, y: 0.0 },
+                        vert_color: RealVector3d { i: 0.0, j: 0.0, k: 0.0 },
+                    }
+                })
+                .collect();
+            let mesh_parts: Vec<RenderMeshPart> = part
+                .mesh
+                .sections
+                .iter()
+                .map(|sec| {
+                    let matname = part
+                        .material_names
+                        .get(sec.material_index as usize)
+                        .cloned()
+                        .unwrap_or_else(|| format!("material_{}", sec.material_index));
+                    RenderMeshPart {
+                        material_index: material_of(matname, &mut materials, &mut material_slot),
+                        index_start: sec.base_index,
+                        index_count: sec.num_triangles * 3,
+                        part_type: GeometryPartType::OpaqueNonShadowing,
+                        transparent_sorting_index: -1,
+                        sort_position: None,
+                    }
+                })
+                .collect();
+            let mesh = RenderMesh {
+                vertices,
+                indices: part.mesh.indices.clone(),
+                parts: mesh_parts,
+                rigid_node_index: None,
+                water_data: None,
+                prt_vertex_type: Enum::default(),
+                has_prt_vertex_stream: false,
+                prt_ambient_stream: Vec::new(),
+                has_vertex_color: false,
+                use_region_index_for_sorting: false,
+                has_lightmap_uvs: false,
+            };
+            items.push((part.region.clone(), part.permutation.clone(), mesh));
+        }
+
+        // Group items by (region, perm), preserving first-seen key order, and
+        // emit each group's meshes consecutively so a permutation's mesh_count
+        // covers all of them (e.g. a vehicle's skeletal body + many static parts).
+        let mut key_order: Vec<(String, String)> = Vec::new();
+        let mut groups: HashMap<(String, String), Vec<usize>> = HashMap::new();
+        for (i, (r, p, _)) in items.iter().enumerate() {
+            let key = (r.clone(), p.clone());
+            groups
+                .entry(key.clone())
+                .or_insert_with(|| {
+                    key_order.push(key.clone());
+                    Vec::new()
+                })
+                .push(i);
+        }
+        let mut render_meshes: Vec<RenderMesh> = Vec::with_capacity(items.len());
+        let mut slots: Vec<Option<RenderMesh>> = items.into_iter().map(|(_, _, m)| Some(m)).collect();
+        // (region, perm) → (first mesh index, mesh count).
+        let mut bindings: HashMap<(String, String), (i16, i16)> = HashMap::new();
+        // region → (first, count) of its first group (default-perm fallback).
+        let mut region_first: HashMap<String, (i16, i16)> = HashMap::new();
+        for key in &key_order {
+            let first = render_meshes.len() as i16;
+            for &i in &groups[key] {
+                if let Some(m) = slots[i].take() {
+                    render_meshes.push(m);
+                }
+            }
+            let count = render_meshes.len() as i16 - first;
+            bindings.insert(key.clone(), (first, count));
+            region_first.entry(key.0.clone()).or_insert((first, count));
+        }
+
+        // Build regions/permutations from the skeleton_model, binding each
+        // permutation to its matched mesh (unmatched perms get mesh_count 0).
+        let regions: Vec<Region> = if skel_regions.is_empty() {
+            let mut m: BTreeMap<String, Vec<Permutation>> = BTreeMap::new();
+            for ((region, perm), (mesh_index, mesh_count)) in &bindings {
+                m.entry(region.clone()).or_default().push(Permutation {
+                    name: perm.clone(),
+                    mesh_index: *mesh_index,
+                    mesh_count: *mesh_count,
+                    instance_mask: [0; 4],
+                });
+            }
+            m.into_iter().map(|(name, permutations)| Region { name, permutations }).collect()
+        } else {
+            skel_regions
+                .iter()
+                .map(|(region, perms)| Region {
+                    name: region.clone(),
+                    permutations: perms
+                        .iter()
+                        .enumerate()
+                        .map(|(pi, perm)| {
+                            // The first (default) perm falls back to the
+                            // region's first loaded group, so the default view
+                            // always renders even when the loaded meshes carry
+                            // a specific permutation name.
+                            let binding = bindings
+                                .get(&(region.clone(), perm.clone()))
+                                .copied()
+                                .or_else(|| {
+                                    (pi == 0).then(|| region_first.get(region).copied()).flatten()
+                                });
+                            let (mesh_index, mesh_count) = binding.unwrap_or((-1, 0));
+                            Permutation {
+                                name: perm.clone(),
+                                mesh_index,
+                                mesh_count,
+                                instance_mask: [0; 4],
+                            }
+                        })
+                        .collect(),
+                })
+                .collect()
+        };
+
+        let model = Self {
+            name: root.read_string_id("name").unwrap_or_default(),
+            flags: Flags::default(),
+            regions,
+            instance_placements: Vec::new(),
+            nodes,
+            marker_groups,
+            materials,
+            render_geometry: Geometry::default(),
+            sky_lights: Vec::new(),
+            default_lightprobe: None,
+            volume_samples: Vec::new(),
+            default_node_orientations: Vec::new(),
+        };
+        Ok((model, render_meshes))
     }
 
     /// Synthesize the [`RenderModel`] super-type from a Halo CE `gbxmodel`:
