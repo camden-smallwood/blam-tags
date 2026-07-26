@@ -18,6 +18,7 @@
 //! Encrypted or multi-partition containers are rejected with a clear error.
 
 pub mod oodle;
+pub mod pak;
 pub mod writer;
 
 pub mod ue_types;
