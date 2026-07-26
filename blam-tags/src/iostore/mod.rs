@@ -19,6 +19,7 @@
 
 pub mod oodle;
 pub mod pak;
+pub mod wwise_event;
 pub mod writer;
 
 pub mod ue_types;
