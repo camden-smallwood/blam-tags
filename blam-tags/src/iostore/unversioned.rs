@@ -1085,3 +1085,114 @@ fn collect_meshes(value: &PropValue) -> Vec<MeshRef> {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::iostore::usmap::UsmapProperty;
+
+    /// Build a two-property schema — a `TSet` followed by an `int32` — and
+    /// decode a hand-written stream through it.
+    ///
+    /// A `TSet` serializes like a `TMap`: `NumElementsToRemove` *then* `Num`.
+    /// Reading it as a bare `TArray` consumes only one of the two, so the
+    /// trailing `int32` is read four bytes early. That failure is silent —
+    /// the shifted bytes still decode as a perfectly plausible integer — which
+    /// is why it needs a test rather than an eyeball.
+    #[test]
+    fn set_consumes_its_remove_count_so_later_properties_stay_aligned() {
+        let mut usmap = Usmap::meteorite().expect("bundled usmap");
+        usmap.register_struct(
+            "SetAlignmentProbe",
+            None,
+            vec![
+                UsmapProperty {
+                    schema_index: 0,
+                    array_dim: 1,
+                    name: "Tags".to_string(),
+                    ty: PropertyType::Set(Box::new(PropertyType::Int)),
+                },
+                UsmapProperty {
+                    schema_index: 1,
+                    array_dim: 1,
+                    name: "Value".to_string(),
+                    ty: PropertyType::Int,
+                },
+            ],
+        );
+
+        let mut export = Vec::new();
+        // One fragment: skip 0, two values present, none zero, is-last.
+        // (ValueNum occupies bits 9+, the is-last flag is bit 8.)
+        let fragment: u16 = (2 << 9) | 0x0100;
+        export.extend_from_slice(&fragment.to_le_bytes());
+        export.extend_from_slice(&0i32.to_le_bytes()); // NumElementsToRemove
+        export.extend_from_slice(&0i32.to_le_bytes()); // Num (empty set)
+        export.extend_from_slice(&0x1122_3344i32.to_le_bytes()); // Value
+
+        let props = read_export_struct(&export, &[], &usmap, "SetAlignmentProbe")
+            .expect("decode probe struct");
+
+        assert!(matches!(props.get("Tags"), Some(PropValue::Array(v)) if v.is_empty()));
+        assert!(
+            matches!(props.get("Value"), Some(PropValue::Int(0x1122_3344))),
+            "int after a set was read from the wrong offset: {:?}",
+            props.get("Value")
+        );
+    }
+
+    /// A non-empty set must still leave the stream aligned.
+    #[test]
+    fn non_empty_set_stays_aligned() {
+        let mut usmap = Usmap::meteorite().expect("bundled usmap");
+        usmap.register_struct(
+            "SetAlignmentProbe2",
+            None,
+            vec![
+                UsmapProperty {
+                    schema_index: 0,
+                    array_dim: 1,
+                    name: "Tags".to_string(),
+                    ty: PropertyType::Set(Box::new(PropertyType::Int)),
+                },
+                UsmapProperty {
+                    schema_index: 1,
+                    array_dim: 1,
+                    name: "Value".to_string(),
+                    ty: PropertyType::Int,
+                },
+            ],
+        );
+
+        let mut export = Vec::new();
+        let fragment: u16 = (2 << 9) | 0x0100;
+        export.extend_from_slice(&fragment.to_le_bytes());
+        export.extend_from_slice(&0i32.to_le_bytes()); // NumElementsToRemove
+        export.extend_from_slice(&2i32.to_le_bytes()); // Num
+        export.extend_from_slice(&7i32.to_le_bytes());
+        export.extend_from_slice(&9i32.to_le_bytes());
+        export.extend_from_slice(&0x0BAD_F00Di32.to_le_bytes());
+
+        let props = read_export_struct(&export, &[], &usmap, "SetAlignmentProbe2")
+            .expect("decode probe struct");
+
+        match props.get("Tags") {
+            Some(PropValue::Array(v)) => {
+                let ints: Vec<i64> = v
+                    .iter()
+                    .map(|e| match e {
+                        PropValue::Int(n) => *n,
+                        other => panic!("expected ints in the set, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(ints, vec![7, 9]);
+            }
+            other => panic!("expected a 2-element set, got {other:?}"),
+        }
+        assert!(
+            matches!(props.get("Value"), Some(PropValue::Int(0x0BAD_F00D))),
+            "int after a non-empty set was misaligned: {:?}",
+            props.get("Value")
+        );
+    }
+}
