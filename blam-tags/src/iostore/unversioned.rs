@@ -419,10 +419,26 @@ fn read_value(r: &mut Reader, ty: &PropertyType, usmap: &Usmap, depth: usize) ->
                 PropValue::Struct(read_struct(r, name, usmap, depth + 1)?)
             }
         }
-        PropertyType::Array(inner) | PropertyType::Set(inner) => {
+        PropertyType::Array(inner) => {
             let n = r.i32()?;
             if !(0..=1_000_000).contains(&n) {
-                bail!("implausible array/set count {n} @ {}", r.o - 4);
+                bail!("implausible array count {n} @ {}", r.o - 4);
+            }
+            let mut v = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                v.push(read_value(r, inner, usmap, depth)?);
+            }
+            PropValue::Array(v)
+        }
+        // A `TSet` serializes like a `TMap`, not like a `TArray`: it is
+        // preceded by an `NumElementsToRemove` count (the delta-serialization
+        // prefix). Treating it as a bare array leaves the stream 4 bytes short
+        // and silently desyncs every property that follows.
+        PropertyType::Set(inner) => {
+            let _num_to_remove = r.i32()?;
+            let n = r.i32()?;
+            if !(0..=1_000_000).contains(&n) {
+                bail!("implausible set count {n} @ {}", r.o - 4);
             }
             let mut v = Vec::with_capacity(n as usize);
             for _ in 0..n {
