@@ -138,7 +138,7 @@ impl WwiseBanks {
                     });
                 }
                 if let Some(hirc) = bnk.hirc_bytes() {
-                    banks.hirc.add_hirc(hirc);
+                    banks.hirc.add_hirc(hirc, bnk.version);
                 }
             }
             banks.pcks.push(pck);

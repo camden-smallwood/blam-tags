@@ -14,11 +14,16 @@
 //! Objects are spread across hundreds of banks, so an index is built by
 //! merging every bank's HIRC (see [`HircIndex`] / [`super::WwiseBanks`]).
 //!
-//! Layouts are pinned for bank version 88 (Halo 4), reverse-engineered from the
-//! shipping banks:
-//! - Event   `(4)`: `id, action_count(u32), action_ids(u32×N)`
+//! Two object layouts are in play, reverse-engineered from the shipping banks
+//! of the games that use each — bank version 88 (Halo 4) and 150 (Campaign
+//! Evolved). Wwise narrowed two count/enum fields from `u32` to `u8` between
+//! them; everything resolution touches is otherwise identical:
+//! - Event   `(4)`: `id, action_count(u32 | u8), action_ids(u32×N)`
 //! - Action  `(3)`: `id, scope(u8), action_type(u8), target_id(u32)`
-//! - Sound   `(2)`: `id, plugin_id(u32), stream_type(u32), source_id(u32)@12`
+//! - Sound   `(2)`: `id, plugin_id(u32), stream_type(u32 | u8), source_id(u32)`
+//!
+//! Reading a v150 bank with the v88 layout is silent, not loud: every event
+//! resolves to zero sources and the audio simply looks absent.
 //!
 //! Container child lists sit past a variable, version-specific "node base
 //! params" blob, so instead of parsing that exactly we locate the child list
@@ -39,6 +44,12 @@ const T_BLEND: u8 = 9;
 
 /// Action type for "Play" (the only one that reaches playable media here).
 const ACTION_PLAY: u8 = 0x04;
+
+/// First bank version with the compact layouts: `CAkEvent`'s action count and
+/// `AkBankSourceData`'s stream type are each a single byte rather than a `u32`.
+/// The two shipped versions we read are 88 (Halo 4) and 150 (Campaign Evolved),
+/// so any threshold between them is equivalent in practice.
+const COMPACT_FIELDS_VERSION: u32 = 112;
 
 /// Container object types whose children we recurse into.
 fn is_container(t: u8) -> bool {
@@ -90,8 +101,9 @@ impl HircIndex {
         Self::default()
     }
 
-    /// Merge one bank's raw `HIRC` chunk body into the index.
-    pub fn add_hirc(&mut self, hirc: &[u8]) {
+    /// Merge one bank's raw `HIRC` chunk body into the index. `bank_version` is
+    /// the owning bank's `BKHD` version, which selects the object layouts.
+    pub fn add_hirc(&mut self, hirc: &[u8], bank_version: u32) {
         if hirc.len() < 4 {
             return;
         }
@@ -114,7 +126,7 @@ impl HircIndex {
             self.types.entry(id).or_insert(obj_type);
             self.objects
                 .entry(id)
-                .or_insert_with(|| parse_object(obj_type, body));
+                .or_insert_with(|| parse_object(obj_type, body, bank_version));
             p = body_end;
         }
     }
@@ -197,19 +209,23 @@ impl HircIndex {
     }
 }
 
-fn parse_object(obj_type: u8, body: &[u8]) -> Object {
+fn parse_object(obj_type: u8, body: &[u8], version: u32) -> Object {
+    let compact = version >= COMPACT_FIELDS_VERSION;
     match obj_type {
         T_EVENT => {
+            // `id, action_count, action_ids…` — only the count's width moved.
+            let (count, mut offset) = match (compact, body.len()) {
+                (true, n) if n >= 5 => (body[4] as usize, 5),
+                (false, n) if n >= 8 => (rd_u32(body, 4) as usize, 8),
+                _ => (0, 0),
+            };
             let mut actions = Vec::new();
-            if body.len() >= 8 {
-                let count = rd_u32(body, 4) as usize;
-                for i in 0..count {
-                    let o = 8 + i * 4;
-                    if o + 4 > body.len() {
-                        break;
-                    }
-                    actions.push(rd_u32(body, o));
+            for _ in 0..count {
+                if offset + 4 > body.len() {
+                    break;
                 }
+                actions.push(rd_u32(body, offset));
+                offset += 4;
             }
             Object::Event { actions }
         }
@@ -217,7 +233,13 @@ fn parse_object(obj_type: u8, body: &[u8]) -> Object {
             action_type: body[5],
             target: rd_u32(body, 6),
         },
-        T_SOUND if body.len() >= 16 => Object::Sound {
+        // `id, plugin_id, stream_type, source_id` — the stream type's width
+        // moved, which shifts the source id with it.
+        T_SOUND if compact && body.len() >= 13 => Object::Sound {
+            streamed: body[8] != 0,
+            source_id: rd_u32(body, 9),
+        },
+        T_SOUND if !compact && body.len() >= 16 => Object::Sound {
             streamed: rd_u32(body, 8) != 0,
             source_id: rd_u32(body, 12),
         },
@@ -293,7 +315,7 @@ mod tests {
         push_object(&mut hirc, T_EVENT, &event);
 
         let mut index = HircIndex::new();
-        index.add_hirc(&hirc);
+        index.add_hirc(&hirc, 88);
         index.finalize();
         let sources = index.resolve_event_id(1);
         assert_eq!(
@@ -303,6 +325,56 @@ mod tests {
                 streamed: false
             }]
         );
+    }
+
+    /// The same graph in the compact (v150 / Campaign Evolved) layout: the
+    /// event's action count and the sound's stream type are single bytes. The
+    /// bytes below are shaped exactly like the ones read out of the shipping
+    /// `CH_Brute` bank.
+    #[test]
+    fn resolves_simple_event_in_the_compact_layout() {
+        let mut hirc = Vec::new();
+        hirc.extend_from_slice(&3u32.to_le_bytes());
+
+        // Sound id=100, plugin=0x40001, stream_type=0 (embedded), source=999
+        let mut sound = Vec::new();
+        sound.extend_from_slice(&100u32.to_le_bytes());
+        sound.extend_from_slice(&0x0004_0001u32.to_le_bytes());
+        sound.push(0); // embedded — one byte, not four
+        sound.extend_from_slice(&999u32.to_le_bytes());
+        sound.extend_from_slice(&1835u32.to_le_bytes()); // in-memory media size
+        push_object(&mut hirc, T_SOUND, &sound);
+
+        let mut action = Vec::new();
+        action.extend_from_slice(&50u32.to_le_bytes());
+        action.push(0x03);
+        action.push(ACTION_PLAY);
+        action.extend_from_slice(&100u32.to_le_bytes());
+        push_object(&mut hirc, T_ACTION, &action);
+
+        let mut event = Vec::new();
+        event.extend_from_slice(&1u32.to_le_bytes());
+        event.push(1); // action count — one byte, not four
+        event.extend_from_slice(&50u32.to_le_bytes());
+        push_object(&mut hirc, T_EVENT, &event);
+
+        let mut index = HircIndex::new();
+        index.add_hirc(&hirc, 150);
+        index.finalize();
+        assert_eq!(
+            index.resolve_event_id(1),
+            vec![SoundSource {
+                source_id: 999,
+                streamed: false
+            }]
+        );
+
+        // And the layouts must not be interchangeable: reading these bytes as
+        // v88 is exactly the failure this fixes — silence, not an error.
+        let mut wrong = HircIndex::new();
+        wrong.add_hirc(&hirc, 88);
+        wrong.finalize();
+        assert!(wrong.resolve_event_id(1).is_empty());
     }
 
     /// Scan a real `.pck`: how many events resolve to 1 vs multiple sources?
@@ -323,7 +395,7 @@ mod tests {
             let bytes = pck.read_entry(entry).expect("read bank");
             let Ok(bnk) = Bnk::parse(bytes) else { continue };
             if let Some(hirc) = bnk.hirc_bytes() {
-                index.add_hirc(hirc);
+                index.add_hirc(hirc, bnk.version);
             }
         }
         index.finalize();
@@ -381,7 +453,7 @@ mod tests {
             let bytes = pck.read_entry(entry).expect("read bank");
             let Ok(bnk) = Bnk::parse(bytes) else { continue };
             if let Some(hirc) = bnk.hirc_bytes() {
-                index.add_hirc(hirc);
+                index.add_hirc(hirc, bnk.version);
             }
         }
         index.finalize();
