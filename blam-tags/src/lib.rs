@@ -87,6 +87,7 @@ pub mod ass;
 pub mod extract;
 pub mod render_geometry;
 pub mod render_model;
+pub mod skeleton;
 pub mod monolithic;
 pub mod tag_function;
 pub mod render_method;
