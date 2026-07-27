@@ -1069,6 +1069,101 @@ impl JmsFile {
         Ok(Self { nodes: world_nodes, materials, regions, vertices, triangles, ..Default::default() })
     }
 
+    /// The world-space rest pose held in a model's `nodes` block —
+    /// `render_model`, or Campaign Evolved's `skeleton_model`, which stores
+    /// the same node layout without the geometry.
+    ///
+    /// This is the skeleton `from_collision_model_with_skeleton` and
+    /// `from_physics_model_with_skeleton` expect: the transforms collision
+    /// vertices and physics shapes are stored relative to. It is deliberately
+    /// **not** the armature the Campaign Evolved render JMS emits — that one is
+    /// reoriented so each bone points down local +X, which preserves bone
+    /// positions but changes 123 of 131 rotations on a character. Composing
+    /// geometry against those rotations would twist every hull off its limb.
+    /// Apply the reorientation afterwards with
+    /// [`Self::reorient_for_campaign_evolved`] instead.
+    pub fn skeleton_rest_pose(model: &TagFile) -> Result<Vec<JmsNode>, JmsError> {
+        let root = model.root();
+        Ok(chain_local_to_world(&read_nodes(&root)?))
+    }
+
+    /// Swap the emitted armature for the Halo-style one the Campaign Evolved
+    /// render JMS and JMA use (every bone down local +X), preserving where
+    /// everything sits.
+    ///
+    /// Collision vertices are absolute, so they need no adjustment. Physics
+    /// shapes are node-local, so each is counter-rotated by the same per-bone
+    /// correction: with `node' = node · C`, a shape holds still at
+    /// `shape' = C⁻¹ · shape`. Call this after building from a CE tag with
+    /// [`Self::skeleton_rest_pose`]; on a model whose skeleton does not match,
+    /// it leaves the file alone.
+    pub fn reorient_for_campaign_evolved(&mut self, skeleton_model: &TagFile) {
+        let root = skeleton_model.root();
+        let Ok(local) = read_nodes(&root) else { return };
+        let world = chain_local_to_world(&local);
+        let reoriented = ce_reorient_rest(&local, &world, skeleton_model);
+        if reoriented.len() != world.len() {
+            return;
+        }
+        // Per bone name: its reoriented world transform, and the correction
+        // that gets there from the rest pose.
+        let mut by_name: std::collections::HashMap<&str, (&JmsNode, RealQuaternion)> =
+            std::collections::HashMap::new();
+        for (rest, new) in world.iter().zip(reoriented.iter()) {
+            let correction = (rest.rotation.conjugate() * new.rotation).normalized();
+            by_name.insert(rest.name.as_str(), (new, correction));
+        }
+
+        // Each emitted node's correction, by its own index, so shapes can look
+        // theirs up by parent.
+        let corrections: Vec<Option<RealQuaternion>> = self
+            .nodes
+            .iter()
+            .map(|n| by_name.get(n.name.as_str()).map(|(_, c)| *c))
+            .collect();
+        for node in self.nodes.iter_mut() {
+            if let Some((new, _)) = by_name.get(node.name.as_str()) {
+                node.rotation = new.rotation;
+                node.translation = new.translation;
+            }
+        }
+
+        let undo = |parent: i32| -> Option<RealQuaternion> {
+            corrections
+                .get(usize::try_from(parent).ok()?)
+                .copied()
+                .flatten()
+                .map(|c| c.conjugate())
+        };
+        for s in self.spheres.iter_mut() {
+            if let Some(c) = undo(s.parent) {
+                s.rotation = (c * s.rotation).normalized();
+                s.translation = RealPoint3d::ZERO + c * s.translation.as_vector();
+            }
+        }
+        for b in self.boxes.iter_mut() {
+            if let Some(c) = undo(b.parent) {
+                b.rotation = (c * b.rotation).normalized();
+                b.translation = RealPoint3d::ZERO + c * b.translation.as_vector();
+            }
+        }
+        for cap in self.capsules.iter_mut() {
+            if let Some(c) = undo(cap.parent) {
+                cap.rotation = (c * cap.rotation).normalized();
+                cap.translation = RealPoint3d::ZERO + c * cap.translation.as_vector();
+            }
+        }
+        for hull in self.convex_shapes.iter_mut() {
+            if let Some(c) = undo(hull.parent) {
+                hull.rotation = (c * hull.rotation).normalized();
+                hull.translation = RealPoint3d::ZERO + c * hull.translation.as_vector();
+                for v in hull.vertices.iter_mut() {
+                    *v = RealPoint3d::ZERO + c * v.as_vector();
+                }
+            }
+        }
+    }
+
     /// Walk a parsed `collision_model` tag and reconstruct the JMS
     /// scene from its BSP geometry. Vertices stay in their BSP's
     /// local space — pass a `render_model`-derived skeleton via
@@ -1094,7 +1189,15 @@ impl JmsFile {
 
     fn build_collision_model(tag: &TagFile, skeleton: Option<&[JmsNode]>) -> Result<Self, JmsError> {
         let root = tag.root();
-        let nodes = read_phmo_nodes(&root)?;
+        let mut nodes = read_phmo_nodes(&root)?;
+        // A collision_model's own nodes carry names and parents but no
+        // transforms, so the emitted armature was a pile of bones at the
+        // origin even when a skeleton was supplied — the geometry landed
+        // in the right place, the skeleton describing it did not.
+        // `build_physics_model` has always overlaid the skeleton here.
+        if let Some(skel) = skeleton {
+            overlay_skeleton(&mut nodes, skel);
+        }
         // Build name → world-transform map from the skeleton (if
         // provided). The skeleton is expected to be in world space
         // (e.g. the result of `from_render_model`).
@@ -1491,14 +1594,7 @@ impl JmsFile {
         let root = tag.root();
         let mut nodes = read_phmo_nodes(&root)?;
         if let Some(skel) = skeleton {
-            let by_name: std::collections::HashMap<&str, &JmsNode> =
-                skel.iter().map(|n| (n.name.as_str(), n)).collect();
-            for n in nodes.iter_mut() {
-                if let Some(src) = by_name.get(n.name.as_str()) {
-                    n.rotation = src.rotation;
-                    n.translation = src.translation;
-                }
-            }
+            overlay_skeleton(&mut nodes, skel);
         }
         let materials = read_phmo_materials(&root)?;
         let parent_lookup = build_phmo_parent_lookup(&root);
@@ -1546,20 +1642,10 @@ impl JmsFile {
 
     fn build_physics_model_h2(tag: &TagFile, skeleton: Option<&[JmsNode]>) -> Result<Self, JmsError> {
         let root = tag.root();
-        let nodes = read_phmo_nodes(&root)?;
-        let nodes = if let Some(skel) = skeleton {
-            let by_name: std::collections::HashMap<&str, &JmsNode> =
-                skel.iter().map(|n| (n.name.as_str(), n)).collect();
-            nodes.into_iter().map(|mut n| {
-                if let Some(src) = by_name.get(n.name.as_str()) {
-                    n.rotation = src.rotation;
-                    n.translation = src.translation;
-                }
-                n
-            }).collect()
-        } else {
-            nodes
-        };
+        let mut nodes = read_phmo_nodes(&root)?;
+        if let Some(skel) = skeleton {
+            overlay_skeleton(&mut nodes, skel);
+        }
         let materials = read_phmo_materials(&root)?;
         // Primary parenting: each H2 rigid_body carries node + a
         // (shape_type, shape_index) reference — the same scheme the H3
@@ -2194,6 +2280,21 @@ fn chain_local_to_world(local: &[JmsNode]) -> Vec<JmsNode> {
 /// nodes block has only names + tree links (no transforms), so we
 /// emit them with identity transforms; bones are placed by the
 /// caller's render_model when combining into a model.
+/// Give a phmo/coll node list the rest-pose transforms it does not store,
+/// matched by bone name. Bones absent from the skeleton keep identity, so a
+/// collision tag shared with a differently-rigged model degrades to unposed
+/// rather than to wrong.
+fn overlay_skeleton(nodes: &mut [JmsNode], skeleton: &[JmsNode]) {
+    let by_name: std::collections::HashMap<&str, &JmsNode> =
+        skeleton.iter().map(|n| (n.name.as_str(), n)).collect();
+    for node in nodes.iter_mut() {
+        if let Some(src) = by_name.get(node.name.as_str()) {
+            node.rotation = src.rotation;
+            node.translation = src.translation;
+        }
+    }
+}
+
 fn read_phmo_nodes(root: &TagStruct<'_>) -> Result<Vec<JmsNode>, JmsError> {
     let block = root.field_path("nodes").and_then(|f| f.as_block())
         .ok_or(JmsError::MissingField("nodes"))?;
@@ -2233,18 +2334,93 @@ fn read_phmo_materials(root: &TagStruct<'_>) -> Result<Vec<JmsMaterial>, JmsErro
 /// so the per-shape walks can attach each shape to the right node.
 /// Shape-type enum values verified by inspecting H3 phmo tags:
 /// 0=sphere, 1=pill (=capsule), 2=box, 3=triangle, 4=polyhedron,
-/// (higher values for multi-sphere/list/mopp not yet seen). See
-/// `SHAPE_TYPE_*` constants below.
+/// 14=list, 15=mopp. See `SHAPE_TYPE_*` constants below.
+///
+/// A rigid body may name a **container** rather than a leaf: a `list`
+/// directly, or a `mopp` (Havok's compiled bounding-volume tree) that
+/// wraps one. The leaves inside it belong to that body's node just as a
+/// directly-named shape would, so containers are expanded here — without
+/// it, every shape reachable only through a list came out unparented
+/// (`parent = -1`). That is the common case, not an edge: the Pelican's
+/// whole hull is 38 polyhedra behind one mopp, and across Halo Reach
+/// 4039 of 5022 polyhedra sit behind a list.
 fn build_phmo_parent_lookup(root: &TagStruct<'_>) -> std::collections::HashMap<(i64, i64), i32> {
     let mut out = std::collections::HashMap::new();
     let Some(rbs) = root.field_path("rigid bodies").and_then(|f| f.as_block()) else { return out; };
+
+    // `list shapes` is one flat block that every list slices in order —
+    // there is no start index on a list, only a child count, so a list's
+    // slice starts at the running sum of the counts before it. Verified
+    // across Halo Reach and Halo 3: of the 37 and 31 physics models with
+    // more than one list, none fails to tile the block this way.
+    let lists = root.field_path("lists").and_then(|f| f.as_block());
+    let mut list_slices: Vec<(usize, usize)> = Vec::new();
+    if let Some(lists) = lists.as_ref() {
+        let mut start = 0usize;
+        for i in 0..lists.len() {
+            let count = lists
+                .element(i)
+                .and_then(|e| e.read_int_any("child shapes size"))
+                .unwrap_or(0)
+                .max(0) as usize;
+            list_slices.push((start, count));
+            start += count;
+        }
+    }
+    let mopp_list: Vec<i32> = match root.field_path("mopps").and_then(|f| f.as_block()) {
+        Some(mopps) => (0..mopps.len())
+            .map(|i| {
+                mopps
+                    .element(i)
+                    .map(|e| e.read_block_index("list") as i32)
+                    .unwrap_or(-1)
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let list_shapes = root.field_path("list shapes").and_then(|f| f.as_block());
+
     for i in 0..rbs.len() {
         let rb = rbs.element(i).unwrap();
         let node_idx = rb.read_int_any("node").map(|v| v as i32).unwrap_or(-1);
         let Some(sr) = rb.field("shape reference").and_then(|f| f.as_struct()) else { continue; };
         let Some(shape_type) = sr.read_int_any("shape type") else { continue; };
         let Some(shape_idx) = sr.read_int_any("shape") else { continue; };
-        out.insert((shape_type as i64, shape_idx as i64), node_idx);
+
+        // Breadth-first through containers. `seen` guards a malformed tag
+        // whose lists cycle; real ones nest at most one level deep.
+        let mut seen = std::collections::HashSet::new();
+        let mut pending = vec![(shape_type as i64, shape_idx as i64)];
+        while let Some((ty, idx)) = pending.pop() {
+            if !seen.insert((ty, idx)) {
+                continue;
+            }
+            out.insert((ty, idx), node_idx);
+            let list = match ty {
+                SHAPE_TYPE_LIST => idx,
+                SHAPE_TYPE_MOPP => mopp_list.get(idx.max(0) as usize).copied().unwrap_or(-1) as i64,
+                _ => continue,
+            };
+            if list < 0 {
+                continue;
+            }
+            let Some((start, count)) = list_slices.get(list as usize).copied() else { continue };
+            let Some(shapes) = list_shapes.as_ref() else { continue };
+            for k in start..(start + count).min(shapes.len()) {
+                let Some(child) = shapes
+                    .element(k)
+                    .and_then(|e| e.field("shape reference").and_then(|f| f.as_struct()))
+                else {
+                    continue;
+                };
+                let (Some(cty), Some(cidx)) =
+                    (child.read_int_any("shape type"), child.read_int_any("shape"))
+                else {
+                    continue;
+                };
+                pending.push((cty as i64, cidx as i64));
+            }
+        }
     }
     out
 }
@@ -2257,6 +2433,11 @@ const SHAPE_TYPE_SPHERE: i64 = 0;
 const SHAPE_TYPE_PILL: i64 = 1;
 const SHAPE_TYPE_BOX: i64 = 2;
 const SHAPE_TYPE_POLYHEDRON: i64 = 4;
+/// Havok `hkpListShape` — a bag of child shapes, sliced out of the flat
+/// `list shapes` block.
+const SHAPE_TYPE_LIST: i64 = 14;
+/// Havok `hkpMoppBvTreeShape` — a compiled BV tree wrapping a list.
+const SHAPE_TYPE_MOPP: i64 = 15;
 
 fn read_phmo_spheres(root: &TagStruct<'_>, parents: &std::collections::HashMap<(i64, i64), i32>) -> Vec<JmsSphere> {
     let Some(block) = root.field_path("spheres").and_then(|f| f.as_block()) else { return Vec::new(); };
@@ -3245,6 +3426,31 @@ const EMPTY_SECTIONS_TRAILING: &[(&str, &[&str])] = &[
 #[cfg(test)]
 mod tests {
     use super::marker_display_name;
+    use super::{overlay_skeleton, JmsNode};
+    use crate::math::{RealPoint3d, RealQuaternion};
+
+    fn node(name: &str, x: f32) -> JmsNode {
+        JmsNode {
+            name: name.to_owned(),
+            parent: -1,
+            rotation: RealQuaternion::IDENTITY,
+            translation: RealPoint3d { x, y: 0.0, z: 0.0 },
+        }
+    }
+
+    /// A collision/physics tag stores bone names and parents but no transforms.
+    /// The rest pose has to be laid over it by name -- and a bone the skeleton
+    /// does not have must stay put rather than pick up a neighbour's transform.
+    #[test]
+    fn skeleton_overlay_poses_bones_by_name() {
+        let mut nodes = vec![node("hip_l", 0.0), node("not_in_skeleton", 0.0), node("head_m", 0.0)];
+        let skeleton = vec![node("head_m", 80.0), node("hip_l", 24.0)];
+        overlay_skeleton(&mut nodes, &skeleton);
+        assert_eq!(nodes[0].translation.x, 24.0);
+        assert_eq!(nodes[1].translation.x, 0.0);
+        assert_eq!(nodes[2].translation.x, 80.0);
+    }
+
 
     fn regions() -> Vec<(String, Vec<String>)> {
         vec![
@@ -3278,5 +3484,162 @@ mod tests {
         assert_eq!(marker_display_name("m", 9, 0, &regions()), "m");
         // Region ok, permutation out of range => region-only.
         assert_eq!(marker_display_name("m", 0, 9, &regions()), "(l_pod)m");
+    }
+}
+
+/// Campaign Evolved keeps geometry in Unreal and the rig in a `skeleton_model`,
+/// so these paths only have real data to run against when the game is installed.
+#[cfg(all(test, feature = "iostore"))]
+mod campaign_evolved_physics_tests {
+    use super::JmsFile;
+    use crate::file::TagFile;
+    use crate::iostore::IoStoreArchive;
+
+    const PAK0: &str =
+        "/Users/camden/Halo/halo-campaign-evolved_pc/Meteorite/Content/Paks/pakchunk0-WinGDK.utoc";
+    const PELICAN: &str = "objects/vehicles/human/pelican/pelican";
+
+    fn read(archive: &IoStoreArchive, group: &str) -> Option<TagFile> {
+        let needle = format!("{PELICAN}-{group}.ubulk");
+        let entry = archive
+            .ublock_entries()
+            .find(|e| e.path.to_ascii_lowercase().replace('\\', "/").ends_with(&needle))?;
+        let path = entry.path.clone();
+        TagFile::read_from_bytes(&archive.read(&path).ok()?).ok()
+    }
+
+    /// The Pelican's whole hull is 38 polyhedra behind a MOPP-wrapped list, and
+    /// its doors hang off bones the physics tag does not store transforms for.
+    /// Both were exported wrong: every hull piece unparented, every bone at the
+    /// origin.
+    #[test]
+    fn pelican_physics_binds_its_hull_and_poses_its_bones() {
+        if !std::path::Path::new(PAK0).exists() {
+            eprintln!("skipping: {PAK0} not present");
+            return;
+        }
+        let archive = IoStoreArchive::open(PAK0).expect("open pakchunk0");
+        let (Some(phmo), Some(skel)) = (read(&archive, "physics_model"), read(&archive, "skeleton_model"))
+        else {
+            panic!("pelican physics_model/skeleton_model not found in pakchunk0");
+        };
+        let rest = JmsFile::skeleton_rest_pose(&skel).expect("rest pose");
+        let jms = JmsFile::from_physics_model_with_skeleton(&phmo, &rest).expect("physics jms");
+
+        assert_eq!(jms.convex_shapes.len(), 38, "the hull is 38 convex pieces");
+        let unparented = jms
+            .spheres
+            .iter()
+            .map(|s| s.parent)
+            .chain(jms.capsules.iter().map(|c| c.parent))
+            .chain(jms.boxes.iter().map(|b| b.parent))
+            .chain(jms.convex_shapes.iter().map(|c| c.parent))
+            .filter(|p| *p < 0)
+            .count();
+        assert_eq!(unparented, 0, "every shape reaches a bone through the mopp/list");
+
+        let posed = jms
+            .nodes
+            .iter()
+            .filter(|n| {
+                n.translation.x != 0.0 || n.translation.y != 0.0 || n.translation.z != 0.0
+            })
+            .count();
+        assert!(posed > 50, "expected a posed armature, got {posed}/{} bones", jms.nodes.len());
+    }
+
+    /// Reorienting the armature to match the render JMS must not move anything:
+    /// bone positions are preserved by construction, and each node-local shape is
+    /// counter-rotated so its world placement holds.
+    #[test]
+    fn reorienting_preserves_where_every_shape_sits() {
+        if !std::path::Path::new(PAK0).exists() {
+            eprintln!("skipping: {PAK0} not present");
+            return;
+        }
+        let archive = IoStoreArchive::open(PAK0).expect("open pakchunk0");
+        let (Some(phmo), Some(skel)) = (read(&archive, "physics_model"), read(&archive, "skeleton_model"))
+        else {
+            panic!("pelican physics_model/skeleton_model not found in pakchunk0");
+        };
+        let rest = JmsFile::skeleton_rest_pose(&skel).expect("rest pose");
+        let before = JmsFile::from_physics_model_with_skeleton(&phmo, &rest).expect("physics jms");
+        let mut after = JmsFile::from_physics_model_with_skeleton(&phmo, &rest).expect("physics jms");
+        after.reorient_for_campaign_evolved(&skel);
+
+        // World placement of a shape = its bone's transform composed with its own.
+        let world = |jms: &JmsFile, parent: i32, local: crate::math::RealPoint3d| {
+            let node = &jms.nodes[parent.max(0) as usize];
+            node.translation + node.rotation * local.as_vector()
+        };
+        let mut rotated = 0;
+        for (a, b) in before.boxes.iter().zip(after.boxes.iter()) {
+            let (wa, wb) = (world(&before, a.parent, a.translation), world(&after, b.parent, b.translation));
+            let drift = (wa.x - wb.x).abs() + (wa.y - wb.y).abs() + (wa.z - wb.z).abs();
+            assert!(drift < 0.01, "box {} moved by {drift}", a.name);
+        }
+        for (a, b) in before.convex_shapes.iter().zip(after.convex_shapes.iter()) {
+            for (va, vb) in a.vertices.iter().zip(b.vertices.iter()) {
+                let (wa, wb) = (world(&before, a.parent, *va), world(&after, b.parent, *vb));
+                let drift = (wa.x - wb.x).abs() + (wa.y - wb.y).abs() + (wa.z - wb.z).abs();
+                assert!(drift < 0.05, "hull point of {} moved by {drift}", a.name);
+            }
+        }
+        for (a, b) in before.nodes.iter().zip(after.nodes.iter()) {
+            let drift = (a.translation.x - b.translation.x).abs()
+                + (a.translation.y - b.translation.y).abs()
+                + (a.translation.z - b.translation.z).abs();
+            assert!(drift < 0.001, "bone {} moved", a.name);
+            let dot = a.rotation.i * b.rotation.i
+                + a.rotation.j * b.rotation.j
+                + a.rotation.k * b.rotation.k
+                + a.rotation.w * b.rotation.w;
+            if dot.abs() < 0.9999 {
+                rotated += 1;
+            }
+        }
+        assert!(rotated > 40, "expected the armature to actually be reoriented, {rotated} bones changed");
+    }
+
+    /// A collision JMS used to carry an armature of bones all sitting at the
+    /// origin, whatever skeleton it was given.
+    #[test]
+    fn pelican_collision_carries_a_posed_armature() {
+        if !std::path::Path::new(PAK0).exists() {
+            eprintln!("skipping: {PAK0} not present");
+            return;
+        }
+        let archive = IoStoreArchive::open(PAK0).expect("open pakchunk0");
+        let (Some(coll), Some(skel)) = (read(&archive, "collision_model"), read(&archive, "skeleton_model"))
+        else {
+            panic!("pelican collision_model/skeleton_model not found in pakchunk0");
+        };
+        let rest = JmsFile::skeleton_rest_pose(&skel).expect("rest pose");
+        let plain = JmsFile::from_collision_model(&coll).expect("collision jms");
+        let posed = JmsFile::from_collision_model_with_skeleton(&coll, &rest).expect("collision jms");
+
+        assert!(
+            plain.nodes.iter().all(|n| n.translation.x == 0.0 && n.translation.z == 0.0),
+            "without a skeleton there is nothing to pose with"
+        );
+        let posed_bones = posed
+            .nodes
+            .iter()
+            .filter(|n| {
+                n.translation.x != 0.0 || n.translation.y != 0.0 || n.translation.z != 0.0
+            })
+            .count();
+        assert!(posed_bones > 50, "expected a posed armature, got {posed_bones}");
+        // And the geometry itself lands out at the wings rather than stacked on
+        // the fuselage centre.
+        let spread = |jms: &JmsFile| {
+            let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+            for v in &jms.vertices {
+                lo = lo.min(v.position.y);
+                hi = hi.max(v.position.y);
+            }
+            hi - lo
+        };
+        assert!(spread(&posed) > spread(&plain) + 100.0, "composing should spread the hulls out");
     }
 }
