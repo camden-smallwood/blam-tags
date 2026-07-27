@@ -118,10 +118,40 @@ type Result<T> = std::result::Result<T, IoStoreError>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FIoChunkId(pub [u8; 12]);
 
+/// `EIoChunkType::ExportBundleData` — a package's `.uasset` payload.
+pub const CHUNK_TYPE_EXPORT_BUNDLE: u8 = 1;
+/// `EIoChunkType::BulkData` — a package's `.ubulk` payload.
+pub const CHUNK_TYPE_BULK_DATA: u8 = 2;
+/// `EIoChunkType::OptionalBulkData` — `.uptnl`.
+pub const CHUNK_TYPE_OPTIONAL_BULK_DATA: u8 = 3;
+/// `EIoChunkType::MemoryMappedBulkData` — `.m.ubulk`.
+pub const CHUNK_TYPE_MEMORY_MAPPED_BULK_DATA: u8 = 4;
+
+/// The file extension a payload chunk type lands on, if it has one.
+fn chunk_type_extension(chunk_type: u8) -> Option<&'static str> {
+    match chunk_type {
+        CHUNK_TYPE_EXPORT_BUNDLE => Some(".uasset"),
+        CHUNK_TYPE_BULK_DATA => Some(".ubulk"),
+        CHUNK_TYPE_OPTIONAL_BULK_DATA => Some(".uptnl"),
+        CHUNK_TYPE_MEMORY_MAPPED_BULK_DATA => Some(".m.ubulk"),
+        _ => None,
+    }
+}
+
 impl FIoChunkId {
     /// The `EIoChunkType` byte (e.g. ExportBundleData, BulkData).
     pub fn chunk_type(&self) -> u8 {
         self.0[11]
+    }
+
+    /// The 8-byte `FPackageId` prefix. A package's `.uasset`
+    /// (`ExportBundleData`) and its `.ubulk` (`BulkData`) share this and differ
+    /// only in the trailing type byte, which is what lets a payload chunk be
+    /// paired back to the package that names it.
+    pub fn package_id(&self) -> [u8; 8] {
+        let mut id = [0u8; 8];
+        id.copy_from_slice(&self.0[..8]);
+        id
     }
 
     pub fn bytes(&self) -> &[u8; 12] {
@@ -138,6 +168,21 @@ pub struct Entry {
     pub path: String,
     /// Index into the TOC's chunk / offset-length arrays.
     pub chunk_index: u32,
+}
+
+/// The prefix container paths carry before the `/Game/` package root — e.g.
+/// `Meteorite/Content/` for `Meteorite/Content/Tags/…`. Taken from the first
+/// base entry that has a `Content/` component so the recovered paths line up
+/// with the ones the base containers already use.
+fn infer_content_prefix(bases: &[&IoStoreArchive]) -> Option<String> {
+    for base in bases {
+        for entry in base.entries() {
+            if let Some(at) = entry.path.find("/Content/") {
+                return Some(entry.path[..at + "/Content/".len()].to_string());
+            }
+        }
+    }
+    None
 }
 
 /// A parsed compression-block entry (12 bytes, bit-packed).
@@ -276,6 +321,118 @@ impl IoStoreArchive {
     /// All files in the container's directory index.
     pub fn entries(&self) -> &[Entry] {
         &self.entries
+    }
+
+    /// Rebuild a file list for a container that carries no directory index.
+    ///
+    /// Override/mod containers address chunks by id, so they ship with
+    /// `directory index size = 0` and [`entries`](Self::entries) comes back
+    /// empty — the container is perfectly loadable by the game but shows up as
+    /// nothing in a browser. The chunk ids and package headers still carry
+    /// enough to reconstruct the paths:
+    ///
+    /// - a chunk id that also appears in one of `bases` takes that container's
+    ///   path, which preserves the original casing;
+    /// - otherwise an `ExportBundleData` chunk names *itself* — its Zen header's
+    ///   `summary.name` is the package path (this is what covers newly created
+    ///   and renamed tags, whose ids appear in no base container);
+    /// - a bulk chunk then inherits the path of the package sharing its
+    ///   [`package_id`](FIoChunkId::package_id), with the extension swapped.
+    ///
+    /// The `/Game/…` package root is mapped back onto the containers' content
+    /// prefix (e.g. `Meteorite/Content/`), taken from `content_prefix` when
+    /// given and otherwise inferred from `bases`.
+    ///
+    /// No-ops (returning 0) when a directory index was already parsed. Returns
+    /// the number of entries recovered.
+    pub fn recover_entries(
+        &mut self,
+        bases: &[&IoStoreArchive],
+        content_prefix: Option<&str>,
+    ) -> usize {
+        if !self.entries.is_empty() {
+            return 0;
+        }
+        let prefix = content_prefix
+            .map(str::to_string)
+            .or_else(|| infer_content_prefix(bases));
+
+        // Every id we can name from a base container, with its original path.
+        let mut known: HashMap<[u8; 12], &str> = HashMap::new();
+        for base in bases {
+            for entry in base.entries() {
+                if let Ok(id) = base.chunk_id(entry.chunk_index) {
+                    known.insert(id.0, entry.path.as_str());
+                }
+            }
+        }
+
+        let mut paths: Vec<Option<String>> = vec![None; self.entry_count as usize];
+        // Package id -> the `.uasset` path naming it, so bulk chunks can follow.
+        let mut packages: HashMap<[u8; 8], String> = HashMap::new();
+
+        for i in 0..self.entry_count {
+            let Ok(id) = self.chunk_id(i) else { continue };
+            let path = match known.get(&id.0) {
+                Some(path) => Some((*path).to_string()),
+                None if id.chunk_type() == CHUNK_TYPE_EXPORT_BUNDLE => {
+                    self.package_path_from_chunk(i, prefix.as_deref())
+                }
+                None => None,
+            };
+            let Some(path) = path else { continue };
+            if id.chunk_type() == CHUNK_TYPE_EXPORT_BUNDLE {
+                packages.insert(id.package_id(), path.clone());
+            }
+            paths[i as usize] = Some(path);
+        }
+
+        // Bulk chunks that no base knew about follow their package.
+        for i in 0..self.entry_count {
+            if paths[i as usize].is_some() {
+                continue;
+            }
+            let Ok(id) = self.chunk_id(i) else { continue };
+            let Some(ext) = chunk_type_extension(id.chunk_type()) else { continue };
+            let Some(package) = packages.get(&id.package_id()) else { continue };
+            let stem = package.strip_suffix(".uasset").unwrap_or(package);
+            paths[i as usize] = Some(format!("{stem}{ext}"));
+        }
+
+        let entries: Vec<Entry> = paths
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, path)| path.map(|path| Entry { path, chunk_index: i as u32 }))
+            .collect();
+        self.by_path = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.path.clone(), i))
+            .collect();
+        self.entries = entries;
+        self.entries.len()
+    }
+
+    /// Read an `ExportBundleData` chunk and turn the package path it declares
+    /// into a container-relative path. `None` if the chunk will not parse as a
+    /// Zen package.
+    fn package_path_from_chunk(&self, chunk_index: u32, prefix: Option<&str>) -> Option<String> {
+        use container_header::EIoContainerHeaderVersion;
+        use ue_types::EIoStoreTocVersion;
+        use zen::FZenPackageHeader;
+
+        let bytes = self.read_chunk(chunk_index).ok()?;
+        let header = FZenPackageHeader::deserialize(
+            &mut std::io::Cursor::new(&bytes[..]),
+            None,
+            EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash,
+            EIoContainerHeaderVersion::SoftPackageReferences,
+            None,
+        )
+        .ok()?;
+        let package = header.name_map.get(header.summary.name).to_string();
+        let tail = package.strip_prefix("/Game/")?;
+        Some(format!("{}{tail}.uasset", prefix.unwrap_or_default()))
     }
 
     /// Number of chunks in the TOC (works even without a directory index).
