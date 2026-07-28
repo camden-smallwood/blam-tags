@@ -39,9 +39,15 @@ impl Fragment {
         }
     }
 
+    fn pack(self) -> u16 {
+        self.skip as u16
+            | if self.has_zeroes { 0x0080 } else { 0 }
+            | ((self.value_num as u16) << 9)
+            | if self.is_last { 0x0100 } else { 0 }
+    }
 }
 
-/// What a property block's header says.
+/// What a property block's header says, in the form a writer can replay.
 ///
 /// `present` is the schema indices carrying a value, each paired with whether
 /// that value is non-zero; a zero-masked property serializes no bytes at all.
@@ -57,6 +63,122 @@ pub struct Header {
     /// `ValueNum == 0`), so they are inert; carrying the count is what lets us
     /// reproduce those packages byte-for-byte rather than merely equivalently.
     pub leading_empty: u8,
+}
+
+/// `FUnversionedHeaderBuilder` (UnversionedPropertySerialization.cpp:795),
+/// ported literally so a header can be *regenerated* from the property set
+/// rather than retained as bytes.
+#[derive(Debug)]
+struct HeaderBuilder {
+    fragments: Vec<Fragment>,
+    zero_mask: Vec<bool>,
+}
+
+impl HeaderBuilder {
+    fn new() -> Self {
+        HeaderBuilder { fragments: vec![Fragment::default()], zero_mask: Vec::new() }
+    }
+
+    /// Drop the zero-mask bits of a fragment that turned out to have no zeroes.
+    /// Called when *closing* a fragment, so it always applies to the last one.
+    fn trim_zero_mask(&mut self) {
+        let last = *self.fragments.last().expect("never empty");
+        if !last.has_zeroes {
+            let keep = self.zero_mask.len() - last.value_num as usize;
+            self.zero_mask.truncate(keep);
+        }
+    }
+
+    fn include(&mut self, is_zero: bool) {
+        if self.fragments.last().expect("never empty").value_num == Fragment::VALUE_MAX {
+            self.trim_zero_mask();
+            self.fragments.push(Fragment::default());
+        }
+        let last = self.fragments.last_mut().expect("never empty");
+        last.value_num += 1;
+        last.has_zeroes |= is_zero;
+        self.zero_mask.push(is_zero);
+    }
+
+    fn exclude(&mut self) {
+        let last = *self.fragments.last().expect("never empty");
+        if last.value_num != 0 || last.skip == Fragment::SKIP_MAX {
+            self.trim_zero_mask();
+            self.fragments.push(Fragment::default());
+        }
+        self.fragments.last_mut().expect("never empty").skip += 1;
+    }
+
+    /// Trailing value-less fragments are dropped — but only down to one, which
+    /// is why a block with nothing present still encodes `min(schema_len, 127)`
+    /// skips rather than nothing at all.
+    fn finalize(&mut self) {
+        self.trim_zero_mask();
+        while self.fragments.len() > 1 && self.fragments.last().expect("never empty").value_num == 0
+        {
+            self.fragments.pop();
+        }
+        self.fragments.last_mut().expect("never empty").is_last = true;
+    }
+
+    /// `FUnversionedHeader::Save` + `SaveZeroMaskData`.
+    fn save(&self, out: &mut Vec<u8>) {
+        for f in &self.fragments {
+            out.extend_from_slice(&f.pack().to_le_bytes());
+        }
+        let bits = self.zero_mask.len();
+        if bits == 0 {
+            return;
+        }
+        let mut words = vec![0u32; bits.div_ceil(32)];
+        for (i, &b) in self.zero_mask.iter().enumerate() {
+            if b {
+                words[i / 32] |= 1 << (i % 32);
+            }
+        }
+        // The last word is masked to the bits in use; the width of the mask as a
+        // whole is chosen by bit count, not by word count.
+        let last = u32::MAX >> ((32 - bits % 32) % 32);
+        if bits <= 8 {
+            out.push((words[0] & last) as u8);
+        } else if bits <= 16 {
+            out.extend_from_slice(&((words[0] & last) as u16).to_le_bytes());
+        } else {
+            let n = words.len();
+            for w in &words[..n - 1] {
+                out.extend_from_slice(&w.to_le_bytes());
+            }
+            out.extend_from_slice(&(words[n - 1] & last).to_le_bytes());
+        }
+    }
+}
+
+/// Emit the `FUnversionedHeader` bytes for a property block.
+///
+/// `schema_len` is the class's flattened property count. UE walks the *whole*
+/// schema calling Include/Exclude per property, and [`HeaderBuilder::finalize`]
+/// pops trailing skips only down to one — so the length is load-bearing for
+/// blocks with nothing present, and stopping at the last present index instead
+/// produces the wrong bytes for them.
+pub(super) fn write_header_inner(header: &Header, schema_len: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for _ in 0..header.leading_empty {
+        out.extend_from_slice(&0u16.to_le_bytes());
+    }
+    let mut b = HeaderBuilder::new();
+    let mut it = header.present.iter().peekable();
+    for i in 0..schema_len {
+        match it.peek() {
+            Some(&&(idx, non_zero)) if idx == i => {
+                b.include(!non_zero);
+                it.next();
+            }
+            _ => b.exclude(),
+        }
+    }
+    b.finalize();
+    b.save(&mut out);
+    out
 }
 
 /// Read an `FUnversionedHeader`, returning `(present_schema_indices, ...)`
@@ -303,6 +425,77 @@ pub(super) fn zero_value(ty: &PropertyType) -> PropValue {
 mod tests {
     use super::*;
 
+    /// Round-trip a header through the reader and the builder.
+    fn roundtrip(present: &[(usize, bool)], schema_len: usize, leading_empty: u8) -> Vec<u8> {
+        let h = Header { present: present.to_vec(), leading_empty };
+        let bytes = emit_header(&h, schema_len);
+        let mut r = Reader::new(&bytes, &[]);
+        let back = read_header(&mut r).expect("re-read the header we just wrote");
+        assert_eq!(back, h, "header did not survive a write/read round trip");
+        assert_eq!(r.o, bytes.len(), "reader did not consume the whole header");
+        bytes
+    }
+
+    /// `Finalize` pops trailing value-less fragments only *down to one*, so a
+    /// block with nothing present still encodes `min(schema_len, 127)` skips.
+    /// Emitting a bare `is_last` fragment instead is the obvious reading and is
+    /// wrong for 62,606 exports in the shipped corpus.
+    #[test]
+    fn empty_block_still_encodes_its_schema_length() {
+        assert_eq!(roundtrip(&[], 16, 0), 0x0110u16.to_le_bytes());
+        assert_eq!(roundtrip(&[], 46, 0), 0x012eu16.to_le_bytes());
+        // Capped at SkipMax, because every fragment past the first is popped.
+        assert_eq!(roundtrip(&[], 300, 0), 0x017fu16.to_le_bytes());
+        // A class with no properties at all is a bare terminator.
+        assert_eq!(roundtrip(&[], 0, 0), 0x0100u16.to_le_bytes());
+    }
+
+    /// Campaign Evolved's tag wrappers open with two empty fragments that
+    /// `FUnversionedHeaderBuilder` cannot produce. Carrying the count is what
+    /// makes those 12,161 packages reproducible byte-for-byte.
+    #[test]
+    fn leading_empty_fragments_are_preserved() {
+        let bytes = roundtrip(&[(0, true)], 8, 2);
+        assert_eq!(bytes, [0x00, 0x00, 0x00, 0x00, 0x00, 0x03]);
+    }
+
+    /// Trailing skips *after* a value vanish, because the pop loop reaches them.
+    #[test]
+    fn trailing_skips_after_a_value_are_dropped() {
+        let with = emit_header(&Header { present: vec![(0, true)], leading_empty: 0 }, 64);
+        let without = emit_header(&Header { present: vec![(0, true)], leading_empty: 0 }, 1);
+        assert_eq!(with, without, "trailing skips should not reach the output");
+    }
+
+    /// A fragment holds at most 127 skips and 127 values, so crossing either
+    /// boundary must open a new one without disturbing the zero mask.
+    #[test]
+    fn fragment_boundaries_round_trip() {
+        roundtrip(&[(200, true)], 201, 0);
+        let many: Vec<(usize, bool)> = (0..300).map(|i| (i, true)).collect();
+        roundtrip(&many, 300, 0);
+        let alternating: Vec<(usize, bool)> = (0..300).map(|i| (i, i % 3 != 0)).collect();
+        roundtrip(&alternating, 300, 0);
+    }
+
+    /// The zero mask is only written for fragments that actually carry a zero,
+    /// and its width is chosen by bit count: u8 to 8 bits, u16 to 16, then u32
+    /// words. Each boundary is a place to be off by one.
+    #[test]
+    fn zero_mask_widths() {
+        // Index 0 is always the zero one, so every case really does carry a
+        // mask; with no zeroes at all the mask is omitted entirely (below).
+        for n in [1usize, 8, 9, 16, 17, 32, 33, 64, 65] {
+            let present: Vec<(usize, bool)> = (0..n).map(|i| (i, i % 2 == 1)).collect();
+            let bytes = roundtrip(&present, n, 0);
+            let mask_bytes = bytes.len() - 2; // one fragment
+            let expect = if n <= 8 { 1 } else if n <= 16 { 2 } else { 4 * n.div_ceil(32) };
+            assert_eq!(mask_bytes, expect, "wrong zero-mask width for {n} values");
+        }
+        // All non-zero: no mask at all.
+        let present: Vec<(usize, bool)> = (0..40).map(|i| (i, true)).collect();
+        assert_eq!(roundtrip(&present, 40, 0).len(), 2);
+    }
     use super::super::export::{read_export_struct, read_export_struct_len};
     use crate::iostore::usmap::UsmapProperty;
 
@@ -543,6 +736,27 @@ mod tests {
             props.get("Value")
         );
     }
+}
+
+/// Parse an `FUnversionedHeader` from the start of an export's bytes, returning
+/// it and how many bytes it occupied.
+///
+/// The byte-slice form, so callers outside this layer need not know about the
+/// cursor. Note the header is the very first thing in every export that has a
+/// property block, so `bytes` is normally the export itself.
+pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize)> {
+    let mut r = Reader::new(bytes, &[]);
+    let h = read_header(&mut r)?;
+    Ok((h, r.o))
+}
+
+/// Emit the `FUnversionedHeader` bytes for `header` against a class whose
+/// flattened schema has `schema_len` properties.
+///
+/// Inverse of [`parse_header`]: `emit_header(parse_header(x).0, len) == x` for
+/// every export in the shipped corpus (see `ce_header_roundtrip`).
+pub fn emit_header(header: &Header, schema_len: usize) -> Vec<u8> {
+    write_header_inner(header, schema_len)
 }
 
 #[cfg(test)]
