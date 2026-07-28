@@ -6,7 +6,7 @@ use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::str::FromStr;
 use strum::FromRepr;
 
-use super::container_header::{EIoContainerHeaderVersion, StoreEntry};
+use crate::iostore::container::header::{EIoContainerHeaderVersion, StoreEntry};
 use super::name_map::{EMappedNameType, break_down_name_string, read_name_batch, read_name_batch_parts, write_name_batch, write_name_batch_parts};
 use super::ser::{ReadExt, Readable, WriteExt, Writeable};
 use super::ue_types::{EIoStoreTocVersion, FGuid, FPackageId, FPackageObjectIndex, FSHAHash, align_u64, align_usize};

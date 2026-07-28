@@ -14,16 +14,16 @@
 //! all — see [`empty_pak_stub`].
 //!
 //! All chunks are stored uncompressed (compression method 0), so no Oodle
-//! *encoder* is needed. Layout matches [`super::IoStoreArchive`] exactly and is
+//! *encoder* is needed. Layout matches [`crate::iostore::IoStoreArchive`] exactly and is
 //! validated by round-tripping through it.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use super::container_header::{EIoContainerHeaderVersion, FIoContainerHeader, StoreEntry};
-use super::ue_types::{FIoContainerId, FPackageId};
-use super::{FIoChunkId, IoStoreArchive, IoStoreError, Result};
+use super::header::{EIoContainerHeaderVersion, FIoContainerHeader, StoreEntry};
+use crate::iostore::package::ue_types::{FIoContainerId, FPackageId};
+use crate::iostore::{FIoChunkId, IoStoreArchive, IoStoreError, Result};
 
 /// `EIoChunkType` raw on-disk bytes (UE5 numbering, version 8).
 pub const CHUNK_TYPE_EXPORT_BUNDLE_DATA: u8 = 1;
@@ -68,7 +68,7 @@ impl OverrideContainerWriter {
     }
 
     /// Add a chunk, reusing the original `id` verbatim (as read from the base
-    /// container via [`super::IoStoreArchive::chunk_id`]).
+    /// container via [`crate::iostore::IoStoreArchive::chunk_id`]).
     pub fn add_chunk(&mut self, id: FIoChunkId, data: Vec<u8>) {
         self.chunks.push((id, data));
     }
@@ -459,8 +459,8 @@ fn add_override_to_writer(
 /// `new_package_path`, setting the `.ubulk` content, plus an optional redirect)
 /// to an in-progress override container writer.
 fn add_new_package_to_writer(w: &mut OverrideContainerWriter, pkg: &NewPackage) -> Result<()> {
-    use super::ue_types::EIoStoreTocVersion;
-    use super::zen::FZenPackageHeader;
+    use crate::iostore::package::ue_types::EIoStoreTocVersion;
+    use crate::iostore::package::zen::FZenPackageHeader;
     const HV: EIoContainerHeaderVersion = EIoContainerHeaderVersion::SoftPackageReferences;
     let cv = EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash;
 
@@ -950,7 +950,7 @@ mod tests {
     /// confirm the id and bytes survive. Skipped when the game is absent.
     #[test]
     fn override_container_roundtrip() {
-        use super::super::{is_tag_payload, IoStoreArchive};
+        use crate::iostore::{is_tag_payload, IoStoreArchive};
         if !std::path::Path::new(PAK0).exists() {
             eprintln!("skipping: {PAK0} not present");
             return;
@@ -1041,7 +1041,7 @@ mod tests {
     /// `old_len` is rejected (no accidental corruption).
     #[test]
     fn serial_size_patch_roundtrip() {
-        use super::super::IoStoreArchive;
+        use crate::iostore::IoStoreArchive;
         if !std::path::Path::new(PAK0).exists() {
             eprintln!("skipping: {PAK0} not present");
             return;
@@ -1094,7 +1094,7 @@ mod tests {
     /// the new tag re-parses and the `.uasset` reports the new length.
     #[test]
     fn size_changing_override_roundtrip() {
-        use super::super::{is_tag_payload, IoStoreArchive};
+        use crate::iostore::{is_tag_payload, IoStoreArchive};
         use crate::file::TagFile;
         if !std::path::Path::new(PAK0).exists() {
             eprintln!("skipping: {PAK0} not present");
@@ -1186,7 +1186,7 @@ mod tests {
     /// In-place chunk overwrite: append + repoint, other chunks untouched.
     #[test]
     fn overwrite_chunk_in_place_roundtrips() {
-        use super::super::IoStoreArchive;
+        use crate::iostore::IoStoreArchive;
         let utoc = std::env::temp_dir().join("blamtags_inplace_test.utoc");
         let id0 = make_chunk_id(0x1111, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA);
         let id1 = make_chunk_id(0x1111, 0, CHUNK_TYPE_BULK_DATA);
@@ -1215,7 +1215,7 @@ mod tests {
     /// confirm it opens with the expected new chunk ids and a valid tag.
     #[test]
     fn native_create_tag_container() {
-        use super::super::IoStoreArchive;
+        use crate::iostore::IoStoreArchive;
         use crate::file::TagFile;
         if !std::path::Path::new(PAK0).exists() {
             eprintln!("skipping: {PAK0} not present");
@@ -1267,7 +1267,7 @@ mod tests {
     /// 2-chunk override (patched uasset + new ubulk); read the ubulk back.
     #[test]
     fn write_tag_override_helper_works() {
-        use super::super::IoStoreArchive;
+        use crate::iostore::IoStoreArchive;
         use crate::file::TagFile;
         if !std::path::Path::new(PAK0).exists() {
             eprintln!("skipping: {PAK0} not present");

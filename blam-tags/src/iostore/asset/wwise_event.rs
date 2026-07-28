@@ -21,8 +21,8 @@ use std::collections::BTreeMap;
 
 use anyhow::{bail, Context, Result};
 
-use super::unversioned::{read_export_struct, PropValue};
-use super::usmap::Usmap;
+use crate::iostore::object::unversioned::{read_export_struct, PropValue};
+use crate::iostore::object::usmap::Usmap;
 
 /// How far into the export body to look for the natively-written struct.
 const PROBE_WINDOW: usize = 24;

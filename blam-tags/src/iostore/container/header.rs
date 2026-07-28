@@ -9,9 +9,9 @@ use std::{
 };
 use strum::FromRepr;
 
-use super::name_map::{EMappedNameType, FMappedName, FNameMap, read_name_batch_parts, write_name_batch_parts};
-use super::ser::*;
-use super::ue_types::{FIoContainerId, FPackageId, FSHAHash};
+use crate::iostore::package::name_map::{EMappedNameType, FMappedName, FNameMap, read_name_batch_parts, write_name_batch_parts};
+use crate::iostore::package::ser::*;
+use crate::iostore::package::ue_types::{FIoContainerId, FPackageId, FSHAHash};
 
 #[derive(Debug, PartialEq)]
 pub struct FIoContainerHeader {

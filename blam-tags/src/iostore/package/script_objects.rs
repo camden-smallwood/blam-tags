@@ -23,7 +23,7 @@ use anyhow::{bail, Context, Result};
 use super::name_map::{EMappedNameType, FMappedName, FNameMap};
 use super::ser::{Readable, ReadExt};
 use super::ue_types::FPackageObjectIndex;
-use super::IoStoreArchive;
+use crate::iostore::IoStoreArchive;
 
 /// `EIoChunkType::ScriptObjects`.
 const CHUNK_TYPE_SCRIPT_OBJECTS: u8 = 5;
@@ -54,7 +54,7 @@ impl ScriptObjects {
         let mut id = [0u8; 12];
         id[11] = CHUNK_TYPE_SCRIPT_OBJECTS;
         let index = archive
-            .find_chunk(&super::FIoChunkId(id))
+            .find_chunk(&crate::iostore::FIoChunkId(id))
             .context("container has no ScriptObjects chunk")?;
         Self::parse(&archive.read_chunk(index)?)
     }

@@ -6,7 +6,7 @@
 //! holds the non-localized `.wem`/`.bnk` media (mounted at the staging root),
 //! and `pakchunk1..13` hold one language each (mounted directly at
 //! `Meteorite/Content/WwiseAudio/`). None of it is reachable through
-//! [`IoStoreArchive`](super::IoStoreArchive).
+//! [`IoStoreArchive`](crate::iostore::IoStoreArchive).
 //!
 //! Scope: the shipping shape — pak version 8..=11, unencrypted index, with a
 //! full directory index. Compression is whatever the footer names, decoded
@@ -33,7 +33,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use super::oodle::{self, OodleCodec};
-use super::{IoStoreError, Result};
+use crate::iostore::{IoStoreError, Result};
 
 /// `FPakInfo::Magic`.
 const PAK_MAGIC: u32 = 0x5A6F12E1;

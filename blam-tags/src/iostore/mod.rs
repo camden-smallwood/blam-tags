@@ -17,22 +17,32 @@
 //! unencrypted (`Compressed | Indexed`), Oodle-compressed, single partition.
 //! Encrypted or multi-partition containers are rejected with a clear error.
 
-pub mod oodle;
-pub mod pak;
-pub mod wwise_event;
-pub mod writer;
+//! # Layout
+//!
+//! The module is four layers, each depending only on the ones above it:
+//!
+//! | Layer | Module | Unit of work |
+//! |---|---|---|
+//! | 1 | [`container`] | chunks in a `.utoc`/`.ucas`/`.pak` |
+//! | 2 | [`package`] | one cooked Zen package |
+//! | 3 | [`object`] | one export's payload |
+//! | 4 | [`asset`] | typed decoders (meshes, Wwise events, …) |
+//!
+//! [`IoStoreArchive`] itself lives here, at the root, because it is the entry
+//! point every layer above is reached through.
 
-pub mod ue_types;
-pub mod ser;
-pub mod name_map;
-pub mod zen;
-pub mod container_header;
-pub mod usmap;
-pub mod unversioned;
-pub mod skeletal_mesh;
-pub mod static_mesh;
-pub mod nanite;
-pub mod script_objects;
+pub mod asset;
+pub mod container;
+pub mod object;
+pub mod package;
+
+// Back-compatible aliases for the pre-layering paths. Every one of these is the
+// same module under its old name, so existing `iostore::zen::…` imports keep
+// resolving while callers migrate. Deprecated; remove after one release.
+pub use asset::{nanite, skeletal_mesh, static_mesh, wwise_event};
+pub use container::{header as container_header, oodle, pak, writer};
+pub use object::{unversioned, usmap};
+pub use package::{name_map, script_objects, ser, ue_types, zen};
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -42,7 +52,7 @@ use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
 
-use oodle::{OodleCodec, OodleError};
+use container::oodle::{OodleCodec, OodleError};
 
 /// IoStore TOC magic: `-==--==--==--==-`.
 const TOC_MAGIC: &[u8; 16] = b"-==--==--==--==-";
