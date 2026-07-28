@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use blam_tags::iostore::container_header::EIoContainerHeaderVersion;
 use blam_tags::iostore::ue_types::EIoStoreTocVersion;
-use blam_tags::iostore::unversioned::{read_datatable, read_userdefined_struct_layout, PropValue};
+use blam_tags::iostore::unversioned::{read_datatable, read_userdefined_struct_layout, ExportContext, PropValue};
 use blam_tags::iostore::usmap::Usmap;
 use blam_tags::iostore::zen::FZenPackageHeader;
 use blam_tags::iostore::IoStoreArchive;
@@ -48,11 +48,26 @@ fn decode(
     let mut usmap = Usmap::meteorite().ok()?;
     let sbytes = find_uasset(archives, struct_basename)?;
     let shdr = FZenPackageHeader::deserialize(&mut Cursor::new(&sbytes[..]), None, CV, HV, None).ok()?;
-    let props = read_userdefined_struct_layout(export0(&sbytes, &shdr)?, &shdr.name_map.copy_raw_names()).ok()?;
+    let sctx = ExportContext::new(&[]);
+    let props = read_userdefined_struct_layout(
+        export0(&sbytes, &shdr)?,
+        &shdr.name_map.copy_raw_names(),
+        &usmap,
+        shdr.export_map.first()?.object_flags,
+        &sctx,
+    )
+    .ok()?;
     usmap.register_struct(struct_name, None, props);
     let dbytes = find_uasset(archives, table_basename)?;
     let dhdr = FZenPackageHeader::deserialize(&mut Cursor::new(&dbytes[..]), None, CV, HV, None).ok()?;
-    read_datatable(export0(&dbytes, &dhdr)?, &dhdr.name_map.copy_raw_names(), &usmap, struct_name).ok()
+    read_datatable(
+        export0(&dbytes, &dhdr)?,
+        &dhdr.name_map.copy_raw_names(),
+        &usmap,
+        struct_name,
+        dhdr.export_map.first()?.object_flags,
+    )
+    .ok()
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
