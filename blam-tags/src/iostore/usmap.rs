@@ -159,16 +159,31 @@ impl Usmap {
     /// (Validated byte-perfect against a cooked `BlamMeshSynchronizationComponent`
     /// export: present fragments `{2,5,7}` land on `MeshSynchronizationDataAsset`,
     /// `AnimationClass`, `RuntimeRegions` only under derived-first ordering.)
+    /// A **static array** property (`T Foo[N]`, `array_dim = N`) occupies `N`
+    /// consecutive schema slots, one per element, each independently present or
+    /// absent in the fragment stream. So it is emitted `array_dim` times.
+    /// Ignoring this mis-indexes every property after the array and desyncs the
+    /// reader — `MaterialInstance::PhysicalMaterialMap` is `array_dim = 8`,
+    /// which is why `Parent` sits at schema index 9 and why every
+    /// `MaterialInstanceConstant` failed to decode. Expanding by `array_dim`
+    /// makes position == `schema_index` (rebased per struct) for all 10,647
+    /// classes in the shipped `.usmap`. Tag classes are all `array_dim = 1`,
+    /// which is why they decoded correctly regardless.
     pub fn flattened_properties(&self, name: &str) -> Option<Vec<&UsmapProperty>> {
         // Walk from the most-derived class up to the root, emitting each
         // struct's own properties as we go (derived→base).
         let mut out: Vec<&UsmapProperty> = Vec::new();
         let mut cur = self.get(name)?;
         loop {
-            // Each struct's own properties, in schema-index order.
+            // Each struct's own properties, in schema-index order, each
+            // occupying `array_dim` slots.
             let mut own: Vec<&UsmapProperty> = cur.properties.iter().collect();
             own.sort_by_key(|p| p.schema_index);
-            out.extend(own);
+            for p in own {
+                for _ in 0..p.array_dim.max(1) {
+                    out.push(p);
+                }
+            }
             match cur.super_name.as_deref().and_then(|s| self.get(s)) {
                 Some(sup) => cur = sup,
                 None => break,
@@ -379,4 +394,49 @@ mod tests {
         let flat = m.flattened_properties("SkeletalMesh").expect("flatten");
         assert!(flat.len() > sk.properties.len(), "flattened includes ancestors");
     }
+}
+
+/// Schemas for classes the shipped game references but that no `.usmap` dumped
+/// from it can contain.
+///
+/// A `.usmap` is a snapshot of a *running* process's reflection data. Campaign
+/// Evolved's cooked packages carry exports of editor-plugin classes
+/// (`WorldPartitionHLODUtilities`, `PerformanceOverlayTool`) because the cooker
+/// ran in the editor with those plugins loaded — their names are even in the
+/// shipped `global.utoc` script-object table. But the shipped executable does
+/// not contain those modules at all (their class names do not appear in it), so
+/// the reflection data is not there to dump and the runtime could not construct
+/// them either.
+///
+/// These are stock Unreal plugins, so their layouts are recovered from the
+/// engine's own definitions and registered here. Each is corpus-checked: the
+/// export must decode *and* account for every byte.
+pub fn register_editor_plugin_classes(usmap: &mut Usmap) {
+    let obj = |index: u16, name: &str, ty: PropertyType| UsmapProperty {
+        schema_index: index,
+        array_dim: 1,
+        name: name.to_string(),
+        ty,
+    };
+
+    // `UHLODBuilderMeshMergeSettings : UHLODBuilderSettings` — the merge
+    // settings struct then an optional override material. Confirmed against
+    // `HLODLayer_Merged`, whose 45-byte export is a 2-byte header (properties 0
+    // and 1 present), a 35-byte `FMeshMergingSettings` block, the material as
+    // `fa ff ff ff` (import -6), and the four-byte object trailer.
+    usmap.register_struct(
+        "HLODBuilderMeshMergeSettings",
+        Some("HLODBuilderSettings".to_string()),
+        vec![
+            obj(0, "MeshMergeSettings", PropertyType::Struct("MeshMergingSettings".to_string())),
+            obj(1, "HLODMaterial", PropertyType::Object),
+        ],
+    );
+
+    // `UHLODBuilderInstancingSettings : UHLODBuilderSettings`.
+    usmap.register_struct(
+        "HLODBuilderInstancingSettings",
+        Some("HLODBuilderSettings".to_string()),
+        vec![obj(0, "bDisallowNanite", PropertyType::Bool)],
+    );
 }

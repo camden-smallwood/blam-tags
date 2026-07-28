@@ -32,6 +32,7 @@ pub mod unversioned;
 pub mod skeletal_mesh;
 pub mod static_mesh;
 pub mod nanite;
+pub mod script_objects;
 
 use std::collections::HashMap;
 use std::error::Error;

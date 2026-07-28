@@ -386,29 +386,8 @@ pub fn write_tag_override(
     new_tag_bytes: &[u8],
     out_utoc: &std::path::Path,
 ) -> Result<()> {
-    let ub_id = base.chunk_id_for(ubulk_path)?;
-    let old_len = base.uncompressed_len(ubulk_path)?;
-    let new_len = new_tag_bytes.len() as u64;
-
     let mut writer = OverrideContainerWriter::new("../../../");
-
-    if new_len != old_len {
-        let ua_path = ubulk_path
-            .strip_suffix(".ubulk")
-            .map(|s| format!("{s}.uasset"))
-            .ok_or(IoStoreError::Package("path is not a .ubulk"))?;
-        if !base.contains(&ua_path) {
-            return Err(IoStoreError::Package(
-                "size-changing edit but no paired .uasset to patch",
-            ));
-        }
-        let ua_id = base.chunk_id_for(&ua_path)?;
-        let mut ua = base.read(&ua_path)?;
-        patch_uasset_serial_size(&mut ua, old_len, new_len)?;
-        writer.add_chunk(ua_id, ua);
-    }
-
-    writer.add_chunk(ub_id, new_tag_bytes.to_vec());
+    add_override_to_writer(&mut writer, base, ubulk_path, new_tag_bytes)?;
     writer.write(out_utoc)
 }
 
@@ -432,8 +411,15 @@ pub struct NewPackage<'a> {
     pub redirect_from: Option<&'a str>,
 }
 
-/// Add one same-name override (edited tag, patching the paired `.uasset` on a
-/// size change) to an in-progress override container writer.
+/// Add one same-name override (edited tag, plus the paired `.uasset` with its
+/// bulk `SerialSize` patched to the new length) to an in-progress override
+/// container writer.
+///
+/// The `.uasset` rides along even when the edit did not change the tag's length
+/// and the patch is a no-op. It costs one small chunk, and it makes the mod
+/// self-contained: in-place surgery on a container can only repoint chunks it
+/// already has, so a mod that shipped the `.ubulk` alone could never be edited
+/// again into a different length.
 fn add_override_to_writer(
     w: &mut OverrideContainerWriter,
     archive: &IoStoreArchive,
@@ -442,20 +428,28 @@ fn add_override_to_writer(
 ) -> Result<()> {
     let ub_id = archive.chunk_id_for(ubulk_path)?;
     let old_len = archive.uncompressed_len(ubulk_path)?;
-    if new_bytes.len() as u64 != old_len {
-        let ua_path = ubulk_path
-            .strip_suffix(".ubulk")
-            .map(|s| format!("{s}.uasset"))
-            .ok_or(IoStoreError::Package("path is not a .ubulk"))?;
-        if !archive.contains(&ua_path) {
+    let size_changed = new_bytes.len() as u64 != old_len;
+    let ua_path = ubulk_path
+        .strip_suffix(".ubulk")
+        .map(|s| format!("{s}.uasset"))
+        .ok_or(IoStoreError::Package("path is not a .ubulk"))?;
+    if !archive.contains(&ua_path) {
+        // Only fatal when the length actually has to be rewritten.
+        if size_changed {
             return Err(IoStoreError::Package(
                 "size-changing edit but no paired .uasset to patch",
             ));
         }
+    } else {
         let ua_id = archive.chunk_id_for(&ua_path)?;
         let mut ua = archive.read(&ua_path)?;
-        patch_uasset_serial_size(&mut ua, old_len, new_bytes.len() as u64)?;
-        w.add_chunk(ua_id, ua);
+        match patch_uasset_serial_size(&mut ua, old_len, new_bytes.len() as u64) {
+            Ok(()) => w.add_chunk(ua_id, ua),
+            // A same-length edit needs nothing from the `.uasset`, so an
+            // unrecognised one is not worth failing the export over.
+            Err(e) if size_changed => return Err(e),
+            Err(_) => {}
+        }
     }
     w.add_chunk(ub_id, new_bytes.to_vec());
     Ok(())
@@ -575,30 +569,60 @@ pub fn overwrite_tag_in_place(
     new_tag_bytes: &[u8],
 ) -> Result<()> {
     // Resolve chunk indices + the paired .uasset via a fresh read-only handle.
-    let updates: Vec<(u32, Vec<u8>)> = {
+    let updates = {
         let archive = IoStoreArchive::open(utoc_path)?;
-        let ub_idx = archive.chunk_index_for(ubulk_rel_path)?;
-        let old_len = archive.uncompressed_len(ubulk_rel_path)?;
-        let mut updates = vec![(ub_idx, new_tag_bytes.to_vec())];
-        if new_tag_bytes.len() as u64 != old_len {
-            let ua_path = ubulk_rel_path
-                .strip_suffix(".ubulk")
-                .map(|s| format!("{s}.uasset"))
-                .ok_or(IoStoreError::Package("path is not a .ubulk"))?;
-            if !archive.contains(&ua_path) {
-                return Err(IoStoreError::Package(
-                    "size-changing edit but no paired .uasset to patch",
-                ));
-            }
-            let ua_idx = archive.chunk_index_for(&ua_path)?;
-            let mut ua = archive.read(&ua_path)?;
-            patch_uasset_serial_size(&mut ua, old_len, new_tag_bytes.len() as u64)?;
-            updates.push((ua_idx, ua));
-        }
-        updates
+        plan_tag_overwrite(&archive, ubulk_rel_path, new_tag_bytes)?
         // archive (and its mmap) dropped here, before we touch the files.
     };
     overwrite_chunks_in_place(utoc_path, &updates)
+}
+
+/// Like [`overwrite_tag_in_place`], but resolves the paths against an
+/// already-open `archive` instead of a fresh handle.
+///
+/// Required for an override/mod container: it addresses chunks by id and ships
+/// no directory index, so a freshly opened handle knows no paths at all and
+/// every lookup fails with [`IoStoreError::NotFound`]. Only a handle whose file
+/// list was rebuilt by [`IoStoreArchive::recover_entries`] can name the chunks —
+/// pass that one here. `archive` must be a handle on `utoc_path`.
+pub fn overwrite_tag_in_place_with(
+    archive: &IoStoreArchive,
+    utoc_path: &std::path::Path,
+    ubulk_rel_path: &str,
+    new_tag_bytes: &[u8],
+) -> Result<()> {
+    let updates = plan_tag_overwrite(archive, ubulk_rel_path, new_tag_bytes)?;
+    overwrite_chunks_in_place(utoc_path, &updates)
+}
+
+/// Resolve what an in-place tag overwrite has to rewrite: the `.ubulk` chunk
+/// itself, plus the paired `.uasset` with its bulk size patched when the edit
+/// changed the tag's length. Returns `(chunk_index, new_bytes)` pairs ready for
+/// [`overwrite_chunks_in_place`].
+pub fn plan_tag_overwrite(
+    archive: &IoStoreArchive,
+    ubulk_rel_path: &str,
+    new_tag_bytes: &[u8],
+) -> Result<Vec<(u32, Vec<u8>)>> {
+    let ub_idx = archive.chunk_index_for(ubulk_rel_path)?;
+    let old_len = archive.uncompressed_len(ubulk_rel_path)?;
+    let mut updates = vec![(ub_idx, new_tag_bytes.to_vec())];
+    if new_tag_bytes.len() as u64 != old_len {
+        let ua_path = ubulk_rel_path
+            .strip_suffix(".ubulk")
+            .map(|s| format!("{s}.uasset"))
+            .ok_or(IoStoreError::Package("path is not a .ubulk"))?;
+        if !archive.contains(&ua_path) {
+            return Err(IoStoreError::Package(
+                "size-changing edit but no paired .uasset to patch",
+            ));
+        }
+        let ua_idx = archive.chunk_index_for(&ua_path)?;
+        let mut ua = archive.read(&ua_path)?;
+        patch_uasset_serial_size(&mut ua, old_len, new_tag_bytes.len() as u64)?;
+        updates.push((ua_idx, ua));
+    }
+    Ok(updates)
 }
 
 /// Core in-place surgery: append each `(chunk_index, new_bytes)` to the `.ucas`
