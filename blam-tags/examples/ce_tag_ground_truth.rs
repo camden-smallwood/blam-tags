@@ -99,7 +99,17 @@ fn jprop(v: &PropValue, resolve: &dyn Fn(i32) -> Option<(String, u64)>) -> Strin
                 .join(",")
         ),
         PropValue::Native(b) => format!("{{\"k\":\"native\",\"len\":{}}}", b.len()),
-        PropValue::Opaque => "{\"k\":\"opaque\"}".to_string(),
+        PropValue::Delegate { object, function } => {
+            format!("{{\"k\":\"delegate\",\"o\":{object},\"f\":{}}}", jstr(function))
+        }
+        PropValue::MulticastDelegate(list) => {
+            format!("{{\"k\":\"multicast\",\"n\":{}}}", list.len())
+        }
+        PropValue::FieldPath { path, owner } => {
+            format!("{{\"k\":\"fieldpath\",\"n\":{},\"o\":{owner}}}", path.len())
+        }
+        PropValue::Unset => "{\"k\":\"unset\"}".to_string(),
+        PropValue::Raw(b) => format!("{{\"k\":\"raw\",\"n\":{}}}", b.len()),
     }
 }
 

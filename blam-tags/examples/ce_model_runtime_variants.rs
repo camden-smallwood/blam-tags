@@ -103,14 +103,14 @@ fn main() {
                 .filter_map(|v| {
                     let s = v.as_struct()?;
                     let name = match s.get("VariantName")? {
-                        PropValue::Name(x) => x.clone(),
+                        PropValue::Name(x) => x.as_str().to_string(),
                         _ => return None,
                     };
                     let mut perms = BTreeMap::new();
                     if let Some(PropValue::Map(m)) = s.get("Permutations") {
                         for (k, val) in m {
                             if let (PropValue::Name(k), PropValue::Name(v)) = (k, val) {
-                                perms.insert(k.clone(), v.clone());
+                                perms.insert(k.as_str().to_string(), v.as_str().to_string());
                             }
                         }
                     }

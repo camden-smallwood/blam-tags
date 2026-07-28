@@ -35,7 +35,7 @@ fn kindof(v:&PropValue)->&'static str{ match v{
     PropValue::Bool(_)=>"bool",PropValue::Int(_)=>"int",PropValue::Float(_)=>"float",
     PropValue::Name(_)=>"name",PropValue::Str(_)=>"str",PropValue::Object(_)=>"obj",
     PropValue::SoftObject(_)=>"soft",PropValue::Array(_)=>"arr",PropValue::Map(_)=>"map",
-    PropValue::Struct(_)=>"struct",PropValue::Native(_)=>"native",PropValue::Opaque=>"opaque"} }
+    PropValue::Struct(_)=>"struct",PropValue::Native(_)=>"native",PropValue::Delegate{..}=>"delegate",PropValue::MulticastDelegate(_)=>"multicast",PropValue::FieldPath{..}=>"fieldpath",PropValue::Unset=>"unset",PropValue::Raw(_)=>"raw"} }
 fn refs(v:&PropValue, key:&str, hard:&mut BTreeMap<String,usize>, soft:&mut BTreeMap<String,usize>){
     match v{
         PropValue::Object(i)=>{ if *i!=0 { *hard.entry(key.into()).or_default()+=1; } }

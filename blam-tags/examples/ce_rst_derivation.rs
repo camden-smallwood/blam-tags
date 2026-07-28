@@ -71,7 +71,7 @@ fn main() {
                             Some(PropValue::Array(v)) => v
                                 .iter()
                                 .filter_map(|x| match x {
-                                    PropValue::Name(n) => Some(n.clone()),
+                                    PropValue::Name(n) => Some(n.as_str().to_string()),
                                     _ => None,
                                 })
                                 .collect(),

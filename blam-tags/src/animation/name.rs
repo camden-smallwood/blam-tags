@@ -157,7 +157,7 @@ impl AnimationName {
 pub fn base_state_candidates(state: &str) -> Vec<String> {
     let mut candidates: Vec<String> = Vec::new();
 
-    let mut add = |c: &mut Vec<String>, s: &str| {
+    let add = |c: &mut Vec<String>, s: &str| {
         if !s.is_empty() && !c.iter().any(|x| x == s) {
             c.push(s.to_string());
         }

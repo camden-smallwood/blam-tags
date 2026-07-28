@@ -15,7 +15,7 @@ const CV: EIoStoreTocVersion = EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash;
 const HV: EIoContainerHeaderVersion = EIoContainerHeaderVersion::SoftPackageReferences;
 fn walk(v:&PropValue, soft:&mut usize, hard:&mut usize, softpaths:&mut BTreeSet<String>, key:&str, hardkeys:&mut BTreeMap<String,usize>){
     match v {
-        PropValue::SoftObject(p)=>{ *soft+=1; if !p.package.is_empty(){ softpaths.insert(p.package.clone()); } }
+        PropValue::SoftObject(p)=>{ *soft+=1; if !p.package.as_str().is_empty(){ softpaths.insert(p.package.as_str().to_string()); } }
         PropValue::Object(i)=>{ if *i!=0 { *hard+=1; *hardkeys.entry(key.into()).or_default()+=1; } }
         PropValue::Array(a)=>for x in a { walk(x,soft,hard,softpaths,key,hardkeys) },
         PropValue::Map(m)=>for (k,val) in m { walk(k,soft,hard,softpaths,key,hardkeys); walk(val,soft,hard,softpaths,key,hardkeys) },

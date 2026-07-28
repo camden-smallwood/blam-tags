@@ -170,9 +170,22 @@ impl Usmap {
     /// classes in the shipped `.usmap`. Tag classes are all `array_dim = 1`,
     /// which is why they decoded correctly regardless.
     pub fn flattened_properties(&self, name: &str) -> Option<Vec<&UsmapProperty>> {
+        Some(self.flattened_slots(name)?.into_iter().map(|(p, _)| p).collect())
+    }
+
+    /// As [`Self::flattened_properties`], but pairing each slot with its index
+    /// *within* a static array (`0` for a plain property).
+    ///
+    /// A `UPROPERTY` declared `Thing[8]` occupies eight consecutive schema
+    /// slots, each independently present or absent in the fragment stream. The
+    /// index is what distinguishes them; without it, a reader keyed on property
+    /// name collapses all eight into whichever came last — which is exactly what
+    /// happened to `MaterialInstance::PhysicalMaterialMap[8]` and the 90 other
+    /// static-array properties the mappings declare.
+    pub fn flattened_slots(&self, name: &str) -> Option<Vec<(&UsmapProperty, u8)>> {
         // Walk from the most-derived class up to the root, emitting each
         // struct's own properties as we go (derived→base).
-        let mut out: Vec<&UsmapProperty> = Vec::new();
+        let mut out: Vec<(&UsmapProperty, u8)> = Vec::new();
         let mut cur = self.get(name)?;
         loop {
             // Each struct's own properties, in schema-index order, each
@@ -180,8 +193,8 @@ impl Usmap {
             let mut own: Vec<&UsmapProperty> = cur.properties.iter().collect();
             own.sort_by_key(|p| p.schema_index);
             for p in own {
-                for _ in 0..p.array_dim.max(1) {
-                    out.push(p);
+                for i in 0..p.array_dim.max(1) {
+                    out.push((p, i));
                 }
             }
             match cur.super_name.as_deref().and_then(|s| self.get(s)) {
