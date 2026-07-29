@@ -24,7 +24,10 @@
 //! | [`crate::iostore::asset::mesh_sync`] | Campaign Evolved mesh-sync extraction |
 
 pub use super::archive::{ExportContext, PackageResolver};
-pub use super::export::{read_export_struct, read_export_struct_len, read_export_with_trailer};
+pub use super::export::{
+    read_export, read_export_struct, read_export_struct_len, read_export_with_trailer,
+    write_export, Export, Trailer, NO_PROPERTY_BLOCK,
+};
 pub use super::property::{can_serialize_as_zero, should_save_as_zero};
 pub use super::reflect::{read_datatable, read_ufunction_script, read_userdefined_struct_layout};
 pub use super::value::{

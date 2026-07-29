@@ -4,7 +4,7 @@
 use anyhow::{bail, Context, Result};
 
 use super::archive::{tail_why, ExportContext, Reader};
-use super::block::read_struct;
+use super::block::{emit_block, read_struct};
 use super::tails::{read_class_native_tail, read_rig_hierarchy, read_rigvm};
 use super::usmap::Usmap;
 use super::value::PropertyBlock;
@@ -121,6 +121,93 @@ pub fn read_export_with_trailer(
     Ok((props, r.o))
 }
 
+/// The `UObject` trailer written after the property block.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Trailer {
+    /// Not written at all: a class-default object, or the export ended before
+    /// the four-byte flag. Also what a *malformed* flag decodes to — see
+    /// [`read_export`] — in which case those bytes stay in the tail.
+    #[default]
+    Absent,
+    /// `hasGuid == 0`.
+    NoGuid,
+    /// `hasGuid == 1`, followed by the GUID.
+    Guid([u8; 16]),
+}
+
+/// One export, decomposed into the parts a writer needs.
+///
+/// The tail — everything each class in the inheritance chain natively
+/// serializes after the reflected properties — is kept as bytes. That is 71% of
+/// the corpus and 4.88 GiB, and modeling it is Phase 4. Keeping it verbatim
+/// makes the export round trip exact *now*, and gives every future tail model
+/// something to be checked against: convert one class, and the gate proves the
+/// model is lossless against the span it replaces.
+#[derive(Debug, Clone, Default)]
+pub struct Export {
+    /// `None` for the classes whose `Serialize` never calls `Super`
+    /// (`URigVM`, `URigHierarchy`), which carry no property block at all.
+    pub block: Option<PropertyBlock>,
+    pub trailer: Trailer,
+    pub tail: Vec<u8>,
+}
+
+/// Split an export into property block, `UObject` trailer and unmodeled tail.
+pub fn read_export(
+    export: &[u8],
+    names: &[String],
+    usmap: &Usmap,
+    class: &str,
+    object_flags: u32,
+) -> Result<Export> {
+    /// `RF_ClassDefaultObject`.
+    const RF_CLASS_DEFAULT_OBJECT: u32 = 0x10;
+
+    if NO_PROPERTY_BLOCK.contains(&class) {
+        return Ok(Export { block: None, trailer: Trailer::Absent, tail: export.to_vec() });
+    }
+    let mut r = Reader::new(export, names);
+    let block = read_struct(&mut r, class, usmap, 0)?;
+    let mut trailer = Trailer::Absent;
+    if object_flags & RF_CLASS_DEFAULT_OBJECT == 0 && export.len() >= r.o + 4 {
+        let at = r.o;
+        match r.u32()? {
+            0 => trailer = Trailer::NoGuid,
+            1 => trailer = Trailer::Guid(r.take(16)?.try_into().expect("16 bytes")),
+            // Not a boolean, so this export does not follow the trailer model.
+            // Rewind and let the bytes belong to the tail, which keeps the
+            // round trip exact rather than failing a good property decode.
+            _ => r.o = at,
+        }
+    }
+    Ok(Export { block: Some(block), trailer, tail: export[r.o..].to_vec() })
+}
+
+/// Reassemble the bytes [`read_export`] took apart.
+///
+/// Inverse by construction, and measured as such: `ce_export_roundtrip` runs it
+/// over every export in the shipped corpus.
+pub fn write_export(class: &str, ex: &Export, usmap: &Usmap) -> Result<Vec<u8>> {
+    let mut out = match &ex.block {
+        Some(b) => emit_block(class, b, usmap)?,
+        None => Vec::new(),
+    };
+    match &ex.trailer {
+        Trailer::Absent => {}
+        Trailer::NoGuid => out.extend_from_slice(&0u32.to_le_bytes()),
+        Trailer::Guid(g) => {
+            out.extend_from_slice(&1u32.to_le_bytes());
+            out.extend_from_slice(g);
+        }
+    }
+    out.extend_from_slice(&ex.tail);
+    Ok(out)
+}
+
+/// Classes whose `Serialize` never calls `Super`, so they have no property
+/// block, no `UObject` trailer and no inherited tails.
+pub const NO_PROPERTY_BLOCK: &[&str] = &["RigVM", "RigHierarchy"];
+
 /// The `UObject` trailer every non-CDO export writes after its property block:
 /// a four-byte `hasGuid` and, when set, the 16-byte GUID.
 pub(super) fn read_uobject_trailer(r: &mut Reader, object_flags: u32) -> Result<()> {
@@ -132,5 +219,95 @@ pub(super) fn read_uobject_trailer(r: &mut Reader, object_flags: u32) -> Result<
         0 => Ok(()),
         1 => r.take(16).map(|_| ()),
         other => bail!("UObject hasGuid is {other}, not a bool (@ {})", r.o - 4),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::iostore::usmap::{PropertyType, UsmapProperty};
+
+    /// A one-`int32` class, so an export is a two-byte header, four bytes of
+    /// value, the trailer, then whatever the class serializes natively.
+    fn probe() -> Usmap {
+        let mut usmap = Usmap::meteorite().expect("bundled usmap");
+        usmap.register_struct(
+            "ExportProbe",
+            None,
+            vec![UsmapProperty {
+                schema_index: 0,
+                array_dim: 1,
+                name: "Value".to_string(),
+                ty: PropertyType::Int,
+            }],
+        );
+        usmap
+    }
+
+    fn body(trailer: &[u8], tail: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x00, 0x03]; // one value present, is-last
+        v.extend_from_slice(&0x1234_5678i32.to_le_bytes());
+        v.extend_from_slice(trailer);
+        v.extend_from_slice(tail);
+        v
+    }
+
+    /// Each trailer shape must survive, and the tail must come back untouched.
+    #[test]
+    fn export_decomposition_round_trips() {
+        let usmap = probe();
+        let tail: Vec<u8> = (0u8..32).collect();
+        for (trailer_bytes, expect) in [
+            (vec![0u8, 0, 0, 0], Trailer::NoGuid),
+            (
+                [1u8, 0, 0, 0].iter().copied().chain(0u8..16).collect::<Vec<u8>>(),
+                Trailer::Guid(core::array::from_fn(|i| i as u8)),
+            ),
+        ] {
+            let raw = body(&trailer_bytes, &tail);
+            let ex = read_export(&raw, &[], &usmap, "ExportProbe", 0).expect("read");
+            assert_eq!(ex.trailer, expect);
+            assert_eq!(ex.tail, tail, "tail was not preserved");
+            assert_eq!(write_export("ExportProbe", &ex, &usmap).expect("write"), raw);
+        }
+    }
+
+    /// A flag that is not a boolean means this export does not follow the
+    /// trailer model. Those bytes must stay in the tail rather than being
+    /// consumed as a trailer, or they would be dropped on write.
+    #[test]
+    fn a_malformed_trailer_flag_stays_in_the_tail() {
+        let usmap = probe();
+        let raw = body(&[0x99, 0x88, 0x77, 0x66], &[1, 2, 3]);
+        let ex = read_export(&raw, &[], &usmap, "ExportProbe", 0).expect("read");
+        assert_eq!(ex.trailer, Trailer::Absent);
+        assert_eq!(ex.tail, vec![0x99, 0x88, 0x77, 0x66, 1, 2, 3]);
+        assert_eq!(write_export("ExportProbe", &ex, &usmap).expect("write"), raw);
+    }
+
+    /// A class-default object writes no trailer at all, so the bytes after the
+    /// block are entirely tail.
+    #[test]
+    fn a_class_default_object_has_no_trailer() {
+        const RF_CLASS_DEFAULT_OBJECT: u32 = 0x10;
+        let usmap = probe();
+        let raw = body(&[], &[0, 0, 0, 0, 7]);
+        let ex = read_export(&raw, &[], &usmap, "ExportProbe", RF_CLASS_DEFAULT_OBJECT)
+            .expect("read");
+        assert_eq!(ex.trailer, Trailer::Absent);
+        assert_eq!(ex.tail, vec![0, 0, 0, 0, 7]);
+        assert_eq!(write_export("ExportProbe", &ex, &usmap).expect("write"), raw);
+    }
+
+    /// `URigVM`/`URigHierarchy` never call `Super::Serialize`, so they have no
+    /// block to emit a header for — writing one would corrupt them.
+    #[test]
+    fn a_class_without_a_property_block_is_all_tail() {
+        let usmap = probe();
+        let raw: Vec<u8> = (0u8..24).collect();
+        let ex = read_export(&raw, &[], &usmap, "RigVM", 0).expect("read");
+        assert!(ex.block.is_none(), "RigVM must not decode a property block");
+        assert_eq!(ex.tail, raw);
+        assert_eq!(write_export("RigVM", &ex, &usmap).expect("write"), raw);
     }
 }
