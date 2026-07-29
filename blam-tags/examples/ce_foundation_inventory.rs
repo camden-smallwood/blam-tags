@@ -6,9 +6,6 @@
 //!
 //!  1. **Class tails** — what each class in an inheritance chain appends after
 //!     the reflected properties. Parsed exactly, kept as a span.
-//!  2. **Hand-written struct spans** — `BlockLayout::Native`, structs whose
-//!     `Serialize` lives in code rather than in a schema. Decoded into fields
-//!     *and* kept as a span, because only the span can be written back.
 //!  3. **Walk stops** — the handful of places the reader declines to continue.
 //!
 //! Reports each separately, with the counts a plan can be ordered by.
@@ -19,7 +16,7 @@ use std::io::Cursor;
 
 use blam_tags::iostore::container_header::EIoContainerHeaderVersion;
 use blam_tags::iostore::object::unversioned::{
-    read_export, walk_export, BlockLayout, ExportContext, PropValue, PropertyBlock,
+    read_export, walk_export, ExportContext, PropValue, PropertyBlock,
 };
 use blam_tags::iostore::package::builder::read_payloads;
 use blam_tags::iostore::script_objects::ScriptObjects;
@@ -31,38 +28,6 @@ use blam_tags::iostore::IoStoreArchive;
 const PAKS: &str = "/Users/camden/Halo/halo-campaign-evolved_pc/Meteorite/Content/Paks";
 const CV: EIoStoreTocVersion = EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash;
 const HV: EIoContainerHeaderVersion = EIoContainerHeaderVersion::SoftPackageReferences;
-
-/// Count every `BlockLayout::Native` span reachable from a value.
-fn native_spans(v: &PropValue, out: &mut BTreeMap<String, (u64, u64)>, depth: usize) {
-    if depth > 24 {
-        return;
-    }
-    match v {
-        PropValue::Struct(b) => {
-            if let BlockLayout::Native { name, bytes } = &b.layout {
-                let e = out.entry(name.to_string()).or_default();
-                e.0 += 1;
-                e.1 += bytes.len() as u64;
-            }
-            for (_, inner) in b.iter() {
-                native_spans(inner, out, depth + 1);
-            }
-        }
-        PropValue::Array(items) => items.iter().for_each(|x| native_spans(x, out, depth + 1)),
-        PropValue::Map(m) => m.iter().for_each(|(k, val)| {
-            native_spans(k, out, depth + 1);
-            native_spans(val, out, depth + 1);
-        }),
-        PropValue::WithRemovals { inner, .. } => native_spans(inner, out, depth + 1),
-        _ => {}
-    }
-}
-
-fn block_spans(b: &PropertyBlock, out: &mut BTreeMap<String, (u64, u64)>) {
-    for (_, v) in b.iter() {
-        native_spans(v, out, 0);
-    }
-}
 
 fn main() {
     let usmap_path = std::env::args().nth(1).unwrap_or_else(|| {
@@ -91,7 +56,6 @@ fn main() {
     utocs.sort();
 
     let mut tails: BTreeMap<String, (u64, u64)> = BTreeMap::new();
-    let mut natives: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     let mut stops: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     let (mut total, mut no_schema, mut with_tail) = (0u64, 0u64, 0u64);
     let (mut tail_bytes, mut stop_bytes) = (0u64, 0u64);
@@ -131,9 +95,6 @@ fn main() {
                     e.0 += 1;
                     e.1 += parts.tail.len() as u64;
                 }
-                if let Some(block) = parts.block.as_ref() {
-                    block_spans(block, &mut natives);
-                }
                 if let Ok(walk) = walk_export(
                     &payloads[i],
                     &names,
@@ -153,9 +114,6 @@ fn main() {
         }
     }
 
-    let native_count: u64 = natives.values().map(|(n, _)| n).sum();
-    let native_bytes: u64 = natives.values().map(|(_, b)| b).sum();
-
     println!("== exports ==");
     println!("  total                {total}");
     println!("  no .usmap schema     {no_schema}  (Blueprint-generated classes)");
@@ -163,7 +121,7 @@ fn main() {
     println!();
     println!("== retained as bytes, by population ==");
     println!("  class tails          {tail_bytes:>13} bytes  ({:.2} GiB) across {} classes", tail_bytes as f64 / (1u64<<30) as f64, tails.len());
-    println!("  hand-written structs {native_bytes:>13} bytes  ({native_count} spans, {} distinct structs)", natives.len());
+    println!("  hand-written structs              0 bytes  (all 23 typed)");
     println!("  behind a walk stop   {stop_bytes:>13} bytes  ({} classes)", stops.len());
     println!();
 
@@ -177,15 +135,6 @@ fn main() {
         if matches!(i + 1, 1 | 3 | 5 | 9 | 22 | 36) || i + 1 == tv.len() {
             println!("  {:>4} classes -> {pct:>6.2}%", i + 1);
         }
-    }
-    println!();
-
-    println!("== hand-written structs, by span count ==");
-    let mut nv: Vec<_> = natives.iter().collect();
-    nv.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
-    println!("  {:<44} {:>10} {:>12}", "struct", "spans", "bytes");
-    for (name, (n, b)) in nv.iter() {
-        println!("  {name:<44} {n:>10} {b:>12}");
     }
     println!();
 

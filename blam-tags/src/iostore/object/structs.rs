@@ -210,291 +210,22 @@ pub(super) fn read_shader_value_type(r: &mut Reader, depth: usize) -> Result<()>
     Ok(())
 }
 
-/// A struct whose layout lives in hand-written `Serialize` code rather than in
-/// a schema.
+/// The two hand-written structs that decode to a *value* rather than to a
+/// struct, so they never needed a typed model of their own.
 ///
-/// The decoded fields are what readers want; the bytes are what a writer needs,
-/// because regenerating one of these means re-implementing its `Serialize` in
-/// the write direction and there are about thirty of them. Retaining the span
-/// makes the round trip exact today, and converting any single struct to a real
-/// writer later is then verifiable *against the span it replaces* — which is the
-/// opposite of having to trust a new layout model.
+/// Everything else that used to live here is now in [`super::hand_written`],
+/// read into typed fields and written back from them. The retained-span wrapper
+/// that used to surround this function is gone with them.
 pub(super) fn read_native_variable_struct(
     r: &mut Reader,
     name: &str,
     usmap: &Usmap,
     depth: usize,
 ) -> Result<Option<PropValue>> {
-    // Shapes that have a typed model are read straight into it and never take
-    // the retained-span path below.
     if let Some(typed) = super::hand_written::HandWritten::read(r, name, usmap, depth)? {
         return Ok(Some(PropValue::HandWritten(typed)));
     }
-    let start = r.o;
-    let decoded = read_native_variable_struct_inner(r, name, usmap, depth)?;
-    Ok(decoded.map(|v| match v {
-        PropValue::Struct(mut b) => {
-            b.layout = BlockLayout::Native { name: Arc::from(name), bytes: r.since(start) };
-            PropValue::Struct(b)
-        }
-        // A few of these decode to a scalar rather than a struct; those are
-        // already writable by their own type's rules.
-        other => other,
-    }))
-}
-
-fn read_native_variable_struct_inner(
-    r: &mut Reader,
-    name: &str,
-    usmap: &Usmap,
-    depth: usize,
-) -> Result<Option<PropValue>> {
     Ok(Some(match name {
-        // `FShaderValueTypeHandle` declares `WithSerializer`
-        // (ShaderParamTypeDefinition.h), so it is never a property block — it
-        // is `operator<<(FArchive&, FShaderValueTypeHandle&)`
-        // (ShaderParamTypeDefinition.cpp:624), which writes the pointed-at
-        // `FShaderValueType` inline: `uint8 Type`, the `bIsDynamicArray` flag
-        // (four bytes, being an `FArchive` bool), and then one of two shapes.
-        // A `Struct` type writes its name and its elements — each of which is
-        // an `FName` and another handle, so this recurses. Anything else
-        // writes a `uint8` dimension type plus the counts that dimension
-        // implies; all three counts are `uint8`.
-        "ShaderValueTypeHandle" => {
-            read_shader_value_type(r, depth)?;
-            PropValue::Struct(PropertyBlock::default())
-        }
-        // `FMovieSceneTimeWarpVariant::Serialize` (MovieSceneTimeWarpVariant.cpp:171)
-        // runs through `FMovieSceneNumericVariant::SerializeCustom`
-        // (MovieSceneNumericVariant.cpp:215), which opens with an `FArchive`
-        // bool: a literal variant is just the NaN-boxed `double`, and anything
-        // else is a `uint8 EMovieSceneTimeWarpType` followed by that type's
-        // payload. Only `Custom` writes an object reference; the rest write an
-        // ordinary property block for their own small struct, and
-        // `FixedPlayRate` writes nothing at all.
-        "MovieSceneTimeWarpVariant" => {
-            let mut s = BTreeMap::new();
-            if r.u32()? != 0 {
-                s.insert("Literal".to_string(), PropValue::Float(f64::from_bits(r.u64()?)));
-            } else {
-                let ty = r.u8()?;
-                s.insert("Type".to_string(), PropValue::Int(ty as i64));
-                let payload = match ty {
-                    0 => None,                                    // FixedPlayRate
-                    1 => {
-                        r.i32()?; // Custom: UMovieSceneNumericVariantGetter*
-                        None
-                    }
-                    2 => Some("MovieSceneTimeWarpFixedFrame"),
-                    3 => Some("FrameRate"),
-                    4 => Some("MovieSceneTimeWarpLoop"),
-                    5 => Some("MovieSceneTimeWarpClamp"),
-                    6 => Some("MovieSceneTimeWarpLoopFloat"),
-                    7 => Some("MovieSceneTimeWarpClampFloat"),
-                    _ => bail!("unknown EMovieSceneTimeWarpType {ty} @ {}", r.o - 1),
-                };
-                if let Some(p) = payload {
-                    s.insert(
-                        "Payload".to_string(),
-                        PropValue::Struct(read_struct(r, p, usmap, depth + 1)?),
-                    );
-                }
-            }
-            PropValue::Struct(s.into())
-        }
-        // `FPerQualityLevelProperty` looks like its `FPerPlatform*` sibling —
-        // `bool bCooked` then `Default` — but its `PerQuality` override map is
-        // **not** behind the cooked check (`PerQualityLevelProperties.cpp`), so
-        // the `TMap<int32, Value>` is always written and the struct is not a
-        // fixed 8 bytes. Cooking strips the map to empty, which is why reading
-        // it as 8 only drifts by the map's four count bytes — enough to land
-        // the next property's `FloatInterval` on a cull distance of 10000 and
-        // read `0x2710` as an unversioned header.
-        "PerQualityLevelInt" | "PerQualityLevelFloat" => {
-            let mut s = BTreeMap::new();
-            s.insert("bCooked".to_string(), PropValue::Bool(r.u32()? != 0));
-            let default = r.i32()?;
-            s.insert(
-                "Default".to_string(),
-                if name.ends_with("Float") {
-                    PropValue::Float(f32::from_bits(default as u32) as f64)
-                } else {
-                    PropValue::Int(default as i64)
-                },
-            );
-            let n = native_count(r, "PerQuality overrides")?;
-            r.take(n * 8)?; // int32 quality level -> int32/float value
-            PropValue::Struct(s.into())
-        }
-        // `FInstancedPropertyBag` holds a struct type invented at runtime, so
-        // there is no schema for its contents anywhere — it serializes the
-        // property *descriptors* and then the value block laid out by them.
-        // Helpfully it also writes that block's byte length, so the payload can
-        // be skipped outright without reconstructing the bag's layout.
-        //
-        // `FPropertyBagPropertyDesc` is 34 bytes plus one byte per nested
-        // container: `ValueTypeObject` (`FPackageIndex`), `ID` (`FGuid`),
-        // `Name` (`FName`), `ValueType` (a `uint8` enum), the container-type
-        // list (`uint8` count + that many bytes), and `bHasMetaData` — four
-        // bytes, being an `FArchive` bool. Metadata itself is editor-only.
-        "InstancedPropertyBag" => {
-            let start = r.o;
-            if r.u32()? != 0 {
-                let descs = native_count(r, "property bag descriptors")?;
-                for _ in 0..descs {
-                    r.i32()?; // ValueTypeObject
-                    r.take(16)?; // ID
-                    r.name()?; // Name
-                    r.u8()?; // ValueType
-                    let containers = r.u8()? as usize;
-                    r.take(containers)?;
-                    if r.u32()? != 0 {
-                        bail!("property-bag descriptor carries editor-only metadata");
-                    }
-                }
-                let serial = r.i32()?;
-                if serial < 0 {
-                    bail!("negative property-bag payload size {serial}");
-                }
-                r.take(serial as usize)?;
-            }
-            PropValue::Raw(r.since(start))
-        }
-        // `FFontData::Serialize` writes a compact cooked form instead of a
-        // property block: `bool bIsCooked` (four bytes) then the font-face
-        // asset reference, and only when there is no face asset the filename,
-        // hinting and loading policy. `SubFaceIndex` always follows.
-        "FontData" => {
-            let mut s = BTreeMap::new();
-            if r.u32()? == 0 {
-                bail!("uncooked FFontData uses the tagged-property form");
-            }
-            let face = r.i32()?;
-            s.insert("FontFaceAsset".to_string(), PropValue::Object(face));
-            if face == 0 {
-                s.insert("FontFilename".to_string(), PropValue::Str(r.fstring()?));
-                r.u8()?; // Hinting
-                r.u8()?; // LoadingPolicy
-            }
-            s.insert("SubFaceIndex".to_string(), PropValue::Int(r.i32()? as i64));
-            PropValue::Struct(s.into())
-        }
-        // A `Serialize` override that returns **false** means "I wrote a prefix
-        // but did not consume the struct" — `UScriptStruct::SerializeItem` then
-        // still writes the normal unversioned property block after it.
-        // `FMaterialOverrideNanite` does exactly that: `bool bCooked` (four bytes)
-        // and, when cooked, the resolved override material as an `FPackageIndex`
-        // (its editor-side soft ref is not written), *followed by* its own
-        // property block. Measured on `MI_Spartan_Shield_Screen_Recharge_Mesh`
-        // and `MI_Elite_Shield_Shockwave`: `01 00 00 00 | fe ff ff ff` then a
-        // 2- or 3-byte property block, after which `ScalarParameterValues`
-        // counts read as 13 and 2. Consuming only the prefix desyncs the
-        // parameter arrays that follow.
-        "MaterialOverrideNanite" => {
-            let mut s = BTreeMap::new();
-            let cooked = r.i32()? != 0;
-            s.insert("bCooked".to_string(), PropValue::Bool(cooked));
-            if cooked {
-                s.insert("OverrideMaterial".to_string(), PropValue::Object(r.i32()?));
-            }
-            s.extend(read_struct(r, name, usmap, depth + 1)?);
-            PropValue::Struct(s.into())
-        }
-        // `FSkeletalMeshAreaWeightedTriangleSampler`, i.e. an
-        // `FWeightedRandomSampler`. Measured on `SK_Cov_BigDoor_rig`, whose
-        // sampler is the 12 zero bytes of two empty arrays and a zero weight.
-        "SkeletalMeshSamplingLODBuiltData" => {
-            let mut s = BTreeMap::new();
-            s.insert("AreaWeightedTriangleSampler".to_string(), read_weighted_random_sampler(r)?);
-            PropValue::Struct(s.into())
-        }
-        // `TArray<int32> TriangleIndices`, `TArray<int32> BoneIndices`, then the
-        // region's area-weighted sampler. Measured on `SK_Manny`: 112 triangle
-        // indices (every one a multiple of 3, i.e. index-buffer offsets around
-        // 35,049), 62 bone indices (12..73 — far too small to be vertex indices
-        // for those triangles), then a 112-entry sampler whose `Prob` values all
-        // lie in [0,1].
-        // `Vertices` is written last and is gated on
-        // `FNiagaraObjectVersion::SkeletalMeshVertexSampling` — note it comes
-        // *after* the sampler, not in declaration order between the triangle
-        // and bone arrays. Omitting it leaves every region element short by
-        // `4 + 4 * NumVertices`, which on `SK_Manny` accumulates until the
-        // `UObject` `hasGuid` trailer lands on garbage and the whole class chain
-        // stops before `USkeletalMesh::Serialize` ever runs.
-        "SkeletalMeshSamplingRegionBuiltData" => {
-            let mut s = BTreeMap::new();
-            s.insert("TriangleIndices".to_string(), read_native_i32_array(r)?);
-            s.insert("BoneIndices".to_string(), read_native_i32_array(r)?);
-            s.insert("AreaWeightedSampler".to_string(), read_weighted_random_sampler(r)?);
-            s.insert("Vertices".to_string(), read_native_i32_array(r)?);
-            PropValue::Struct(s.into())
-        }
-        // `FNiagaraVariableBase` writes its `Name` and `TypeDefHandle` natively;
-        // the handle in turn serializes an `FNiagaraTypeDefinition` *by value*,
-        // which — having no serializer of its own — lands as an ordinary
-        // unversioned property block. `FNiagaraVariableWithOffset` then appends
-        // its `Offset`. (Its `StructConverter` is not written to a cooked
-        // stream.) Measured on `NS_Brute_Beatdown_Stomp_var4`, whose 13 sorted
-        // parameter offsets read 0, 16, 32, … — the strides into `ParameterData`.
-        "NiagaraVariableBase" | "NiagaraVariableWithOffset" | "NiagaraVariable"
-        | "NiagaraDataChannelVariable" => {
-            let mut s = BTreeMap::new();
-            s.insert("Name".to_string(), PropValue::Name(r.fname()?));
-            s.insert(
-                "TypeDefHandle".to_string(),
-                PropValue::Struct(read_struct(r, "NiagaraTypeDefinition", usmap, depth + 1)?),
-            );
-            // `FNiagaraVariableWithOffset` appends its `Offset`;
-            // `FNiagaraVariable` instead appends its `VarData` payload
-            // (`TArray<uint8>`) — measured on `NS_collision`.
-            if name == "NiagaraVariableWithOffset" {
-                s.insert("Offset".to_string(), PropValue::Int(r.i32()? as i64));
-            } else if name == "NiagaraVariable" {
-                let n = r.i32()?;
-                if !(0..=100_000_000).contains(&n) {
-                    bail!("implausible NiagaraVariable VarData length {n} @ {}", r.o - 4);
-                }
-                s.insert("VarData".to_string(), PropValue::Raw(r.take(n as usize)?.to_vec()));
-            }
-            PropValue::Struct(s.into())
-        }
-        // `FUniversalObjectLocatorFragment` is polymorphic: it writes the `FName`
-        // of its registered fragment type, then that type's payload as an
-        // ordinary unversioned property block. Measured on `LS_FrontEnd`:
-        // an `FName`, then `00 03` (one value present) and the `FString`
-        // `"CameraComponent"` — a sub-object path.
-        "UniversalObjectLocatorFragment" => {
-            let fragment_type = r.fname()?;
-            let payload_struct = locator_fragment_payload(&fragment_type).with_context(|| {
-                format!("unmapped universal object locator fragment type '{fragment_type}'")
-            })?;
-            let mut s = BTreeMap::new();
-            s.insert("FragmentType".to_string(), PropValue::Name(fragment_type));
-            if !payload_struct.is_empty() {
-                s.extend(read_struct(r, payload_struct, usmap, depth + 1)?);
-            }
-            PropValue::Struct(s.into())
-        }
-        // `FMaterialLayersFunctionsTree`: a node array (four int32 ids each), a
-        // payload array (layer + blend), then the root index.
-        "MaterialLayersFunctionsTree" => {
-            let nodes = native_count(r, "layer tree nodes")?;
-            r.take(nodes * 16)?;
-            let payloads = native_count(r, "layer tree payloads")?;
-            r.take(payloads * 8)?;
-            let mut s = BTreeMap::new();
-            s.insert("Root".to_string(), PropValue::Int(r.i32()? as i64));
-            PropValue::Struct(s.into())
-        }
-        // `FSoftObjectPath` carries a custom serializer, so despite listing
-        // `AssetPath`/`SubPathString` in the `.usmap` it writes its parts
-        // back-to-back with no property header — the same shape as the
-        // `SoftObjectProperty` value reader. Measured on `LS_C10_PerfCap_01`:
-        // two `FName`s then the 67-character sub-path
-        // `PersistentLevel.CineCameraActor…`.
-        // `FSoftClassPath` derives from `FSoftObjectPath` and inherits its
-        // serializer. Measured on a `NavigationSystemModuleConfig`, whose
-        // 29-byte export resolves exactly: two `FName`s and an empty sub-path.
         // `FGameplayTagContainer` writes a plain array of `FGameplayTag`, each
         // just its tag `FName`.
         "GameplayTagContainer" => {
@@ -505,127 +236,21 @@ fn read_native_variable_struct_inner(
             }
             PropValue::Array(tags)
         }
+        // `FSoftObjectPath` carries a custom serializer, so despite listing
+        // `AssetPath`/`SubPathString` in the `.usmap` it writes its parts
+        // back-to-back with no property header — the same shape as the
+        // `SoftObjectProperty` value reader. `FSoftClassPath` derives from it
+        // and inherits the serializer.
+        //
+        // NOTE: `FTopLevelAssetPath` is deliberately NOT handled here. Its
+        // fields are written natively only as *part of* `FSoftObjectPath`'s
+        // serializer; as a property in its own right it uses ordinary reflected
+        // serialization, and treating it as native broke all 72 of them.
         "SoftObjectPath" | "SoftClassPath" => {
             let package = r.fname()?;
             let asset = r.fname()?;
             let sub_path = r.fstring()?;
             PropValue::SoftObject(SoftObjectPath { package, asset, sub_path })
-        }
-        // NOTE: `FTopLevelAssetPath` is deliberately NOT handled here. Its
-        // fields are written natively only as *part of* `FSoftObjectPath`'s
-        // serializer; as a property in its own right it uses ordinary reflected
-        // serialization. Treating it as native broke all 72
-        // `WorldPartitionLevelStreamingPolicy` exports, whose
-        // `SourceWorldAssetPath` begins with its own fragment header.
-        // `FNiagaraDataInterfaceGPUParamInfo`: the HLSL symbol and DI class name
-        // as `FString`s, then the generated-function table. Note there is no
-        // `ShaderParametersOffset` in the stream despite the `.usmap` listing
-        // one. Confirmed against CUE4Parse's reader and against
-        // `NS_collision`, where the first entry reads `Emitter_GridMesh` /
-        // `NiagaraDataInterfaceDynamicMesh` with two generated functions.
-        "NiagaraDataInterfaceGPUParamInfo" => {
-            let mut s = BTreeMap::new();
-            s.insert("DataInterfaceHLSLSymbol".to_string(), PropValue::Str(r.fstring()?));
-            s.insert("DIClassName".to_string(), PropValue::Str(r.fstring()?));
-            let n = native_count(r, "GeneratedFunctions")?;
-            let mut fns = Vec::with_capacity(n.min(PREALLOC_CAP));
-            for _ in 0..n {
-                fns.push(read_niagara_generated_function(r)?);
-            }
-            s.insert("GeneratedFunctions".to_string(), PropValue::Array(fns));
-            PropValue::Struct(s.into())
-        }
-        // `FMovieSceneChannel<T>`: two extrapolation enums, then the key times
-        // and key values as **bulk** arrays — each preceded by its own
-        // serialized element size, which lets them be consumed without modeling
-        // `FMovieSceneValue`/`FMovieSceneTangentData` at all — then the default
-        // value, a four-byte `bHasDefaultValue`, the `FFrameRate` tick
-        // resolution and a four-byte `bShowCurve`.
-        "MovieSceneFloatChannel" | "MovieSceneDoubleChannel" => {
-            let value_size = if name == "MovieSceneFloatChannel" { 4 } else { 8 };
-            let mut s = BTreeMap::new();
-            s.insert("PreInfinityExtrap".to_string(), PropValue::Int(r.u8()? as i64));
-            s.insert("PostInfinityExtrap".to_string(), PropValue::Int(r.u8()? as i64));
-            let times = read_bulk_array(r, "Times")?;
-            let values = read_bulk_array(r, "Values")?;
-            s.insert("NumKeys".to_string(), PropValue::Int(times as i64));
-            s.insert("NumValues".to_string(), PropValue::Int(values as i64));
-            s.insert(
-                "DefaultValue".to_string(),
-                if value_size == 4 {
-                    PropValue::Float(r.f32()? as f64)
-                } else {
-                    PropValue::Float(r.f64()?)
-                },
-            );
-            s.insert("bHasDefaultValue".to_string(), PropValue::Bool(r.u32()? != 0));
-            s.insert("TickResolutionNumerator".to_string(), PropValue::Int(r.i32()? as i64));
-            s.insert("TickResolutionDenominator".to_string(), PropValue::Int(r.i32()? as i64));
-            s.insert("bShowCurve".to_string(), PropValue::Bool(r.u32()? != 0));
-            PropValue::Struct(s.into())
-        }
-        // `FPCGPoint` leads with a byte mask saying which of its fields were
-        // written, then the transform, then only the flagged fields. The
-        // transform goes through this build's *reflected* `FTransform` (it has
-        // no native serializer here), not a fixed-size blob.
-        "PCGPoint" => {
-            let mask = r.u8()?;
-            let mut s = BTreeMap::new();
-            // Inside a hand-written serializer an `FTransform` is written raw —
-            // `FQuat` (4 × f64) then translation and scale (3 × f64 each), 80
-            // bytes — unlike an `FTransform` *property*, which goes through the
-            // unversioned schema. Measured here: identity rotation and unit
-            // scale land exactly, and `BoundsMin` follows at the right offset.
-            s.insert("Transform".to_string(), PropValue::Raw(r.take(80)?.to_vec()));
-            if mask & (1 << 0) != 0 {
-                s.insert("Density".to_string(), PropValue::Float(r.f32()? as f64));
-            }
-            for (bit, field) in [(1usize, "BoundsMin"), (2, "BoundsMax")] {
-                if mask & (1 << bit) != 0 {
-                    s.insert(field.to_string(), PropValue::Raw(r.take(24)?.to_vec()));
-                }
-            }
-            if mask & (1 << 3) != 0 {
-                s.insert("Color".to_string(), PropValue::Raw(r.take(32)?.to_vec()));
-            }
-            if mask & (1 << 4) != 0 {
-                s.insert("Steepness".to_string(), PropValue::Float(r.f32()? as f64));
-            }
-            if mask & (1 << 5) != 0 {
-                s.insert("Seed".to_string(), PropValue::Int(r.i32()? as i64));
-            }
-            if mask & (1 << 6) != 0 {
-                s.insert("MetadataEntry".to_string(), PropValue::Int(r.u64()? as i64));
-            }
-            PropValue::Struct(s.into())
-        }
-        // `FMovieSceneEvaluationFieldEntityTree` is a
-        // `TMovieSceneEvaluationTree<FEntityAndMetaDataIndex>`: a root node,
-        // then two entry containers (child nodes, and the payload data). Each
-        // container is an array of 12-byte `FEntry` records followed by an array
-        // of items. A tree node is a `TRange<FFrameNumber>` (10 bytes, as
-        // measured for `FMovieSceneFrameRange`) plus a parent handle and two
-        // entry handles — 26 bytes.
-        // `FEntityAndMetaDataIndex` is two `int32`s.
-        "MovieSceneEvaluationFieldEntityTree" => read_evaluation_tree(r, 8)?,
-        // `FMovieSceneSubSequenceTreeEntry` is a `uint32` sequence id and a
-        // one-byte flags enum (the warp counter that older streams carried is
-        // gone in 5.5).
-        "MovieSceneSubSequenceTree" => read_evaluation_tree(r, 5)?,
-        // The MovieScene "inline value" pointers are polymorphic: an `FString`
-        // naming the concrete struct type (a full script path), then — when it
-        // is non-empty — that type's ordinary unversioned property block.
-        "MovieSceneEvalTemplatePtr"
-        | "MovieSceneTrackImplementationPtr"
-        | "MovieSceneSequenceInstanceDataPtr" => {
-            let type_name = r.fstring()?;
-            let mut s = BTreeMap::new();
-            s.insert("TypeName".to_string(), PropValue::Str(type_name.clone()));
-            if !type_name.is_empty() {
-                let short = type_name.rsplit('.').next().unwrap_or(&type_name).to_string();
-                s.extend(read_struct(r, &short, usmap, depth + 1)?);
-            }
-            PropValue::Struct(s.into())
         }
         _ => return Ok(None),
     }))

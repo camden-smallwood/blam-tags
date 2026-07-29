@@ -189,10 +189,11 @@ pub struct PropertyBlock {
 
 /// How a block's bytes are produced again.
 ///
-/// The distinction is load-bearing and used to be invisible: `PropValue::Struct`
-/// meant *either* a cooked unversioned block *or* a map some hand-written
-/// decoder assembled, and those go back to bytes by completely different rules.
-/// Conflating them is why writing any struct at all had to be refused.
+/// There is only one way now. A `Native` variant used to sit beside this one,
+/// holding a retained span for structs whose `Serialize` lives in engine code —
+/// the arrangement where the decoded fields were a view and the bytes were the
+/// truth. Every one of those is typed in [`super::hand_written`], so the
+/// scaffolding is gone.
 #[derive(Debug, Clone)]
 pub enum BlockLayout {
     /// A cooked unversioned property block. The header is regenerated from the
@@ -207,12 +208,6 @@ pub enum BlockLayout {
         /// emit but Campaign Evolved's tag wrappers all carry two of.
         leading_empty: u8,
     },
-    /// A struct with a hand-written `Serialize`, whose layout lives in code
-    /// rather than in a schema. The decoded fields are for readers; the bytes
-    /// are what goes back out, so the round trip is exact before the layout is
-    /// modeled. Converting one to a real writer is then verifiable against the
-    /// span it replaces.
-    Native { name: Arc<str>, bytes: Vec<u8> },
 }
 
 impl Default for BlockLayout {
@@ -227,7 +222,7 @@ pub struct PropertyEntry {
     pub name: Arc<str>,
     pub value: PropValue,
     /// Where this entry sat in the class's flattened schema, or `None` for a
-    /// [`BlockLayout::Native`] block, which has no schema to index into.
+    /// a block built from a bare field map, which has no schema to index into.
     pub slot: Option<SchemaSlot>,
 }
 
@@ -285,18 +280,15 @@ impl PropertyBlock {
     pub fn schema_len(&self) -> Option<u32> {
         match self.layout {
             BlockLayout::Unversioned { schema_len, .. } => Some(schema_len),
-            BlockLayout::Native { .. } => None,
         }
     }
 }
 
 /// Adopt a hand-assembled field map as a block.
 ///
-/// The hand-written struct decoders name their fields themselves rather than
-/// walking a schema, so their entries have no [`SchemaSlot`]. Such a block is
-/// only writable once [`BlockLayout::Native`] bytes are attached to it, which
-/// [`read_native_variable_struct`](super::structs::read_native_variable_struct)
-/// does centrally for all of them.
+/// Entries adopted this way have no [`SchemaSlot`], so the block is not
+/// writable through the schema path. Nothing produces one any more — it remains
+/// only as a convenience for building a block in tests.
 impl From<std::collections::BTreeMap<String, PropValue>> for PropertyBlock {
     fn from(m: std::collections::BTreeMap<String, PropValue>) -> Self {
         PropertyBlock {
@@ -418,13 +410,6 @@ impl BlockLayout {
                 BlockLayout::Unversioned { schema_len: a, leading_empty: b },
                 BlockLayout::Unversioned { schema_len: c, leading_empty: d },
             ) => a == c && b == d,
-            // While a hand-written struct is still a retained span, its bytes
-            // *are* its value. This arm disappears with the last `Native` block.
-            (
-                BlockLayout::Native { name: a, bytes: b },
-                BlockLayout::Native { name: c, bytes: d },
-            ) => a == c && b == d,
-            _ => false,
         }
     }
 }

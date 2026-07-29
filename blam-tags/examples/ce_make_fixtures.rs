@@ -198,13 +198,13 @@ fn walk(v: &PropValue, has: &mut Vec<&'static str>) {
             }
         }
         PropValue::Str(_) => has.push("string"),
+        // The hand-written structs are typed now, so they are their own value
+        // rather than a block with a retained span.
+        PropValue::HandWritten(h) => has.push(match h {
+            blam_tags::iostore::object::hand_written::HandWritten::Text(_) => "text",
+            _ => "native-struct",
+        }),
         PropValue::Struct(b) => {
-            match &b.layout {
-                BlockLayout::Native { name, .. } => {
-                    has.push(if &**name == "Text" { "text" } else { "native-struct" })
-                }
-                BlockLayout::Unversioned { .. } => {}
-            }
             for (_, v) in b.iter() {
                 walk(v, has);
             }

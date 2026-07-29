@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 
 use blam_tags::iostore::container_header::EIoContainerHeaderVersion;
-use blam_tags::iostore::object::unversioned::{read_export, BlockLayout, PropValue, PropertyBlock};
+use blam_tags::iostore::object::unversioned::{read_export, PropValue, PropertyBlock};
 use blam_tags::iostore::package::builder::read_payloads;
 use blam_tags::iostore::script_objects::ScriptObjects;
 use blam_tags::iostore::ue_types::EIoStoreTocVersion;
@@ -39,6 +39,10 @@ struct Untyped {
     tail: u64,
     native_struct_span: u64,
     fixed_native: u64,
+    /// Payloads inside an otherwise-typed hand-written struct — currently only
+    /// `FInstancedPropertyBag`, whose values are laid out by the bag's own
+    /// descriptors and which nothing in the corpus ships enough of to model.
+    hand_written: u64,
     raw: u64,
 }
 
@@ -50,18 +54,9 @@ fn walk(v: &PropValue, u: &mut Untyped, by_struct: &mut BTreeMap<String, u64>, d
         // Typed now (work item A2) — only an unmodeled `Opaque` still counts.
         PropValue::Native(n) => u.fixed_native += n.untyped_bytes() as u64,
         // Typed as of work item A; nothing left untyped inside one.
-        PropValue::HandWritten(h) => u.fixed_native += h.untyped_bytes() as u64,
+        PropValue::HandWritten(h) => u.hand_written += h.untyped_bytes() as u64,
         PropValue::Raw(b) => u.raw += b.len() as u64,
         PropValue::Struct(block) => {
-            if let BlockLayout::Native { name, bytes } = &block.layout {
-                // The span already accounts for everything inside it, fields
-                // included. Walking in as well double-counts — the decoded
-                // fields of a retained struct are a *view* of those same bytes,
-                // not additional bytes.
-                u.native_struct_span += bytes.len() as u64;
-                *by_struct.entry(name.to_string()).or_default() += bytes.len() as u64;
-                return;
-            }
             for (_, inner) in block.iter() {
                 walk(inner, u, by_struct, depth + 1);
             }
@@ -155,7 +150,7 @@ fn main() {
         }
     }
 
-    let untyped = u.tail + u.native_struct_span + u.fixed_native + u.raw;
+    let untyped = u.tail + u.native_struct_span + u.fixed_native + u.hand_written + u.raw;
     let typed = total_bytes.saturating_sub(untyped);
 
     println!("export bytes total     {total_bytes:>14}");
@@ -168,5 +163,6 @@ fn main() {
     println!("  class tails          {:>14}  ({} classes)", u.tail, tail_by_class.len());
     println!("  hand-written structs {:>14}  ({} structs)", u.native_struct_span, by_struct.len());
     println!("  unmodeled natives    {:>14}  (NativeStruct::Opaque)", u.fixed_native);
+    println!("  property-bag payload {:>14}  (laid out by its own descriptors)", u.hand_written);
     println!("  unmodeled (Raw)      {:>14}", u.raw);
 }

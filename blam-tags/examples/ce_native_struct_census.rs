@@ -16,7 +16,7 @@ use std::io::Cursor;
 
 use blam_tags::iostore::container_header::EIoContainerHeaderVersion;
 use blam_tags::iostore::object::structs::{native_struct_size, NATIVE_STRUCT_NAMES};
-use blam_tags::iostore::object::unversioned::{read_export, BlockLayout, PropValue, PropertyBlock};
+use blam_tags::iostore::object::unversioned::{read_export, PropValue, PropertyBlock};
 use blam_tags::iostore::package::builder::read_payloads;
 use blam_tags::iostore::script_objects::ScriptObjects;
 use blam_tags::iostore::ue_types::EIoStoreTocVersion;
@@ -49,9 +49,6 @@ fn collect_value(
             *out.entry(name.clone()).or_default() += 1;
         }
         (PropertyType::Struct(name), PropValue::Struct(block)) => {
-            if matches!(block.layout, BlockLayout::Native { .. }) {
-                return;
-            }
             let Some(flat) = usmap.flattened_slots(name) else { return };
             walk_block(block, &flat, usmap, out, depth + 1);
         }

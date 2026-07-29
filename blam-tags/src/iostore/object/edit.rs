@@ -67,9 +67,6 @@ pub fn set_property_slot(
     value: PropValue,
     usmap: &Usmap,
 ) -> Result<()> {
-    if let BlockLayout::Native { name, .. } = &block.layout {
-        bail!("{name} has a hand-written layout, so its fields are not schema properties");
-    }
     let flat = flattened_schema(class, usmap)?;
     let schema_index = flat
         .iter()

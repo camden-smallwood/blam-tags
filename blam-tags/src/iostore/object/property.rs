@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use super::archive::{Ar, Reader, Writer};
 use super::block::{flattened_schema, read_struct, write_block};
 use super::usmap::{PropertyType, Usmap};
-use super::value::{BlockLayout, PropValue, SoftObjectPath};
+use super::value::{PropValue, SoftObjectPath};
 use super::common::{read_container_removals, with_removals};
 use super::limits::{bounded, MAX_CONTAINER_ELEMENTS, PREALLOC_CAP};
 use super::native::NativeStruct;
@@ -378,13 +378,10 @@ pub(super) fn write_value(
         // A nested struct: either a real property block, whose header is
         // regenerated from the *nested* class's schema, or a hand-written one,
         // which replays its retained bytes and needs no schema at all.
-        (PropertyType::Struct(name), PropValue::Struct(b)) => match &b.layout {
-            BlockLayout::Native { .. } => write_block(ar, b, &[], usmap),
-            BlockLayout::Unversioned { .. } => {
-                let flat = flattened_schema(name, usmap)?;
-                write_block(ar, b, &flat, usmap)
-            }
-        },
+        (PropertyType::Struct(name), PropValue::Struct(b)) => {
+            let flat = flattened_schema(name, usmap)?;
+            write_block(ar, b, &flat, usmap)
+        }
         // `FText::Serialize` is hand-written; it is typed now, not a span.
         (PropertyType::Text, PropValue::HandWritten(h)) => h.write(ar, "Text", usmap),
         (t, other) => bail!("cannot write {other:?} as {t:?}"),
@@ -679,26 +676,4 @@ mod tests {
         assert!(e.contains("schema"), "unhelpful refusal: {e}");
     }
 
-    /// A hand-written struct replays the exact bytes it consumed, so it round
-    /// trips before its layout is modeled — and needs no schema to do it.
-    #[test]
-    fn native_layout_block_replays_its_bytes() {
-        use super::super::value::{BlockLayout, PropertyBlock};
-        let usmap = Usmap::meteorite().expect("bundled usmap");
-        let bytes: Vec<u8> = (0u8..9).collect();
-        let block = PropertyBlock {
-            entries: Vec::new(),
-            layout: BlockLayout::Native { name: "ShaderValueTypeHandle".into(), bytes: bytes.clone() },
-        };
-        let mut w = Writer::new();
-        write_value(
-            &mut w,
-            &PropertyType::Struct("ShaderValueTypeHandle".into()),
-            &PropValue::Struct(block),
-            false,
-            &usmap,
-        )
-        .expect("a native block writes its span");
-        assert_eq!(w.into_bytes(), bytes);
-    }
 }

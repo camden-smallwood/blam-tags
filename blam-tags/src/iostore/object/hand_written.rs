@@ -56,6 +56,44 @@ pub enum HandWritten {
     TimeWarpVariant(TimeWarpVariant),
     /// `FUniversalObjectLocatorFragment`.
     LocatorFragment(LocatorFragment),
+    /// `FInstancedPropertyBag` — a struct type invented at runtime.
+    InstancedPropertyBag(InstancedPropertyBag),
+    /// `FMaterialLayersFunctionsTree`.
+    MaterialLayersTree(MaterialLayersTree),
+}
+
+/// `FInstancedPropertyBag`: a bag of descriptors and an opaque payload laid out
+/// by them. Nothing in Campaign Evolved ships one, so this is modeled from the
+/// layout rather than measured against data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstancedPropertyBag {
+    /// Absent when the bag was written empty.
+    pub descriptors: Option<Vec<PropertyBagDesc>>,
+    /// The values, laid out by the descriptors. Opaque until a bag turns up to
+    /// model it against.
+    pub payload: Vec<u8>,
+}
+
+/// `FPropertyBagPropertyDesc`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyBagDesc {
+    pub value_type_object: i32,
+    pub id: [u8; 16],
+    pub name: FName,
+    pub value_type: u8,
+    /// The nested container types, one byte each.
+    pub container_types: Vec<u8>,
+}
+
+/// `FMaterialLayersFunctionsTree` — a node array, a payload array, then the
+/// root index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterialLayersTree {
+    /// Four int32 ids each.
+    pub nodes: Vec<[i32; 4]>,
+    /// Layer and blend.
+    pub payloads: Vec<[i32; 2]>,
+    pub root: i32,
 }
 
 /// `FMovieSceneEvalTemplatePtr` and its two siblings: a type name, then that
@@ -394,6 +432,8 @@ pub const MODELED: &[&str] = &[
     "MaterialOverrideNanite",
     "MovieSceneTimeWarpVariant",
     "UniversalObjectLocatorFragment",
+    "InstancedPropertyBag",
+    "MaterialLayersFunctionsTree",
 ];
 
 impl TreeNode {
@@ -1077,6 +1117,57 @@ impl HandWritten {
                 };
                 Some(HandWritten::LocatorFragment(LocatorFragment { fragment_type, payload }))
             }
+            "InstancedPropertyBag" => {
+                let (descriptors, payload) = if r.u32()? != 0 {
+                    let n = count(r, "property bag descriptors")?;
+                    let mut descs = Vec::with_capacity(n.min(super::limits::PREALLOC_CAP));
+                    for _ in 0..n {
+                        let value_type_object = r.i32()?;
+                        let id: [u8; 16] = r.take(16)?.try_into().expect("16 bytes");
+                        let name = r.fname()?;
+                        let value_type = r.u8()?;
+                        let containers = r.u8()? as usize;
+                        let container_types = r.take(containers)?.to_vec();
+                        if r.u32()? != 0 {
+                            anyhow::bail!(
+                                "property-bag descriptor carries editor-only metadata"
+                            );
+                        }
+                        descs.push(PropertyBagDesc {
+                            value_type_object,
+                            id,
+                            name,
+                            value_type,
+                            container_types,
+                        });
+                    }
+                    let serial = count(r, "property bag payload")?;
+                    (Some(descs), r.take(serial)?.to_vec())
+                } else {
+                    (Option::None, Vec::new())
+                };
+                Some(HandWritten::InstancedPropertyBag(InstancedPropertyBag {
+                    descriptors,
+                    payload,
+                }))
+            }
+            "MaterialLayersFunctionsTree" => {
+                let n = count(r, "layer tree nodes")?;
+                let mut nodes = Vec::with_capacity(n.min(super::limits::PREALLOC_CAP));
+                for _ in 0..n {
+                    nodes.push([r.i32()?, r.i32()?, r.i32()?, r.i32()?]);
+                }
+                let n = count(r, "layer tree payloads")?;
+                let mut payloads = Vec::with_capacity(n.min(super::limits::PREALLOC_CAP));
+                for _ in 0..n {
+                    payloads.push([r.i32()?, r.i32()?]);
+                }
+                Some(HandWritten::MaterialLayersTree(MaterialLayersTree {
+                    nodes,
+                    payloads,
+                    root: r.i32()?,
+                }))
+            }
             "NiagaraDataInterfaceGPUParamInfo" => {
                 let hlsl_symbol = r.fstring()?;
                 let di_class_name = r.fstring()?;
@@ -1284,6 +1375,44 @@ impl HandWritten {
                     Ok(())
                 }
             },
+            HandWritten::InstancedPropertyBag(b) => {
+                match &b.descriptors {
+                    Some(descs) => {
+                        ar.u32(&mut 1)?;
+                        ar.i32(&mut (descs.len() as i32))?;
+                        for d in descs {
+                            ar.i32(&mut d.value_type_object.to_owned())?;
+                            ar.raw(&mut d.id.to_vec(), 16)?;
+                            ar.fname(&mut d.name.clone())?;
+                            ar.u8(&mut d.value_type.to_owned())?;
+                            ar.u8(&mut (d.container_types.len() as u8))?;
+                            let n = d.container_types.len();
+                            ar.raw(&mut d.container_types.clone(), n)?;
+                            ar.u32(&mut 0)?;
+                        }
+                        ar.i32(&mut (b.payload.len() as i32))?;
+                        let n = b.payload.len();
+                        ar.raw(&mut b.payload.clone(), n)?;
+                    }
+                    Option::None => ar.u32(&mut 0)?,
+                }
+                Ok(())
+            }
+            HandWritten::MaterialLayersTree(t) => {
+                ar.i32(&mut (t.nodes.len() as i32))?;
+                for n in &t.nodes {
+                    for v in n {
+                        ar.i32(&mut v.to_owned())?;
+                    }
+                }
+                ar.i32(&mut (t.payloads.len() as i32))?;
+                for p in &t.payloads {
+                    for v in p {
+                        ar.i32(&mut v.to_owned())?;
+                    }
+                }
+                ar.i32(&mut t.root.to_owned())
+            }
             HandWritten::LocatorFragment(f) => {
                 ar.fname(&mut f.fragment_type.clone())?;
                 if let Some(b) = &f.payload {
@@ -1419,6 +1548,8 @@ impl HandWritten {
                 }
                 _ => false,
             },
+            (HandWritten::InstancedPropertyBag(a), HandWritten::InstancedPropertyBag(b)) => a == b,
+            (HandWritten::MaterialLayersTree(a), HandWritten::MaterialLayersTree(b)) => a == b,
             (HandWritten::LocatorFragment(a), HandWritten::LocatorFragment(b)) => {
                 a.fragment_type == b.fragment_type
                     && match (&a.payload, &b.payload) {
@@ -1454,9 +1585,15 @@ impl HandWritten {
         }
     }
 
-    /// Bytes still untyped inside this value — zero for everything modeled
-    /// here. What `ce_decode_coverage` counts.
+    /// Bytes still untyped inside this value. What `ce_decode_coverage` counts.
+    ///
+    /// Only `FInstancedPropertyBag`'s payload is left: its layout is described
+    /// by the bag's own descriptors, and nothing in the corpus ships one to
+    /// model it against.
     pub fn untyped_bytes(&self) -> usize {
-        0
+        match self {
+            HandWritten::InstancedPropertyBag(b) => b.payload.len(),
+            _ => 0,
+        }
     }
 }

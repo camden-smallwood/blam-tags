@@ -199,15 +199,7 @@ pub(super) fn write_block(
     flat: &[(&UsmapProperty, u8)],
     usmap: &Usmap,
 ) -> Result<()> {
-    let (schema_len, leading_empty) = match &block.layout {
-        // A hand-written struct goes back as the bytes it came from. See
-        // `BlockLayout::Native`.
-        BlockLayout::Native { bytes, .. } => {
-            let n = bytes.len();
-            return ar.raw(&mut bytes.clone(), n);
-        }
-        BlockLayout::Unversioned { schema_len, leading_empty } => (*schema_len, *leading_empty),
-    };
+    let BlockLayout::Unversioned { schema_len, leading_empty } = block.layout;
 
     // The block records the schema length it was read against, and the caller
     // resolved the schema independently. If those disagree the header would be
@@ -282,13 +274,8 @@ pub(super) fn write_block(
 /// reproduce the exact bytes it was read from.
 pub fn emit_block(class: &str, block: &PropertyBlock, usmap: &Usmap) -> Result<Vec<u8>> {
     let mut w = super::archive::Writer::new();
-    match &block.layout {
-        BlockLayout::Native { .. } => write_block(&mut w, block, &[], usmap)?,
-        BlockLayout::Unversioned { .. } => {
-            let flat = flattened_schema(class, usmap)?;
-            write_block(&mut w, block, &flat, usmap)?;
-        }
-    }
+    let flat = flattened_schema(class, usmap)?;
+    write_block(&mut w, block, &flat, usmap)?;
     Ok(w.into_bytes())
 }
 
