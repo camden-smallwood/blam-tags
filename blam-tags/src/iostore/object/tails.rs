@@ -1662,6 +1662,14 @@ pub(super) fn read_class_native_tail(
         // them in `Serialize` is editor-only, so in a cooked package they follow
         // the property block directly.
         "NiagaraScript" => {
+            // A script with no shader maps ends exactly here, and reading a
+            // resource count off the end fails in a way that presents as "the
+            // tail is unmodeled". It is not — there is nothing left to model.
+            // This accounted for 14,767 of the declining exports, every one of
+            // them with zero bytes behind it.
+            if r.o >= r.b.len() {
+                return Ok(true);
+            }
             let at = r.o;
             let ok = read_niagara_shader_maps(r);
             if let Err(e) = ok {
