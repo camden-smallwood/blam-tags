@@ -1026,6 +1026,31 @@ read. Read the *serializer*, not `sizeof`.
 but unreachable from the edit path; make the recovered `FField` chain a
 first-class schema source.
 
+**G. Make the zero mask fully derivable, using the UHT dump.**
+The writer currently decides masking as "the file masked it **and** the value is
+still zero". The first half is taken from the file because `CanSerializeAsZero`
+gates a bool on `IsNativeBool()`, and the `.usmap` records a real `bool` and a
+bitfield `uint8 b:1` identically — deriving it from the schema over-masked
+627,396 of 6,304,759 entries, 99.7% of them bools (§2.3).
+
+The distinction *is* in the UHT dump, which the `.usmap` simply does not carry:
+
+```text
+bool bCullByMaxRadius;                       // native   -> maskable
+uint8 bIgnoreAllPressedKeysUntilRelease: 1;  // bitfield -> not maskable
+```
+
+Measured across its 15,060 headers: **4,393 native bool declarations and 3,192
+bitfields**, a split consistent with the over-masking population. And the
+property that made the fixture test work, `HaloAudioCategory::bCullByMaxRadius`,
+is declared `bool` — which is exactly why the cooker was allowed to mask it.
+
+Extracting a native-bool set from the dump closes the last place the writer
+depends on what the file recorded rather than on what the schema says. That
+matters for **inserted** properties specifically: a property the block never had
+has no recorded flag, so today it is always written longhand. With the table it
+can be masked exactly as the cooker would have.
+
 **F. Format edges.** `TSet` needs its own variant — it currently decodes as
 `PropValue::Array`, indistinguishable from `TArray`. `FStr` drops trailing bytes
 when a declared length exceeds text-plus-terminator. Neither occurs in the
