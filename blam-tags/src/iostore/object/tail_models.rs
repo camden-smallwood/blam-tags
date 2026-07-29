@@ -685,6 +685,14 @@ pub struct TextureCookedData {
     pub cooked: bool,
     pub serialize_mip_data: Option<bool>,
     pub formats: Vec<TexturePlatformData>,
+    /// The `NAME_None` that ends the format list, kept as the name it actually
+    /// was rather than rebuilt.
+    ///
+    /// Its *text* is "None" but its identity is not `FName::none()` — this
+    /// package's name map puts "None" at index 3444, and writing index 0
+    /// produced the right length with the wrong four bytes on 8,937 textures.
+    /// An `FName` is an index and a number, not a string.
+    pub terminator: FName,
 }
 
 impl TextureCookedData {
@@ -697,6 +705,7 @@ impl TextureCookedData {
                 cooked,
                 serialize_mip_data: None,
                 formats: Vec::new(),
+                terminator: FName::none(),
             });
         }
         let serialize_mip_data = has_mip_data_flag.then(|| r.u32()).transpose()?.map(|v| v != 0);
@@ -710,6 +719,7 @@ impl TextureCookedData {
                     cooked,
                     serialize_mip_data,
                     formats,
+                    terminator: format_name,
                 });
             }
             let loc = r.o;
@@ -750,7 +760,7 @@ impl TextureCookedData {
             let n = body.len();
             ar.raw(&mut body.clone(), n)?;
         }
-        ar.fname(&mut FName::none())?;
+        ar.fname(&mut self.terminator.clone())?;
         Ok(())
     }
 }
