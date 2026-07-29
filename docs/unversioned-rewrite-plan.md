@@ -938,59 +938,100 @@ against the bytes it replaces — but the gate ignores it, so progress is honest
 | Behind a walk stop | 90,066 | 14,894 exports | 3 classes |
 | Blueprint-class exports | — | 89,762 exports | schema from class package |
 
-### 7.3 Work items, in dependency order
+### 7.3 The unit of work is 64 arms, not 226 classes
 
-**A. Hand-written structs → typed models (23 structs, 48 MB).**
-Cheapest population and the one that unblocks the value model: while any
+The inventory counts *classes with a tail*, which is the wrong unit for planning.
+A class contributes tail bytes only if `read_class_native_tail` has an arm for
+it; the default arm is `_ => {}`. So the 226 figure counts classes whose tails
+come from their **base** classes — a `StaticMeshActor` has a tail because
+`AActor` and `UObject` do, not because it has one of its own.
+
+Measured on the dispatcher:
+
+| | Count |
+|---|---|
+| Dispatcher arms | **64** |
+| Distinct class names matched | 128 |
+| Helper walkers already factored out | **42** |
+| `r.take(..)` calls inside the dispatcher | **100** |
+
+**Converting 64 arms and 42 helpers covers all 226 classes and all 4.77 GiB.**
+There is no long tail of 190 small classes to grind through; that batch was an
+artifact of counting classes instead of arms.
+
+### 7.4 The layouts are already known — this is retention, not discovery
+
+The expensive part of modeling a tail is normally working out its layout from
+engine source against a binary. That is **already done and already verified**:
+the coverage matrix accounts for every byte of 1,153,834 exports, and the
+tail-stop census says only 3 arms ever decline. `StaticMesh`'s arm walks strip
+flags, every LOD, the whole `FNaniteResources` block — root data, page streaming
+states, 208-byte hierarchy nodes, imposter atlas — and the ray-tracing proxy,
+field by field.
+
+So each conversion is the same mechanical change Phase 1 made to property values
+and the `StaticMeshComponent` pilot made to a tail: a walker that advances a
+cursor becomes one that fills a struct, plus a writer that puts it back. The 100
+`r.take(..)` calls are the concrete retention points.
+
+That reframes the risk. **Nanite and Chaos are not blockers for serialization.**
+Their *container* layouts are already walked exactly; what `iostore/asset/nanite.rs`
+does beyond that — decoding cluster bitstreams into geometry — is needed to
+*extract meshes*, not to round-trip bytes.
+
+Which raises a real choice worth making explicitly rather than by accident:
+
+* **Level 1 — serialization complete.** Every byte regenerated from a typed
+  model. Compressed payloads the engine itself treats as opaque (Nanite page
+  data, cooked physics buffers, texture mips) are typed as sized, named blobs.
+  This is what "100% serialization support" means, and the regeneration gate
+  reaches 100%.
+* **Level 2 — semantics complete.** Those blobs decoded into meaningful values
+  too, so a caller can edit geometry and collision rather than replace them
+  wholesale. A superset of Level 1, and a much larger job.
+
+**Level 1 is the target here.** Level 2 is per-blob, on demand, and each piece
+of it is independently verifiable against the Level 1 blob it replaces — the
+same relationship Level 1 has with the retained span today.
+
+### 7.5 Work items, in dependency order
+
+**A. Hand-written structs → typed models (23 structs, 48 MB, 1.92M spans).**
+The cheapest population and the one that unblocks the value model: while any
 `PropValue::Struct` can be a `Native` span, no struct is fully typed. Ordered by
-span count: the three Niagara variable types are 1.86M of the 1.92M spans, then
+span count — the three Niagara variable types are 1.86M of the 1.92M spans, then
 `NiagaraDataInterfaceGPUParamInfo`, `PCGPoint`, `Text`, the MovieScene channels,
-and a tail of fifteen with under a thousand spans each. Each gets a typed struct
-plus a writer, verified against its retained span. `BlockLayout::Native` is
-deleted when the last one lands.
+and fifteen with under a thousand spans each. `BlockLayout::Native` is deleted
+when the last one lands.
 
-**B. Class tails → typed models (226 classes, 4.77 GiB).**
-The distribution says how to sequence it, not whether to finish it:
+**B. Tail arms → typed models (64 arms + 42 helpers, 4.77 GiB).**
+Sequence by bytes so the regeneration gate moves early, but the batches are
+arms, not classes:
 
-| Batch | Classes | Cumulative bytes | Character |
-|---|---|---|---|
-| B1 | 9 | 90.45% | the heavy hitters — `StaticMesh` (Nanite), `BodySetup` (Chaos), `SkeletalMesh`, `Texture2D`, `InstancedStaticMeshComponent`, `MaterialInstanceConstant`, `AnimSequence`, `GeometryCollection`, `TextureCube` |
-| B2 | 13 more | 99.09% | mid-size, conventional layouts |
-| B3 | 14 more | 99.85% | small |
-| B4 | 190 more | 100.00% | 0.15% of bytes; mostly a few hundred bytes each |
+| Batch | What | Cumulative bytes |
+|---|---|---|
+| B1 | the arms behind the 9 heaviest classes | 90.45% |
+| B2 | the arms behind the next 13 | 99.09% |
+| B3 | everything remaining | 100% |
 
-B1 is where the engineering is. `StaticMesh` needs the Nanite decoder (already
-started, `iostore/nanite.rs`) and `BodySetup` needs Chaos implicit objects. B4 is
-volume, not difficulty — and it is the batch that makes the claim "100%" true, so
-it is not optional.
+**C. Close the 3 declining arms (90 KB).** `DataTable` (89 exports, 87 KB) and
+`UserDefinedStruct` (38, 2.9 KB) are partial; `NiagaraScript` declines at the end
+of its export with **0 bytes** left, so removing it is a no-op.
 
-Each class is verified by `ce_tail_model_roundtrip` against the span it replaces,
-which is the property that makes this safe to do incrementally: a tail model
-never has to be trusted.
+**D. Cite the remaining 22 struct sizes.** Four are declared by schemas the game
+uses but never present in a block, so they are one edited property from being
+read. Read the *serializer*, not `sizeof`.
 
-**C. Close the 3 walk stops (90 KB).**
-`DataTable` (89 exports, 87 KB), `UserDefinedStruct` (38, 2.9 KB), and
-`NiagaraScript` (14,767 exports, **0 bytes** — it declines exactly at the end, so
-it is a no-op to remove). Small, and they are the last places the reader gives up.
+**E. Blueprint-class exports (89,762).** Decoded today via their class package
+but unreachable from the edit path; make the recovered `FField` chain a
+first-class schema source.
 
-**D. Cite the remaining 22 struct sizes.**
-Four are declared by schemas Campaign Evolved uses but never present in a block —
-`Matrix`, `Timespan`, `PerPlatformBool`, `NavAgentSelector` (cited) — so they are
-one edited property from being read. Eighteen are not declared by any class the
-game uses. Source citations from UE 5.5.4; read the *serializer*, not `sizeof`.
+**F. Format edges.** `TSet` needs its own variant — it currently decodes as
+`PropValue::Array`, indistinguishable from `TArray`. `FStr` drops trailing bytes
+when a declared length exceeds text-plus-terminator. Neither occurs in the
+shipped corpus; both are reachable from a mod.
 
-**E. Blueprint-class exports (89,762).**
-Already decoded via their class package for the coverage matrix, but not
-reachable through the edit path. Make the recovered `FField` schema a first-class
-schema source so these are editable like any other export.
-
-**F. Format edges.**
-`TSet` decodes as `PropValue::Array`, indistinguishable from `TArray` — give it
-its own variant. `FStr` drops trailing bytes when a declared length exceeds
-text-plus-terminator. Neither occurs in the shipped corpus; both are reachable
-from a mod.
-
-### 7.4 The API, which is a requirement and not a finishing touch
+### 7.6 The API, which is a requirement and not a finishing touch
 
 Typed models are only half of "strongly typed" — the other half is that a caller
 never touches a `PropValue` unless they want to.
@@ -1007,15 +1048,14 @@ never touches a `PropValue` unless they want to.
 * **One error type** for the object layer, so a caller can distinguish "this is
   not that format" from "this format is corrupt" from "this codec has a gap".
 
-### 7.5 Sequencing
+### 7.7 Sequencing
 
 1. `ce_regeneration_gate` — the number that says how far along we are.
 2. **A** (23 structs) — closes a whole population, deletes `BlockLayout::Native`.
 3. **C** and **D** — small, and they clear the last non-tail gaps.
-4. **B1** — 90% of tail bytes; the real engineering.
-5. **API** — once the typed models exist, the surface can be built on them
-   rather than retrofitted.
-6. **B2–B4**, **E**, **F** — volume work to reach a true 100%.
+4. **B1** — 90% of tail bytes.
+5. **API** — built on the typed models rather than retrofitted onto them.
+6. **B2**, **B3**, **E**, **F** — to a true 100%.
 
-Steps 2, 3 and 5 are independent of the hard decoding in step 4, so the API and
-the long tail are not blocked behind Nanite and Chaos.
+Steps 2, 3 and 5 do not depend on step 4, so the API is not blocked behind the
+heaviest tail arms.
