@@ -25,6 +25,7 @@
 
 pub use super::archive::{ExportContext, PackageResolver};
 pub use super::export::{read_export_struct, read_export_struct_len, read_export_with_trailer};
+pub use super::property::{can_serialize_as_zero, should_save_as_zero};
 pub use super::reflect::{read_datatable, read_ufunction_script, read_userdefined_struct_layout};
 pub use super::value::{
     BlockLayout, MeshTransform, PropValue, PropertyBlock, PropertyEntry, SchemaSlot, SoftObjectPath,

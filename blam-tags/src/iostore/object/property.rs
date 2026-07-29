@@ -344,6 +344,67 @@ pub(super) fn write_value(
     }
 }
 
+/// Whether a property of this type *may* be zero-masked at all.
+///
+/// `CanSerializeAsZero` (UnversionedPropertySerialization.cpp:189). A zero-masked
+/// property serializes no bytes and `LoadZero` memzeroes its storage, so the
+/// engine only allows it where that is a faithful reconstruction: the property
+/// must need no destructor and be zero-constructible, a `bool` must be a real
+/// `bool` rather than a bitfield, and a struct must be `STRUCT_Atomic` and
+/// small. Everything with a heap allocation behind it — strings, containers,
+/// text, delegates, field paths, soft object paths — is excluded, which matches
+/// the masked population measured across the shipped corpus exactly.
+pub fn can_serialize_as_zero(ty: &PropertyType) -> bool {
+    match ty {
+        PropertyType::Bool
+        | PropertyType::Int8
+        | PropertyType::Int16
+        | PropertyType::Int
+        | PropertyType::Int64
+        | PropertyType::UInt16
+        | PropertyType::UInt32
+        | PropertyType::UInt64
+        | PropertyType::Byte { .. }
+        | PropertyType::Float
+        | PropertyType::Double
+        | PropertyType::Name
+        | PropertyType::Object
+        | PropertyType::WeakObject
+        | PropertyType::LazyObject
+        | PropertyType::Interface => true,
+        PropertyType::Enum { inner, .. } => can_serialize_as_zero(inner),
+        // Atomic-and-small, which is what having a fixed native size means here.
+        PropertyType::Struct(name) => native_struct_size(name).is_some(),
+        // An optional inherits its inner type's flags.
+        PropertyType::Optional(inner) => can_serialize_as_zero(inner),
+        _ => false,
+    }
+}
+
+/// Whether this value would be written as a zero mask bit rather than as bytes.
+///
+/// `ShouldSaveAsZero` (UnversionedPropertySerialization.cpp:149). The engine
+/// **derives this from the value at save time** — it is not carried in the file
+/// and cannot be. Replaying the bit we read instead is indistinguishable for an
+/// unmodified block, and wrong the moment a value is edited: setting a property
+/// to zero must start masking it, and clearing a mask must start emitting bytes.
+///
+/// The test is on the *bytes*, which is why it is done by serializing rather
+/// than by comparing values: `IsIntZero` memcmps the property's storage, so
+/// negative zero is not zero, and for every zero-maskable type the serialized
+/// form and the in-memory form coincide.
+pub fn should_save_as_zero(ty: &PropertyType, v: &PropValue, usmap: &Usmap) -> bool {
+    if !can_serialize_as_zero(ty) {
+        return false;
+    }
+    let mut w = Writer::new();
+    if write_value(&mut w, ty, v, false, usmap).is_err() {
+        return false;
+    }
+    let b = w.into_bytes();
+    !b.is_empty() && b.iter().all(|&x| x == 0)
+}
+
 /// Emit one property value's bytes, given the schema type it is declared as.
 ///
 /// The byte-slice counterpart to [`read_value`], and the write half of this

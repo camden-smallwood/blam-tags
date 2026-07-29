@@ -13,7 +13,7 @@ use super::archive::{trace_enabled, Ar, Reader};
 use super::usmap::{PropertyType, Usmap, UsmapProperty};
 use super::limits::MAX_DEPTH;
 use super::value::{BlockLayout, FName, PropValue, PropertyBlock, PropertyEntry, SchemaSlot};
-use super::property::{read_value, write_value};
+use super::property::{read_value, should_save_as_zero, write_value};
 use super::structs::native_struct_size;
 
 /// One `FUnversionedHeader` fragment (`FFragment`,
@@ -219,13 +219,42 @@ pub(super) fn write_block(
         );
     }
 
-    let mut present = Vec::with_capacity(block.entries.len());
+    // Masking is decided per entry by *both* halves of what the engine knows:
+    // whether this property may be masked at all, and whether its value is
+    // currently zero.
+    //
+    // Replaying the file's bit alone is wrong — edit a masked property to a
+    // non-zero value and the edit is silently discarded, since a masked entry
+    // writes no bytes. Deriving it alone is also wrong, and measurably so
+    // (`ce_zero_mask_census`): 629,385 of 6,304,759 entries would be masked
+    // that the cooker wrote longhand, 627,396 of them `Bool`, because
+    // `CanSerializeAsZero` gates bools on `IsNativeBool()` and the `.usmap`
+    // cannot tell a real `bool` from a bitfield `uint8 bFoo:1`. Masking a
+    // bitfield is not merely different, it is unsafe: `LoadZero` memzeroes the
+    // property's storage and would clear the sibling bits sharing that byte.
+    //
+    // So the file supplies maskability — it is a static fact about the property,
+    // and a cooked block that wrote a zero longhand has *proven* that property
+    // is not maskable — and the value supplies zero-ness. The census measured
+    // zero entries where the cooker masked something we would not, so this is
+    // never too permissive.
+    //
+    // Consequence, deliberately accepted: editing an unmasked property to zero
+    // writes it longhand where the cooker might have masked it. That loads to
+    // the identical value, and for a bitfield it is the only safe encoding.
+    let mut plan = Vec::with_capacity(block.entries.len());
     for e in &block.entries {
         let slot = e.slot.with_context(|| {
             format!("property {} has no schema slot, so its block cannot be written", e.name)
         })?;
-        present.push((slot.index as usize, !slot.zero_masked));
+        let (prop, _) = *flat.get(slot.index as usize).with_context(|| {
+            format!("schema index {} beyond {} properties", slot.index, flat.len())
+        })?;
+        let is_zero = slot.zero_masked && should_save_as_zero(&prop.ty, &e.value, usmap);
+        plan.push((e, &prop.ty, slot.index as usize, is_zero));
     }
+    let present: Vec<(usize, bool)> =
+        plan.iter().map(|(_, _, idx, is_zero)| (*idx, !*is_zero)).collect();
     // `HeaderBuilder` walks the schema in order, so the entries must be in it.
     if present.windows(2).any(|w| w[0].0 >= w[1].0) {
         bail!("property block entries are not in ascending schema order");
@@ -234,15 +263,11 @@ pub(super) fn write_block(
     let n = header.len();
     ar.raw(&mut header.clone(), n)?;
 
-    for e in &block.entries {
-        let slot = e.slot.expect("checked above");
-        if slot.zero_masked {
-            continue; // The zero *is* the encoding; no bytes follow.
+    for (e, ty, _, is_zero) in plan {
+        if is_zero {
+            continue; // The mask bit *is* the encoding; no bytes follow.
         }
-        let (prop, _) = *flat.get(slot.index as usize).with_context(|| {
-            format!("schema index {} beyond {} properties", slot.index, flat.len())
-        })?;
-        write_value(ar, &prop.ty, &e.value, false, usmap)
+        write_value(ar, ty, &e.value, false, usmap)
             .with_context(|| format!("writing property {}", e.name))?;
     }
     Ok(())
@@ -762,6 +787,51 @@ mod tests {
             })
             .collect();
         assert_eq!(got, vec![(1, 7)], "only the slot the block mentions exists");
+    }
+
+    /// Editing a zero-masked property to a non-zero value must start emitting
+    /// bytes for it.
+    ///
+    /// This is the failure that replaying the file's mask bit produces, and it
+    /// is silent and total: a masked entry writes *no bytes*, so the edit is
+    /// discarded and the property loads back as zero. The round-trip gate cannot
+    /// see it — every block it checks is unmodified — which is why it needs a
+    /// test rather than a corpus run.
+    #[test]
+    fn editing_a_masked_property_stops_masking_it() {
+        let mut usmap = Usmap::meteorite().expect("bundled usmap");
+        usmap.register_struct(
+            "MaskedEditProbe",
+            None,
+            vec![UsmapProperty {
+                schema_index: 0,
+                array_dim: 1,
+                name: "Value".to_string(),
+                ty: PropertyType::Int,
+            }],
+        );
+        // One value present, zero-masked: no value bytes follow the header.
+        let export = [0x80u8, 0x03, 0x01];
+        let (mut block, used) =
+            read_export_struct_len(&export, &[], &usmap, "MaskedEditProbe").expect("decode");
+        assert_eq!(used, export.len());
+        assert!(block.entries[0].slot.expect("slot").zero_masked);
+        assert!(matches!(block.entries[0].value, PropValue::Int(0)));
+
+        // Unmodified, it must reproduce the original bytes exactly.
+        assert_eq!(emit_block("MaskedEditProbe", &block, &usmap).expect("emit"), export);
+
+        // Edited, the mask must drop and the value must appear.
+        block.entries[0].value = PropValue::Int(7);
+        let out = emit_block("MaskedEditProbe", &block, &usmap).expect("emit edited");
+        let (back, _) =
+            read_export_struct_len(&out, &[], &usmap, "MaskedEditProbe").expect("re-read");
+        assert!(
+            matches!(back.entries[0].value, PropValue::Int(7)),
+            "the edit was discarded by the zero mask: {:?}",
+            back.entries[0].value
+        );
+        assert!(!back.entries[0].slot.expect("slot").zero_masked);
     }
 
     /// A non-empty set must still leave the stream aligned.
