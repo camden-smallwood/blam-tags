@@ -5,7 +5,48 @@ both reads and writes cooked Unreal exports, and to split the `iostore` module
 into layers that match what it actually does.
 
 Every number below is measured against the shipped Campaign Evolved corpus
-(1,153,964 runtime native-class exports across 103,867 packages), not estimated.
+(1,153,838 runtime native-class exports across 103,867 packages), not estimated.
+
+---
+
+## Status
+
+**Phases 0–3 are done, Phase 4 is measured with one class converted, Phase 5's
+CI half is done.** The codec reads and writes cooked exports, rebuilds packages
+around edits, and writes them into a mod container the game mounts.
+
+| Gate | Measures | Result |
+|---|---|---|
+| `ce_coverage_matrix` | every byte of every export accounted for | 1,153,834 / 1,153,834 |
+| `ce_header_roundtrip` | `FUnversionedHeader` regenerated | 1,153,836 / 1,153,836 |
+| `ce_block_roundtrip` | property block written back | 1,153,836 / 1,153,836 |
+| `ce_export_roundtrip` | block + trailer + tail | 1,153,838 / 1,153,838 |
+| `ce_package_roundtrip` | package header regenerated | 103,867 / 103,867 |
+| `ce_package_rebuild` | package rebuilt from re-encoded exports | 103,867 / 103,867 |
+| `ce_edit_roundtrip` | an **edit** survives a rebuild | 32,742 / 32,742 |
+| `ce_insert_property` | an **absent** property added back | 58,575 / 58,575 |
+| `ce_tail_model_roundtrip` | a modeled tail reproduces its span | 126,158 / 126,158 |
+| `ce_edit_to_container` | edit → package → `.utoc`/`.ucas`/`.pak` → read back | passes |
+
+All ten need a game install. `blam-tags/tests/ce_iostore_roundtrip.rs` runs the
+same claims in CI against 7 KB of committed fixtures, in 0.1 s.
+
+**The one thing not proven: that the game loads a rebuilt package.** Everything
+up to writing the container is measured; running it is a human with a build.
+
+### Two rules this work kept re-learning
+
+**A round-trip gate is blind to anything that only breaks when data changes.**
+Reading X and writing X back proves replay, not authoring. Both of the worst
+bugs found here — replaying the zero mask, and dropping container removals —
+scored ≥99.99% on round-trip gates while losing real data on edit. Every
+write-side rule needs a test that *changes* something.
+
+**When the engine source and the corpus disagree, the corpus is evidence and the
+source reading is a hypothesis.** Deriving the zero mask exactly as
+`ShouldSaveAsZero` does collapsed the gate from 99.9996% to 74.67%, because the
+`.usmap` cannot distinguish a native `bool` from a bitfield and `CanSerializeAsZero`
+gates on exactly that. See §2.3.
 
 ---
 
@@ -690,71 +731,174 @@ decided about".
 **Gate:** coverage matrix still 100%, plus a new round-trip gate over the
 property block alone at 100%.
 
-### Phase 2 — Export round-trip
+### Phase 2 — Export round-trip — **DONE**
 
-`object/export.rs`: `read_export` → `Export { block, trailer, tails }`,
-`write_export` emits. Tails start as `TailSpan`s — raw byte ranges — which gives
-100% export round-trip immediately.
+`PropertyBlock` replaced the `BTreeMap<String, PropValue>` a struct decoded to.
+A map answers "what is this property's value", which is all a reader wants, but
+it has no order, no schema slots, no zero-mask bits and it merges a shadowed
+name — all four are needed to emit a block, so the map was a lossy shape between
+the reader and any writer.
 
-**Gate:** `ce_roundtrip_matrix`, sibling to `ce_coverage_matrix`, reporting per
-class: exports, byte-identical, and first divergence offset with a hexdump either
-side. Target 1,153,964 / 1,153,964.
+`PropValue::Struct` turned out to mean **two** things: a cooked unversioned
+block, and a map a hand-written decoder assembled for itself. Those go back to
+bytes by completely different rules, which is *why* no struct could be written.
+`BlockLayout::Unversioned` regenerates its header; `BlockLayout::Native` replays
+a retained span. That closed all three refusals at once — nested struct,
+hand-written struct and `FText`, which is hand-written too.
 
-Add a `cargo-fuzz` target here, over both `read_export` and read→write→read.
+`read_export` → `Export { block: Option<PropertyBlock>, trailer, tail }`.
+`block` is an `Option` because `URigVM`/`URigHierarchy` have no block at all and
+emitting a header for them would corrupt them. A trailer flag that is not a
+boolean leaves its four bytes in the tail rather than being consumed.
 
-### Phase 3 — Package assembly
+**Found by the gates, not by reading:**
 
-`package/builder.rs`: rebuild a package from modified exports — recompute
-`cooked_serial_offset` / `cooked_serial_size`, grow the name map, update
-`imported_public_export_hashes` and the dependency bundles.
-`FZenPackageHeader::serialize` today recomputes its *own* internal offsets by
-seek-back but writes the export map verbatim, so export offsets are the caller's
-job and nothing currently does it.
+* `FSoftObjectPath`/`FSoftClassPath` used as a *struct* type (12,770 blocks) and
+  `FGameplayTagContainer` write their parts with no property header, so they
+  decode to bare values rather than blocks and need their own writer arms.
+* Container **removals** — `TSet`/`TMap` open with a count of entries to remove
+  *followed by that many elements*. Those were read and dropped, which is
+  invisible while the count is zero (all but 5 exports of 1,153,836) and made
+  exactly those 5 unwritable. Now `PropValue::WithRemovals`, which wraps rather
+  than widening `Map`/`Set` because ~14 call sites destructure those positionally.
+* **The zero mask is decided per save, not per read.** See §2.3.
 
-**Gate:** package-level round-trip — read and rewrite all 103,867 `.uasset`s byte
--identically. Much stronger than the export gate: it catches name-map ordering,
-alignment and summary-offset bugs that the export gate cannot see.
+### Phase 3 — Package assembly — **DONE**
 
-Then the real test: change one property on a real CE asset, rebuild, load in
-game.
+`package/builder.rs`: `read_payloads` takes a package apart into one payload per
+export, `write_package` puts it back and recomputes every
+`cooked_serial_offset`/`cooked_serial_size`, so an export that changed size needs
+nothing from the caller. `FZenPackageHeader::serialize` already recomputed the
+header's *own* offsets by seek-back; the export map was the missing half.
 
-### Phase 4 — Model the tails
+Measured rather than assumed: **exports are laid out in export-map order, each
+starting where the last ended**, in all 103,867 packages.
 
-Every tail is a stock UE or Wwise class (§2.5), so 5.5.4 source describes all of
-them — including **Nanite**, inside the largest tail of all, where we have the
-encoder as well as the decoder (§2.6). **No part of this project needs the
-executable.**
+The gate found a footer nothing modeled: every cooked package ends with four
+bytes, `PACKAGE_FILE_TAG` = `0x9E2A83C1` (ObjectVersion.h:14), *outside* every
+export's serial range — so a reader walking the export map never sees it and a
+writer concatenating payloads silently drops it.
 
-Class by class, ordered by value: `StaticMesh` (1,309 MiB), `BodySetup`
-(1,051 MiB), `SkeletalMesh` (470 MiB), `Texture2D` (453 MiB),
-`InstancedStaticMeshComponent` (434 MiB), `MaterialInstanceConstant` (249 MiB),
-`AnimSequence` (171 MiB).
+**Editing** (`object/edit.rs`): `intern_name` grows the package name map and
+returns the `FName` a property can hold; `set_property` sets or **inserts**,
+keeping entries in ascending schema order. Inserting matters because the cooker
+omits every property equal to its class default, so most of a class's schema is
+absent from any given export.
 
-The ordering matters for a reason worth calling out: **a modeled tail can be
-validated against the span it replaces.** Convert one class, and the round-trip
-gate proves the model is lossless against the bytes it used to copy. You never
-have to trust a tail model — which is the opposite of the situation the reader
-was built under.
+Reproducing that omission would need the class default object, which cooked data
+does not carry — so a property set to its default is written longhand where the
+cooker would have dropped it. The engine loads both to the same value; only
+byte-identity with the cooker is lost, and a mod does not need it.
 
-### Phase 5 — Hardening
+`container/writer.rs::write_package_mod_container` writes a rebuilt package into
+the `.utoc`/`.ucas`/`.pak` triplet. The store entry is re-declared rather than
+inherited, because an edit changes `export_bundles_size`. Note an override
+container carries **no directory index** — deliberately, since it overrides
+chunks the base container already names — so reading one back needs the chunk
+id, not the path.
 
-Fixture-based per-class tests (~30 committed exports, a few hundred KB, so CI
-needs no game install); engine-version gating for `native_struct_size` and the
-tail table; upgrading the fixed-size struct table from "measured on asset X" to
-"cited from `TStructOpsTypeTraits<T>::WithSerializer`".
+### Phase 4 — Model the tails — measured, one class converted
 
----
+`ce_tail_census` re-planned this from the data. 4.77 GiB across 803 classes;
+**28.8% of exports have no tail at all**. Byte share and export count give
+different orderings:
 
-## 5. Can we discard the original bytes?
+| class | with tail | MiB | % | median |
+|---|---|---|---|---|
+| `StaticMesh` | 15,231 | 1309.9 | 26.8% | 54,470 |
+| `BodySetup` | 17,754 | 1051.1 | 21.5% | 9,754 |
+| `SkeletalMesh` | 415 | 470.3 | 9.6% | 483,962 |
+| `Texture2D` | 14,237 | 453.9 | 9.3% | 768 |
+| `InstancedStaticMeshComponent` | 121,013 | 435.0 | 8.9% | 360 |
+| `StaticMeshComponent` | **126,158** | 7.7 | 0.16% | **16** |
+| `StaticMeshActor` | 69,832 | 5.3 | 0.11% | 79 |
 
-The stated preference is to regenerate rather than retain. Staged answer:
+`StaticMeshComponent` went first — a cheap conversion covering a sixth of all
+exports proves the pattern before anything expensive depends on it.
+`ce_tail_model_roundtrip` checks a model **against the span it replaces**, which
+is what makes this safe: a tail model is normally a reading of engine source
+against a binary blob, where a subtly wrong one still produces plausible values.
+
+**Two facts that break the obvious approach, both found by that gate:**
+
+1. **A tail is the whole inheritance chain**, base to derived — not one class's
+   data. `StaticMeshComponent`'s 16 bytes are `UActorComponent`'s 4,
+   `USceneComponent`'s 4 and `UStaticMeshComponent`'s 8. The first model did one
+   class and failed all 126,158 at "consumed 8 of 16 bytes".
+2. **Part of a tail is conditional on property values.** `USceneComponent` writes
+   its baked bounds only when `bComputeBoundsOnceForGame` is set, so a tail
+   cannot be written without the property block. Every model takes it as input.
+
+**Recommendation: keep the rest demand-driven.** Tails already round-trip
+losslessly as spans, so modeling one buys the ability to *edit that class's data*
+and nothing else. `StaticMesh` and `BodySetup` are half the bytes and are Nanite
+and Chaos respectively — worth doing when someone wants to edit meshes or
+physics, not before. The census says what each conversion costs and covers.
+
+### Phase 5 — Hardening — CI done, the rest open
+
+**Done:** `blam-tags/tests/ce_iostore_roundtrip.rs` runs the round-trip claims in
+CI against eight committed packages (7,002 bytes) chosen by `ce_make_fixtures` —
+*chosen*, not sampled, because the shapes that break a writer are rare enough
+that a random sample contains none of them. Three tests assert the round trips;
+three assert the fixtures still exercise what they were chosen for.
+
+Every one was mutation-checked. That was not ceremony: the suite as first written
+passed **all seven** tests with the zero-mask regression reintroduced, because
+its edit test edited a string and a string is never masked. It now edits a real
+masked `bool`.
+
+**Open:**
+
+* Engine-version gating for `native_struct_size` and the tail table. Both are
+  correct for 5.5.4 and unverified against anything else.
+* Upgrading the fixed-size struct table from "measured on asset X" to cited from
+  `TStructOpsTypeTraits<T>::WithSerializer`. The corpus validates every entry for
+  CE's data; the citation would guard a mod or a future build.
+* The §2.4 audit over the remaining `WithSerializer` candidates. Note an unknown
+  struct already errors rather than falling through silently — `flattened_schema`
+  fails with "no `.usmap` schema for struct X" — so this is forward-compatibility
+  work, not an open hole.
+
+## 5. Can we discard the original bytes? — answered
+
+The stated preference was to regenerate rather than retain. Where that landed:
 
 | Layer | Regenerate? |
 |---|---|
-| `FUnversionedHeader` | **Yes — proven**, 99.9998% (the 2 exceptions are not headers). Needs `schema_len` + `leading_empty_fragments`. |
-| Property values | **Yes**, once `PropValue` is lossless (Phase 1). The gate proves it rather than asserting it. |
-| Native tails | **Not yet.** 4.88 GiB, 71% of exports. Spans in Phase 2, modeled per class in Phase 4, each verified against the span it replaces. |
+| `FUnversionedHeader` | **Yes, proven.** 1,153,836 / 1,153,836. Needs `schema_len` + `leading_empty`. |
+| Property values | **Yes, proven.** 1,153,836 / 1,153,836 blocks written back byte-exactly. |
+| Hand-written structs | **No, by choice.** ~30 of them; `BlockLayout::Native` retains the span. Converting one is verifiable against what it replaces. |
+| Package header | **Yes, proven.** 103,867 / 103,867. |
+| Export placement | **Yes, proven.** Offsets recomputed; 58,575 insertions resized an export and every neighbour survived. |
+| Class tails | **Partly.** 4.77 GiB retained as spans; `StaticMeshComponent` converted (126,158 exports, 8.0 MB). |
 
-So full regeneration is reachable, incrementally, and at every point we know
-exactly how far along we are — because the gate reports it per class rather than
-as an aggregate claim.
+So full regeneration is reachable and, more usefully, *measurable at every
+point*: each gate reports per class rather than as an aggregate claim, so
+"how far along is this" always has a number rather than an opinion.
+
+The retained spans are not a compromise to be embarrassed about. They are what
+makes the remaining conversions safe — a tail model never has to be trusted,
+because the bytes it must reproduce are already in hand.
+
+---
+
+## 6. What would break this
+
+Written down because these are the things a future change is most likely to get
+wrong, and each one is silent.
+
+* **Editing a masked property.** A zero-masked entry writes no bytes. Deciding
+  the mask by replaying what was read discards the edit entirely and the property
+  loads back as zero. The rule is: mask **iff** the file masked it *and* the
+  value is still zero.
+* **Assuming the corpus covers write behaviour.** It cannot. Every package in it
+  is unmodified, so it exercises replay and never authoring.
+* **Matching properties by name.** A static array's slots share one name. Compare
+  by `slot.index`, or you compare slot 1 against slot 0 — which produced 16 false
+  failures in `ce_insert_property` before it was fixed.
+* **Reading an override container by path.** It has no directory index by design.
+  Use the chunk id.
+* **Trusting `WithSerializer` in a source grep.** It matched commented-out code
+  once and produced two confidently wrong "confirmed bugs". Strip comments first,
+  and remember it usually means *hook*, not *format*.
