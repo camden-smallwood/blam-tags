@@ -37,6 +37,76 @@ pub enum HandWritten {
     SkeletalMeshSamplingRegion(SkeletalMeshSamplingRegion),
     /// `FNiagaraDataInterfaceGPUParamInfo`.
     NiagaraGpuParamInfo(NiagaraGpuParamInfo),
+    /// `FText` — the only genuinely polymorphic shape in the set.
+    Text(TextValue),
+}
+
+/// `FText`: flags, then a history whose type byte decides everything after it.
+#[derive(Debug, Clone)]
+pub struct TextValue {
+    pub flags: u32,
+    pub history: TextHistory,
+}
+
+/// `ETextHistoryType`. The discriminant is kept on the variants that share a
+/// body, because it is what the writer emits and the shapes are not otherwise
+/// distinguishable.
+#[derive(Debug, Clone)]
+pub enum TextHistory {
+    /// `None` (-1). Still writes a four-byte `bHasCultureInvariantString`, and
+    /// the string itself when set.
+    None { culture_invariant: Option<FStr> },
+    /// `Base` (0).
+    Base { namespace: FStr, key: FStr, source: FStr },
+    /// `StringTableEntry` (11).
+    StringTableEntry { table_id: FName, key: FStr },
+    /// `OrderedFormat` (2) — **positional** arguments, with none of the names
+    /// `ArgumentDataFormat` carries.
+    OrderedFormat { source_fmt: Box<TextValue>, arguments: Vec<TextFormatArgument> },
+    /// `NamedFormat` (1) and `ArgumentDataFormat` (3): both a count followed by
+    /// name/value pairs. Only the latter appears in Campaign Evolved.
+    NamedFormat {
+        kind: i8,
+        source_fmt: Box<TextValue>,
+        arguments: Vec<(FStr, TextFormatArgument)>,
+    },
+    /// `AsNumber` (4), `AsPercent` (5), `AsCurrency` (6).
+    AsNumber {
+        kind: i8,
+        /// `AsCurrency` leads with the currency code.
+        currency_code: Option<FStr>,
+        source_value: TextFormatArgument,
+        options: Option<NumberFormattingOptions>,
+        target_culture: FStr,
+    },
+}
+
+/// `FFormatArgumentValue`.
+///
+/// The type byte is part of the value, not a detail of parsing it: `Int` and
+/// `UInt` are both eight bytes on the wire and `Float` and `Double` differ only
+/// in width, so collapsing them — as the untyped reader did — loses the
+/// information needed to write the argument back.
+#[derive(Debug, Clone)]
+pub enum TextFormatArgument {
+    Int(i64),
+    UInt(u64),
+    Float(f32),
+    Double(f64),
+    Text(Box<TextValue>),
+}
+
+/// `FNumberFormattingOptions` — three `FArchive` bools, a rounding mode, then
+/// four digit counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NumberFormattingOptions {
+    pub always_sign: bool,
+    pub use_grouping: bool,
+    pub rounding_mode: u8,
+    pub minimum_integral_digits: i32,
+    pub maximum_integral_digits: i32,
+    pub minimum_fractional_digits: i32,
+    pub maximum_fractional_digits: i32,
 }
 
 /// `FNiagaraDataInterfaceGPUParamInfo` — the HLSL symbol, the data-interface
@@ -170,7 +240,249 @@ pub const MODELED: &[&str] = &[
     "SkeletalMeshSamplingLODBuiltData",
     "SkeletalMeshSamplingRegionBuiltData",
     "NiagaraDataInterfaceGPUParamInfo",
+    "Text",
 ];
+
+impl TextFormatArgument {
+    fn read(r: &mut Reader, depth: usize) -> Result<Self> {
+        let ty = r.u8()? as i8;
+        Ok(match ty {
+            0 => TextFormatArgument::Int(r.u64()? as i64),
+            1 => TextFormatArgument::UInt(r.u64()?),
+            2 => TextFormatArgument::Float(r.f32()?),
+            3 => TextFormatArgument::Double(r.f64()?),
+            4 => TextFormatArgument::Text(Box::new(TextValue::read(r, depth + 1)?)),
+            other => anyhow::bail!("FText format argument type {other} not modeled (@ {})", r.o - 1),
+        })
+    }
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        match self {
+            TextFormatArgument::Int(v) => {
+                ar.u8(&mut 0)?;
+                ar.u64(&mut (*v as u64))
+            }
+            TextFormatArgument::UInt(v) => {
+                ar.u8(&mut 1)?;
+                ar.u64(&mut v.to_owned())
+            }
+            TextFormatArgument::Float(v) => {
+                ar.u8(&mut 2)?;
+                ar.f32(&mut v.to_owned())
+            }
+            TextFormatArgument::Double(v) => {
+                ar.u8(&mut 3)?;
+                ar.f64(&mut v.to_owned())
+            }
+            TextFormatArgument::Text(t) => {
+                ar.u8(&mut 4)?;
+                t.write(ar)
+            }
+        }
+    }
+    fn semantic_eq(&self, o: &TextFormatArgument) -> bool {
+        use TextFormatArgument::*;
+        match (self, o) {
+            (Int(a), Int(b)) => a == b,
+            (UInt(a), UInt(b)) => a == b,
+            (Float(a), Float(b)) => a.to_bits() == b.to_bits(),
+            (Double(a), Double(b)) => a.to_bits() == b.to_bits(),
+            (Text(a), Text(b)) => a.semantic_eq(b),
+            _ => false,
+        }
+    }
+}
+
+impl TextValue {
+    pub(super) fn read(r: &mut Reader, depth: usize) -> Result<Self> {
+        if depth > 16 {
+            anyhow::bail!("FText nesting too deep @ {}", r.o);
+        }
+        let flags = r.u32()?;
+        let kind = r.u8()? as i8;
+        let history = match kind {
+            -1 => TextHistory::None {
+                culture_invariant: if r.u32()? != 0 { Some(r.fstring()?) } else { None },
+            },
+            0 => TextHistory::Base {
+                namespace: r.fstring()?,
+                key: r.fstring()?,
+                source: r.fstring()?,
+            },
+            11 => TextHistory::StringTableEntry { table_id: r.fname()?, key: r.fstring()? },
+            2 => {
+                let source_fmt = Box::new(TextValue::read(r, depth + 1)?);
+                let n = count(r, "FText ordered arguments")?;
+                let mut arguments = Vec::with_capacity(n.min(super::limits::PREALLOC_CAP));
+                for _ in 0..n {
+                    arguments.push(TextFormatArgument::read(r, depth + 1)?);
+                }
+                TextHistory::OrderedFormat { source_fmt, arguments }
+            }
+            1 | 3 => {
+                let source_fmt = Box::new(TextValue::read(r, depth + 1)?);
+                let n = count(r, "FText arguments")?;
+                let mut arguments = Vec::with_capacity(n.min(super::limits::PREALLOC_CAP));
+                for _ in 0..n {
+                    arguments.push((r.fstring()?, TextFormatArgument::read(r, depth + 1)?));
+                }
+                TextHistory::NamedFormat { kind, source_fmt, arguments }
+            }
+            4 | 5 | 6 => {
+                let currency_code = if kind == 6 { Some(r.fstring()?) } else { None };
+                let source_value = TextFormatArgument::read(r, depth + 1)?;
+                let options = if r.u32()? != 0 {
+                    Some(NumberFormattingOptions {
+                        always_sign: r.u32()? != 0,
+                        use_grouping: r.u32()? != 0,
+                        rounding_mode: r.u8()?,
+                        minimum_integral_digits: r.i32()?,
+                        maximum_integral_digits: r.i32()?,
+                        minimum_fractional_digits: r.i32()?,
+                        maximum_fractional_digits: r.i32()?,
+                    })
+                } else {
+                    None
+                };
+                TextHistory::AsNumber {
+                    kind,
+                    currency_code,
+                    source_value,
+                    options,
+                    target_culture: r.fstring()?,
+                }
+            }
+            other => anyhow::bail!("FText history type {other} not modeled (@ {})", r.o - 1),
+        };
+        Ok(TextValue { flags, history })
+    }
+
+    pub(super) fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.u32(&mut self.flags.to_owned())?;
+        match &self.history {
+            TextHistory::None { culture_invariant } => {
+                ar.u8(&mut (-1i8 as u8))?;
+                match culture_invariant {
+                    Some(s) => {
+                        ar.u32(&mut 1)?;
+                        ar.fstring(&mut s.clone())?;
+                    }
+                    None => ar.u32(&mut 0)?,
+                }
+            }
+            TextHistory::Base { namespace, key, source } => {
+                ar.u8(&mut 0)?;
+                ar.fstring(&mut namespace.clone())?;
+                ar.fstring(&mut key.clone())?;
+                ar.fstring(&mut source.clone())?;
+            }
+            TextHistory::StringTableEntry { table_id, key } => {
+                ar.u8(&mut 11)?;
+                ar.fname(&mut table_id.clone())?;
+                ar.fstring(&mut key.clone())?;
+            }
+            TextHistory::OrderedFormat { source_fmt, arguments } => {
+                ar.u8(&mut 2)?;
+                source_fmt.write(ar)?;
+                ar.i32(&mut (arguments.len() as i32))?;
+                for a in arguments {
+                    a.write(ar)?;
+                }
+            }
+            TextHistory::NamedFormat { kind, source_fmt, arguments } => {
+                ar.u8(&mut (*kind as u8))?;
+                source_fmt.write(ar)?;
+                ar.i32(&mut (arguments.len() as i32))?;
+                for (name, a) in arguments {
+                    ar.fstring(&mut name.clone())?;
+                    a.write(ar)?;
+                }
+            }
+            TextHistory::AsNumber {
+                kind,
+                currency_code,
+                source_value,
+                options,
+                target_culture,
+            } => {
+                ar.u8(&mut (*kind as u8))?;
+                // Only `AsCurrency` carries one, so the pairing is checked
+                // rather than assumed.
+                match (currency_code, *kind == 6) {
+                    (Some(c), true) => ar.fstring(&mut c.clone())?,
+                    (None, false) => {}
+                    _ => anyhow::bail!("currency code does not match FText history type {kind}"),
+                }
+                source_value.write(ar)?;
+                match options {
+                    Some(o) => {
+                        ar.u32(&mut 1)?;
+                        ar.u32(&mut (o.always_sign as u32))?;
+                        ar.u32(&mut (o.use_grouping as u32))?;
+                        ar.u8(&mut o.rounding_mode.to_owned())?;
+                        for v in [
+                            o.minimum_integral_digits,
+                            o.maximum_integral_digits,
+                            o.minimum_fractional_digits,
+                            o.maximum_fractional_digits,
+                        ] {
+                            ar.i32(&mut v.to_owned())?;
+                        }
+                    }
+                    None => ar.u32(&mut 0)?,
+                }
+                ar.fstring(&mut target_culture.clone())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn semantic_eq(&self, o: &TextValue) -> bool {
+        use TextHistory::*;
+        if self.flags != o.flags {
+            return false;
+        }
+        let str_eq = |a: &FStr, b: &FStr| a == b && a.wide == b.wide;
+        match (&self.history, &o.history) {
+            (None { culture_invariant: a }, None { culture_invariant: b }) => match (a, b) {
+                (Some(x), Some(y)) => str_eq(x, y),
+                (Option::None, Option::None) => true,
+                _ => false,
+            },
+            (Base { namespace: a1, key: a2, source: a3 }, Base { namespace: b1, key: b2, source: b3 }) => {
+                str_eq(a1, b1) && str_eq(a2, b2) && str_eq(a3, b3)
+            }
+            (StringTableEntry { table_id: a1, key: a2 }, StringTableEntry { table_id: b1, key: b2 }) => {
+                a1 == b1 && str_eq(a2, b2)
+            }
+            (OrderedFormat { source_fmt: a1, arguments: a2 }, OrderedFormat { source_fmt: b1, arguments: b2 }) => {
+                a1.semantic_eq(b1)
+                    && a2.len() == b2.len()
+                    && a2.iter().zip(b2).all(|(x, y)| x.semantic_eq(y))
+            }
+            (NamedFormat { kind: a0, source_fmt: a1, arguments: a2 }, NamedFormat { kind: b0, source_fmt: b1, arguments: b2 }) => {
+                a0 == b0
+                    && a1.semantic_eq(b1)
+                    && a2.len() == b2.len()
+                    && a2.iter().zip(b2).all(|((n, x), (m, y))| str_eq(n, m) && x.semantic_eq(y))
+            }
+            (
+                AsNumber { kind: a0, currency_code: a1, source_value: a2, options: a3, target_culture: a4 },
+                AsNumber { kind: b0, currency_code: b1, source_value: b2, options: b3, target_culture: b4 },
+            ) => {
+                a0 == b0
+                    && match (a1, b1) {
+                        (Some(x), Some(y)) => str_eq(x, y),
+                        (Option::None, Option::None) => true,
+                        _ => false,
+                    }
+                    && a2.semantic_eq(b2)
+                    && a3 == b3
+                    && str_eq(a4, b4)
+            }
+            _ => false,
+        }
+    }
+}
 
 impl NiagaraGeneratedFunction {
     fn read(r: &mut Reader) -> Result<Self> {
@@ -492,6 +804,7 @@ impl HandWritten {
                 }
                 Ok(())
             }
+            HandWritten::Text(t) => t.write(ar),
             HandWritten::NiagaraGpuParamInfo(p) => {
                 ar.fstring(&mut p.hlsl_symbol.clone())?;
                 ar.fstring(&mut p.di_class_name.clone())?;
@@ -554,6 +867,7 @@ impl HandWritten {
                     && a.seed == b.seed
                     && a.metadata_entry == b.metadata_entry
             }
+            (HandWritten::Text(a), HandWritten::Text(b)) => a.semantic_eq(b),
             (HandWritten::NiagaraGpuParamInfo(a), HandWritten::NiagaraGpuParamInfo(b)) => {
                 a.hlsl_symbol == b.hlsl_symbol
                     && a.hlsl_symbol.wide == b.hlsl_symbol.wide

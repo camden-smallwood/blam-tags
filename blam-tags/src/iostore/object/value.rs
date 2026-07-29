@@ -93,20 +93,36 @@ impl PartialEq<&str> for FName {
 /// different bytes. Recording the flag makes it right by construction, which is
 /// what a codec reading third-party mod containers needs.
 ///
-/// Known limit: a declared length longer than the text plus its terminator has
-/// trailing bytes, and those are still dropped. No string in the shipped corpus
-/// has any — the round-trip proves it — so retaining them would be machinery for
-/// a case with zero instances.
+/// An empty string has **two** encodings and they both occur: a bare zero
+/// length, or a length of one followed by the terminator. Both read back as
+/// empty, so normalizing to the first changed 825 exports across every
+/// text-bearing class — an `FText` with an empty namespace is the common case.
+/// [`FStr::empty_has_terminator`] is which.
+///
+/// Known limit: a declared length longer than the text plus its terminator
+/// still drops the excess. No string in the shipped corpus has any.
 #[derive(Debug, Clone, PartialEq, Eq, Default, PartialOrd, Ord, Hash)]
 pub struct FStr {
     text: String,
     /// The file stored this as UTF-16 rather than as bytes.
     pub wide: bool,
+    /// Only meaningful when the text is empty: the file wrote a terminator
+    /// rather than a bare zero length.
+    pub empty_has_terminator: bool,
 }
 
 impl FStr {
     pub fn new(text: impl Into<String>, wide: bool) -> Self {
-        FStr { text: text.into(), wide }
+        let text = text.into();
+        // A non-empty string always has a terminator; the flag only decides the
+        // empty case, so defaulting it this way keeps an authored string in the
+        // canonical form.
+        FStr { empty_has_terminator: !text.is_empty(), text, wide }
+    }
+
+    /// As [`FStr::new`], recording how an empty string was encoded.
+    pub fn with_terminator(text: impl Into<String>, wide: bool, empty_has_terminator: bool) -> Self {
+        FStr { text: text.into(), wide, empty_has_terminator }
     }
     pub fn as_str(&self) -> &str {
         &self.text
@@ -133,12 +149,12 @@ impl std::fmt::Display for FStr {
 }
 impl From<String> for FStr {
     fn from(text: String) -> Self {
-        FStr { text, wide: false }
+        FStr::new(text, false)
     }
 }
 impl From<&str> for FStr {
     fn from(text: &str) -> Self {
-        FStr { text: text.to_string(), wide: false }
+        FStr::new(text, false)
     }
 }
 impl PartialEq<str> for FStr {

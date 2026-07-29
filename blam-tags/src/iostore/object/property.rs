@@ -385,8 +385,8 @@ pub(super) fn write_value(
                 write_block(ar, b, &flat, usmap)
             }
         },
-        // `FText::Serialize` is hand-written, so it arrives as a native block.
-        (PropertyType::Text, PropValue::Struct(b)) => write_block(ar, b, &[], usmap),
+        // `FText::Serialize` is hand-written; it is typed now, not a span.
+        (PropertyType::Text, PropValue::HandWritten(h)) => h.write(ar, "Text", usmap),
         (t, other) => bail!("cannot write {other:?} as {t:?}"),
     }
 }

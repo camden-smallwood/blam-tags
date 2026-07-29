@@ -149,7 +149,13 @@ impl<'a> Reader<'a> {
         if n > 0 {
             let bytes = self.take(n as usize)?;
             let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-            Ok(FStr::new(String::from_utf8_lossy(&bytes[..end]).into_owned(), false))
+            // A positive length means a terminator was written, which is what
+            // distinguishes an empty string here from one stored as length 0.
+            Ok(FStr::with_terminator(
+                String::from_utf8_lossy(&bytes[..end]).into_owned(),
+                false,
+                true,
+            ))
         } else {
             let chars = (-n) as usize;
             let bytes = self.take(chars * 2)?;
@@ -158,7 +164,7 @@ impl<'a> Reader<'a> {
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .take_while(|&c| c != 0)
                 .collect();
-            Ok(FStr::new(String::from_utf16_lossy(&u16s), true))
+            Ok(FStr::with_terminator(String::from_utf16_lossy(&u16s), true, true))
         }
     }
 }
@@ -297,7 +303,13 @@ impl Ar for Writer {
         // a NUL, or UTF-16 with a negated character count. Which one is *not*
         // re-derived from the content — it is whatever the file used, so a
         // UTF-16 string of ASCII goes back out as UTF-16.
-        if v.is_empty() {
+        // An empty string is *not* automatically a bare zero length: an empty
+        // UTF-16 one is a negated count of 1 plus its terminator, six bytes
+        // rather than four. Checking emptiness before the encoding dropped that
+        // and changed 825 exports across every text-bearing class — caught by
+        // `ce_semantic_roundtrip` reporting them as value-stable but no longer
+        // byte-identical.
+        if v.is_empty() && !v.empty_has_terminator {
             self.b.extend_from_slice(&0i32.to_le_bytes());
         } else if !v.is_wide() {
             self.b.extend_from_slice(&(v.len() as i32 + 1).to_le_bytes());

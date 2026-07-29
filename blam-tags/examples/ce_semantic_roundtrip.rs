@@ -115,6 +115,22 @@ fn main() {
                         byte_ok += 1;
                     } else {
                         *lossy.entry(short.to_string()).or_default() += 1;
+                        if samples.len() < 4 {
+                            let at = bytes
+                                .iter()
+                                .zip(&payloads[i])
+                                .position(|(x, y)| x != y)
+                                .unwrap_or(bytes.len().min(payloads[i].len()));
+                            let lo = at.saturating_sub(12);
+                            samples.push(format!(
+                                "{} :: {short}[{i}] value-stable, bytes differ\n    {} in, {} out, first difference at {at}\n    orig {:02x?}\n    ours {:02x?}",
+                                h.package_name(),
+                                payloads[i].len(),
+                                bytes.len(),
+                                &payloads[i][lo..(at + 12).min(payloads[i].len())],
+                                &bytes[lo..(at + 12).min(bytes.len())],
+                            ));
+                        }
                     }
                 } else {
                     failed += 1;
