@@ -1,0 +1,29 @@
+[package]
+name = "blam-tags-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.blam-tags]
+path = "../blam-tags"
+features = ["iostore"]
+
+[[bin]]
+name = "read_package"
+path = "fuzz_targets/read_package.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "export_roundtrip"
+path = "fuzz_targets/export_roundtrip.rs"
+test = false
+doc = false
+bench = false

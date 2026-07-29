@@ -1,5 +1,5 @@
 // Ported from trumank/retoc (MIT)
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 use std::{borrow::Cow, io::Read};
@@ -51,7 +51,10 @@ pub fn read_name_batch<S: Read>(s: &mut S) -> Result<Vec<String>> {
     }
     let _num_string_bytes: u32 = s.de()?;
     let hash_version: u64 = s.de()?;
-    assert_eq!(hash_version, FNAME_HASH_ALGORITHM_ID);
+    // An assert here aborts on a corrupt name batch; this is a parse failure.
+    if hash_version != FNAME_HASH_ALGORITHM_ID {
+        bail!("unknown FName hash algorithm {hash_version:#x}");
+    }
 
     let _hash_bytes: Vec<u8> = s.de_ctx(num as usize * 8)?;
     let lengths = read_array(num as usize, s, |s| Ok(i16::from_be_bytes(s.de()?)))?;

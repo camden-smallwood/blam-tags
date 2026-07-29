@@ -1,5 +1,5 @@
 // Ported from trumank/retoc (MIT)
-use anyhow::Result;
+use anyhow::{bail, Result};
 use byteorder::{LE, ReadBytesExt, WriteBytesExt};
 use std::fmt::{Display, Formatter};
 use std::ops::{Deref, DerefMut};
@@ -138,9 +138,7 @@ impl Readable for u8 {
     where
         Self: Sized,
     {
-        let mut buf = vec![0; len];
-        stream.read_exact(&mut buf)?;
-        Ok(buf)
+        read_exact_bounded(stream, len)
     }
     fn de_array<S: Read, const N: usize>(stream: &mut S) -> Result<[Self; N]>
     where
@@ -253,11 +251,36 @@ impl Writeable for f64 {
     }
 }
 
+
+/// How many elements to reserve up front for a length read from a file.
+///
+/// A length is untrusted input. Reserving it directly turns a corrupt four-byte
+/// field into a multi-exabyte allocation, and an allocation failure **aborts** —
+/// it is not a panic a caller can catch. So reserve a sane amount and let the
+/// vector grow; a bogus length then fails on the first short read instead of at
+/// the allocator.
+pub const PREALLOC_CAP: usize = 4096;
+
+/// Read exactly `len` bytes without trusting `len` enough to allocate it up
+/// front.
+///
+/// `Read::take` + `read_to_end` grows as bytes actually arrive, so the peak
+/// allocation is bounded by the input rather than by a number the input claims.
+pub fn read_exact_bounded<S: Read>(stream: &mut S, len: usize) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let read = stream.take(len as u64).read_to_end(&mut buf)?;
+    if read != len {
+        bail!("stream ended after {read} of {len} bytes");
+    }
+    Ok(buf)
+}
+
 pub fn read_array<S: Read, T, F>(len: usize, stream: &mut S, mut f: F) -> Result<Vec<T>>
 where
     F: FnMut(&mut S) -> Result<T>,
 {
-    let mut array = Vec::with_capacity(len);
+    // Not `with_capacity(len)`: see `PREALLOC_CAP`.
+    let mut array = Vec::with_capacity(len.min(PREALLOC_CAP));
     for _ in 0..len {
         array.push(f(stream)?);
     }
@@ -268,10 +291,11 @@ pub fn read_string_data<S: Read>(len: i32, stream: &mut S) -> Result<String> {
     if len < 0 {
         let chars = read_array((-len) as usize, stream, |r| Ok(r.read_u16::<LE>()?))?;
         let length = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
-        Ok(String::from_utf16(&chars[..length]).unwrap())
+        // Lossy, not `unwrap`: a corrupt package is an error to report, not a
+        // reason to unwind out of a parser.
+        Ok(String::from_utf16_lossy(&chars[..length]))
     } else {
-        let mut chars = vec![0; len as usize];
-        stream.read_exact(&mut chars)?;
+        let chars = read_exact_bounded(stream, len as usize)?;
         let length = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
         Ok(String::from_utf8_lossy(&chars[..length]).into_owned())
     }
@@ -323,9 +347,11 @@ pub fn write_string<S: Write>(stream: &mut S, value: &str) -> Result<()> {
 
 pub fn read_utf8_string<S: Read>(stream: &mut S) -> Result<String> {
     let len: i32 = stream.de()?;
-    let mut chars = vec![0; len as usize];
-    stream.read_exact(&mut chars)?;
-    Ok(String::from_utf8(chars).unwrap())
+    if len < 0 {
+        bail!("utf-8 string has a negative length {len}");
+    }
+    let chars = read_exact_bounded(stream, len as usize)?;
+    Ok(String::from_utf8_lossy(&chars).into_owned())
 }
 
 pub fn write_utf8_string<S: Write>(stream: &mut S, value: &str) -> Result<()> {

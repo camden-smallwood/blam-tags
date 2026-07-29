@@ -272,7 +272,10 @@ impl Readable for FZenPackageVersioningInfo {
     fn de<S: Read>(s: &mut S) -> Result<Self> {
         let zen_version_raw: u32 = s.de()?;
         Ok(Self {
-            zen_version: EZenPackageVersion::from_repr(zen_version_raw).unwrap(),
+            // An unknown version is corrupt input, not a reason to unwind out
+            // of a parser reading third-party containers.
+            zen_version: EZenPackageVersion::from_repr(zen_version_raw)
+                .ok_or_else(|| anyhow!("unknown EZenPackageVersion {zen_version_raw}"))?,
             package_file_version: s.de()?,
             licensee_version: s.de()?,
             custom_versions: s.de()?,
@@ -457,7 +460,11 @@ impl Readable for FExportBundleEntry {
     fn de<S: Read>(s: &mut S) -> Result<Self> {
         Ok(Self {
             local_export_index: s.de()?,
-            command_type: EExportCommandType::from_repr(s.de()?).unwrap(),
+            command_type: {
+                let raw: u32 = s.de()?;
+                EExportCommandType::from_repr(raw)
+                    .ok_or_else(|| anyhow!("unknown EExportCommandType {raw}"))?
+            },
         })
     }
 }

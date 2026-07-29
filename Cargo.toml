@@ -1,3 +1,7 @@
 [workspace]
 members = ["blam-tags", "blam-tag-shell"]
+# `fuzz` is a cargo-fuzz crate: it needs nightly and libFuzzer, so it must stay
+# out of the workspace or `cargo build --all-targets` on stable CI would try to
+# build it and fail.
+exclude = ["fuzz"]
 resolver = "3"
