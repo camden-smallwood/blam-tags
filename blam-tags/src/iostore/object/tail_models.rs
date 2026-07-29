@@ -268,14 +268,25 @@ fn scene_component_writes_bounds(block: &PropertyBlock) -> bool {
     flag("bComputeBoundsOnceForGame") || flag("bComputedBoundsOnceForGame")
 }
 
-impl StaticMeshComponentChainTail {
+/// `UActorComponent` + `USceneComponent` — the tail of any scene component that
+/// appends nothing of its own.
+///
+/// That is most of them: 42 classes and 151,249 exports in this corpus, from
+/// `USpotLightComponent` to `UHaloAudioPlacementComponent`, whose whole tail is
+/// these two layers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneComponentChainTail {
+    pub actor_component: ActorComponentTail,
+    pub scene_component: SceneComponentTail,
+}
+
+impl SceneComponentChainTail {
     pub fn read(r: &mut Reader, block: &PropertyBlock) -> Result<Self> {
         let n = {
             let n = r.i32()?;
             super::limits::bounded(n, MAX_NATIVE_COUNT, "UCSModifiedProperties", r.o - 4)?
         };
         let ucs_modified_properties = r.take(n * 28)?.to_vec();
-
         let bounds = if scene_component_writes_bounds(block) {
             Some(if r.u32()? != 0 {
                 Some(r.take(56)?.try_into().expect("56 bytes"))
@@ -285,10 +296,43 @@ impl StaticMeshComponentChainTail {
         } else {
             None
         };
-
-        Ok(StaticMeshComponentChainTail {
+        Ok(SceneComponentChainTail {
             actor_component: ActorComponentTail { ucs_modified_properties },
             scene_component: SceneComponentTail { bounds },
+        })
+    }
+
+    pub fn write(&self, ar: &mut impl Ar, block: &PropertyBlock) -> Result<()> {
+        let ucs = &self.actor_component.ucs_modified_properties;
+        if ucs.len() % 28 != 0 {
+            bail!("UCS modified properties is {} bytes, not a multiple of 28", ucs.len());
+        }
+        ar.i32(&mut ((ucs.len() / 28) as i32))?;
+        let n = ucs.len();
+        ar.raw(&mut ucs.clone(), n)?;
+        // The property block decides whether these bytes exist, so a model that
+        // disagrees with it would change the tail's length.
+        match (&self.scene_component.bounds, scene_component_writes_bounds(block)) {
+            (Some(b), true) => match b {
+                Some(bounds) => {
+                    ar.u32(&mut 1)?;
+                    ar.raw(&mut bounds.to_vec(), 56)?;
+                }
+                None => ar.u32(&mut 0)?,
+            },
+            (None, false) => {}
+            _ => bail!("scene component bounds disagree with the property block"),
+        }
+        Ok(())
+    }
+}
+
+impl StaticMeshComponentChainTail {
+    pub fn read(r: &mut Reader, block: &PropertyBlock) -> Result<Self> {
+        let base = SceneComponentChainTail::read(r, block)?;
+        Ok(StaticMeshComponentChainTail {
+            actor_component: base.actor_component,
+            scene_component: base.scene_component,
             static_mesh_component: StaticMeshComponentTail::read(r)?,
         })
     }
@@ -3763,6 +3807,70 @@ pub fn roundtrip_tail(
             modeled.write(&mut w)?;
             Ok(w.into_bytes())
         })()),
-        _ => None,
+        // Anything else: decide by *chain* rather than by name. A class that
+        // appends nothing of its own has exactly its ancestors' tail, and most
+        // of the long tail is that — 49 actor subclasses and 42 scene-component
+        // subclasses in this corpus, 242,647 exports between them, none of which
+        // needs a model naming it.
+        class => match owner_key(class, ctx.usmap).as_str() {
+            "Actor" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let modeled = ActorTail::read(&mut r)?;
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                modeled.write(&mut w)?;
+                Ok(w.into_bytes())
+            })()),
+            "SceneComponent+ActorComponent" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let modeled = SceneComponentChainTail::read(&mut r, block)?;
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                modeled.write(&mut w, block)?;
+                Ok(w.into_bytes())
+            })()),
+            "Texture2D+Texture" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let modeled = TextureChainTail::read(&mut r, ctx, true)?;
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                modeled.write(&mut w)?;
+                Ok(w.into_bytes())
+            })()),
+            _ => None,
+        },
     }
+}
+
+/// The ancestors of `class` — itself included — that append a tail of their own,
+/// most-derived first.
+///
+/// This is what says whether a class needs a model naming it or is simply its
+/// base classes' tail under a new name. It reads the `.usmap` super chain and
+/// keeps the entries [`CLASSES_WITH_OWN_TAIL`](super::tails::CLASSES_WITH_OWN_TAIL)
+/// lists, so it stays correct as arms are added.
+pub fn tail_owners(class: &str, usmap: &Usmap) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = class.to_string();
+    for _ in 0..64 {
+        if super::tails::CLASSES_WITH_OWN_TAIL.contains(&cur.as_str()) {
+            out.push(cur.clone());
+        }
+        match usmap.get(&cur).and_then(|s| s.super_name.clone()) {
+            Some(s) => cur = s,
+            None => break,
+        }
+    }
+    out
+}
+
+/// [`tail_owners`] joined with `+`, so a whole family can be matched as one key.
+fn owner_key(class: &str, usmap: &Usmap) -> String {
+    tail_owners(class, usmap).join("+")
 }

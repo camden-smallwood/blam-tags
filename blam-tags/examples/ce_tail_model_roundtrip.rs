@@ -17,7 +17,7 @@ use std::io::Cursor;
 
 use blam_tags::iostore::container_header::EIoContainerHeaderVersion;
 use blam_tags::iostore::object::unversioned::{
-    read_export, roundtrip_tail, TailContext, MODELED_TAILS,
+    read_export, roundtrip_tail, TailContext,
 };
 use blam_tags::iostore::package::builder::read_payloads;
 use blam_tags::iostore::script_objects::ScriptObjects;
@@ -81,9 +81,10 @@ fn main() {
             for (i, ex) in h.export_map.iter().enumerate() {
                 let Some(class) = by_hash.get(&ex.class_index.raw_index()) else { continue };
                 let short = class.rsplit('.').next().unwrap_or(class);
-                if !MODELED_TAILS.contains(&short) {
-                    continue;
-                }
+                // Deliberately *not* filtered by `MODELED_TAILS`: families are
+                // dispatched by inheritance chain, so most modeled classes are
+                // never named in that list. `roundtrip_tail` returning `None` is
+                // the authority on "no model yet".
                 if usmap.flattened_properties(short).is_none() {
                     continue;
                 }
@@ -139,15 +140,25 @@ fn main() {
 
     println!("{:<32} {:>12} {:>12} {:>10} {:>12}", "class", "tails", "exact", "failed", "bytes");
     let (mut t, mut e, mut f, mut by) = (0u64, 0u64, 0u64, 0u64);
+    // A class with no model at all reports zero exact and zero failed. Counting
+    // those in the denominator makes the pass rate look like a failure rate, so
+    // they are reported as their own bucket.
+    let mut unmodeled = 0u64;
+    let mut unmodeled_classes = 0u64;
     for (class, (seen, exact, failed, bytes)) in &stats {
-        println!("{class:<32} {seen:>12} {exact:>12} {failed:>10} {bytes:>12}");
+        if *exact == 0 && *failed == 0 {
+            unmodeled += seen;
+            unmodeled_classes += 1;
+            continue;
+        }
+        println!("{class:<44} {seen:>10} {exact:>10} {failed:>8} {bytes:>13}");
         t += seen;
         e += exact;
         f += failed;
         by += bytes;
     }
     println!(
-        "\n{e} of {t} modeled tails exact ({:.4}%), {f} failed, {by} bytes now regenerated rather than retained",
+        "\n{e} of {t} modeled tails exact ({:.4}%), {f} failed, {by} bytes now regenerated rather than retained\nno model yet: {unmodeled} tails across {unmodeled_classes} classes",
         100.0 * e as f64 / t.max(1) as f64
     );
     for s in &samples {
