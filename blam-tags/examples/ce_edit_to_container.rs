@@ -158,7 +158,7 @@ fn main() {
         .iter_mut()
         .find(|e| &*e.name == prop.as_str())
         .expect("property")
-        .value = PropValue::Str(NEW_STRING.to_string());
+        .value = PropValue::Str(NEW_STRING.into());
     let before_len = payloads[idx].len();
     payloads[idx] = write_export(&class, &parts, &usmap).expect("re-encode export");
     println!(

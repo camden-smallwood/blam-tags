@@ -14,7 +14,7 @@ use anyhow::{bail, Context, Result};
 use std::sync::OnceLock;
 
 use super::usmap::UsmapProperty;
-use super::value::FName;
+use super::value::{FName, FStr};
 
 /// A bidirectional byte archive.
 ///
@@ -37,7 +37,7 @@ pub(super) trait Ar {
     /// rather than the display string.
     fn fname(&mut self, v: &mut FName) -> Result<()>;
     /// An `FString`: a length then the characters, negative meaning UTF-16.
-    fn fstring(&mut self, v: &mut String) -> Result<()>;
+    fn fstring(&mut self, v: &mut FStr) -> Result<()>;
     /// Exactly `n` bytes, uninterpreted.
     fn raw(&mut self, v: &mut Vec<u8>, n: usize) -> Result<()>;
 }
@@ -140,15 +140,16 @@ impl<'a> Reader<'a> {
     }
     /// `FString`: `i32 len`; positive = UTF-8 (NUL-terminated), negative =
     /// UTF-16 (len is negated char count).
-    pub(super) fn fstring(&mut self) -> Result<String> {
+    /// The sign of the length is the encoding, and it is kept — see [`FStr`].
+    pub(super) fn fstring(&mut self) -> Result<FStr> {
         let n = self.i32()?;
         if n == 0 {
-            return Ok(String::new());
+            return Ok(FStr::default());
         }
         if n > 0 {
             let bytes = self.take(n as usize)?;
             let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-            Ok(String::from_utf8_lossy(&bytes[..end]).into_owned())
+            Ok(FStr::new(String::from_utf8_lossy(&bytes[..end]).into_owned(), false))
         } else {
             let chars = (-n) as usize;
             let bytes = self.take(chars * 2)?;
@@ -157,7 +158,7 @@ impl<'a> Reader<'a> {
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .take_while(|&c| c != 0)
                 .collect();
-            Ok(String::from_utf16_lossy(&u16s))
+            Ok(FStr::new(String::from_utf16_lossy(&u16s), true))
         }
     }
 }
@@ -291,14 +292,14 @@ impl Ar for Writer {
         self.b.extend_from_slice(&v.number.to_le_bytes());
         Ok(())
     }
-    fn fstring(&mut self, v: &mut String) -> Result<()> {
-        // Mirrors `FString::operator<<`: empty is a bare zero length; ASCII goes
-        // out as bytes with a NUL; anything else as UTF-16 with a negated
-        // character count. `Reader::fstring` stops at the first NUL, so a string
-        // that survives a round trip must not contain one.
+    fn fstring(&mut self, v: &mut FStr) -> Result<()> {
+        // Mirrors `FString::operator<<`: empty is a bare zero length; bytes with
+        // a NUL, or UTF-16 with a negated character count. Which one is *not*
+        // re-derived from the content — it is whatever the file used, so a
+        // UTF-16 string of ASCII goes back out as UTF-16.
         if v.is_empty() {
             self.b.extend_from_slice(&0i32.to_le_bytes());
-        } else if v.is_ascii() {
+        } else if !v.is_wide() {
             self.b.extend_from_slice(&(v.len() as i32 + 1).to_le_bytes());
             self.b.extend_from_slice(v.as_bytes());
             self.b.push(0);
@@ -354,7 +355,7 @@ impl Ar for Reader<'_> {
         *v = Reader::fname(self)?;
         Ok(())
     }
-    fn fstring(&mut self, v: &mut String) -> Result<()> {
+    fn fstring(&mut self, v: &mut FStr) -> Result<()> {
         *v = Reader::fstring(self)?;
         Ok(())
     }
@@ -427,14 +428,61 @@ mod tests {
     fn fstring_round_trips() {
         for s in ["", "SK_Marine_Torso_01", "naïve", "日本語"] {
             let mut w = Writer::new();
-            w.fstring(&mut s.to_string()).unwrap();
+            w.fstring(&mut FStr::from(s)).unwrap();
             let bytes = w.into_bytes();
             let mut r = Reader::new(&bytes, &[]);
-            let mut back = String::new();
+            let mut back = FStr::default();
             Ar::fstring(&mut r, &mut back).unwrap();
             assert_eq!(back, s, "string did not survive a round trip");
             assert_eq!(r.o, bytes.len(), "wrong length consumed for {s:?}");
         }
+    }
+
+    /// A UTF-16 string whose content is pure ASCII must go back out as UTF-16.
+    ///
+    /// This is the case the old `is_ascii()` guess got wrong: same text, half
+    /// the bytes, and a round trip that silently rewrites the file. It never
+    /// happens in Campaign Evolved — which is why the corpus gate was already
+    /// 100% — so only a hand-built case can catch it.
+    #[test]
+    fn a_wide_string_of_ascii_stays_wide() {
+        let wide = FStr::new("Rocket", true);
+        let mut w = Writer::new();
+        w.fstring(&mut wide.clone()).unwrap();
+        let bytes = w.into_bytes();
+        // Negative length = UTF-16: 7 characters including the terminator.
+        assert_eq!(&bytes[..4], (-7i32).to_le_bytes());
+        assert_eq!(bytes.len(), 4 + 7 * 2);
+
+        let mut r = Reader::new(&bytes, &[]);
+        let mut back = FStr::default();
+        Ar::fstring(&mut r, &mut back).unwrap();
+        assert_eq!(back.as_str(), "Rocket");
+        assert!(back.wide, "the encoding was not preserved");
+        assert_eq!(r.o, bytes.len());
+
+        // And the narrow form of the same text is genuinely different bytes.
+        let mut w2 = Writer::new();
+        w2.fstring(&mut FStr::new("Rocket", false)).unwrap();
+        assert_ne!(w2.into_bytes(), bytes);
+    }
+
+    /// An authored non-ASCII string still gets UTF-16, because
+    /// `FString::operator<<` chooses on exactly that condition — so a string
+    /// built in code rather than read from a file is encoded the way the engine
+    /// would have encoded it.
+    #[test]
+    fn an_authored_non_ascii_string_becomes_wide() {
+        let s = FStr::from("naïve");
+        assert!(!s.wide, "not read from a file, so no recorded encoding");
+        assert!(s.is_wide(), "but it cannot be written as bytes");
+        let mut w = Writer::new();
+        w.fstring(&mut s.clone()).unwrap();
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes, &[]);
+        let mut back = FStr::default();
+        Ar::fstring(&mut r, &mut back).unwrap();
+        assert_eq!(back.as_str(), "naïve");
     }
 
     /// A writer handed the wrong number of bytes for a fixed-size field is a

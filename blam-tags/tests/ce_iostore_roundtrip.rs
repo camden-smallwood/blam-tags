@@ -250,7 +250,7 @@ fn an_edit_survives_a_package_rebuild() {
             continue;
         };
         let prop = entry.name.to_string();
-        entry.value = PropValue::Str(NEW.to_string());
+        entry.value = PropValue::Str(NEW.into());
         payloads[i] = write_export(&short, &parts, &usmap).expect("write_export");
         edited = Some((i, short, prop));
         break;

@@ -183,7 +183,7 @@ fn main() {
                 .expect("found above");
             match kind {
                 Kind::Str => {
-                    entry.value = PropValue::Str(NEW_STRING.to_string());
+                    entry.value = PropValue::Str(NEW_STRING.into());
                     str_edits += 1;
                 }
                 Kind::Name => {

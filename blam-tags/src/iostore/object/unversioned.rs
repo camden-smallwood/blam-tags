@@ -38,7 +38,8 @@ pub use super::tail_models::{
 };
 pub use super::reflect::{read_datatable, read_ufunction_script, read_userdefined_struct_layout};
 pub use super::value::{
-    BlockLayout, MeshTransform, PropValue, PropertyBlock, PropertyEntry, SchemaSlot, SoftObjectPath,
+    BlockLayout, FStr, MeshTransform, PropValue, PropertyBlock, PropertyEntry, SchemaSlot,
+    SoftObjectPath,
 };
 pub use crate::iostore::asset::mesh_sync::{
     read_material_slots, MaterialSlot, MeshRef, MeshSyncRegions, Permutation, Region,

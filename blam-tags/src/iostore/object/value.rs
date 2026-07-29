@@ -76,6 +76,79 @@ impl PartialEq<&str> for FName {
     }
 }
 
+/// An `FString`, with the encoding the file actually used.
+///
+/// `FString::operator<<` picks the encoding from the *content*: a positive
+/// length means ANSI/UTF-8 bytes, a negative one means UTF-16 with a negated
+/// character count. A reader that keeps only the decoded text has thrown that
+/// choice away, and a writer then has to guess it back — which is what this
+/// used to do, by testing `is_ascii()`.
+///
+/// The guess happens to be right for every string Campaign Evolved ships, which
+/// is why the block round-trip was already 100%. It is right by coincidence: an
+/// all-ASCII string stored as UTF-16 re-emits as UTF-8 — the same value, and
+/// different bytes. Recording the flag makes it right by construction, which is
+/// what a codec reading third-party mod containers needs.
+///
+/// Known limit: a declared length longer than the text plus its terminator has
+/// trailing bytes, and those are still dropped. No string in the shipped corpus
+/// has any — the round-trip proves it — so retaining them would be machinery for
+/// a case with zero instances.
+#[derive(Debug, Clone, PartialEq, Eq, Default, PartialOrd, Ord, Hash)]
+pub struct FStr {
+    text: String,
+    /// The file stored this as UTF-16 rather than as bytes.
+    pub wide: bool,
+}
+
+impl FStr {
+    pub fn new(text: impl Into<String>, wide: bool) -> Self {
+        FStr { text: text.into(), wide }
+    }
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+    /// Whether this must go out as UTF-16: because the file did, or because the
+    /// content cannot be represented as bytes. `FString::operator<<` chooses on
+    /// exactly that second condition, so an authored string still gets the
+    /// encoding the engine would have picked.
+    pub fn is_wide(&self) -> bool {
+        self.wide || !self.text.is_ascii()
+    }
+}
+
+impl Deref for FStr {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+impl std::fmt::Display for FStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+impl From<String> for FStr {
+    fn from(text: String) -> Self {
+        FStr { text, wide: false }
+    }
+}
+impl From<&str> for FStr {
+    fn from(text: &str) -> Self {
+        FStr { text: text.to_string(), wide: false }
+    }
+}
+impl PartialEq<str> for FStr {
+    fn eq(&self, other: &str) -> bool {
+        self.text == other
+    }
+}
+impl PartialEq<&str> for FStr {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
 /// One property block: the entries it holds, in the order the file stores
 /// them, plus what is needed to put the block back.
 ///
@@ -248,7 +321,7 @@ pub enum PropValue {
     Int(i64),
     Float(f64),
     Name(FName),
-    Str(String),
+    Str(FStr),
     /// An `FPackageIndex` (import if negative, export if positive).
     Object(i32),
     /// An `FSoftObjectPath`: `(PackageName, AssetName, SubPath)`.
@@ -314,7 +387,7 @@ impl PropValue {
     pub fn as_str(&self) -> Option<&str> {
         match self {
             PropValue::Name(n) => Some(n.as_str()),
-            PropValue::Str(s) => Some(s),
+            PropValue::Str(s) => Some(s.as_str()),
             _ => None,
         }
     }
@@ -413,7 +486,9 @@ pub struct SoftObjectPath {
     pub package: FName,
     /// Object name within the package, e.g. `SK_Marine_Torso_01`.
     pub asset: FName,
-    pub sub_path: String,
+    /// Read through `fstring`, so it carries its encoding like any other
+    /// `FString` — see [`FStr`].
+    pub sub_path: FStr,
 }
 
 impl SoftObjectPath {

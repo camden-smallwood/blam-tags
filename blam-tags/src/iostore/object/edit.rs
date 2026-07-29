@@ -166,7 +166,7 @@ pub fn set_string_property(
     text: &str,
     usmap: &Usmap,
 ) -> Result<()> {
-    set_property(block, class, property, PropValue::Str(text.to_string()), usmap)
+    set_property(block, class, property, PropValue::Str(text.into()), usmap)
 }
 
 #[cfg(test)]
