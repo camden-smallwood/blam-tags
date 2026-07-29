@@ -32,6 +32,7 @@
 //! point every layer above is reached through.
 
 pub mod asset;
+pub mod compat;
 pub mod container;
 pub mod object;
 pub mod package;

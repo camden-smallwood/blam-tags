@@ -108,6 +108,15 @@ impl OverrideContainerWriter {
             if self.packages.is_empty() && self.redirects.is_empty() {
                 None
             } else {
+                // A version the target build rejects would escape silently from
+                // here; nothing downstream checks it.
+                if crate::iostore::compat::check_writable_container_header_version(
+                    EIoContainerHeaderVersion::SoftPackageReferences,
+                )
+                .is_err()
+                {
+                    return Err(IoStoreError::Package("unsupported container header version"));
+                }
                 let mut header = FIoContainerHeader::new(
                     EIoContainerHeaderVersion::SoftPackageReferences,
                     FIoContainerId(container_id),
