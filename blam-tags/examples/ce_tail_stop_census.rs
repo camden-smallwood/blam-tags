@@ -71,13 +71,21 @@ fn main() {
             };
             let Ok(payloads) = read_payloads(&h, &b) else { continue };
             let names = h.name_map.copy_raw_names();
+            // The bulk-data map is not optional context: `BodySetup` and friends
+            // resolve their cooked payloads through it, so omitting it makes
+            // them fail every time and attributes their whole tail to a "stop"
+            // that is really a missing argument.
+            let bulk: Vec<(i64, i64)> = h
+                .bulk_data
+                .iter()
+                .map(|b| (b.serial_offset, b.serial_size))
+                .collect();
             for (i, ex) in h.export_map.iter().enumerate() {
                 let Some(class) = by_hash.get(&ex.class_index.raw_index()) else { continue };
                 let short = class.rsplit('.').next().unwrap_or(class);
                 if usmap.flattened_properties(short).is_none() {
                     continue;
                 }
-                let bulk: Vec<(i64, i64)> = Vec::new();
                 let Ok(walk) = walk_export(
                     &payloads[i],
                     &names,
