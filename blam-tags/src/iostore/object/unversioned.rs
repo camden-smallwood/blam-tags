@@ -24,6 +24,7 @@
 //! | [`crate::iostore::asset::mesh_sync`] | Campaign Evolved mesh-sync extraction |
 
 pub use super::archive::{ExportContext, PackageResolver};
+pub use super::edit::{intern_name, set_name_property, set_string_property};
 pub use super::export::{
     read_export, read_export_struct, read_export_struct_len, read_export_with_trailer,
     write_export, Export, Trailer, NO_PROPERTY_BLOCK,
