@@ -1979,6 +1979,773 @@ impl StaticMeshTail {
     }
 }
 
+/// A `TArray<T>` of fixed-width blittable elements written with a *bare* count —
+/// no element size ahead of it, unlike [`BulkArray`].
+///
+/// The width is carried so the count can be derived on write instead of stored
+/// twice and allowed to disagree with the payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedArray {
+    pub element_size: usize,
+    pub data: Vec<u8>,
+}
+
+impl FixedArray {
+    fn read(r: &mut Reader, what: &str, element_size: usize) -> Result<Self> {
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, what, r.o - 4)?
+        };
+        Ok(FixedArray { element_size, data: r.take(n * element_size)?.to_vec() })
+    }
+
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        if self.element_size == 0 || self.data.len() % self.element_size != 0 {
+            bail!(
+                "fixed array of {}-byte elements has {} bytes",
+                self.element_size,
+                self.data.len()
+            );
+        }
+        ar.i32(&mut ((self.data.len() / self.element_size) as i32))?;
+        let n = self.data.len();
+        ar.raw(&mut self.data.clone(), n)
+    }
+}
+
+/// `FReferenceSkeleton` — the rig the renderer skins against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceSkeleton {
+    /// `FMeshBoneInfo`: an `FName` and an `int32` parent index.
+    pub bone_info: FixedArray,
+    /// How wide an `FTransform` is in this cook, 80 or 40 bytes.
+    ///
+    /// It is not written anywhere, so the reader finds it by checking which
+    /// width leaves the following bone-count where it belongs. Keeping the
+    /// answer is what lets the writer reproduce the pose without probing again.
+    pub transform_size: usize,
+    pub bone_pose: Vec<u8>,
+    /// `RawRefBoneNameToIndexMap`: an `FName` and an `int32`.
+    pub name_to_index: FixedArray,
+}
+
+impl ReferenceSkeleton {
+    fn read(r: &mut Reader) -> Result<Self> {
+        let bone_info = FixedArray::read(r, "RawRefBoneInfo", 12)?;
+        let nbones = bone_info.data.len() / 12;
+        let npose = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "RawRefBonePose", r.o - 4)?
+        };
+        let transform_size = if npose == 0 {
+            80
+        } else {
+            [80usize, 40]
+                .into_iter()
+                .find(|&ts| {
+                    r.b.get(r.o + npose * ts..r.o + npose * ts + 4)
+                        .and_then(|s| s.try_into().ok())
+                        .map(|s| i32::from_le_bytes(s) == nbones as i32)
+                        .unwrap_or(false)
+                })
+                .context("could not size FTransform in FReferenceSkeleton")?
+        };
+        Ok(ReferenceSkeleton {
+            bone_info,
+            transform_size,
+            bone_pose: r.take(npose * transform_size)?.to_vec(),
+            name_to_index: FixedArray::read(r, "RawRefBoneNameToIndexMap", 12)?,
+        })
+    }
+
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        self.bone_info.write(ar)?;
+        if self.transform_size == 0 || self.bone_pose.len() % self.transform_size != 0 {
+            bail!(
+                "bone pose is {} bytes for {}-byte transforms",
+                self.bone_pose.len(),
+                self.transform_size
+            );
+        }
+        ar.i32(&mut ((self.bone_pose.len() / self.transform_size) as i32))?;
+        let n = self.bone_pose.len();
+        ar.raw(&mut self.bone_pose.clone(), n)?;
+        self.name_to_index.write(ar)
+    }
+}
+
+/// One `FSkelMeshRenderSection`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkelRenderSection {
+    pub global_strip: u8,
+    pub class_strip: u8,
+    /// `MaterialIndex` (`uint16`) through `BaseVertexIndex` — a flat run of
+    /// scalars, 27 bytes: the `uint8`
+    /// `RecomputeTangentsVertexMaskChannel` sits in the middle of it and is
+    /// unpadded.
+    pub header: [u8; 27],
+    /// `ClothMappingDataLODs`: an array of arrays of 80-byte `FMeshToMeshVertData`.
+    pub cloth_mapping_lods: Vec<FixedArray>,
+    pub bone_map: FixedArray,
+    pub num_vertices: u32,
+    pub max_bone_influences: i32,
+    pub correspond_cloth_asset_index: [u8; 2],
+    /// `FClothingSectionData`: an `FGuid` and an `int32`.
+    pub clothing_section_data: [u8; 20],
+    /// The duplicated-vertex buffers, stripped from cooks that do not need them.
+    pub dup_verts: Option<(FixedArray, FixedArray)>,
+    pub disabled: u32,
+}
+
+impl SkelRenderSection {
+    /// Whether this section carries cloth, which decides what the LOD's buffers
+    /// contain further down.
+    fn has_cloth(&self) -> bool {
+        self.cloth_mapping_lods.iter().any(|a| !a.data.is_empty())
+    }
+
+    fn read(r: &mut Reader) -> Result<Self> {
+        let global_strip = r.u8()?;
+        let class_strip = r.u8()?;
+        let header: [u8; 27] = r.take(27)?.try_into().expect("27 bytes");
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "ClothMappingDataLODs", r.o - 4)?
+        };
+        let mut cloth_mapping_lods = Vec::with_capacity(n.min(16));
+        for _ in 0..n {
+            cloth_mapping_lods.push(FixedArray::read(r, "cloth mapping data", 80)?);
+        }
+        let bone_map = FixedArray::read(r, "BoneMap", 2)?;
+        let num_vertices = r.u32()?;
+        let max_bone_influences = r.i32()?;
+        let correspond_cloth_asset_index = r.take(2)?.try_into().expect("2 bytes");
+        let clothing_section_data = r.take(20)?.try_into().expect("20 bytes");
+        let dup_verts = (class_strip & 1 == 0)
+            .then(|| -> Result<(FixedArray, FixedArray)> {
+                Ok((
+                    FixedArray::read(r, "DupVertData", 4)?,
+                    FixedArray::read(r, "DupVertIndexData", 8)?,
+                ))
+            })
+            .transpose()?;
+        Ok(SkelRenderSection {
+            global_strip,
+            class_strip,
+            header,
+            cloth_mapping_lods,
+            bone_map,
+            num_vertices,
+            max_bone_influences,
+            correspond_cloth_asset_index,
+            clothing_section_data,
+            dup_verts,
+            disabled: r.u32()?,
+        })
+    }
+
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.u8(&mut self.global_strip.to_owned())?;
+        ar.u8(&mut self.class_strip.to_owned())?;
+        ar.raw(&mut self.header.to_vec(), 27)?;
+        ar.i32(&mut (self.cloth_mapping_lods.len() as i32))?;
+        for a in &self.cloth_mapping_lods {
+            a.write(ar)?;
+        }
+        self.bone_map.write(ar)?;
+        ar.u32(&mut self.num_vertices.to_owned())?;
+        ar.i32(&mut self.max_bone_influences.to_owned())?;
+        ar.raw(&mut self.correspond_cloth_asset_index.to_vec(), 2)?;
+        ar.raw(&mut self.clothing_section_data.to_vec(), 20)?;
+        match (&self.dup_verts, self.class_strip & 1 == 0) {
+            (Some((a, b)), true) => {
+                a.write(ar)?;
+                b.write(ar)?;
+            }
+            (None, false) => {}
+            _ => bail!("duplicated vertex data disagrees with the strip flags"),
+        }
+        ar.u32(&mut self.disabled.to_owned())
+    }
+}
+
+/// One skin-weight profile's override data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkinWeightProfile {
+    pub name: [u8; 8],
+    pub bone_ids: FixedArray,
+    pub bone_weights: FixedArray,
+    pub num_weights_per_vertex: u8,
+    pub vertex_index_to_influence_offset: FixedArray,
+}
+
+/// One named per-vertex attribute buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VertexAttributeBuffer {
+    pub name: [u8; 8],
+    pub component_count: i32,
+    pub pixel_format: i32,
+    pub component_stride: i32,
+    pub values: BulkArray,
+}
+
+/// Compressed morph-target render data, present only when the cook wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MorphTargetData {
+    pub morph_data: FixedArray,
+    pub minimum_value_per_morph: FixedArray,
+    pub maximum_value_per_morph: FixedArray,
+    pub batch_start_offset_per_morph: FixedArray,
+    pub batches_per_morph: FixedArray,
+    /// `NumTotalBatches`, `PositionPrecision`, `TangentZPrecision`.
+    pub precision: [u8; 12],
+}
+
+/// `FSkeletalMeshLODRenderData::SerializeStreamedData` — everything a LOD keeps
+/// inline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkelStreamedData {
+    pub strip_flags: [u8; 2],
+    pub index_data_type_size: u8,
+    pub index_buffer: BulkArray,
+    pub position_stride: i32,
+    pub position_num_vertices: i32,
+    pub positions: BulkArray,
+    pub vertex_strip: [u8; 2],
+    /// `NumTexCoords`, `NumVertices`, and the two precision flags.
+    pub vertex_header: [u8; 16],
+    pub tangents: BulkArray,
+    pub uvs: BulkArray,
+    pub skin_strip: [u8; 2],
+    /// `bVariableBonesPerVertex` through `bUse16BitBoneWeight`.
+    pub skin_header: [u8; 24],
+    pub skin_weights: BulkArray,
+    pub lookup_strip: [u8; 2],
+    pub lookup_num_vertices: u32,
+    pub skin_weight_lookup: BulkArray,
+    /// Present only when the mesh declares vertex colours; the inner option is
+    /// the buffer, which serializes only when it has vertices.
+    pub colors: Option<(([u8; 2], i32, u32), Option<BulkArray>)>,
+    pub cloth: Option<([u8; 2], BulkArray, FixedArray)>,
+    pub skin_weight_profiles: Vec<SkinWeightProfile>,
+    /// `FRayTracingGeometry::RawData`.
+    pub source_ray_tracing_geometry: FixedArray,
+    pub morph: Option<MorphTargetData>,
+    pub vertex_attributes: Vec<VertexAttributeBuffer>,
+    pub half_edge_strip: [u8; 2],
+    pub half_edge: Option<(FixedArray, FixedArray)>,
+}
+
+impl SkelStreamedData {
+    fn read(r: &mut Reader, has_vertex_colors: bool, has_cloth: bool) -> Result<Self> {
+        let strip_flags = [r.u8()?, r.u8()?];
+        let index_data_type_size = r.u8()?;
+        let index_buffer = BulkArray::read(r, "index buffer")?;
+        let position_stride = r.i32()?;
+        let position_num_vertices = r.i32()?;
+        let positions = BulkArray::read(r, "positions")?;
+        let vertex_strip = [r.u8()?, r.u8()?];
+        let vertex_header: [u8; 16] = r.take(16)?.try_into().expect("16 bytes");
+        let tangents = BulkArray::read(r, "tangents")?;
+        let uvs = BulkArray::read(r, "UVs")?;
+        let skin_strip = [r.u8()?, r.u8()?];
+        let skin_header: [u8; 24] = r.take(24)?.try_into().expect("24 bytes");
+        let skin_weights = BulkArray::read(r, "skin weights")?;
+        let lookup_strip = [r.u8()?, r.u8()?];
+        let lookup_num_vertices = r.u32()?;
+        let skin_weight_lookup = BulkArray::read(r, "skin weight lookup")?;
+        let colors = has_vertex_colors
+            .then(|| -> Result<_> {
+                let strip = [r.u8()?, r.u8()?];
+                let stride = r.i32()?;
+                let n = r.u32()?;
+                let buf = (n > 0).then(|| BulkArray::read(r, "vertex colors")).transpose()?;
+                Ok(((strip, stride, n), buf))
+            })
+            .transpose()?;
+        let cloth = has_cloth
+            .then(|| -> Result<_> {
+                Ok((
+                    [r.u8()?, r.u8()?],
+                    BulkArray::read(r, "cloth vertices")?,
+                    FixedArray::read(r, "ClothIndexMapping", 12)?,
+                ))
+            })
+            .transpose()?;
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "SkinWeightProfiles", r.o - 4)?
+        };
+        let mut skin_weight_profiles = Vec::with_capacity(n.min(16));
+        for _ in 0..n {
+            skin_weight_profiles.push(SkinWeightProfile {
+                name: r.take(8)?.try_into().expect("8 bytes"),
+                bone_ids: FixedArray::read(r, "profile BoneIDs", 1)?,
+                bone_weights: FixedArray::read(r, "profile BoneWeights", 1)?,
+                num_weights_per_vertex: r.u8()?,
+                vertex_index_to_influence_offset: FixedArray::read(
+                    r,
+                    "profile VertexIndexToInfluenceOffset",
+                    8,
+                )?,
+            });
+        }
+        let source_ray_tracing_geometry = FixedArray::read(r, "SourceRayTracingGeometry", 1)?;
+        let morph = (r.u32()? != 0)
+            .then(|| -> Result<MorphTargetData> {
+                Ok(MorphTargetData {
+                    morph_data: FixedArray::read(r, "MorphData", 4)?,
+                    minimum_value_per_morph: FixedArray::read(r, "MinimumValuePerMorph", 16)?,
+                    maximum_value_per_morph: FixedArray::read(r, "MaximumValuePerMorph", 16)?,
+                    batch_start_offset_per_morph: FixedArray::read(
+                        r,
+                        "BatchStartOffsetPerMorph",
+                        4,
+                    )?,
+                    batches_per_morph: FixedArray::read(r, "BatchesPerMorph", 4)?,
+                    precision: r.take(12)?.try_into().expect("12 bytes"),
+                })
+            })
+            .transpose()?;
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "VertexAttributeBuffers", r.o - 4)?
+        };
+        let mut vertex_attributes = Vec::with_capacity(n.min(16));
+        for _ in 0..n {
+            vertex_attributes.push(VertexAttributeBuffer {
+                name: r.take(8)?.try_into().expect("8 bytes"),
+                component_count: r.i32()?,
+                pixel_format: r.i32()?,
+                component_stride: r.i32()?,
+                values: BulkArray::read(r, "attribute values")?,
+            });
+        }
+        let half_edge_strip = [r.u8()?, r.u8()?];
+        let half_edge = (half_edge_strip[1] & 1 == 0)
+            .then(|| -> Result<(FixedArray, FixedArray)> {
+                Ok((
+                    FixedArray::read(r, "VertexToEdgeData", 4)?,
+                    FixedArray::read(r, "EdgeToTwinEdgeData", 4)?,
+                ))
+            })
+            .transpose()?;
+        Ok(SkelStreamedData {
+            strip_flags,
+            index_data_type_size,
+            index_buffer,
+            position_stride,
+            position_num_vertices,
+            positions,
+            vertex_strip,
+            vertex_header,
+            tangents,
+            uvs,
+            skin_strip,
+            skin_header,
+            skin_weights,
+            lookup_strip,
+            lookup_num_vertices,
+            skin_weight_lookup,
+            colors,
+            cloth,
+            skin_weight_profiles,
+            source_ray_tracing_geometry,
+            morph,
+            vertex_attributes,
+            half_edge_strip,
+            half_edge,
+        })
+    }
+
+    fn write(&self, ar: &mut impl Ar, has_vertex_colors: bool, has_cloth: bool) -> Result<()> {
+        ar.u8(&mut self.strip_flags[0].to_owned())?;
+        ar.u8(&mut self.strip_flags[1].to_owned())?;
+        ar.u8(&mut self.index_data_type_size.to_owned())?;
+        self.index_buffer.write(ar)?;
+        ar.i32(&mut self.position_stride.to_owned())?;
+        ar.i32(&mut self.position_num_vertices.to_owned())?;
+        self.positions.write(ar)?;
+        ar.u8(&mut self.vertex_strip[0].to_owned())?;
+        ar.u8(&mut self.vertex_strip[1].to_owned())?;
+        ar.raw(&mut self.vertex_header.to_vec(), 16)?;
+        self.tangents.write(ar)?;
+        self.uvs.write(ar)?;
+        ar.u8(&mut self.skin_strip[0].to_owned())?;
+        ar.u8(&mut self.skin_strip[1].to_owned())?;
+        ar.raw(&mut self.skin_header.to_vec(), 24)?;
+        self.skin_weights.write(ar)?;
+        ar.u8(&mut self.lookup_strip[0].to_owned())?;
+        ar.u8(&mut self.lookup_strip[1].to_owned())?;
+        ar.u32(&mut self.lookup_num_vertices.to_owned())?;
+        self.skin_weight_lookup.write(ar)?;
+        match (&self.colors, has_vertex_colors) {
+            (Some(((strip, stride, n), buf)), true) => {
+                ar.u8(&mut strip[0].to_owned())?;
+                ar.u8(&mut strip[1].to_owned())?;
+                ar.i32(&mut stride.to_owned())?;
+                ar.u32(&mut n.to_owned())?;
+                match (buf, *n > 0) {
+                    (Some(b), true) => b.write(ar)?,
+                    (None, false) => {}
+                    _ => bail!("colour buffer presence disagrees with its vertex count"),
+                }
+            }
+            (None, false) => {}
+            _ => bail!("vertex colour presence disagrees with the property block"),
+        }
+        match (&self.cloth, has_cloth) {
+            (Some((strip, verts, mapping)), true) => {
+                ar.u8(&mut strip[0].to_owned())?;
+                ar.u8(&mut strip[1].to_owned())?;
+                verts.write(ar)?;
+                mapping.write(ar)?;
+            }
+            (None, false) => {}
+            _ => bail!("cloth presence disagrees with the render sections"),
+        }
+        ar.i32(&mut (self.skin_weight_profiles.len() as i32))?;
+        for p in &self.skin_weight_profiles {
+            ar.raw(&mut p.name.to_vec(), 8)?;
+            p.bone_ids.write(ar)?;
+            p.bone_weights.write(ar)?;
+            ar.u8(&mut p.num_weights_per_vertex.to_owned())?;
+            p.vertex_index_to_influence_offset.write(ar)?;
+        }
+        self.source_ray_tracing_geometry.write(ar)?;
+        match &self.morph {
+            Some(m) => {
+                ar.u32(&mut 1)?;
+                m.morph_data.write(ar)?;
+                m.minimum_value_per_morph.write(ar)?;
+                m.maximum_value_per_morph.write(ar)?;
+                m.batch_start_offset_per_morph.write(ar)?;
+                m.batches_per_morph.write(ar)?;
+                ar.raw(&mut m.precision.to_vec(), 12)?;
+            }
+            None => ar.u32(&mut 0)?,
+        }
+        ar.i32(&mut (self.vertex_attributes.len() as i32))?;
+        for a in &self.vertex_attributes {
+            ar.raw(&mut a.name.to_vec(), 8)?;
+            ar.i32(&mut a.component_count.to_owned())?;
+            ar.i32(&mut a.pixel_format.to_owned())?;
+            ar.i32(&mut a.component_stride.to_owned())?;
+            a.values.write(ar)?;
+        }
+        ar.u8(&mut self.half_edge_strip[0].to_owned())?;
+        ar.u8(&mut self.half_edge_strip[1].to_owned())?;
+        match (&self.half_edge, self.half_edge_strip[1] & 1 == 0) {
+            (Some((a, b)), true) => {
+                a.write(ar)?;
+                b.write(ar)?;
+            }
+            (None, false) => {}
+            _ => bail!("half-edge data disagrees with the strip flags"),
+        }
+        Ok(())
+    }
+}
+
+/// The metadata a streamed-out LOD leaves behind in the export.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkelAvailabilityInfo {
+    /// Everything from `DataTypeSize` through the skin-weight lookup count — a
+    /// flat run of scalars whose order differs from the streamed form.
+    pub header: [u8; 65],
+    pub cloth: Option<(FixedArray, i32, u32)>,
+    pub skin_weight_profile_names: FixedArray,
+}
+
+impl SkelAvailabilityInfo {
+    fn read(r: &mut Reader, has_cloth: bool) -> Result<Self> {
+        let header: [u8; 65] = r.take(65)?.try_into().expect("65 bytes");
+        let cloth = has_cloth
+            .then(|| -> Result<_> {
+                Ok((FixedArray::read(r, "ClothIndexMapping", 12)?, r.i32()?, r.u32()?))
+            })
+            .transpose()?;
+        Ok(SkelAvailabilityInfo {
+            header,
+            cloth,
+            skin_weight_profile_names: FixedArray::read(r, "SkinWeightProfileNames", 8)?,
+        })
+    }
+
+    fn write(&self, ar: &mut impl Ar, has_cloth: bool) -> Result<()> {
+        ar.raw(&mut self.header.to_vec(), 65)?;
+        match (&self.cloth, has_cloth) {
+            (Some((m, stride, n)), true) => {
+                m.write(ar)?;
+                ar.i32(&mut stride.to_owned())?;
+                ar.u32(&mut n.to_owned())?;
+            }
+            (None, false) => {}
+            _ => bail!("cloth mapping disagrees with the render sections"),
+        }
+        self.skin_weight_profile_names.write(ar)
+    }
+}
+
+/// One `FSkeletalMeshLODRenderData`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkeletalMeshLod {
+    pub global_strip: u8,
+    pub class_strip: u8,
+    pub is_lod_cooked_out: bool,
+    pub is_inlined: bool,
+    pub required_bones: FixedArray,
+    /// Absent for a server cook or a LOD below the minimum — the LOD ends at
+    /// `RequiredBones`.
+    pub render: Option<SkeletalMeshLodRender>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkeletalMeshLodRender {
+    pub sections: Vec<SkelRenderSection>,
+    pub active_bone_indices: FixedArray,
+    pub buffers_size: u32,
+    pub buffers: SkeletalMeshLodBuffers,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkeletalMeshLodBuffers {
+    Inline(Box<SkelStreamedData>),
+    /// Streamed to `.ubulk`. A zero-size payload means the LOD was discarded
+    /// outright and not even the metadata follows.
+    Streamed { bulk_index: i32, availability: Option<SkelAvailabilityInfo> },
+}
+
+impl SkeletalMeshLod {
+    fn read(r: &mut Reader, ctx: TailContext, has_vertex_colors: bool) -> Result<Self> {
+        let global_strip = r.u8()?;
+        let class_strip = r.u8()?;
+        let is_lod_cooked_out = r.u32()? != 0;
+        let is_inlined = r.u32()? != 0;
+        let required_bones = FixedArray::read(r, "RequiredBones", 2)?;
+        // `EStrippedData::AudioVisual` is bit 1 — bit 0 is `EditorOnly`, which
+        // every client cook sets and which must NOT suppress the buffers.
+        if global_strip & 2 != 0 || is_lod_cooked_out {
+            return Ok(SkeletalMeshLod {
+                global_strip,
+                class_strip,
+                is_lod_cooked_out,
+                is_inlined,
+                required_bones,
+                render: None,
+            });
+        }
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "RenderSections", r.o - 4)?
+        };
+        let mut sections = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            sections.push(SkelRenderSection::read(r)?);
+        }
+        let has_cloth = sections.iter().any(SkelRenderSection::has_cloth);
+        let active_bone_indices = FixedArray::read(r, "ActiveBoneIndices", 2)?;
+        let buffers_size = r.u32()?;
+        let buffers = if is_inlined {
+            SkeletalMeshLodBuffers::Inline(Box::new(SkelStreamedData::read(
+                r,
+                has_vertex_colors,
+                has_cloth,
+            )?))
+        } else {
+            let bulk_index = r.i32()?;
+            let size =
+                ctx.bulk_data.get(bulk_index.max(0) as usize).map(|&(_, s)| s).unwrap_or(0);
+            SkeletalMeshLodBuffers::Streamed {
+                bulk_index,
+                availability: (size != 0)
+                    .then(|| SkelAvailabilityInfo::read(r, has_cloth))
+                    .transpose()?,
+            }
+        };
+        Ok(SkeletalMeshLod {
+            global_strip,
+            class_strip,
+            is_lod_cooked_out,
+            is_inlined,
+            required_bones,
+            render: Some(SkeletalMeshLodRender {
+                sections,
+                active_bone_indices,
+                buffers_size,
+                buffers,
+            }),
+        })
+    }
+
+    fn write(&self, ar: &mut impl Ar, has_vertex_colors: bool) -> Result<()> {
+        ar.u8(&mut self.global_strip.to_owned())?;
+        ar.u8(&mut self.class_strip.to_owned())?;
+        ar.u32(&mut u32::from(self.is_lod_cooked_out))?;
+        ar.u32(&mut u32::from(self.is_inlined))?;
+        self.required_bones.write(ar)?;
+        let expected = self.global_strip & 2 == 0 && !self.is_lod_cooked_out;
+        let rd = match (&self.render, expected) {
+            (Some(rd), true) => rd,
+            (None, false) => return Ok(()),
+            _ => bail!("LOD render data presence disagrees with its flags"),
+        };
+        ar.i32(&mut (rd.sections.len() as i32))?;
+        for s in &rd.sections {
+            s.write(ar)?;
+        }
+        let has_cloth = rd.sections.iter().any(SkelRenderSection::has_cloth);
+        rd.active_bone_indices.write(ar)?;
+        ar.u32(&mut rd.buffers_size.to_owned())?;
+        match (&rd.buffers, self.is_inlined) {
+            (SkeletalMeshLodBuffers::Inline(d), true) => d.write(ar, has_vertex_colors, has_cloth),
+            (SkeletalMeshLodBuffers::Streamed { bulk_index, availability }, false) => {
+                ar.i32(&mut bulk_index.to_owned())?;
+                match availability {
+                    Some(a) => a.write(ar, has_cloth),
+                    None => Ok(()),
+                }
+            }
+            _ => bail!("buffer form disagrees with the inlined flag"),
+        }
+    }
+}
+
+/// The whole tail of a `USkeletalMesh` export: 415 exports, 470 MiB.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkeletalMeshTail {
+    pub strip_flags: [u8; 2],
+    /// `ImportedBounds`, an `FBoxSphereBounds` at LWC precision.
+    pub imported_bounds: [u8; 56],
+    pub materials: Vec<SkeletalMeshMaterial>,
+    pub reference_skeleton: ReferenceSkeleton,
+    pub cooked: u32,
+    /// The render data, written only when cooked.
+    pub render: Option<SkeletalMeshRenderData>,
+    pub dummy_objs: FixedArray,
+    /// `BodySetup`, written only when the mesh enables per-poly collision — a
+    /// condition that lives in the property block.
+    pub body_setup: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkeletalMeshMaterial {
+    pub material_interface: i32,
+    pub slot_name: [u8; 8],
+    /// The imported slot name only survives a cook that keeps editor data.
+    pub imported_slot_name: Option<[u8; 8]>,
+    /// `FMeshUVChannelInfo`: two 32-bit bools and four floats.
+    pub uv_channel_info: [u8; 24],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkeletalMeshRenderData {
+    pub lods: Vec<SkeletalMeshLod>,
+    pub nanite: NaniteResources,
+    pub num_inlined_lods: u8,
+    pub num_non_optional_lods: u8,
+}
+
+impl SkeletalMeshTail {
+    pub fn read(r: &mut Reader, block: &PropertyBlock, ctx: TailContext) -> Result<Self> {
+        let flag = |name: &str| matches!(block.get(name), Some(PropValue::Bool(true)));
+        let strip_flags = [r.u8()?, r.u8()?];
+        let imported_bounds: [u8; 56] = r.take(56)?.try_into().expect("56 bytes");
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "Materials", r.o - 4)?
+        };
+        let mut materials = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            let material_interface = r.i32()?;
+            let slot_name = r.take(8)?.try_into().expect("8 bytes");
+            let imported_slot_name = (r.u32()? != 0)
+                .then(|| -> Result<[u8; 8]> { Ok(r.take(8)?.try_into().expect("8 bytes")) })
+                .transpose()?;
+            materials.push(SkeletalMeshMaterial {
+                material_interface,
+                slot_name,
+                imported_slot_name,
+                uv_channel_info: r.take(24)?.try_into().expect("24 bytes"),
+            });
+        }
+        let reference_skeleton = ReferenceSkeleton::read(r)?;
+        let cooked = r.u32()?;
+        let render = (cooked != 0)
+            .then(|| -> Result<SkeletalMeshRenderData> {
+                let n = {
+                    let n = r.i32()?;
+                    super::limits::bounded(n, MAX_NATIVE_COUNT, "LODRenderData", r.o - 4)?
+                };
+                let mut lods = Vec::with_capacity(n.min(16));
+                for _ in 0..n {
+                    lods.push(SkeletalMeshLod::read(r, ctx, flag("bHasVertexColors"))?);
+                }
+                Ok(SkeletalMeshRenderData {
+                    lods,
+                    nanite: NaniteResources::read(r)?,
+                    num_inlined_lods: r.u8()?,
+                    num_non_optional_lods: r.u8()?,
+                })
+            })
+            .transpose()?;
+        let dummy_objs = FixedArray::read(r, "legacy DummyObjs", 4)?;
+        let body_setup = flag("bEnablePerPolyCollision").then(|| r.i32()).transpose()?;
+        Ok(SkeletalMeshTail {
+            strip_flags,
+            imported_bounds,
+            materials,
+            reference_skeleton,
+            cooked,
+            render,
+            dummy_objs,
+            body_setup,
+        })
+    }
+
+    pub fn write(&self, ar: &mut impl Ar, block: &PropertyBlock) -> Result<()> {
+        let flag = |name: &str| matches!(block.get(name), Some(PropValue::Bool(true)));
+        ar.u8(&mut self.strip_flags[0].to_owned())?;
+        ar.u8(&mut self.strip_flags[1].to_owned())?;
+        ar.raw(&mut self.imported_bounds.to_vec(), 56)?;
+        ar.i32(&mut (self.materials.len() as i32))?;
+        for m in &self.materials {
+            ar.i32(&mut m.material_interface.to_owned())?;
+            ar.raw(&mut m.slot_name.to_vec(), 8)?;
+            match &m.imported_slot_name {
+                Some(n) => {
+                    ar.u32(&mut 1)?;
+                    ar.raw(&mut n.to_vec(), 8)?;
+                }
+                None => ar.u32(&mut 0)?,
+            }
+            ar.raw(&mut m.uv_channel_info.to_vec(), 24)?;
+        }
+        self.reference_skeleton.write(ar)?;
+        ar.u32(&mut self.cooked.to_owned())?;
+        match (&self.render, self.cooked != 0) {
+            (Some(rd), true) => {
+                ar.i32(&mut (rd.lods.len() as i32))?;
+                for l in &rd.lods {
+                    l.write(ar, flag("bHasVertexColors"))?;
+                }
+                rd.nanite.write(ar)?;
+                ar.u8(&mut rd.num_inlined_lods.to_owned())?;
+                ar.u8(&mut rd.num_non_optional_lods.to_owned())?;
+            }
+            (None, false) => {}
+            _ => bail!("render data presence disagrees with the cooked flag"),
+        }
+        self.dummy_objs.write(ar)?;
+        match (self.body_setup, flag("bEnablePerPolyCollision")) {
+            (Some(v), true) => ar.i32(&mut v.to_owned())?,
+            (None, false) => {}
+            _ => bail!("body setup presence disagrees with the property block"),
+        }
+        Ok(())
+    }
+}
+
 /// One entry of an `FFormatContainer`: a format name and the payload cooked for
 /// it.
 ///
@@ -2303,6 +3070,7 @@ pub const MODELED_TAILS: &[&str] = &[
     "MaterialInstanceDynamic",
     "BodySetup",
     "StaticMesh",
+    "SkeletalMesh",
 ];
 
 /// Decode a modeled tail and re-emit it, for verification against the span it
@@ -2369,6 +3137,16 @@ pub fn roundtrip_tail(
             }
             let mut w = super::archive::Writer::new();
             modeled.write(&mut w, block, ctx)?;
+            Ok(w.into_bytes())
+        })()),
+        "SkeletalMesh" => Some((|| {
+            let mut r = Reader::new(tail, names);
+            let modeled = SkeletalMeshTail::read(&mut r, block, ctx)?;
+            if r.o != tail.len() {
+                bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+            }
+            let mut w = super::archive::Writer::new();
+            modeled.write(&mut w, block)?;
             Ok(w.into_bytes())
         })()),
         "StaticMesh" => Some((|| {
