@@ -12,12 +12,28 @@
 //! already there, so `ce_tail_model_roundtrip` checks the model against the span
 //! it would replace rather than against anyone's reading of the engine.
 //!
-//! `ce_tail_census` says where the bytes are. Two orderings fall out of it and
-//! which matters depends on the goal: `StaticMesh` and `BodySetup` are 48% of
-//! the 4.77 GiB, while `StaticMeshComponent` and `StaticMeshActor` are 196,000
-//! exports whose tails have medians of 16 and 79 bytes. This starts with the
-//! latter, because a cheap conversion covering a sixth of all exports proves the
-//! pattern before anything expensive depends on it.
+//! `ce_tail_census` says where the bytes are, and two orderings fall out of it:
+//! a few classes hold most of the 4.77 GiB, while `StaticMeshComponent` and
+//! `StaticMeshActor` are 196,000 exports with medians of 16 and 79 bytes. This
+//! started with the latter, because a cheap conversion covering a sixth of all
+//! exports proves the pattern before anything expensive depends on it, and then
+//! took the heavy classes in order of bytes.
+//!
+//! Converted so far — 351,018 tails, 2.51 GiB, all byte-exact: the
+//! static-mesh-component family, the instanced-static-mesh family, every cooked
+//! texture shape, every material shape, and `UBodySetup`. What is left is
+//! `StaticMesh` (Nanite), `SkeletalMesh`, `AnimSequence` (ACL) and
+//! `GeometryCollection`.
+//!
+//! # Payloads another serializer owns
+//!
+//! Several of these tails end in a blob a *different* serializer produced: a
+//! texture mip's block-compressed pixels, a material's compiled shader map,
+//! `UBodySetup`'s Chaos physics data. Those stay byte strings here, and that is
+//! not the model quietly retaining a span — they are leaf data, not an encoding
+//! of some richer value this layer could recover and re-emit. What the model
+//! owes them is *addressing*: which format, which bulk-data index, how long.
+//! Decoding them is its own work item.
 //!
 //! # A tail is a chain, and parts of it are property-dependent
 //!
@@ -1140,6 +1156,86 @@ impl VirtualTextureBuiltData {
     }
 }
 
+/// One entry of an `FFormatContainer`: a format name and the payload cooked for
+/// it.
+///
+/// `payload` is Chaos's serialized physics geometry. It stays a byte string in
+/// this layer for the same reason a texture mip does — it is a separate
+/// serializer's output, and decoding it is its own work item rather than
+/// something the tail model can do on the way past. What the model does supply
+/// is the addressing: which format, which bulk-data index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CookedFormat {
+    pub format: FName,
+    pub bulk_index: i32,
+    pub payload: Vec<u8>,
+}
+
+/// `UBodySetup::Serialize`: the setup GUID, then — when cooked — the per-format
+/// cooked physics data.
+///
+/// 17,754 exports and 1,051 MiB, the second-largest tail population in the
+/// corpus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodySetupTail {
+    pub guid: [u8; 16],
+    pub cooked: bool,
+    /// Written only when cooked, so `None` and `Some(false)` are different
+    /// files, not the same one described two ways.
+    pub has_cooked_data: Option<bool>,
+    pub formats: Vec<CookedFormat>,
+}
+
+impl BodySetupTail {
+    pub fn read(r: &mut Reader, ctx: TailContext) -> Result<Self> {
+        let guid: [u8; 16] = r.take(16)?.try_into().expect("16 bytes");
+        let cooked = r.u32()? != 0;
+        if !cooked {
+            return Ok(BodySetupTail { guid, cooked, has_cooked_data: None, formats: Vec::new() });
+        }
+        let has_cooked_data = Some(r.u32()? != 0);
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "CookedFormatData", r.o - 4)?
+        };
+        let mut formats = Vec::with_capacity(n.min(16));
+        for _ in 0..n {
+            let format = r.fname()?;
+            let bulk_index = r.i32()?;
+            let Some(&(offset, size)) = ctx.bulk_data.get(bulk_index.max(0) as usize) else {
+                bail!("body setup: bulk data index {bulk_index} out of range");
+            };
+            if offset as usize != ctx.origin + r.o {
+                bail!("body setup payload at {offset} is not inline at {}", ctx.origin + r.o);
+            }
+            formats.push(CookedFormat {
+                format,
+                bulk_index,
+                payload: r.take(size.max(0) as usize)?.to_vec(),
+            });
+        }
+        Ok(BodySetupTail { guid, cooked, has_cooked_data, formats })
+    }
+
+    pub fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.raw(&mut self.guid.to_vec(), 16)?;
+        ar.u32(&mut u32::from(self.cooked))?;
+        match (self.has_cooked_data, self.cooked) {
+            (Some(v), true) => ar.u32(&mut u32::from(v))?,
+            (None, false) => return Ok(()),
+            _ => bail!("cooked-data flag disagrees with the cooked flag"),
+        }
+        ar.i32(&mut (self.formats.len() as i32))?;
+        for f in &self.formats {
+            ar.fname(&mut f.format.clone())?;
+            ar.i32(&mut f.bulk_index.to_owned())?;
+            let n = f.payload.len();
+            ar.raw(&mut f.payload.clone(), n)?;
+        }
+        Ok(())
+    }
+}
+
 /// One `FMaterialResourceLocOnDisk`: where a resource starts and which
 /// feature/quality level it was compiled for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1382,6 +1478,7 @@ pub const MODELED_TAILS: &[&str] = &[
     "MaterialInstanceConstant",
     "LandscapeMaterialInstanceConstant",
     "MaterialInstanceDynamic",
+    "BodySetup",
 ];
 
 /// Decode a modeled tail and re-emit it, for verification against the span it
@@ -1448,6 +1545,16 @@ pub fn roundtrip_tail(
             }
             let mut w = super::archive::Writer::new();
             modeled.write(&mut w, block, ctx)?;
+            Ok(w.into_bytes())
+        })()),
+        "BodySetup" => Some((|| {
+            let mut r = Reader::new(tail, names);
+            let modeled = BodySetupTail::read(&mut r, ctx)?;
+            if r.o != tail.len() {
+                bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+            }
+            let mut w = super::archive::Writer::new();
+            modeled.write(&mut w)?;
             Ok(w.into_bytes())
         })()),
         _ => None,
