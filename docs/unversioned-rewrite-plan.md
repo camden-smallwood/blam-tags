@@ -1042,7 +1042,10 @@ span count — the three Niagara variable types are 1.86M of the 1.92M spans, th
 and fifteen with under a thousand spans each. `BlockLayout::Native` is deleted
 when the last one lands.
 
-**B. Tail arms → typed models (64 arms + 42 helpers, 4.77 GiB).**
+**B. Tail arms → typed models (64 arms + 42 helpers, 4.77 GiB).** *Started: the
+instanced-static-mesh family is done — 277,477 tails, 546 MB, 100% exact. The
+four heaviest classes above it are all behind a compression codec, so they are
+work item H.*
 Sequence by bytes so the regeneration gate moves early, but the batches are
 arms, not classes:
 
@@ -1052,13 +1055,21 @@ arms, not classes:
 | B2 | the arms behind the next 13 | 99.09% |
 | B3 | everything remaining | 100% |
 
-**C. Close the 3 declining arms (90 KB).** `DataTable` (89 exports, 87 KB) and
-`UserDefinedStruct` (38, 2.9 KB) are partial; `NiagaraScript` declines at the end
-of its export with **0 bytes** left, so removing it is a no-op.
+**C. Close the 3 declining arms (90 KB). — DONE.** One was a real bug and two
+were the census measuring itself. `NiagaraScript` declined at the end of its
+export with 0 bytes left, because it read a shader-map resource count off the
+end; guarding that closed 14,767 of the 14,894 declining exports. The rest was
+`ce_tail_stop_census` building an `ExportContext` with no `PackageResolver`, so
+every `UDataTable` failed to find its row layout — it now runs the same
+cross-package resolver `ce_coverage_matrix` does. **All 1,153,838 exports now
+walk their whole chain with zero stops.**
 
-**D. Cite the remaining 22 struct sizes.** Four are declared by schemas the game
-uses but never present in a block, so they are one edited property from being
-read. Read the *serializer*, not `sizeof`.
+**D. Cite the remaining 22 struct sizes. — DONE.** The `declared` column of
+`ce_native_struct_census` splits them: 19 are referenced by no schema in the game
+and are purely defensive, while four are declared by real classes and never
+serialized. `FNavAgentSelector` and `FPerPlatformBool` were already cited;
+`FMatrix` (four `FPlane`s, NoExportTypes.h:1743) and `FTimespan` (one `int64`,
+:2229) now are.
 
 **E. Blueprint-class exports (89,762).** Decoded today via their class package
 but unreachable from the edit path; make the recovered `FField` chain a
@@ -1087,7 +1098,19 @@ held to `ce_semantic_roundtrip` rather than to byte-identity:
 * **H4 ACL animation** (172 MiB, `AnimSequence`). `ACLPlugin` is in the UHT
   dump; ACL itself is open source, so the codec is readable.
 
-**G. Make the zero mask fully derivable, using the UHT dump.**
+**G. Make the zero mask fully derivable, using the UHT dump. — DONE for bools.**
+`native_bool` is scraped from the shipped `UHTHeaderDump`: 4,393 native and 3,192
+bitfield declarations, keyed by *declaring* struct because 133 bool names are
+declared both ways by different structs. `ce_native_bool_check` measured it
+against all 1,412,525 bool entries in the corpus with **zero disagreements in
+either direction**, so bools now derive their maskability instead of replaying
+it — which is what an *inserted* property needs, having no bit to replay. Every
+other type still replays: the engine gates those on
+`CPF_ZeroConstructor | CPF_NoDestructor`, flags the `.usmap` does not carry. That
+residue is now 1,795 `Object` and 194 `Name` entries across 3 declarations, down
+from 629,385.
+
+The original statement of the problem:
 The writer currently decides masking as "the file masked it **and** the value is
 still zero". The first half is taken from the file because `CanSerializeAsZero`
 gates a bool on `IsNativeBool()`, and the `.usmap` records a real `bool` and a
