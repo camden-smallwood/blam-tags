@@ -1979,6 +1979,245 @@ impl StaticMeshTail {
     }
 }
 
+/// The bone-compression codec's own trailing data, which differs by codec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoneCodecData {
+    /// `FACLCompressedAnimDataBase::SerializeCompressedData` — the base key
+    /// count then `bCompressionFailed`. The compressed clip itself lives in
+    /// `CompressedByteStream`, not here.
+    Acl { compression_failed: u32 },
+    /// `FUECompressedAnimData` — four `TEnumAsByte` formats, three
+    /// `SerializeView` counts whose payloads are also in `CompressedByteStream`,
+    /// and `CompressedScaleOffsets.StripSize`.
+    Ue { formats: [u8; 4], view_counts: [i32; 3], strip_size: i32 },
+}
+
+/// The whole tail of a `UAnimSequence` export.
+///
+/// `UAnimationAsset` writes a 16-byte GUID *first*. A model that starts at the
+/// compressed-data block reads that GUID's tail as a track count and reports
+/// 2,039,646,153 tracks — which is what happened, on all 14,130 exports, before
+/// this type existed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnimSequenceChainTail {
+    pub animation_asset_guid: [u8; 16],
+    pub sequence: AnimSequenceTail,
+}
+
+impl AnimSequenceChainTail {
+    pub fn read(r: &mut Reader) -> Result<Self> {
+        Ok(AnimSequenceChainTail {
+            animation_asset_guid: r.take(16)?.try_into().expect("16 bytes"),
+            sequence: AnimSequenceTail::read(r)?,
+        })
+    }
+
+    pub fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.raw(&mut self.animation_asset_guid.to_vec(), 16)?;
+        self.sequence.write(ar)
+    }
+}
+
+/// `UAnimSequence`'s compressed animation data: 14,130 exports, 172 MiB.
+///
+/// The ACL-compressed clip is in `compressed_byte_stream`, and it stays a byte
+/// string here — it is ACL's own container, and decoding it is work item H.
+/// Everything that describes and addresses it is a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnimSequenceTail {
+    pub strip_flags: [u8; 2],
+    /// `bSerializeCompressedData`. When clear the tail ends here.
+    pub serialize_compressed_data: bool,
+    pub compressed_raw_data_size: i32,
+    pub track_to_skeleton_map: FixedArray,
+    /// `FAnimCompressedCurveIndexedName` serializes **only** its `CurveName`;
+    /// the `CurveIndex` the struct declares is written for memory counting only,
+    /// so an element is 8 bytes on the wire, not 12.
+    pub indexed_curve_names: FixedArray,
+    /// The declared length of the compressed stream. Kept because a bulk-backed
+    /// stream writes the length with no payload behind it, so it cannot be
+    /// derived from what follows.
+    pub compressed_byte_stream_len: i32,
+    pub use_bulk: bool,
+    /// Present only when the stream is inline rather than bulk-backed.
+    pub compressed_byte_stream: Option<Vec<u8>>,
+    pub bone_codec: FStr,
+    pub curve_codec: FStr,
+    pub compressed_curve_byte_stream: FixedArray,
+    /// `CompressedNumberOfKeys` from the `ICompressedAnimData` base.
+    pub compressed_number_of_keys: i32,
+    pub codec_data: BoneCodecData,
+    /// `UAnimSequence`'s trailing flag.
+    pub trailing_flag: u32,
+}
+
+impl AnimSequenceTail {
+    pub fn read(r: &mut Reader) -> Result<Self> {
+        let strip_flags = [r.u8()?, r.u8()?];
+        let serialize_compressed_data = r.u32()? != 0;
+        if !serialize_compressed_data {
+            return Ok(AnimSequenceTail {
+                strip_flags,
+                serialize_compressed_data,
+                compressed_raw_data_size: 0,
+                track_to_skeleton_map: FixedArray { element_size: 4, data: Vec::new() },
+                indexed_curve_names: FixedArray { element_size: 8, data: Vec::new() },
+                compressed_byte_stream_len: 0,
+                use_bulk: false,
+                compressed_byte_stream: None,
+                bone_codec: FStr::default(),
+                curve_codec: FStr::default(),
+                compressed_curve_byte_stream: FixedArray { element_size: 1, data: Vec::new() },
+                compressed_number_of_keys: 0,
+                codec_data: BoneCodecData::Acl { compression_failed: 0 },
+                trailing_flag: 0,
+            });
+        }
+        let compressed_raw_data_size = r.i32()?;
+        let track_to_skeleton_map = FixedArray::read(r, "CompressedTrackToSkeletonMapTable", 4)?;
+        let indexed_curve_names = FixedArray::read(r, "IndexedCurveNames", 8)?;
+        let compressed_byte_stream_len = r.i32()?;
+        let n = super::limits::bounded(
+            compressed_byte_stream_len,
+            MAX_NATIVE_COUNT,
+            "CompressedByteStream",
+            r.o - 4,
+        )?;
+        let use_bulk = r.u32()? != 0;
+        let compressed_byte_stream =
+            (!use_bulk).then(|| r.take(n).map(<[u8]>::to_vec)).transpose()?;
+        let bone_codec = r.fstring()?;
+        let curve_codec = r.fstring()?;
+        let compressed_curve_byte_stream = FixedArray::read(r, "CompressedCurveByteStream", 1)?;
+        let compressed_number_of_keys = r.i32()?;
+        let codec_name = bone_codec.as_str();
+        let codec_data = if codec_name.starts_with("AnimBoneCompressionCodec_ACL") {
+            BoneCodecData::Acl { compression_failed: r.u32()? }
+        } else if codec_name.starts_with("AnimCompress_") {
+            BoneCodecData::Ue {
+                formats: r.take(4)?.try_into().expect("4 bytes"),
+                view_counts: [r.i32()?, r.i32()?, r.i32()?],
+                strip_size: r.i32()?,
+            }
+        } else {
+            bail!("unmodeled bone compression codec {codec_name:?}");
+        };
+        Ok(AnimSequenceTail {
+            strip_flags,
+            serialize_compressed_data,
+            compressed_raw_data_size,
+            track_to_skeleton_map,
+            indexed_curve_names,
+            compressed_byte_stream_len,
+            use_bulk,
+            compressed_byte_stream,
+            bone_codec,
+            curve_codec,
+            compressed_curve_byte_stream,
+            compressed_number_of_keys,
+            codec_data,
+            trailing_flag: r.u32()?,
+        })
+    }
+
+    pub fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.u8(&mut self.strip_flags[0].to_owned())?;
+        ar.u8(&mut self.strip_flags[1].to_owned())?;
+        ar.u32(&mut u32::from(self.serialize_compressed_data))?;
+        if !self.serialize_compressed_data {
+            return Ok(());
+        }
+        ar.i32(&mut self.compressed_raw_data_size.to_owned())?;
+        self.track_to_skeleton_map.write(ar)?;
+        self.indexed_curve_names.write(ar)?;
+        ar.i32(&mut self.compressed_byte_stream_len.to_owned())?;
+        ar.u32(&mut u32::from(self.use_bulk))?;
+        match (&self.compressed_byte_stream, self.use_bulk) {
+            (Some(s), false) => {
+                if s.len() as i32 != self.compressed_byte_stream_len {
+                    bail!(
+                        "compressed stream is {} bytes but its length field says {}",
+                        s.len(),
+                        self.compressed_byte_stream_len
+                    );
+                }
+                let n = s.len();
+                ar.raw(&mut s.clone(), n)?;
+            }
+            (None, true) => {}
+            _ => bail!("compressed stream presence disagrees with the bulk flag"),
+        }
+        ar.fstring(&mut self.bone_codec.clone())?;
+        ar.fstring(&mut self.curve_codec.clone())?;
+        self.compressed_curve_byte_stream.write(ar)?;
+        ar.i32(&mut self.compressed_number_of_keys.to_owned())?;
+        match &self.codec_data {
+            BoneCodecData::Acl { compression_failed } => {
+                ar.u32(&mut compression_failed.to_owned())?;
+            }
+            BoneCodecData::Ue { formats, view_counts, strip_size } => {
+                ar.raw(&mut formats.to_vec(), 4)?;
+                for v in view_counts {
+                    ar.i32(&mut v.to_owned())?;
+                }
+                ar.i32(&mut strip_size.to_owned())?;
+            }
+        }
+        ar.u32(&mut self.trailing_flag.to_owned())
+    }
+}
+
+/// `UDNAAsset`'s two RigLogic DNA streams, back to back: the behaviour layers
+/// then the geometry.
+///
+/// DNA is RigLogic's own container format, so the streams stay byte strings and
+/// what this model owns is the *split* — which is not trivial, because the first
+/// stream can be written without a size and the reader has to find where the
+/// second one begins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnaAssetTail {
+    pub behavior: Vec<u8>,
+    pub geometry: Vec<u8>,
+}
+
+impl DnaAssetTail {
+    pub fn read(r: &mut Reader) -> Result<Self> {
+        use super::tails::{dna_stream_end, dna_unsized_floor};
+        let start = r.o;
+        // The behaviour stream usually carries its own size. When it does not,
+        // its end is wherever a *second* stream begins that closes the export
+        // exactly — the same search the walker does.
+        let split = match dna_stream_end(r.b, r.o)? {
+            Some(end) => end,
+            None => {
+                let floor = dna_unsized_floor(r.b, r.o)?;
+                (floor..r.b.len().saturating_sub(3))
+                    .filter(|&i| &r.b[i..i + 3] == b"DNA")
+                    .find(|&i| matches!(dna_stream_end(r.b, i), Ok(Some(e)) if e == r.b.len()))
+                    .with_context(|| {
+                        format!("no second DNA stream closing the export after {floor}")
+                    })?
+            }
+        };
+        let end = dna_stream_end(r.b, split)?
+            .context("the second DNA stream is itself unsized")?;
+        if end != r.b.len() {
+            bail!("second DNA stream ends at {end}, not the export end {}", r.b.len());
+        }
+        let behavior = r.b[start..split].to_vec();
+        let geometry = r.b[split..end].to_vec();
+        r.o = end;
+        Ok(DnaAssetTail { behavior, geometry })
+    }
+
+    pub fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        let n = self.behavior.len();
+        ar.raw(&mut self.behavior.clone(), n)?;
+        let n = self.geometry.len();
+        ar.raw(&mut self.geometry.clone(), n)
+    }
+}
+
 /// A `TArray<T>` of fixed-width blittable elements written with a *bare* count —
 /// no element size ahead of it, unlike [`BulkArray`].
 ///
@@ -3071,6 +3310,8 @@ pub const MODELED_TAILS: &[&str] = &[
     "BodySetup",
     "StaticMesh",
     "SkeletalMesh",
+    "AnimSequence",
+    "DNAAsset",
 ];
 
 /// Decode a modeled tail and re-emit it, for verification against the span it
@@ -3137,6 +3378,26 @@ pub fn roundtrip_tail(
             }
             let mut w = super::archive::Writer::new();
             modeled.write(&mut w, block, ctx)?;
+            Ok(w.into_bytes())
+        })()),
+        "AnimSequence" => Some((|| {
+            let mut r = Reader::new(tail, names);
+            let modeled = AnimSequenceChainTail::read(&mut r)?;
+            if r.o != tail.len() {
+                bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+            }
+            let mut w = super::archive::Writer::new();
+            modeled.write(&mut w)?;
+            Ok(w.into_bytes())
+        })()),
+        "DNAAsset" => Some((|| {
+            let mut r = Reader::new(tail, names);
+            let modeled = DnaAssetTail::read(&mut r)?;
+            if r.o != tail.len() {
+                bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+            }
+            let mut w = super::archive::Writer::new();
+            modeled.write(&mut w)?;
             Ok(w.into_bytes())
         })()),
         "SkeletalMesh" => Some((|| {
