@@ -18,7 +18,7 @@ use anyhow::Result;
 use super::archive::{Ar, Reader};
 use super::block::{flattened_schema, read_struct, write_block};
 use super::usmap::Usmap;
-use super::value::{FName, PropertyBlock};
+use super::value::{FName, FStr, PropertyBlock};
 
 /// A hand-written struct, decoded.
 #[derive(Debug, Clone)]
@@ -35,6 +35,40 @@ pub enum HandWritten {
     SkeletalMeshSamplingLod(WeightedRandomSampler),
     /// `FSkeletalMeshSamplingRegionBuiltData`.
     SkeletalMeshSamplingRegion(SkeletalMeshSamplingRegion),
+    /// `FNiagaraDataInterfaceGPUParamInfo`.
+    NiagaraGpuParamInfo(NiagaraGpuParamInfo),
+}
+
+/// `FNiagaraDataInterfaceGPUParamInfo` — the HLSL symbol, the data-interface
+/// class name, and the generated-function table.
+///
+/// There is no `ShaderParametersOffset` in the stream despite the `.usmap`
+/// listing one.
+#[derive(Debug, Clone)]
+pub struct NiagaraGpuParamInfo {
+    pub hlsl_symbol: FStr,
+    pub di_class_name: FStr,
+    pub generated_functions: Vec<NiagaraGeneratedFunction>,
+}
+
+/// One entry of `FNiagaraDataInterfaceGPUParamInfo::GeneratedFunctions`.
+#[derive(Debug, Clone)]
+pub struct NiagaraGeneratedFunction {
+    pub definition_name: FName,
+    pub instance_name: FStr,
+    /// Name/value pairs.
+    pub specifiers: Vec<(FName, FName)>,
+    pub variadic_inputs: Vec<NiagaraVariableCommonReference>,
+    pub variadic_outputs: Vec<NiagaraVariableCommonReference>,
+    // No trailing `MiscUsageBitMask`: that field is gated on a later Niagara
+    // custom version than this build writes.
+}
+
+/// `FNiagaraVariableCommonReference` — a name and an `FPackageIndex`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NiagaraVariableCommonReference {
+    pub name: FName,
+    pub underlying_type: i32,
 }
 
 /// `FMovieSceneFloatChannel` and its double-width twin. The key times and
@@ -135,7 +169,66 @@ pub const MODELED: &[&str] = &[
     "PCGPoint",
     "SkeletalMeshSamplingLODBuiltData",
     "SkeletalMeshSamplingRegionBuiltData",
+    "NiagaraDataInterfaceGPUParamInfo",
 ];
+
+impl NiagaraGeneratedFunction {
+    fn read(r: &mut Reader) -> Result<Self> {
+        let definition_name = r.fname()?;
+        let instance_name = r.fstring()?;
+        let n = count(r, "Specifiers")?;
+        let mut specifiers = Vec::with_capacity(n.min(super::limits::PREALLOC_CAP));
+        for _ in 0..n {
+            specifiers.push((r.fname()?, r.fname()?));
+        }
+        let mut refs = [Vec::new(), Vec::new()];
+        for slot in refs.iter_mut() {
+            let n = count(r, "variadic references")?;
+            slot.reserve(n.min(super::limits::PREALLOC_CAP));
+            for _ in 0..n {
+                slot.push(NiagaraVariableCommonReference {
+                    name: r.fname()?,
+                    underlying_type: r.i32()?,
+                });
+            }
+        }
+        let [variadic_inputs, variadic_outputs] = refs;
+        Ok(NiagaraGeneratedFunction {
+            definition_name,
+            instance_name,
+            specifiers,
+            variadic_inputs,
+            variadic_outputs,
+        })
+    }
+
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.fname(&mut self.definition_name.clone())?;
+        ar.fstring(&mut self.instance_name.clone())?;
+        ar.i32(&mut (self.specifiers.len() as i32))?;
+        for (k, v) in &self.specifiers {
+            ar.fname(&mut k.clone())?;
+            ar.fname(&mut v.clone())?;
+        }
+        for list in [&self.variadic_inputs, &self.variadic_outputs] {
+            ar.i32(&mut (list.len() as i32))?;
+            for e in list {
+                ar.fname(&mut e.name.clone())?;
+                ar.i32(&mut e.underlying_type.to_owned())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn semantic_eq(&self, o: &NiagaraGeneratedFunction) -> bool {
+        self.definition_name == o.definition_name
+            && self.instance_name == o.instance_name
+            && self.instance_name.wide == o.instance_name.wide
+            && self.specifiers == o.specifiers
+            && self.variadic_inputs == o.variadic_inputs
+            && self.variadic_outputs == o.variadic_outputs
+    }
+}
 
 /// A count read from the file, bounded before it is trusted.
 fn count(r: &mut Reader, what: &str) -> Result<usize> {
@@ -297,6 +390,20 @@ impl HandWritten {
             "SkeletalMeshSamplingLODBuiltData" => Some(HandWritten::SkeletalMeshSamplingLod(
                 WeightedRandomSampler::read(r)?,
             )),
+            "NiagaraDataInterfaceGPUParamInfo" => {
+                let hlsl_symbol = r.fstring()?;
+                let di_class_name = r.fstring()?;
+                let n = count(r, "GeneratedFunctions")?;
+                let mut generated_functions = Vec::with_capacity(n.min(super::limits::PREALLOC_CAP));
+                for _ in 0..n {
+                    generated_functions.push(NiagaraGeneratedFunction::read(r)?);
+                }
+                Some(HandWritten::NiagaraGpuParamInfo(NiagaraGpuParamInfo {
+                    hlsl_symbol,
+                    di_class_name,
+                    generated_functions,
+                }))
+            }
             "SkeletalMeshSamplingRegionBuiltData" => {
                 Some(HandWritten::SkeletalMeshSamplingRegion(SkeletalMeshSamplingRegion {
                     triangle_indices: read_i32_array(r, "TriangleIndices")?,
@@ -385,6 +492,15 @@ impl HandWritten {
                 }
                 Ok(())
             }
+            HandWritten::NiagaraGpuParamInfo(p) => {
+                ar.fstring(&mut p.hlsl_symbol.clone())?;
+                ar.fstring(&mut p.di_class_name.clone())?;
+                ar.i32(&mut (p.generated_functions.len() as i32))?;
+                for f in &p.generated_functions {
+                    f.write(ar)?;
+                }
+                Ok(())
+            }
             HandWritten::SkeletalMeshSamplingLod(s) => s.write(ar),
             HandWritten::SkeletalMeshSamplingRegion(rg) => {
                 write_i32_array(ar, &rg.triangle_indices)?;
@@ -437,6 +553,17 @@ impl HandWritten {
                     && a.steepness.map(f32::to_bits) == b.steepness.map(f32::to_bits)
                     && a.seed == b.seed
                     && a.metadata_entry == b.metadata_entry
+            }
+            (HandWritten::NiagaraGpuParamInfo(a), HandWritten::NiagaraGpuParamInfo(b)) => {
+                a.hlsl_symbol == b.hlsl_symbol
+                    && a.hlsl_symbol.wide == b.hlsl_symbol.wide
+                    && a.di_class_name == b.di_class_name
+                    && a.di_class_name.wide == b.di_class_name.wide
+                    && a.generated_functions.len() == b.generated_functions.len()
+                    && a.generated_functions
+                        .iter()
+                        .zip(&b.generated_functions)
+                        .all(|(x, y)| x.semantic_eq(y))
             }
             (HandWritten::SkeletalMeshSamplingLod(a), HandWritten::SkeletalMeshSamplingLod(b)) => {
                 a.semantic_eq(b)
