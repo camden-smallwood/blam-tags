@@ -1979,6 +1979,294 @@ impl StaticMeshTail {
     }
 }
 
+/// `AActor`'s tail: an optional name string, then the actor and instance GUIDs.
+///
+/// Modeled on its own because several actor classes add nothing of their own —
+/// `AStaticMeshActor` alone is 69,832 exports whose whole tail is this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorTail {
+    pub name: Option<FStr>,
+    /// `FActorInstanceGuid`: `ActorGuid` then `ActorInstanceGuid`.
+    pub guids: [u8; 32],
+}
+
+impl ActorTail {
+    pub fn read(r: &mut Reader) -> Result<Self> {
+        let name = (r.u32()? != 0).then(|| r.fstring()).transpose()?;
+        Ok(ActorTail { name, guids: r.take(32)?.try_into().expect("32 bytes") })
+    }
+
+    pub fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        match &self.name {
+            Some(s) => {
+                ar.u32(&mut 1)?;
+                ar.fstring(&mut s.clone())?;
+            }
+            None => ar.u32(&mut 0)?,
+        }
+        ar.raw(&mut self.guids.to_vec(), 32)
+    }
+}
+
+/// `UAkAudioEvent`'s tail: the localized cooked event data, then its durations
+/// and attenuation radius.
+#[derive(Debug, Clone)]
+pub struct AkAudioEventTail {
+    pub cooked_data: PropertyBlock,
+    /// `MaximumDuration`, `MinimumDuration`, `IsInfinite`, `MaxAttenuationRadius`.
+    pub durations: [u8; 16],
+}
+
+impl AkAudioEventTail {
+    pub fn read(r: &mut Reader, ctx: TailContext) -> Result<Self> {
+        Ok(AkAudioEventTail {
+            cooked_data: read_struct(r, "WwiseLocalizedEventCookedData", ctx.usmap, 0)?,
+            durations: r.take(16)?.try_into().expect("16 bytes"),
+        })
+    }
+
+    pub fn write(&self, ar: &mut impl Ar, ctx: TailContext) -> Result<()> {
+        let flat = flattened_schema("WwiseLocalizedEventCookedData", ctx.usmap)?;
+        write_block(ar, &self.cooked_data, &flat, ctx.usmap)?;
+        ar.raw(&mut self.durations.to_vec(), 16)
+    }
+}
+
+/// `UModel`'s BSP data.
+///
+/// `UModel` uses the **float** math variants throughout in UE5, which the stream
+/// confirms: its `Vectors`/`Points` element size is 12, not 24. An `FModelVertex`
+/// is 56 bytes for the same reason — a double-width reading survived 16,722
+/// models because every one of them has an empty vertex buffer, and blew up on
+/// the two that do not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelTail {
+    pub global_strip: u8,
+    pub class_strip: u8,
+    pub bounds: [u8; 56],
+    pub vectors: BulkArray,
+    pub points: BulkArray,
+    pub nodes: BulkArray,
+    /// `FBspSurf` — 56 bytes each.
+    pub surfs: FixedArray,
+    pub verts: BulkArray,
+    pub num_shared_sides: i32,
+    pub root_outside: u32,
+    pub linked: u32,
+    pub num_unique_vertices: u32,
+    /// `FModelVertex` — 56 bytes each. Absent when both editor data and the
+    /// class's vertex-buffer flag are stripped.
+    pub vertex_buffer: Option<FixedArray>,
+    pub lighting_guid: [u8; 16],
+    /// `FLightmassPrimitiveSettings` — five four-byte bools and four floats.
+    pub lightmass_settings: FixedArray,
+}
+
+impl ModelTail {
+    pub fn read(r: &mut Reader) -> Result<Self> {
+        let global_strip = r.u8()?;
+        let class_strip = r.u8()?;
+        let bounds = r.take(56)?.try_into().expect("56 bytes");
+        let vectors = BulkArray::read(r, "Vectors")?;
+        let points = BulkArray::read(r, "Points")?;
+        let nodes = BulkArray::read(r, "Nodes")?;
+        let surfs = FixedArray::read(r, "Surfs", 56)?;
+        let verts = BulkArray::read(r, "Verts")?;
+        let num_shared_sides = r.i32()?;
+        let root_outside = r.u32()?;
+        let linked = r.u32()?;
+        let num_unique_vertices = r.u32()?;
+        let vertex_buffer = (global_strip & 1 == 0 || class_strip & 1 == 0)
+            .then(|| FixedArray::read(r, "model vertices", 56))
+            .transpose()?;
+        Ok(ModelTail {
+            global_strip,
+            class_strip,
+            bounds,
+            vectors,
+            points,
+            nodes,
+            surfs,
+            verts,
+            num_shared_sides,
+            root_outside,
+            linked,
+            num_unique_vertices,
+            vertex_buffer,
+            lighting_guid: r.take(16)?.try_into().expect("16 bytes"),
+            lightmass_settings: FixedArray::read(r, "LightmassSettings", 36)?,
+        })
+    }
+
+    pub fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.u8(&mut self.global_strip.to_owned())?;
+        ar.u8(&mut self.class_strip.to_owned())?;
+        ar.raw(&mut self.bounds.to_vec(), 56)?;
+        self.vectors.write(ar)?;
+        self.points.write(ar)?;
+        self.nodes.write(ar)?;
+        self.surfs.write(ar)?;
+        self.verts.write(ar)?;
+        ar.i32(&mut self.num_shared_sides.to_owned())?;
+        ar.u32(&mut self.root_outside.to_owned())?;
+        ar.u32(&mut self.linked.to_owned())?;
+        ar.u32(&mut self.num_unique_vertices.to_owned())?;
+        match (
+            &self.vertex_buffer,
+            self.global_strip & 1 == 0 || self.class_strip & 1 == 0,
+        ) {
+            (Some(v), true) => v.write(ar)?,
+            (None, false) => {}
+            _ => bail!("vertex buffer presence disagrees with the strip flags"),
+        }
+        ar.raw(&mut self.lighting_guid.to_vec(), 16)?;
+        self.lightmass_settings.write(ar)
+    }
+}
+
+/// One bucket of a level's precomputed visibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibilityBucket {
+    pub cell_data_size: i32,
+    /// `FCompressedVisibilityChunk` cells: an `FVector` min and two `uint16`.
+    pub cells: FixedArray,
+    pub chunks: Vec<VisibilityChunk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibilityChunk {
+    pub compressed: u32,
+    pub uncompressed_size: i32,
+    pub data: Vec<u8>,
+}
+
+/// `ULevel`'s tail: the actor list, the level's `FURL`, the model and component
+/// references, and the precomputed visibility and distance-field data.
+// No `Eq`: the volume distance field carries an `f32` scale.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LevelTail {
+    pub actors: FixedArray,
+    /// Protocol, host, map and portal.
+    pub url_strings: [FStr; 4],
+    pub url_options: Vec<FStr>,
+    pub port: i32,
+    pub url_valid: u32,
+    pub model: i32,
+    pub model_components: FixedArray,
+    pub level_script_actor: i32,
+    pub nav_list_start: i32,
+    pub nav_list_end: i32,
+    /// Bucket origin, then the cell sizes, bucket size and bucket count.
+    pub visibility_header: [u8; 32],
+    pub visibility_buckets: Vec<VisibilityBucket>,
+    pub volume_distance_field_scale: f32,
+    pub volume_distance_field_box: [u8; 49],
+    pub volume_size: [u8; 12],
+    pub volume_distance_field_data: FixedArray,
+}
+
+impl LevelTail {
+    pub fn read(r: &mut Reader) -> Result<Self> {
+        let actors = FixedArray::read(r, "Actors", 4)?;
+        let url_strings = [r.fstring()?, r.fstring()?, r.fstring()?, r.fstring()?];
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "URL options", r.o - 4)?
+        };
+        let url_options = (0..n).map(|_| r.fstring()).collect::<Result<Vec<_>>>()?;
+        let port = r.i32()?;
+        let url_valid = r.u32()?;
+        let model = r.i32()?;
+        let model_components = FixedArray::read(r, "ModelComponents", 4)?;
+        let level_script_actor = r.i32()?;
+        let nav_list_start = r.i32()?;
+        let nav_list_end = r.i32()?;
+        let visibility_header = r.take(32)?.try_into().expect("32 bytes");
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "visibility buckets", r.o - 4)?
+        };
+        let mut visibility_buckets = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            let cell_data_size = r.i32()?;
+            let cells = FixedArray::read(r, "visibility cells", 28)?;
+            let m = {
+                let m = r.i32()?;
+                super::limits::bounded(m, MAX_NATIVE_COUNT, "visibility chunks", r.o - 4)?
+            };
+            let mut chunks = Vec::with_capacity(m.min(64));
+            for _ in 0..m {
+                let compressed = r.u32()?;
+                let uncompressed_size = r.i32()?;
+                let bytes = {
+                    let b = r.i32()?;
+                    super::limits::bounded(b, MAX_NATIVE_COUNT, "visibility chunk data", r.o - 4)?
+                };
+                chunks.push(VisibilityChunk {
+                    compressed,
+                    uncompressed_size,
+                    data: r.take(bytes)?.to_vec(),
+                });
+            }
+            visibility_buckets.push(VisibilityBucket { cell_data_size, cells, chunks });
+        }
+        Ok(LevelTail {
+            actors,
+            url_strings,
+            url_options,
+            port,
+            url_valid,
+            model,
+            model_components,
+            level_script_actor,
+            nav_list_start,
+            nav_list_end,
+            visibility_header,
+            visibility_buckets,
+            volume_distance_field_scale: r.f32()?,
+            volume_distance_field_box: r.take(49)?.try_into().expect("49 bytes"),
+            volume_size: r.take(12)?.try_into().expect("12 bytes"),
+            volume_distance_field_data: FixedArray::read(r, "distance field data", 4)?,
+        })
+    }
+
+    pub fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        self.actors.write(ar)?;
+        for s in &self.url_strings {
+            ar.fstring(&mut s.clone())?;
+        }
+        ar.i32(&mut (self.url_options.len() as i32))?;
+        for s in &self.url_options {
+            ar.fstring(&mut s.clone())?;
+        }
+        ar.i32(&mut self.port.to_owned())?;
+        ar.u32(&mut self.url_valid.to_owned())?;
+        ar.i32(&mut self.model.to_owned())?;
+        self.model_components.write(ar)?;
+        ar.i32(&mut self.level_script_actor.to_owned())?;
+        ar.i32(&mut self.nav_list_start.to_owned())?;
+        ar.i32(&mut self.nav_list_end.to_owned())?;
+        ar.raw(&mut self.visibility_header.to_vec(), 32)?;
+        ar.i32(&mut (self.visibility_buckets.len() as i32))?;
+        for b in &self.visibility_buckets {
+            ar.i32(&mut b.cell_data_size.to_owned())?;
+            b.cells.write(ar)?;
+            ar.i32(&mut (b.chunks.len() as i32))?;
+            for c in &b.chunks {
+                ar.u32(&mut c.compressed.to_owned())?;
+                ar.i32(&mut c.uncompressed_size.to_owned())?;
+                ar.i32(&mut (c.data.len() as i32))?;
+                let n = c.data.len();
+                ar.raw(&mut c.data.clone(), n)?;
+            }
+        }
+        ar.f32(&mut self.volume_distance_field_scale.to_owned())?;
+        ar.raw(&mut self.volume_distance_field_box.to_vec(), 49)?;
+        ar.raw(&mut self.volume_size.to_vec(), 12)?;
+        self.volume_distance_field_data.write(ar)
+    }
+}
+
 /// The bone-compression codec's own trailing data, which differs by codec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoneCodecData {
@@ -3312,6 +3600,10 @@ pub const MODELED_TAILS: &[&str] = &[
     "SkeletalMesh",
     "AnimSequence",
     "DNAAsset",
+    "StaticMeshActor",
+    "AkAudioEvent",
+    "Model",
+    "Level",
 ];
 
 /// Decode a modeled tail and re-emit it, for verification against the span it
@@ -3378,6 +3670,47 @@ pub fn roundtrip_tail(
             }
             let mut w = super::archive::Writer::new();
             modeled.write(&mut w, block, ctx)?;
+            Ok(w.into_bytes())
+        })()),
+        // `AStaticMeshActor` adds nothing of its own; its whole tail is `AActor`'s.
+        "StaticMeshActor" => Some((|| {
+            let mut r = Reader::new(tail, names);
+            let modeled = ActorTail::read(&mut r)?;
+            if r.o != tail.len() {
+                bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+            }
+            let mut w = super::archive::Writer::new();
+            modeled.write(&mut w)?;
+            Ok(w.into_bytes())
+        })()),
+        "AkAudioEvent" => Some((|| {
+            let mut r = Reader::new(tail, names);
+            let modeled = AkAudioEventTail::read(&mut r, ctx)?;
+            if r.o != tail.len() {
+                bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+            }
+            let mut w = super::archive::Writer::new();
+            modeled.write(&mut w, ctx)?;
+            Ok(w.into_bytes())
+        })()),
+        "Model" => Some((|| {
+            let mut r = Reader::new(tail, names);
+            let modeled = ModelTail::read(&mut r)?;
+            if r.o != tail.len() {
+                bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+            }
+            let mut w = super::archive::Writer::new();
+            modeled.write(&mut w)?;
+            Ok(w.into_bytes())
+        })()),
+        "Level" => Some((|| {
+            let mut r = Reader::new(tail, names);
+            let modeled = LevelTail::read(&mut r)?;
+            if r.o != tail.len() {
+                bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+            }
+            let mut w = super::archive::Writer::new();
+            modeled.write(&mut w)?;
             Ok(w.into_bytes())
         })()),
         "AnimSequence" => Some((|| {
