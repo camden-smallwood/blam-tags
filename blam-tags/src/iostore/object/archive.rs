@@ -1,11 +1,52 @@
-//! The cursor an export's bytes pass through, and the context it resolves
-//! references against.
+//! The cursor an export's bytes pass through, in either direction, and the
+//! context it resolves references against.
+//!
+//! [`Ar`] is the seam: a layout is described once, against a trait that either
+//! reads into a value or writes out of it, which is how UE's own
+//! `FArchive& operator<<` works. The alternative — a `read_x` and a `write_x`
+//! per layout — is two descriptions of one fact, and they drift.
+//!
+//! Values are passed as `&mut`: on load the callee fills them in, on save it
+//! reads them out. A caller that wants to *write* therefore prepares the value
+//! first and hands it over, rather than the archive returning anything.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::sync::OnceLock;
 
 use super::usmap::UsmapProperty;
 use super::value::FName;
+
+/// A bidirectional byte archive.
+///
+/// Implemented by [`Reader`] (loading) and [`Writer`] (saving). Every method
+/// takes the value by `&mut` so one body serves both directions; branch on
+/// [`Ar::is_loading`] only where the *shape* genuinely differs, such as sizing a
+/// container from a count that is read on load and derived on save.
+pub(super) trait Ar {
+    fn u8(&mut self, v: &mut u8) -> Result<()>;
+    fn u16(&mut self, v: &mut u16) -> Result<()>;
+    fn i32(&mut self, v: &mut i32) -> Result<()>;
+    fn u32(&mut self, v: &mut u32) -> Result<()>;
+    fn u64(&mut self, v: &mut u64) -> Result<()>;
+    fn f32(&mut self, v: &mut f32) -> Result<()>;
+    fn f64(&mut self, v: &mut f64) -> Result<()>;
+    /// An `FName` as the file stores it: name-map index then instance number.
+    ///
+    /// Note the writer needs no name map. The index travels with the value
+    /// (see [`FName`]), which is the whole reason that type keeps the pair
+    /// rather than the display string.
+    fn fname(&mut self, v: &mut FName) -> Result<()>;
+    /// An `FString`: a length then the characters, negative meaning UTF-16.
+    fn fstring(&mut self, v: &mut String) -> Result<()>;
+    /// Exactly `n` bytes, uninterpreted.
+    fn raw(&mut self, v: &mut Vec<u8>, n: usize) -> Result<()>;
+}
+
+// An `is_loading` / `pos` pair belongs on this trait the moment a *single* body
+// serves both directions and has to size a container from a count that is read
+// on load and derived on save. Nothing does yet — `write_value` is still a
+// mirror of `read_value` rather than one shared description — so they are left
+// out rather than added speculatively.
 
 /// Little-endian byte-cursor over an export's serial data.
 pub(super) struct Reader<'a> {
@@ -194,5 +235,214 @@ impl<'a> ExportContext<'a> {
     /// tail is self-describing.
     pub fn new(bulk_data: &'a [(i64, i64)]) -> Self {
         ExportContext { bulk_data, resolver: None }
+    }
+}
+
+/// The saving half of [`Ar`]: appends to a byte buffer.
+///
+/// Deliberately has no name map. An `FName` carries its own index, so a block
+/// can be re-emitted without interning anything; a writer that *introduces* new
+/// names is a package-level concern (growing `FNameMap`), not an export-level
+/// one.
+pub(super) struct Writer {
+    pub(super) b: Vec<u8>,
+}
+
+impl Writer {
+    pub(super) fn new() -> Self {
+        Writer { b: Vec::new() }
+    }
+    pub(super) fn into_bytes(self) -> Vec<u8> {
+        self.b
+    }
+}
+
+impl Ar for Writer {
+    fn u8(&mut self, v: &mut u8) -> Result<()> {
+        self.b.push(*v);
+        Ok(())
+    }
+    fn u16(&mut self, v: &mut u16) -> Result<()> {
+        self.b.extend_from_slice(&v.to_le_bytes());
+        Ok(())
+    }
+    fn i32(&mut self, v: &mut i32) -> Result<()> {
+        self.b.extend_from_slice(&v.to_le_bytes());
+        Ok(())
+    }
+    fn u32(&mut self, v: &mut u32) -> Result<()> {
+        self.b.extend_from_slice(&v.to_le_bytes());
+        Ok(())
+    }
+    fn u64(&mut self, v: &mut u64) -> Result<()> {
+        self.b.extend_from_slice(&v.to_le_bytes());
+        Ok(())
+    }
+    fn f32(&mut self, v: &mut f32) -> Result<()> {
+        self.b.extend_from_slice(&v.to_le_bytes());
+        Ok(())
+    }
+    fn f64(&mut self, v: &mut f64) -> Result<()> {
+        self.b.extend_from_slice(&v.to_le_bytes());
+        Ok(())
+    }
+    fn fname(&mut self, v: &mut FName) -> Result<()> {
+        self.b.extend_from_slice(&v.index.to_le_bytes());
+        self.b.extend_from_slice(&v.number.to_le_bytes());
+        Ok(())
+    }
+    fn fstring(&mut self, v: &mut String) -> Result<()> {
+        // Mirrors `FString::operator<<`: empty is a bare zero length; ASCII goes
+        // out as bytes with a NUL; anything else as UTF-16 with a negated
+        // character count. `Reader::fstring` stops at the first NUL, so a string
+        // that survives a round trip must not contain one.
+        if v.is_empty() {
+            self.b.extend_from_slice(&0i32.to_le_bytes());
+        } else if v.is_ascii() {
+            self.b.extend_from_slice(&(v.len() as i32 + 1).to_le_bytes());
+            self.b.extend_from_slice(v.as_bytes());
+            self.b.push(0);
+        } else {
+            let chars: Vec<u16> = v.encode_utf16().collect();
+            self.b.extend_from_slice(&(-(chars.len() as i32 + 1)).to_le_bytes());
+            for c in chars {
+                self.b.extend_from_slice(&c.to_le_bytes());
+            }
+            self.b.extend_from_slice(&0u16.to_le_bytes());
+        }
+        Ok(())
+    }
+    fn raw(&mut self, v: &mut Vec<u8>, n: usize) -> Result<()> {
+        if v.len() != n {
+            bail!("writer given {} bytes for a {n}-byte field", v.len());
+        }
+        self.b.extend_from_slice(v);
+        Ok(())
+    }
+}
+
+impl Ar for Reader<'_> {
+    fn u8(&mut self, v: &mut u8) -> Result<()> {
+        *v = Reader::u8(self)?;
+        Ok(())
+    }
+    fn u16(&mut self, v: &mut u16) -> Result<()> {
+        *v = Reader::u16(self)?;
+        Ok(())
+    }
+    fn i32(&mut self, v: &mut i32) -> Result<()> {
+        *v = Reader::i32(self)?;
+        Ok(())
+    }
+    fn u32(&mut self, v: &mut u32) -> Result<()> {
+        *v = Reader::u32(self)?;
+        Ok(())
+    }
+    fn u64(&mut self, v: &mut u64) -> Result<()> {
+        *v = Reader::u64(self)?;
+        Ok(())
+    }
+    fn f32(&mut self, v: &mut f32) -> Result<()> {
+        *v = Reader::f32(self)?;
+        Ok(())
+    }
+    fn f64(&mut self, v: &mut f64) -> Result<()> {
+        *v = Reader::f64(self)?;
+        Ok(())
+    }
+    fn fname(&mut self, v: &mut FName) -> Result<()> {
+        *v = Reader::fname(self)?;
+        Ok(())
+    }
+    fn fstring(&mut self, v: &mut String) -> Result<()> {
+        *v = Reader::fstring(self)?;
+        Ok(())
+    }
+    fn raw(&mut self, v: &mut Vec<u8>, n: usize) -> Result<()> {
+        *v = Reader::take(self, n)?.to_vec();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every primitive must survive write→read unchanged. This is the floor the
+    /// whole write path stands on: if a scalar or a name cannot round-trip,
+    /// nothing built above it can either.
+    #[test]
+    fn primitives_round_trip() {
+        let mut w = Writer::new();
+        w.u8(&mut 0xA5).unwrap();
+        w.u16(&mut 0xBEEF).unwrap();
+        w.i32(&mut -123_456).unwrap();
+        w.u32(&mut 0xDEAD_BEEF).unwrap();
+        w.u64(&mut 0x0123_4567_89AB_CDEF).unwrap();
+        w.f32(&mut 0.5).unwrap();
+        w.f64(&mut -2.25).unwrap();
+        let bytes = w.into_bytes();
+        assert_eq!(bytes.len(), 1 + 2 + 4 + 4 + 8 + 4 + 8);
+
+        let mut r = Reader::new(&bytes, &[]);
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g) = (0u8, 0u16, 0i32, 0u32, 0u64, 0f32, 0f64);
+        Ar::u8(&mut r, &mut a).unwrap();
+        Ar::u16(&mut r, &mut b).unwrap();
+        Ar::i32(&mut r, &mut c).unwrap();
+        Ar::u32(&mut r, &mut d).unwrap();
+        Ar::u64(&mut r, &mut e).unwrap();
+        Ar::f32(&mut r, &mut f).unwrap();
+        Ar::f64(&mut r, &mut g).unwrap();
+        assert_eq!(
+            (a, b, c, d, e, f, g),
+            (0xA5, 0xBEEF, -123_456, 0xDEAD_BEEF, 0x0123_4567_89AB_CDEF, 0.5, -2.25)
+        );
+        assert_eq!(r.o, bytes.len(), "reader did not consume exactly what was written");
+    }
+
+    /// The writer needs no name map: an `FName` carries its own index, so the
+    /// bytes come straight back even though the reader resolves them against a
+    /// name table the writer never saw.
+    #[test]
+    fn fname_round_trips_without_a_name_map() {
+        let mut w = Writer::new();
+        w.fname(&mut FName::new(7, 5, "Rocket_4")).unwrap();
+        let bytes = w.into_bytes();
+        assert_eq!(bytes, [7, 0, 0, 0, 5, 0, 0, 0]);
+
+        // Resolved against a table where index 7 is "Rocket": number 5 renders
+        // as `_4`, and the identity is preserved regardless.
+        let names: Vec<String> = (0..8).map(|i| format!("n{i}")).collect();
+        let mut names = names;
+        names[7] = "Rocket".to_string();
+        let mut r = Reader::new(&bytes, &names);
+        let mut back = FName::default();
+        Ar::fname(&mut r, &mut back).unwrap();
+        assert_eq!((back.index, back.number), (7, 5));
+        assert_eq!(back.as_str(), "Rocket_4");
+    }
+
+    /// ASCII, empty and non-ASCII strings each take a different encoding path.
+    #[test]
+    fn fstring_round_trips() {
+        for s in ["", "SK_Marine_Torso_01", "naïve", "日本語"] {
+            let mut w = Writer::new();
+            w.fstring(&mut s.to_string()).unwrap();
+            let bytes = w.into_bytes();
+            let mut r = Reader::new(&bytes, &[]);
+            let mut back = String::new();
+            Ar::fstring(&mut r, &mut back).unwrap();
+            assert_eq!(back, s, "string did not survive a round trip");
+            assert_eq!(r.o, bytes.len(), "wrong length consumed for {s:?}");
+        }
+    }
+
+    /// A writer handed the wrong number of bytes for a fixed-size field is a
+    /// caller bug, and must not silently emit a differently-sized record.
+    #[test]
+    fn raw_length_mismatch_is_an_error() {
+        let mut w = Writer::new();
+        assert!(w.raw(&mut vec![1, 2, 3], 4).is_err());
+        assert!(w.raw(&mut vec![1, 2, 3, 4], 4).is_ok());
     }
 }

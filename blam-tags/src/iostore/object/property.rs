@@ -3,9 +3,9 @@
 //! `in_container` distinguishes the two ways UE reaches a value, which matters
 //! for enums and only for enums — see [`read_value`].
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
-use super::archive::Reader;
+use super::archive::{Ar, Reader, Writer};
 use super::block::read_struct;
 use super::usmap::{PropertyType, Usmap};
 use super::value::{PropValue, SoftObjectPath};
@@ -162,4 +162,290 @@ pub(super) fn read_value(
         }
         PropertyType::Unknown(t) => bail!("unknown property kind {t} in unversioned stream"),
     })
+}
+
+
+/// Emit one property value, mirroring [`read_value`].
+///
+/// Covers every *leaf* shape: scalars, names, strings, object indices, soft
+/// object paths, delegates, field paths, optionals, containers of those, and
+/// natively-sized structs whose bytes we kept verbatim.
+///
+/// It deliberately does **not** cover a nested reflected struct or a
+/// hand-written native struct. Both need a property *block* underneath them, and
+/// emitting one byte-exactly needs per-slot presence and zero-masking — which
+/// the current `BTreeMap` value shape has already thrown away by the time we get
+/// here. That is the `PropertyBlock` model, and it is the next piece of work;
+/// until it lands those arms return an error naming what is missing rather than
+/// writing something plausible and wrong.
+pub(super) fn write_value(
+    ar: &mut impl Ar,
+    ty: &PropertyType,
+    v: &PropValue,
+    in_container: bool,
+) -> Result<()> {
+    /// Widths follow the property's alignment, per `SerializeAsInteger`
+    /// (UnversionedPropertySerialization.cpp:234) — the same rule `read_value`
+    /// reads by.
+    fn int_of(v: &PropValue, what: &str) -> Result<i64> {
+        match v {
+            PropValue::Int(n) => Ok(*n),
+            PropValue::Bool(b) => Ok(*b as i64),
+            other => bail!("expected an integer for {what}, have {other:?}"),
+        }
+    }
+    match (ty, v) {
+        (PropertyType::Bool, PropValue::Bool(b)) => ar.u8(&mut (*b as u8)),
+        (PropertyType::Byte { enum_name: Some(_) }, PropValue::Name(n)) if in_container => {
+            ar.fname(&mut n.clone())
+        }
+        (PropertyType::Byte { .. } | PropertyType::Int8, _) => {
+            ar.u8(&mut (int_of(v, "byte")? as u8))
+        }
+        (PropertyType::Int, _) => ar.i32(&mut (int_of(v, "int32")? as i32)),
+        (PropertyType::UInt32, _) => ar.u32(&mut (int_of(v, "uint32")? as u32)),
+        (PropertyType::Int16 | PropertyType::UInt16, _) => {
+            ar.u16(&mut (int_of(v, "int16")? as u16))
+        }
+        (PropertyType::Int64 | PropertyType::UInt64, _) => {
+            ar.u64(&mut (int_of(v, "int64")? as u64))
+        }
+        (PropertyType::Float, PropValue::Float(f)) => ar.f32(&mut (*f as f32)),
+        (PropertyType::Double, PropValue::Float(f)) => ar.f64(&mut f.to_owned()),
+        (PropertyType::Name, PropValue::Name(n)) => ar.fname(&mut n.clone()),
+        (PropertyType::Str | PropertyType::Utf8Str | PropertyType::AnsiStr, PropValue::Str(s)) => {
+            ar.fstring(&mut s.clone())
+        }
+        (PropertyType::Enum { inner, .. }, _) => {
+            if in_container {
+                match v {
+                    PropValue::Name(n) => ar.fname(&mut n.clone()),
+                    other => bail!("expected an enum name in a container, have {other:?}"),
+                }
+            } else {
+                write_value(ar, inner, v, false)
+            }
+        }
+        (
+            PropertyType::Object
+            | PropertyType::WeakObject
+            | PropertyType::LazyObject
+            | PropertyType::Interface,
+            PropValue::Object(i),
+        ) => ar.i32(&mut i.to_owned()),
+        (
+            PropertyType::SoftObject | PropertyType::AssetObject,
+            PropValue::SoftObject(p),
+        ) => {
+            ar.fname(&mut p.package.clone())?;
+            ar.fname(&mut p.asset.clone())?;
+            ar.fstring(&mut p.sub_path.clone())
+        }
+        // A natively sized struct kept its bytes, so it goes back exactly.
+        (PropertyType::Struct(name), PropValue::Native(b)) => {
+            let size = native_struct_size(name)
+                .with_context(|| format!("no native size for struct {name}"))?;
+            ar.raw(&mut b.clone(), size)
+        }
+        (PropertyType::Array(inner), PropValue::Array(items)) => {
+            ar.i32(&mut (items.len() as i32))?;
+            for e in items {
+                write_value(ar, inner, e, true)?;
+            }
+            Ok(())
+        }
+        // The removal prefix is reconstructible from the schema — a set or map
+        // always writes one — but its *contents* were not retained. Five exports
+        // in the shipped corpus have a non-empty one; they will surface as
+        // round-trip failures rather than as silently wrong bytes.
+        (PropertyType::Set(inner), PropValue::Array(items)) => {
+            ar.i32(&mut 0)?;
+            ar.i32(&mut (items.len() as i32))?;
+            for e in items {
+                write_value(ar, inner, e, true)?;
+            }
+            Ok(())
+        }
+        (PropertyType::Map(k, val), PropValue::Map(entries)) => {
+            ar.i32(&mut 0)?;
+            ar.i32(&mut (entries.len() as i32))?;
+            for (key, value) in entries {
+                write_value(ar, k, key, true)?;
+                write_value(ar, val, value, true)?;
+            }
+            Ok(())
+        }
+        (PropertyType::Delegate, PropValue::Delegate { object, function }) => {
+            ar.i32(&mut object.to_owned())?;
+            ar.fname(&mut function.clone())
+        }
+        (PropertyType::MulticastDelegate, PropValue::MulticastDelegate(list)) => {
+            ar.i32(&mut (list.len() as i32))?;
+            for (object, function) in list {
+                ar.i32(&mut object.to_owned())?;
+                ar.fname(&mut function.clone())?;
+            }
+            Ok(())
+        }
+        (PropertyType::FieldPath, PropValue::FieldPath { path, owner }) => {
+            ar.i32(&mut (path.len() as i32))?;
+            for n in path {
+                ar.fname(&mut n.clone())?;
+            }
+            ar.i32(&mut owner.to_owned())
+        }
+        (PropertyType::Optional(_), PropValue::Unset) => ar.u32(&mut 0),
+        (PropertyType::Optional(inner), set) => {
+            ar.u32(&mut 1)?;
+            write_value(ar, inner, set, true)
+        }
+        // Anything the reader declined to interpret goes back as it came.
+        (_, PropValue::Raw(b)) => {
+            let n = b.len();
+            ar.raw(&mut b.clone(), n)
+        }
+        (PropertyType::Struct(name), _) => {
+            bail!("writing struct {name} needs the PropertyBlock model (per-slot presence)")
+        }
+        (PropertyType::Text, _) => bail!("writing FText is not modeled yet"),
+        (t, other) => bail!("cannot write {other:?} as {t:?}"),
+    }
+}
+
+/// Emit one property value's bytes, given the schema type it is declared as.
+///
+/// The byte-slice counterpart to [`read_value`], and the write half of this
+/// layer's public surface alongside
+/// [`emit_header`](super::block::emit_header). Errors — rather than guessing —
+/// for the shapes that still need the `PropertyBlock` model: a nested reflected
+/// struct, a hand-written native struct, and `FText`.
+pub fn emit_value(ty: &PropertyType, v: &PropValue) -> Result<Vec<u8>> {
+    let mut w = Writer::new();
+    write_value(&mut w, ty, v, false)?;
+    Ok(w.into_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::value::{FName, SoftObjectPath};
+    use super::super::usmap::Usmap;
+
+    /// Write a value, read it back through the same schema type, and require
+    /// the bytes to be identical on a second write. Comparing bytes rather than
+    /// values is deliberate: it is the property the writer actually has to have,
+    /// and it does not depend on `PropValue` implementing equality.
+    fn round_trip(ty: &PropertyType, v: &PropValue, in_container: bool, names: &[String]) {
+        let usmap = Usmap::meteorite().expect("bundled usmap");
+        let mut w = Writer::new();
+        write_value(&mut w, ty, v, in_container).expect("write");
+        let first = w.into_bytes();
+
+        let mut r = Reader::new(&first, names);
+        let back = read_value(&mut r, ty, &usmap, 0, in_container).expect("read back");
+        assert_eq!(r.o, first.len(), "reader consumed {} of {} bytes for {ty:?}", r.o, first.len());
+
+        let mut w2 = Writer::new();
+        write_value(&mut w2, ty, &back, in_container).expect("re-write");
+        assert_eq!(first, w2.into_bytes(), "value did not survive a round trip: {ty:?} = {v:?}");
+    }
+
+    #[test]
+    fn leaf_values_round_trip() {
+        let names: Vec<String> = vec!["None".into(), "Rocket".into(), "Fire".into()];
+        let n = |i: u32, num: u32, t: &str| FName::new(i, num, t);
+
+        round_trip(&PropertyType::Bool, &PropValue::Bool(true), false, &names);
+        round_trip(&PropertyType::Int, &PropValue::Int(-42), false, &names);
+        round_trip(&PropertyType::UInt32, &PropValue::Int(0xDEAD_BEEF), false, &names);
+        round_trip(&PropertyType::Int64, &PropValue::Int(i32::MIN as i64), false, &names);
+        round_trip(&PropertyType::Float, &PropValue::Float(0.25), false, &names);
+        round_trip(&PropertyType::Double, &PropValue::Float(-2.5), false, &names);
+        round_trip(&PropertyType::Name, &PropValue::Name(n(1, 5, "Rocket_4")), false, &names);
+        round_trip(&PropertyType::Str, &PropValue::Str("SK_Marine".into()), false, &names);
+        round_trip(&PropertyType::Object, &PropValue::Object(-6), false, &names);
+        round_trip(
+            &PropertyType::SoftObject,
+            &PropValue::SoftObject(SoftObjectPath {
+                package: n(1, 0, "Rocket"),
+                asset: n(2, 0, "Fire"),
+                sub_path: "Sub".into(),
+            }),
+            false,
+            &names,
+        );
+        round_trip(
+            &PropertyType::Delegate,
+            &PropValue::Delegate { object: -3, function: n(2, 0, "Fire") },
+            false,
+            &names,
+        );
+        round_trip(
+            &PropertyType::MulticastDelegate,
+            &PropValue::MulticastDelegate(vec![(1, n(1, 0, "Rocket")), (2, n(2, 0, "Fire"))]),
+            false,
+            &names,
+        );
+        round_trip(
+            &PropertyType::FieldPath,
+            &PropValue::FieldPath { path: vec![n(1, 0, "Rocket")], owner: 9 },
+            false,
+            &names,
+        );
+        round_trip(
+            &PropertyType::Array(Box::new(PropertyType::Int)),
+            &PropValue::Array(vec![PropValue::Int(1), PropValue::Int(2)]),
+            false,
+            &names,
+        );
+        round_trip(
+            &PropertyType::Set(Box::new(PropertyType::Int)),
+            &PropValue::Array(vec![PropValue::Int(7)]),
+            false,
+            &names,
+        );
+        round_trip(
+            &PropertyType::Map(Box::new(PropertyType::Int), Box::new(PropertyType::Int)),
+            &PropValue::Map(vec![(PropValue::Int(1), PropValue::Int(2))]),
+            false,
+            &names,
+        );
+        // A natively sized struct goes back byte for byte.
+        round_trip(
+            &PropertyType::Struct("Guid".into()),
+            &PropValue::Native((0u8..16).collect()),
+            false,
+            &names,
+        );
+    }
+
+    /// An unset optional writes only its four-byte flag, and stays unset.
+    #[test]
+    fn unset_optional_round_trips() {
+        let names: Vec<String> = vec!["None".into()];
+        let ty = PropertyType::Optional(Box::new(PropertyType::Int));
+        let mut w = Writer::new();
+        write_value(&mut w, &ty, &PropValue::Unset, false).unwrap();
+        let bytes = w.into_bytes();
+        assert_eq!(bytes, [0, 0, 0, 0]);
+        let usmap = Usmap::meteorite().unwrap();
+        let mut r = Reader::new(&bytes, &names);
+        assert!(matches!(read_value(&mut r, &ty, &usmap, 0, false).unwrap(), PropValue::Unset));
+    }
+
+    /// The arms that need the not-yet-built `PropertyBlock` say so, rather than
+    /// emitting something plausible and wrong.
+    #[test]
+    fn unmodeled_arms_refuse_rather_than_guess() {
+        let mut w = Writer::new();
+        let e = write_value(
+            &mut w,
+            &PropertyType::Struct("Transform".into()),
+            &PropValue::Struct(Default::default()),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("PropertyBlock"), "unhelpful refusal: {e}");
+    }
 }
