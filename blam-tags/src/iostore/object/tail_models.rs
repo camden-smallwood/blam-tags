@@ -2023,6 +2023,307 @@ impl StaticMeshTail {
     }
 }
 
+/// One LOD of a `UMorphTarget`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MorphLodModel {
+    /// `true` when the vertex array was stripped and only its count is written.
+    pub stripped: bool,
+    /// The count when stripped, or the 28-byte deltas when not.
+    pub vertices: Result2<i32, FixedArray>,
+    pub num_base_mesh_verts: i32,
+    pub section_indices: FixedArray,
+    pub generated_by_engine: u32,
+    /// Empty in a cook, but written.
+    pub source_filename: FStr,
+}
+
+/// A two-way choice that is not an error — named to avoid reading as `Result`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Result2<A, B> {
+    A(A),
+    B(B),
+}
+
+/// `UMorphTarget::Serialize`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MorphTargetTail {
+    pub strip_flags: u16,
+    /// Absent when audio-visual data was stripped — the tail ends at the flags.
+    pub lods: Option<Vec<MorphLodModel>>,
+}
+
+impl MorphTargetTail {
+    fn read(r: &mut Reader) -> Result<Self> {
+        let strip_flags = r.u16()?;
+        if strip_flags & 0x02 != 0 {
+            return Ok(MorphTargetTail { strip_flags, lods: None });
+        }
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "MorphLODModels", r.o - 4)?
+        };
+        let mut lods = Vec::with_capacity(n.min(16));
+        for _ in 0..n {
+            let stripped = r.u32()? != 0;
+            let vertices = if stripped {
+                Result2::A(r.i32()?)
+            } else {
+                Result2::B(FixedArray::read(r, "morph vertices", 28)?)
+            };
+            lods.push(MorphLodModel {
+                stripped,
+                vertices,
+                num_base_mesh_verts: r.i32()?,
+                section_indices: FixedArray::read(r, "SectionIndices", 4)?,
+                generated_by_engine: r.u32()?,
+                source_filename: r.fstring()?,
+            });
+        }
+        Ok(MorphTargetTail { strip_flags, lods: Some(lods) })
+    }
+
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.u16(&mut self.strip_flags.to_owned())?;
+        match (&self.lods, self.strip_flags & 0x02 != 0) {
+            (None, true) => return Ok(()),
+            (Some(_), false) => {}
+            _ => bail!("LOD presence disagrees with the strip flags"),
+        }
+        let lods = self.lods.as_ref().expect("checked above");
+        ar.i32(&mut (lods.len() as i32))?;
+        for l in lods {
+            ar.u32(&mut u32::from(l.stripped))?;
+            match (&l.vertices, l.stripped) {
+                (Result2::A(n), true) => ar.i32(&mut n.to_owned())?,
+                (Result2::B(a), false) => a.write(ar)?,
+                _ => bail!("morph vertex form disagrees with the stripped flag"),
+            }
+            ar.i32(&mut l.num_base_mesh_verts.to_owned())?;
+            l.section_indices.write(ar)?;
+            ar.u32(&mut l.generated_by_engine.to_owned())?;
+            ar.fstring(&mut l.source_filename.clone())?;
+        }
+        Ok(())
+    }
+}
+
+/// One streamed audio chunk of a `USoundWave`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioChunk {
+    pub flags: u32,
+    pub bulk: InlineBulkPayload,
+    pub data_size: i32,
+    pub audio_data_size: i32,
+    /// Written only when the chunk's flags say it is seekable.
+    pub seek_offset_in_audio_frames: Option<i32>,
+}
+
+/// `USoundWave::Serialize` in a cooked, streaming build.
+#[derive(Debug, Clone)]
+pub struct SoundWaveTail {
+    pub flags: u32,
+    pub cue_points: Vec<PropertyBlock>,
+    pub compressed_data_guid: [u8; 16],
+    pub audio_format: FName,
+    pub chunks: Vec<AudioChunk>,
+}
+
+impl SoundWaveTail {
+    const SEEKABLE: u32 = 2;
+
+    fn read(r: &mut Reader, ctx: TailContext) -> Result<Self> {
+        let flags = r.u32()?;
+        if flags & 1 == 0 {
+            bail!("uncooked SoundWave");
+        }
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "CuePoints", r.o - 4)?
+        };
+        let mut cue_points = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            cue_points.push(read_struct(r, "SoundWaveCuePoint", ctx.usmap, 0)?);
+        }
+        let compressed_data_guid: [u8; 16] = r.take(16)?.try_into().expect("16 bytes");
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "audio chunks", r.o - 4)?
+        };
+        // The format name comes *after* the chunk count, not before it.
+        let audio_format = r.fname()?;
+        let mut chunks = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            let flags = r.u32()?;
+            let bulk = InlineBulkPayload::read(r, ctx, "audio chunk")?;
+            chunks.push(AudioChunk {
+                flags,
+                bulk,
+                data_size: r.i32()?,
+                audio_data_size: r.i32()?,
+                seek_offset_in_audio_frames: (flags & Self::SEEKABLE != 0)
+                    .then(|| r.i32())
+                    .transpose()?,
+            });
+        }
+        Ok(SoundWaveTail { flags, cue_points, compressed_data_guid, audio_format, chunks })
+    }
+
+    fn write(&self, ar: &mut impl Ar, ctx: TailContext) -> Result<()> {
+        ar.u32(&mut self.flags.to_owned())?;
+        ar.i32(&mut (self.cue_points.len() as i32))?;
+        let flat = flattened_schema("SoundWaveCuePoint", ctx.usmap)?;
+        for b in &self.cue_points {
+            write_block(ar, b, &flat, ctx.usmap)?;
+        }
+        ar.raw(&mut self.compressed_data_guid.to_vec(), 16)?;
+        ar.i32(&mut (self.chunks.len() as i32))?;
+        ar.fname(&mut self.audio_format.clone())?;
+        for c in &self.chunks {
+            ar.u32(&mut c.flags.to_owned())?;
+            c.bulk.write(ar)?;
+            ar.i32(&mut c.data_size.to_owned())?;
+            ar.i32(&mut c.audio_data_size.to_owned())?;
+            match (c.seek_offset_in_audio_frames, c.flags & Self::SEEKABLE != 0) {
+                (Some(v), true) => ar.i32(&mut v.to_owned())?,
+                (None, false) => {}
+                _ => bail!("seek offset presence disagrees with the chunk flags"),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One element of a `UModelComponent`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelElement {
+    pub map_build_data_id: [u8; 16],
+    pub component: i32,
+    pub material: i32,
+    pub nodes: FixedArray,
+}
+
+/// `UModelComponent::Serialize`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelComponentTail {
+    pub model: i32,
+    pub elements: Vec<ModelElement>,
+    pub component_index: u32,
+    pub nodes: FixedArray,
+}
+
+impl ModelComponentTail {
+    fn read(r: &mut Reader) -> Result<Self> {
+        let model = r.i32()?;
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "model elements", r.o - 4)?
+        };
+        let mut elements = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            elements.push(ModelElement {
+                map_build_data_id: r.take(16)?.try_into().expect("16 bytes"),
+                component: r.i32()?,
+                material: r.i32()?,
+                nodes: FixedArray::read(r, "element nodes", 2)?,
+            });
+        }
+        Ok(ModelComponentTail {
+            model,
+            elements,
+            component_index: r.u32()?,
+            nodes: FixedArray::read(r, "component nodes", 2)?,
+        })
+    }
+
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.i32(&mut self.model.to_owned())?;
+        ar.i32(&mut (self.elements.len() as i32))?;
+        for e in &self.elements {
+            ar.raw(&mut e.map_build_data_id.to_vec(), 16)?;
+            ar.i32(&mut e.component.to_owned())?;
+            ar.i32(&mut e.material.to_owned())?;
+            e.nodes.write(ar)?;
+        }
+        ar.u32(&mut self.component_index.to_owned())?;
+        self.nodes.write(ar)
+    }
+}
+
+/// One `FReferencePose` of a `USkeleton`'s retarget sources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetargetSource {
+    pub key: [u8; 8],
+    pub pose_name: [u8; 8],
+    pub reference_pose: Vec<u8>,
+}
+
+/// `USkeleton::Serialize`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkeletonTail {
+    pub reference_skeleton: ReferenceSkeleton,
+    pub retarget_sources: Vec<RetargetSource>,
+    pub guid: [u8; 16],
+    pub strip_flags: [u8; 2],
+}
+
+impl SkeletonTail {
+    fn read(r: &mut Reader) -> Result<Self> {
+        let reference_skeleton = ReferenceSkeleton::read(r)?;
+        // Retarget poses use the same `FTransform` width the reference skeleton
+        // had to discover, which is why that answer is worth keeping.
+        let tsize = reference_skeleton.transform_size;
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "AnimRetargetSources", r.o - 4)?
+        };
+        let mut retarget_sources = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            let key = r.take(8)?.try_into().expect("8 bytes");
+            let pose_name = r.take(8)?.try_into().expect("8 bytes");
+            let m = {
+                let m = r.i32()?;
+                super::limits::bounded(m, MAX_NATIVE_COUNT, "FReferencePose", r.o - 4)?
+            };
+            retarget_sources.push(RetargetSource {
+                key,
+                pose_name,
+                reference_pose: r.take(m * tsize)?.to_vec(),
+            });
+        }
+        let guid = r.take(16)?.try_into().expect("16 bytes");
+        let smart_names = r.i32()?;
+        if smart_names != 0 {
+            bail!("non-empty deprecated SmartNames container");
+        }
+        Ok(SkeletonTail {
+            reference_skeleton,
+            retarget_sources,
+            guid,
+            strip_flags: [r.u8()?, r.u8()?],
+        })
+    }
+
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        self.reference_skeleton.write(ar)?;
+        let tsize = self.reference_skeleton.transform_size;
+        ar.i32(&mut (self.retarget_sources.len() as i32))?;
+        for s in &self.retarget_sources {
+            ar.raw(&mut s.key.to_vec(), 8)?;
+            ar.raw(&mut s.pose_name.to_vec(), 8)?;
+            if tsize == 0 || s.reference_pose.len() % tsize != 0 {
+                bail!("retarget pose is {} bytes for {tsize}-byte transforms", s.reference_pose.len());
+            }
+            ar.i32(&mut ((s.reference_pose.len() / tsize) as i32))?;
+            let n = s.reference_pose.len();
+            ar.raw(&mut s.reference_pose.clone(), n)?;
+        }
+        ar.raw(&mut self.guid.to_vec(), 16)?;
+        ar.i32(&mut 0)?; // the deprecated SmartNames container, always empty
+        ar.u8(&mut self.strip_flags[0].to_owned())?;
+        ar.u8(&mut self.strip_flags[1].to_owned())
+    }
+}
+
 /// `UStruct::Serialize` — the layer under every function, class and script
 /// struct: 11,250 exports across seven classes.
 ///
@@ -4990,6 +5291,190 @@ pub fn roundtrip_tail(
                     None => w.u32(&mut 0)?,
                 }
                 Ok(w.into_bytes())
+            })()),
+            "MorphTarget" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let m = MorphTargetTail::read(&mut r)?;
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                m.write(&mut w)?;
+                Ok(w.into_bytes())
+            })()),
+            "SoundWave" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let m = SoundWaveTail::read(&mut r, ctx)?;
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                m.write(&mut w, ctx)?;
+                Ok(w.into_bytes())
+            })()),
+            "ModelComponent+SceneComponent+ActorComponent" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let base = SceneComponentChainTail::read(&mut r, block)?;
+                let m = ModelComponentTail::read(&mut r)?;
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                base.write(&mut w, block)?;
+                m.write(&mut w)?;
+                Ok(w.into_bytes())
+            })()),
+            "Skeleton" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let m = SkeletonTail::read(&mut r)?;
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                m.write(&mut w)?;
+                Ok(w.into_bytes())
+            })()),
+            // `ARecastNavMesh` writes a version then a self-sized blob whose
+            // interior is Recast's own tile format.
+            "RecastNavMesh+Actor" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let actor = ActorTail::read(&mut r)?;
+                let version = r.u32()?;
+                // The size is measured from its *own* offset, so it includes the
+                // four bytes it occupies — the payload is `size - 4`.
+                let size = r.u32()? as usize;
+                let data = r.take(size.checked_sub(4).context("Recast blob size under 4")?)?
+                    .to_vec();
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                actor.write(&mut w)?;
+                w.u32(&mut version.to_owned())?;
+                w.u32(&mut ((data.len() + 4) as u32))?;
+                let n = data.len();
+                w.raw(&mut data.clone(), n)?;
+                Ok(w.into_bytes())
+            })()),
+            "PCGLandscapeCache" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let n = {
+                    let n = r.i32()?;
+                    super::limits::bounded(n, MAX_NATIVE_COUNT, "PCG cache entries", r.o - 4)?
+                };
+                let mut entries = Vec::with_capacity(n.min(256));
+                for _ in 0..n {
+                    let key: Vec<u8> = r.take(24)?.to_vec(); // FGuid + FIntPoint
+                    let half_size: Vec<u8> = r.take(24)?.to_vec(); // FVector
+                    let stride = r.i32()?;
+                    let layer_names = FixedArray::read(&mut r, "LayerDataNames", 8)?;
+                    let bulk = InlineBulkPayload::read(&mut r, ctx, "landscape cache entry")?;
+                    entries.push((key, half_size, stride, layer_names, bulk));
+                }
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                w.i32(&mut (entries.len() as i32))?;
+                for (key, half, stride, layers, bulk) in &entries {
+                    w.raw(&mut key.clone(), 24)?;
+                    w.raw(&mut half.clone(), 24)?;
+                    w.i32(&mut stride.to_owned())?;
+                    layers.write(&mut w)?;
+                    bulk.write(&mut w)?;
+                }
+                Ok(w.into_bytes())
+            })()),
+            "InstancedFoliageActor+Actor" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let actor = ActorTail::read(&mut r)?;
+                let n = {
+                    let n = r.i32()?;
+                    super::limits::bounded(n, MAX_NATIVE_COUNT, "FoliageInfos", r.o - 4)?
+                };
+                let mut infos = Vec::with_capacity(n.min(256));
+                for _ in 0..n {
+                    let ty = r.i32()?;
+                    let impl_type = r.u8()?;
+                    let component = match impl_type {
+                        0 => None,
+                        1 => Some(r.i32()?),
+                        other => bail!("unmodeled EFoliageImplType {other}"),
+                    };
+                    infos.push((ty, impl_type, component));
+                }
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                actor.write(&mut w)?;
+                w.i32(&mut (infos.len() as i32))?;
+                for (ty, impl_type, component) in &infos {
+                    w.i32(&mut ty.to_owned())?;
+                    w.u8(&mut impl_type.to_owned())?;
+                    if let Some(c) = component {
+                        w.i32(&mut c.to_owned())?;
+                    }
+                }
+                Ok(w.into_bytes())
+            })()),
+            "ComputeGraph" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let n = {
+                    let n = r.i32()?;
+                    super::limits::bounded(n, MAX_NATIVE_COUNT, "compute kernels", r.o - 4)?
+                };
+                let mut kernels = Vec::with_capacity(n.min(64));
+                for _ in 0..n {
+                    let m = {
+                        let m = r.i32()?;
+                        super::limits::bounded(m, MAX_NATIVE_COUNT, "kernel resources", r.o - 4)?
+                    };
+                    let mut res = Vec::with_capacity(m.min(64));
+                    for _ in 0..m {
+                        let cooked = r.u32()? != 0;
+                        let map = cooked
+                            .then(|| -> Result<Option<Box<ShaderMap>>> {
+                                Ok((r.u32()? != 0)
+                                    .then(|| ShaderMap::read(&mut r, false).map(Box::new))
+                                    .transpose()?)
+                            })
+                            .transpose()?;
+                        res.push((cooked, map));
+                    }
+                    kernels.push(res);
+                }
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                w.i32(&mut (kernels.len() as i32))?;
+                for res in &kernels {
+                    w.i32(&mut (res.len() as i32))?;
+                    for (cooked, map) in res {
+                        w.u32(&mut u32::from(*cooked))?;
+                        if *cooked {
+                            match map {
+                                Some(Some(m)) => {
+                                    w.u32(&mut 1)?;
+                                    m.write(&mut w)?;
+                                }
+                                _ => w.u32(&mut 0)?,
+                            }
+                        }
+                    }
+                }
+                Ok(w.into_bytes())
+            })()),
+            // `UDynamicMesh`'s interior is its own recursive attribute-set
+            // format with no writer here, so the whole run stays a span.
+            "DynamicMesh" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                super::tails::read_dynamic_mesh(&mut r)?;
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                Ok(tail.to_vec())
             })()),
             "Struct" => Some((|| {
                 let mut r = Reader::new(tail, names);
