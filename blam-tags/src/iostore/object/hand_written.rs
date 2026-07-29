@@ -39,6 +39,147 @@ pub enum HandWritten {
     NiagaraGpuParamInfo(NiagaraGpuParamInfo),
     /// `FText` — the only genuinely polymorphic shape in the set.
     Text(TextValue),
+    /// The MovieScene "inline value" pointers, which name their concrete type
+    /// and then write it as an ordinary reflected block.
+    MovieSceneInlineValue(MovieSceneInlineValue),
+    /// `TMovieSceneEvaluationTree<T>`.
+    EvaluationTree(EvaluationTree),
+    /// `FShaderValueTypeHandle` — recursive.
+    ShaderValueType(ShaderValueType),
+    /// `FPerQualityLevelInt` / `FPerQualityLevelFloat`.
+    PerQualityLevel(PerQualityLevel),
+    /// `FFontData`.
+    FontData(FontData),
+    /// `FMaterialOverrideNanite`.
+    MaterialOverrideNanite(MaterialOverrideNanite),
+    /// `FMovieSceneTimeWarpVariant`.
+    TimeWarpVariant(TimeWarpVariant),
+    /// `FUniversalObjectLocatorFragment`.
+    LocatorFragment(LocatorFragment),
+}
+
+/// `FMovieSceneEvalTemplatePtr` and its two siblings: a type name, then that
+/// type's own property block. An empty name means no payload.
+#[derive(Debug, Clone)]
+pub struct MovieSceneInlineValue {
+    pub type_name: FStr,
+    pub payload: Option<PropertyBlock>,
+}
+
+/// `FEvaluationTreeEntryHandle` / the entry records — start, size, capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeEntry {
+    pub start: i32,
+    pub size: i32,
+    pub capacity: i32,
+}
+
+/// `FMovieSceneEvaluationTreeNode` — 26 bytes, and the arithmetic settles it:
+/// `Range` (a `TRange<FFrameNumber>`, 10) + `Parent` (a node handle, two
+/// int32s) + `ChildrenID` + `DataID` (an entry handle each). Confirmed against
+/// its `operator<<` in MovieSceneEvaluationTree.h.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeNode {
+    pub range_lower_kind: u8,
+    pub range_lower: i32,
+    pub range_upper_kind: u8,
+    pub range_upper: i32,
+    pub parent_children_handle: i32,
+    pub parent_index: i32,
+    pub children_id: i32,
+    pub data_id: i32,
+}
+
+/// A `TMovieSceneEvaluationTree<T>`: a root node, then two entry containers —
+/// the child nodes and the payload items.
+#[derive(Debug, Clone)]
+pub struct EvaluationTree {
+    pub root: TreeNode,
+    pub child_entries: Vec<TreeEntry>,
+    pub child_nodes: Vec<TreeNode>,
+    pub data_entries: Vec<TreeEntry>,
+    pub items: Vec<TreeItem>,
+}
+
+/// The payload type differs per tree, and the struct name is what says which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeItem {
+    /// `FEntityAndMetaDataIndex` — two int32s.
+    EntityAndMetaDataIndex { entity: i32, meta_data: i32 },
+    /// `FMovieSceneSubSequenceTreeEntry` — a sequence id and a one-byte flags
+    /// enum. The warp counter older streams carried is gone in 5.5.
+    SubSequence { sequence_id: u32, flags: u8 },
+}
+
+/// `FShaderValueType`, reached through its handle. Recursive: a struct type
+/// names itself and its elements, each of which is another value type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShaderValueType {
+    pub kind: u8,
+    pub is_dynamic_array: bool,
+    pub body: ShaderValueTypeBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShaderValueTypeBody {
+    /// `kind == 4`.
+    Struct { name: FName, elements: Vec<(FName, ShaderValueType)> },
+    /// Anything else: a dimension type and the counts it implies, all `uint8`.
+    Dimension { dimension: u8, counts: Vec<u8> },
+}
+
+/// `FPerQualityLevelInt` / `FPerQualityLevelFloat`. Unlike its `FPerPlatform*`
+/// sibling the override map is **not** behind the cooked check, so it is always
+/// written — cooking merely strips it to empty.
+#[derive(Debug, Clone)]
+pub struct PerQualityLevel {
+    pub cooked: bool,
+    /// The bits, so the int and float forms share one field without rounding.
+    pub default_bits: i32,
+    pub overrides: Vec<(i32, i32)>,
+}
+
+/// `FFontData`.
+#[derive(Debug, Clone)]
+pub struct FontData {
+    pub font_face_asset: i32,
+    /// Present only when there is no face asset.
+    pub inline_face: Option<InlineFontFace>,
+    pub sub_face_index: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct InlineFontFace {
+    pub filename: FStr,
+    pub hinting: u8,
+    pub loading_policy: u8,
+}
+
+/// `FMaterialOverrideNanite`.
+#[derive(Debug, Clone)]
+pub struct MaterialOverrideNanite {
+    pub cooked: bool,
+    pub override_material: Option<i32>,
+    /// Its own reflected properties follow the native prefix.
+    pub properties: PropertyBlock,
+}
+
+/// `FMovieSceneTimeWarpVariant`, through `FMovieSceneNumericVariant`.
+#[derive(Debug, Clone)]
+pub enum TimeWarpVariant {
+    /// A NaN-boxed double.
+    Literal(f64),
+    /// A `uint8 EMovieSceneTimeWarpType` and that type's payload: `Custom`
+    /// writes an object reference, `FixedPlayRate` nothing at all, and the rest
+    /// an ordinary block for their own small struct.
+    Typed { kind: u8, object: Option<i32>, payload: Option<PropertyBlock> },
+}
+
+/// `FUniversalObjectLocatorFragment` — polymorphic on a registered `FName`.
+#[derive(Debug, Clone)]
+pub struct LocatorFragment {
+    pub fragment_type: FName,
+    pub payload: Option<PropertyBlock>,
 }
 
 /// `FText`: flags, then a history whose type byte decides everything after it.
@@ -241,7 +382,111 @@ pub const MODELED: &[&str] = &[
     "SkeletalMeshSamplingRegionBuiltData",
     "NiagaraDataInterfaceGPUParamInfo",
     "Text",
+    "MovieSceneEvalTemplatePtr",
+    "MovieSceneTrackImplementationPtr",
+    "MovieSceneSequenceInstanceDataPtr",
+    "MovieSceneEvaluationFieldEntityTree",
+    "MovieSceneSubSequenceTree",
+    "ShaderValueTypeHandle",
+    "PerQualityLevelInt",
+    "PerQualityLevelFloat",
+    "FontData",
+    "MaterialOverrideNanite",
+    "MovieSceneTimeWarpVariant",
+    "UniversalObjectLocatorFragment",
 ];
+
+impl TreeNode {
+    fn read(r: &mut Reader) -> Result<Self> {
+        Ok(TreeNode {
+            range_lower_kind: r.u8()?,
+            range_lower: r.i32()?,
+            range_upper_kind: r.u8()?,
+            range_upper: r.i32()?,
+            parent_children_handle: r.i32()?,
+            parent_index: r.i32()?,
+            children_id: r.i32()?,
+            data_id: r.i32()?,
+        })
+    }
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.u8(&mut self.range_lower_kind.to_owned())?;
+        ar.i32(&mut self.range_lower.to_owned())?;
+        ar.u8(&mut self.range_upper_kind.to_owned())?;
+        ar.i32(&mut self.range_upper.to_owned())?;
+        ar.i32(&mut self.parent_children_handle.to_owned())?;
+        ar.i32(&mut self.parent_index.to_owned())?;
+        ar.i32(&mut self.children_id.to_owned())?;
+        ar.i32(&mut self.data_id.to_owned())
+    }
+}
+
+impl TreeEntry {
+    fn read(r: &mut Reader) -> Result<Self> {
+        Ok(TreeEntry { start: r.i32()?, size: r.i32()?, capacity: r.i32()? })
+    }
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.i32(&mut self.start.to_owned())?;
+        ar.i32(&mut self.size.to_owned())?;
+        ar.i32(&mut self.capacity.to_owned())
+    }
+}
+
+impl ShaderValueType {
+    fn read(r: &mut Reader, depth: usize) -> Result<Self> {
+        if depth > super::limits::MAX_DEPTH {
+            anyhow::bail!("shader value type nested too deep");
+        }
+        const STRUCT: u8 = 4;
+        let kind = r.u8()?;
+        let is_dynamic_array = r.u32()? != 0;
+        let body = if kind == STRUCT {
+            let name = r.fname()?;
+            let n = count(r, "shader value type struct elements")?;
+            let mut elements = Vec::with_capacity(n.min(super::limits::PREALLOC_CAP));
+            for _ in 0..n {
+                elements.push((r.fname()?, ShaderValueType::read(r, depth + 1)?));
+            }
+            ShaderValueTypeBody::Struct { name, elements }
+        } else {
+            // EShaderFundamentalDimensionType: Scalar 0, Vector 1, Matrix 2 —
+            // each implying how many `uint8` counts follow.
+            let dimension = r.u8()?;
+            let n = match dimension {
+                1 => 1,
+                2 => 2,
+                _ => 0,
+            };
+            let mut counts = Vec::with_capacity(n);
+            for _ in 0..n {
+                counts.push(r.u8()?);
+            }
+            ShaderValueTypeBody::Dimension { dimension, counts }
+        };
+        Ok(ShaderValueType { kind, is_dynamic_array, body })
+    }
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.u8(&mut self.kind.to_owned())?;
+        ar.u32(&mut (self.is_dynamic_array as u32))?;
+        match &self.body {
+            ShaderValueTypeBody::Struct { name, elements } => {
+                ar.fname(&mut name.clone())?;
+                ar.i32(&mut (elements.len() as i32))?;
+                for (n, t) in elements {
+                    ar.fname(&mut n.clone())?;
+                    t.write(ar)?;
+                }
+            }
+            ShaderValueTypeBody::Dimension { dimension, counts } => {
+                ar.u8(&mut dimension.to_owned())?;
+                for c in counts {
+                    ar.u8(&mut c.to_owned())?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 impl TextFormatArgument {
     fn read(r: &mut Reader, depth: usize) -> Result<Self> {
@@ -702,6 +947,136 @@ impl HandWritten {
             "SkeletalMeshSamplingLODBuiltData" => Some(HandWritten::SkeletalMeshSamplingLod(
                 WeightedRandomSampler::read(r)?,
             )),
+            "MovieSceneEvalTemplatePtr" | "MovieSceneTrackImplementationPtr"
+            | "MovieSceneSequenceInstanceDataPtr" => {
+                let type_name = r.fstring()?;
+                let payload = if type_name.is_empty() {
+                    Option::None
+                } else {
+                    let short = type_name.rsplit('.').next().unwrap_or(&type_name).to_string();
+                    Some(read_struct(r, &short, usmap, depth + 1)?)
+                };
+                Some(HandWritten::MovieSceneInlineValue(MovieSceneInlineValue {
+                    type_name,
+                    payload,
+                }))
+            }
+            "MovieSceneEvaluationFieldEntityTree" | "MovieSceneSubSequenceTree" => {
+                let root = TreeNode::read(r)?;
+                let n = count(r, "child node entries")?;
+                let mut child_entries = Vec::with_capacity(n.min(super::limits::PREALLOC_CAP));
+                for _ in 0..n {
+                    child_entries.push(TreeEntry::read(r)?);
+                }
+                let n = count(r, "child nodes")?;
+                let mut child_nodes = Vec::with_capacity(n.min(super::limits::PREALLOC_CAP));
+                for _ in 0..n {
+                    child_nodes.push(TreeNode::read(r)?);
+                }
+                let n = count(r, "data entries")?;
+                let mut data_entries = Vec::with_capacity(n.min(super::limits::PREALLOC_CAP));
+                for _ in 0..n {
+                    data_entries.push(TreeEntry::read(r)?);
+                }
+                let n = count(r, "data items")?;
+                let mut items = Vec::with_capacity(n.min(super::limits::PREALLOC_CAP));
+                let sub = name == "MovieSceneSubSequenceTree";
+                for _ in 0..n {
+                    items.push(if sub {
+                        TreeItem::SubSequence { sequence_id: r.u32()?, flags: r.u8()? }
+                    } else {
+                        TreeItem::EntityAndMetaDataIndex { entity: r.i32()?, meta_data: r.i32()? }
+                    });
+                }
+                Some(HandWritten::EvaluationTree(EvaluationTree {
+                    root,
+                    child_entries,
+                    child_nodes,
+                    data_entries,
+                    items,
+                }))
+            }
+            "ShaderValueTypeHandle" => {
+                Some(HandWritten::ShaderValueType(ShaderValueType::read(r, depth)?))
+            }
+            "PerQualityLevelInt" | "PerQualityLevelFloat" => {
+                let cooked = r.u32()? != 0;
+                let default_bits = r.i32()?;
+                let n = count(r, "PerQuality overrides")?;
+                let mut overrides = Vec::with_capacity(n.min(super::limits::PREALLOC_CAP));
+                for _ in 0..n {
+                    overrides.push((r.i32()?, r.i32()?));
+                }
+                Some(HandWritten::PerQualityLevel(PerQualityLevel {
+                    cooked,
+                    default_bits,
+                    overrides,
+                }))
+            }
+            "FontData" => {
+                if r.u32()? == 0 {
+                    anyhow::bail!("uncooked FFontData uses the tagged-property form");
+                }
+                let font_face_asset = r.i32()?;
+                let inline_face = if font_face_asset == 0 {
+                    Some(InlineFontFace {
+                        filename: r.fstring()?,
+                        hinting: r.u8()?,
+                        loading_policy: r.u8()?,
+                    })
+                } else {
+                    Option::None
+                };
+                Some(HandWritten::FontData(FontData {
+                    font_face_asset,
+                    inline_face,
+                    sub_face_index: r.i32()?,
+                }))
+            }
+            "MaterialOverrideNanite" => {
+                let cooked = r.i32()? != 0;
+                let override_material = if cooked { Some(r.i32()?) } else { Option::None };
+                Some(HandWritten::MaterialOverrideNanite(MaterialOverrideNanite {
+                    cooked,
+                    override_material,
+                    properties: read_struct(r, name, usmap, depth + 1)?,
+                }))
+            }
+            "MovieSceneTimeWarpVariant" => Some(HandWritten::TimeWarpVariant(
+                if r.u32()? != 0 {
+                    TimeWarpVariant::Literal(f64::from_bits(r.u64()?))
+                } else {
+                    let kind = r.u8()?;
+                    let (object, payload) = match kind {
+                        0 => (Option::None, Option::None),
+                        1 => (Some(r.i32()?), Option::None),
+                        _ => {
+                            let s = match kind {
+                                2 => "MovieSceneTimeWarpFixedFrame",
+                                3 => "FrameRate",
+                                4 => "MovieSceneTimeWarpLoop",
+                                5 => "MovieSceneTimeWarpClamp",
+                                6 => "MovieSceneTimeWarpLoopFloat",
+                                7 => "MovieSceneTimeWarpClampFloat",
+                                other => anyhow::bail!("unknown EMovieSceneTimeWarpType {other}"),
+                            };
+                            (Option::None, Some(read_struct(r, s, usmap, depth + 1)?))
+                        }
+                    };
+                    TimeWarpVariant::Typed { kind, object, payload }
+                },
+            )),
+            "UniversalObjectLocatorFragment" => {
+                let fragment_type = r.fname()?;
+                let payload = match super::text::locator_fragment_payload(&fragment_type) {
+                    Some("") => Option::None,
+                    Some(s) => Some(read_struct(r, s, usmap, depth + 1)?),
+                    Option::None => anyhow::bail!(
+                        "unmapped universal object locator fragment type '{fragment_type}'"
+                    ),
+                };
+                Some(HandWritten::LocatorFragment(LocatorFragment { fragment_type, payload }))
+            }
             "NiagaraDataInterfaceGPUParamInfo" => {
                 let hlsl_symbol = r.fstring()?;
                 let di_class_name = r.fstring()?;
@@ -805,6 +1180,120 @@ impl HandWritten {
                 Ok(())
             }
             HandWritten::Text(t) => t.write(ar),
+            HandWritten::MovieSceneInlineValue(v) => {
+                ar.fstring(&mut v.type_name.clone())?;
+                match (&v.payload, v.type_name.is_empty()) {
+                    (Some(b), false) => {
+                        let short =
+                            v.type_name.rsplit('.').next().unwrap_or(&v.type_name).to_string();
+                        let flat = flattened_schema(&short, usmap)?;
+                        write_block(ar, b, &flat, usmap)
+                    }
+                    (Option::None, true) => Ok(()),
+                    _ => anyhow::bail!("inline value payload does not match its type name"),
+                }
+            }
+            HandWritten::EvaluationTree(t) => {
+                t.root.write(ar)?;
+                ar.i32(&mut (t.child_entries.len() as i32))?;
+                for e in &t.child_entries {
+                    e.write(ar)?;
+                }
+                ar.i32(&mut (t.child_nodes.len() as i32))?;
+                for n in &t.child_nodes {
+                    n.write(ar)?;
+                }
+                ar.i32(&mut (t.data_entries.len() as i32))?;
+                for e in &t.data_entries {
+                    e.write(ar)?;
+                }
+                ar.i32(&mut (t.items.len() as i32))?;
+                for item in &t.items {
+                    match item {
+                        TreeItem::EntityAndMetaDataIndex { entity, meta_data } => {
+                            ar.i32(&mut entity.to_owned())?;
+                            ar.i32(&mut meta_data.to_owned())?;
+                        }
+                        TreeItem::SubSequence { sequence_id, flags } => {
+                            ar.u32(&mut sequence_id.to_owned())?;
+                            ar.u8(&mut flags.to_owned())?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            HandWritten::ShaderValueType(t) => t.write(ar),
+            HandWritten::PerQualityLevel(q) => {
+                ar.u32(&mut (q.cooked as u32))?;
+                ar.i32(&mut q.default_bits.to_owned())?;
+                ar.i32(&mut (q.overrides.len() as i32))?;
+                for (k, v) in &q.overrides {
+                    ar.i32(&mut k.to_owned())?;
+                    ar.i32(&mut v.to_owned())?;
+                }
+                Ok(())
+            }
+            HandWritten::FontData(f) => {
+                // Only the cooked form is modeled, so the flag is a constant.
+                ar.u32(&mut 1)?;
+                ar.i32(&mut f.font_face_asset.to_owned())?;
+                match (&f.inline_face, f.font_face_asset == 0) {
+                    (Some(face), true) => {
+                        ar.fstring(&mut face.filename.clone())?;
+                        ar.u8(&mut face.hinting.to_owned())?;
+                        ar.u8(&mut face.loading_policy.to_owned())?;
+                    }
+                    (Option::None, false) => {}
+                    _ => anyhow::bail!("inline font face does not match the face asset index"),
+                }
+                ar.i32(&mut f.sub_face_index.to_owned())
+            }
+            HandWritten::MaterialOverrideNanite(m) => {
+                ar.i32(&mut (m.cooked as i32))?;
+                match (m.override_material, m.cooked) {
+                    (Some(o), true) => ar.i32(&mut o.to_owned())?,
+                    (Option::None, false) => {}
+                    _ => anyhow::bail!("override material does not match the cooked flag"),
+                }
+                let flat = flattened_schema(name, usmap)?;
+                write_block(ar, &m.properties, &flat, usmap)
+            }
+            HandWritten::TimeWarpVariant(v) => match v {
+                TimeWarpVariant::Literal(d) => {
+                    ar.u32(&mut 1)?;
+                    ar.u64(&mut d.to_bits())
+                }
+                TimeWarpVariant::Typed { kind, object, payload } => {
+                    ar.u32(&mut 0)?;
+                    ar.u8(&mut kind.to_owned())?;
+                    if let Some(o) = object {
+                        ar.i32(&mut o.to_owned())?;
+                    }
+                    if let Some(b) = payload {
+                        let s = match kind {
+                            2 => "MovieSceneTimeWarpFixedFrame",
+                            3 => "FrameRate",
+                            4 => "MovieSceneTimeWarpLoop",
+                            5 => "MovieSceneTimeWarpClamp",
+                            6 => "MovieSceneTimeWarpLoopFloat",
+                            _ => "MovieSceneTimeWarpClampFloat",
+                        };
+                        let flat = flattened_schema(s, usmap)?;
+                        write_block(ar, b, &flat, usmap)?;
+                    }
+                    Ok(())
+                }
+            },
+            HandWritten::LocatorFragment(f) => {
+                ar.fname(&mut f.fragment_type.clone())?;
+                if let Some(b) = &f.payload {
+                    let s = super::text::locator_fragment_payload(&f.fragment_type)
+                        .ok_or_else(|| anyhow::anyhow!("unmapped locator fragment"))?;
+                    let flat = flattened_schema(s, usmap)?;
+                    write_block(ar, b, &flat, usmap)?;
+                }
+                Ok(())
+            }
             HandWritten::NiagaraGpuParamInfo(p) => {
                 ar.fstring(&mut p.hlsl_symbol.clone())?;
                 ar.fstring(&mut p.di_class_name.clone())?;
@@ -868,6 +1357,76 @@ impl HandWritten {
                     && a.metadata_entry == b.metadata_entry
             }
             (HandWritten::Text(a), HandWritten::Text(b)) => a.semantic_eq(b),
+            (HandWritten::MovieSceneInlineValue(a), HandWritten::MovieSceneInlineValue(b)) => {
+                a.type_name == b.type_name
+                    && a.type_name.wide == b.type_name.wide
+                    && match (&a.payload, &b.payload) {
+                        (Some(x), Some(y)) => x.semantic_eq(y),
+                        (Option::None, Option::None) => true,
+                        _ => false,
+                    }
+            }
+            // These carry no floats, so structural equality is already bit
+            // equality — the concern that made `semantic_eq` necessary does not
+            // arise for them.
+            (HandWritten::EvaluationTree(a), HandWritten::EvaluationTree(b)) => {
+                a.root == b.root
+                    && a.child_entries == b.child_entries
+                    && a.child_nodes == b.child_nodes
+                    && a.data_entries == b.data_entries
+                    && a.items == b.items
+            }
+            (HandWritten::ShaderValueType(a), HandWritten::ShaderValueType(b)) => a == b,
+            (HandWritten::PerQualityLevel(a), HandWritten::PerQualityLevel(b)) => {
+                a.cooked == b.cooked
+                    && a.default_bits == b.default_bits
+                    && a.overrides == b.overrides
+            }
+            (HandWritten::FontData(a), HandWritten::FontData(b)) => {
+                a.font_face_asset == b.font_face_asset
+                    && a.sub_face_index == b.sub_face_index
+                    && match (&a.inline_face, &b.inline_face) {
+                        (Some(x), Some(y)) => {
+                            x.filename == y.filename
+                                && x.filename.wide == y.filename.wide
+                                && x.hinting == y.hinting
+                                && x.loading_policy == y.loading_policy
+                        }
+                        (Option::None, Option::None) => true,
+                        _ => false,
+                    }
+            }
+            (HandWritten::MaterialOverrideNanite(a), HandWritten::MaterialOverrideNanite(b)) => {
+                a.cooked == b.cooked
+                    && a.override_material == b.override_material
+                    && a.properties.semantic_eq(&b.properties)
+            }
+            (HandWritten::TimeWarpVariant(a), HandWritten::TimeWarpVariant(b)) => match (a, b) {
+                (TimeWarpVariant::Literal(x), TimeWarpVariant::Literal(y)) => {
+                    x.to_bits() == y.to_bits()
+                }
+                (
+                    TimeWarpVariant::Typed { kind: k1, object: o1, payload: p1 },
+                    TimeWarpVariant::Typed { kind: k2, object: o2, payload: p2 },
+                ) => {
+                    k1 == k2
+                        && o1 == o2
+                        && match (p1, p2) {
+                            (Some(x), Some(y)) => x.semantic_eq(y),
+                            (Option::None, Option::None) => true,
+                            _ => false,
+                        }
+                }
+                _ => false,
+            },
+            (HandWritten::LocatorFragment(a), HandWritten::LocatorFragment(b)) => {
+                a.fragment_type == b.fragment_type
+                    && match (&a.payload, &b.payload) {
+                        (Some(x), Some(y)) => x.semantic_eq(y),
+                        (Option::None, Option::None) => true,
+                        _ => false,
+                    }
+            }
             (HandWritten::NiagaraGpuParamInfo(a), HandWritten::NiagaraGpuParamInfo(b)) => {
                 a.hlsl_symbol == b.hlsl_symbol
                     && a.hlsl_symbol.wide == b.hlsl_symbol.wide

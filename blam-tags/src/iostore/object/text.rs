@@ -16,7 +16,7 @@ use super::value::PropValue;
 /// `subobj` is the only type this build's content uses — swept across all 121
 /// `LevelSequence` packages. Anything else surfaces as an error naming the
 /// unmapped type rather than silently mis-consuming the stream.
-pub(super) fn locator_fragment_payload(fragment_type: &str) -> Option<&'static str> {
+pub(crate) fn locator_fragment_payload(fragment_type: &str) -> Option<&'static str> {
     Some(match fragment_type {
         "subobj" => "SubObjectLocator",
         "actor" => "ActorLocatorFragment",
