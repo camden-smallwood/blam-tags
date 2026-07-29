@@ -42,6 +42,37 @@ pub fn read_export_struct_len(
     Ok((props, r.o))
 }
 
+/// Where the native-tail walk stopped short of modeling the whole export.
+///
+/// The tail dispatcher has 49 sites that rewind and decline to continue —
+/// `MaterialInterface`'s partly-modeled cached expressions, `Material`'s inline
+/// shader maps, and so on. Each one is a deliberate boundary, but until now the
+/// only trace was a line on stderr behind `BLAM_TAIL_WHY`, so a caller learned
+/// that a tail existed and nothing about *why* modeling stopped there.
+///
+/// This is that boundary as data: the class that declined, where in the export
+/// it happened, and how much was left. The reason itself is the comment at the
+/// site — the class and offset are what locate it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailStop {
+    /// The class in the inheritance chain whose tail reader declined.
+    pub class: String,
+    /// Offset into the export where the walk stopped.
+    pub at: usize,
+    /// Bytes after that point, left as an unmodeled span.
+    pub remaining: usize,
+}
+
+/// A chain walk's outcome: what it consumed, and where it gave up if it did.
+#[derive(Debug, Clone)]
+pub struct TailWalk {
+    pub block: PropertyBlock,
+    /// Bytes consumed by block + trailer + every tail that was modeled.
+    pub consumed: usize,
+    /// `None` when the whole chain was walked to the end.
+    pub stopped: Option<TailStop>,
+}
+
 pub fn read_export_with_trailer(
     export: &[u8],
     names: &[String],
@@ -50,6 +81,19 @@ pub fn read_export_with_trailer(
     object_flags: u32,
     ctx: &ExportContext<'_>,
 ) -> Result<(PropertyBlock, usize)> {
+    let walk = walk_export(export, names, usmap, class, object_flags, ctx)?;
+    Ok((walk.block, walk.consumed))
+}
+
+/// As [`read_export_with_trailer`], but reporting where the tail walk stopped.
+pub fn walk_export(
+    export: &[u8],
+    names: &[String],
+    usmap: &Usmap,
+    class: &str,
+    object_flags: u32,
+    ctx: &ExportContext<'_>,
+) -> Result<TailWalk> {
     /// `RF_ClassDefaultObject`.
     const RF_CLASS_DEFAULT_OBJECT: u32 = 0x10;
 
@@ -67,11 +111,11 @@ pub fn read_export_with_trailer(
             if read_rig_hierarchy(&mut r).is_err() {
                 r.o = at;
             }
-            return Ok((props, r.o));
+            return Ok(TailWalk { block: props, consumed: r.o, stopped: None });
         }
         let props = PropertyBlock::default();
         read_rigvm(&mut r, usmap)?;
-        return Ok((props, r.o));
+        return Ok(TailWalk { block: props, consumed: r.o, stopped: None });
     }
     let props = read_struct(&mut r, class, usmap, 0)?;
     if object_flags & RF_CLASS_DEFAULT_OBJECT == 0 && export.len() >= r.o + 4 {
@@ -85,9 +129,19 @@ pub fn read_export_with_trailer(
             // (its property walk stopped early, or the class serializes
             // something else here). Rewind and leave the rest as an unmodeled
             // tail rather than failing an otherwise good property decode.
+            // Not a boolean, so this export does not follow the trailer model
+            // — the walk stops here and everything from `at` is unmodeled.
             _ => {
                 r.o = at;
-                return Ok((props, r.o));
+                return Ok(TailWalk {
+                    block: props,
+                    consumed: r.o,
+                    stopped: Some(TailStop {
+                        class: "UObject".to_string(),
+                        at: r.o,
+                        remaining: export.len() - r.o,
+                    }),
+                });
             }
         }
     }
@@ -103,6 +157,7 @@ pub fn read_export_with_trailer(
     }
     chain.reverse();
     let why = tail_why();
+    let mut stopped = None;
     for c in &chain {
         let at = r.o;
         let keep_going = read_class_native_tail(&mut r, c, &props, usmap, ctx, object_flags)
@@ -115,10 +170,15 @@ pub fn read_export_with_trailer(
             );
         }
         if !keep_going {
+            stopped = Some(TailStop {
+                class: c.clone(),
+                at: r.o,
+                remaining: export.len().saturating_sub(r.o),
+            });
             break;
         }
     }
-    Ok((props, r.o))
+    Ok(TailWalk { block: props, consumed: r.o, stopped })
 }
 
 /// The `UObject` trailer written after the property block.

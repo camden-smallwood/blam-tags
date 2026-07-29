@@ -30,6 +30,7 @@ pub use super::edit::{
 };
 pub use super::export::{
     read_export, read_export_struct, read_export_struct_len, read_export_with_trailer,
+    walk_export, TailStop, TailWalk,
     write_export, Export, Trailer, NO_PROPERTY_BLOCK,
 };
 pub use super::property::{can_serialize_as_zero, should_save_as_zero};
