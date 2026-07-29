@@ -1156,6 +1156,829 @@ impl VirtualTextureBuiltData {
     }
 }
 
+/// An `FWeightedRandomSampler`: two float arrays and a total weight.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WeightedRandomSampler {
+    pub prob: Vec<f32>,
+    pub alias: Vec<i32>,
+    pub total_weight: f32,
+}
+
+impl WeightedRandomSampler {
+    fn read(r: &mut Reader) -> Result<Self> {
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "sampler prob", r.o - 4)?
+        };
+        let prob = (0..n).map(|_| r.f32()).collect::<Result<Vec<_>>>()?;
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "sampler alias", r.o - 4)?
+        };
+        let alias = (0..n).map(|_| r.i32()).collect::<Result<Vec<_>>>()?;
+        Ok(WeightedRandomSampler { prob, alias, total_weight: r.f32()? })
+    }
+
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.i32(&mut (self.prob.len() as i32))?;
+        for v in &self.prob {
+            ar.f32(&mut v.to_owned())?;
+        }
+        ar.i32(&mut (self.alias.len() as i32))?;
+        for v in &self.alias {
+            ar.i32(&mut v.to_owned())?;
+        }
+        ar.f32(&mut self.total_weight.to_owned())
+    }
+}
+
+/// An `FRawStaticIndexBuffer`: a 32-bit flag, the indices as a bulk array, and
+/// the "should expand to 32 bit" flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawStaticIndexBuffer {
+    pub is_32_bit: u32,
+    pub indices: BulkArray,
+    pub should_expand_to_32_bit: u32,
+}
+
+impl RawStaticIndexBuffer {
+    fn read(r: &mut Reader) -> Result<Self> {
+        Ok(RawStaticIndexBuffer {
+            is_32_bit: r.u32()?,
+            indices: BulkArray::read(r, "index buffer")?,
+            should_expand_to_32_bit: r.u32()?,
+        })
+    }
+
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.u32(&mut self.is_32_bit.to_owned())?;
+        self.indices.write(ar)?;
+        ar.u32(&mut self.should_expand_to_32_bit.to_owned())
+    }
+}
+
+/// `FStaticMeshLODResources::SerializeBuffers` — the vertex and index buffers.
+///
+/// Every payload is a bulk array carrying its own element size, so none of the
+/// vertex *formats* need modeling here: the stride and the flags that decide it
+/// are all present as values, and the packed vertices behind them are leaf data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticMeshBuffers {
+    pub global_strip: u8,
+    pub class_strip: u8,
+    pub position_stride: i32,
+    pub position_num_vertices: i32,
+    pub positions: BulkArray,
+    pub vertex_strip: [u8; 2],
+    pub num_tex_coords: i32,
+    pub num_vertices: i32,
+    pub use_full_precision_uvs: u32,
+    pub use_high_precision_tangent_basis: u32,
+    /// Tangents and UVs, present unless the vertex buffer's own strip flags say
+    /// otherwise.
+    pub tangents_and_uvs: Option<(BulkArray, BulkArray)>,
+    pub color_strip: [u8; 2],
+    pub color_stride: i32,
+    pub color_num_vertices: i32,
+    pub colors: Option<BulkArray>,
+    pub index_buffer: RawStaticIndexBuffer,
+    pub reversed_index_buffer: Option<RawStaticIndexBuffer>,
+    pub depth_only_index_buffer: RawStaticIndexBuffer,
+    pub reversed_depth_only_index_buffer: Option<RawStaticIndexBuffer>,
+    /// Editor-only, so absent from a cooked package unless the global strip
+    /// flags kept it.
+    pub wireframe_index_buffer: Option<RawStaticIndexBuffer>,
+    pub ray_tracing_geometry: Option<BulkArray>,
+}
+
+/// The samplers that follow the buffers: one per section, then one for the LOD.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StaticMeshSamplers {
+    pub per_section: Vec<WeightedRandomSampler>,
+    pub area_weighted: WeightedRandomSampler,
+}
+
+impl StaticMeshBuffers {
+    fn read(r: &mut Reader) -> Result<Self> {
+        let global_strip = r.u8()?;
+        let class_strip = r.u8()?;
+        let position_stride = r.i32()?;
+        let position_num_vertices = r.i32()?;
+        let positions = BulkArray::read(r, "positions")?;
+        let vertex_strip = [r.u8()?, r.u8()?];
+        let num_tex_coords = r.i32()?;
+        let num_vertices = r.i32()?;
+        let use_full_precision_uvs = r.u32()?;
+        let use_high_precision_tangent_basis = r.u32()?;
+        let tangents_and_uvs = if vertex_strip[0] & 2 == 0 {
+            Some((BulkArray::read(r, "tangents")?, BulkArray::read(r, "UVs")?))
+        } else {
+            None
+        };
+        let color_strip = [r.u8()?, r.u8()?];
+        let color_stride = r.i32()?;
+        let color_num_vertices = r.i32()?;
+        let colors = (color_strip[0] & 2 == 0 && color_num_vertices > 0)
+            .then(|| BulkArray::read(r, "vertex colours"))
+            .transpose()?;
+        let index_buffer = RawStaticIndexBuffer::read(r)?;
+        // `CDSF_ReversedIndexBuffer` is bit 2 of the class strip flags.
+        let reversed_index_buffer =
+            (class_strip & 4 == 0).then(|| RawStaticIndexBuffer::read(r)).transpose()?;
+        let depth_only_index_buffer = RawStaticIndexBuffer::read(r)?;
+        let reversed_depth_only_index_buffer =
+            (class_strip & 4 == 0).then(|| RawStaticIndexBuffer::read(r)).transpose()?;
+        let wireframe_index_buffer =
+            (global_strip & 1 == 0).then(|| RawStaticIndexBuffer::read(r)).transpose()?;
+        let ray_tracing_geometry = (class_strip & 8 == 0)
+            .then(|| BulkArray::read(r, "ray tracing geometry"))
+            .transpose()?;
+        Ok(StaticMeshBuffers {
+            global_strip,
+            class_strip,
+            position_stride,
+            position_num_vertices,
+            positions,
+            vertex_strip,
+            num_tex_coords,
+            num_vertices,
+            use_full_precision_uvs,
+            use_high_precision_tangent_basis,
+            tangents_and_uvs,
+            color_strip,
+            color_stride,
+            color_num_vertices,
+            colors,
+            index_buffer,
+            reversed_index_buffer,
+            depth_only_index_buffer,
+            reversed_depth_only_index_buffer,
+            wireframe_index_buffer,
+            ray_tracing_geometry,
+        })
+    }
+
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.u8(&mut self.global_strip.to_owned())?;
+        ar.u8(&mut self.class_strip.to_owned())?;
+        ar.i32(&mut self.position_stride.to_owned())?;
+        ar.i32(&mut self.position_num_vertices.to_owned())?;
+        self.positions.write(ar)?;
+        ar.u8(&mut self.vertex_strip[0].to_owned())?;
+        ar.u8(&mut self.vertex_strip[1].to_owned())?;
+        ar.i32(&mut self.num_tex_coords.to_owned())?;
+        ar.i32(&mut self.num_vertices.to_owned())?;
+        ar.u32(&mut self.use_full_precision_uvs.to_owned())?;
+        ar.u32(&mut self.use_high_precision_tangent_basis.to_owned())?;
+        match (&self.tangents_and_uvs, self.vertex_strip[0] & 2 == 0) {
+            (Some((t, u)), true) => {
+                t.write(ar)?;
+                u.write(ar)?;
+            }
+            (None, false) => {}
+            _ => bail!("tangent/UV presence disagrees with the vertex strip flags"),
+        }
+        ar.u8(&mut self.color_strip[0].to_owned())?;
+        ar.u8(&mut self.color_strip[1].to_owned())?;
+        ar.i32(&mut self.color_stride.to_owned())?;
+        ar.i32(&mut self.color_num_vertices.to_owned())?;
+        match (&self.colors, self.color_strip[0] & 2 == 0 && self.color_num_vertices > 0) {
+            (Some(c), true) => c.write(ar)?,
+            (None, false) => {}
+            _ => bail!("vertex colour presence disagrees with the colour buffer's flags"),
+        }
+        self.index_buffer.write(ar)?;
+        write_optional_index_buffer(ar, &self.reversed_index_buffer, self.class_strip & 4 == 0)?;
+        self.depth_only_index_buffer.write(ar)?;
+        write_optional_index_buffer(
+            ar,
+            &self.reversed_depth_only_index_buffer,
+            self.class_strip & 4 == 0,
+        )?;
+        write_optional_index_buffer(ar, &self.wireframe_index_buffer, self.global_strip & 1 == 0)?;
+        match (&self.ray_tracing_geometry, self.class_strip & 8 == 0) {
+            (Some(b), true) => b.write(ar)?,
+            (None, false) => {}
+            _ => bail!("ray tracing geometry presence disagrees with the strip flags"),
+        }
+        Ok(())
+    }
+}
+
+fn write_optional_index_buffer(
+    ar: &mut impl Ar,
+    buf: &Option<RawStaticIndexBuffer>,
+    expected: bool,
+) -> Result<()> {
+    match (buf, expected) {
+        (Some(b), true) => b.write(ar),
+        (None, false) => Ok(()),
+        _ => bail!("index buffer presence disagrees with the strip flags"),
+    }
+}
+
+/// One `FStaticMeshLODResources`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StaticMeshLod {
+    pub global_strip: u8,
+    pub class_strip: u8,
+    /// `FStaticMeshSection` — five `int32`s then five four-byte flags.
+    pub sections: Vec<[u8; 40]>,
+    pub max_deviation: f32,
+    pub is_lod_cooked_out: bool,
+    pub is_inlined: bool,
+    /// Everything after `bInlined`, absent for a LOD that was cooked out or had
+    /// its render data stripped — such a LOD ends right there.
+    pub render: Option<StaticMeshLodRender>,
+}
+
+/// The part of a LOD that only exists when it kept its render data.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StaticMeshLodRender {
+    pub has_ray_tracing_geometry: u32,
+    /// Inline buffers, or the bulk-data handle and metadata of stripped ones.
+    pub buffers: StaticMeshLodBuffers,
+    /// `FStaticMeshBuffersSize`: three `uint32` totals.
+    pub buffers_size: [u8; 12],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StaticMeshLodBuffers {
+    Inline { buffers: Box<StaticMeshBuffers>, samplers: StaticMeshSamplers },
+    /// Streamed: a bulk-data index, the depth-only triangle count and packed
+    /// flags, then the metadata describing each buffer that was left out.
+    Streamed { bulk_index: i32, depth_only_and_flags: [u8; 8], buffer_metadata: [u8; 72] },
+}
+
+impl StaticMeshLod {
+    fn read(r: &mut Reader) -> Result<Self> {
+        let global_strip = r.u8()?;
+        let class_strip = r.u8()?;
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "mesh sections", r.o - 4)?
+        };
+        let mut sections = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            sections.push(r.take(40)?.try_into().expect("40 bytes"));
+        }
+        let max_deviation = r.f32()?;
+        let is_lod_cooked_out = r.u32()? != 0;
+        let is_inlined = r.u32()? != 0;
+        let render = if global_strip & 2 == 0 && !is_lod_cooked_out {
+            let has_ray_tracing_geometry = r.u32()?;
+            let buffers = if is_inlined {
+                let buffers = Box::new(StaticMeshBuffers::read(r)?);
+                let mut per_section = Vec::with_capacity(sections.len().min(64));
+                for _ in 0..sections.len() {
+                    per_section.push(WeightedRandomSampler::read(r)?);
+                }
+                StaticMeshLodBuffers::Inline {
+                    buffers,
+                    samplers: StaticMeshSamplers {
+                        per_section,
+                        area_weighted: WeightedRandomSampler::read(r)?,
+                    },
+                }
+            } else {
+                StaticMeshLodBuffers::Streamed {
+                    bulk_index: r.i32()?,
+                    depth_only_and_flags: r.take(8)?.try_into().expect("8 bytes"),
+                    buffer_metadata: r.take(72)?.try_into().expect("72 bytes"),
+                }
+            };
+            Some(StaticMeshLodRender {
+                has_ray_tracing_geometry,
+                buffers,
+                buffers_size: r.take(12)?.try_into().expect("12 bytes"),
+            })
+        } else {
+            None
+        };
+        Ok(StaticMeshLod {
+            global_strip,
+            class_strip,
+            sections,
+            max_deviation,
+            is_lod_cooked_out,
+            is_inlined,
+            render,
+        })
+    }
+
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.u8(&mut self.global_strip.to_owned())?;
+        ar.u8(&mut self.class_strip.to_owned())?;
+        ar.i32(&mut (self.sections.len() as i32))?;
+        for s in &self.sections {
+            ar.raw(&mut s.to_vec(), 40)?;
+        }
+        ar.f32(&mut self.max_deviation.to_owned())?;
+        ar.u32(&mut u32::from(self.is_lod_cooked_out))?;
+        ar.u32(&mut u32::from(self.is_inlined))?;
+        let expected = self.global_strip & 2 == 0 && !self.is_lod_cooked_out;
+        match (&self.render, expected) {
+            (Some(rd), true) => {
+                ar.u32(&mut rd.has_ray_tracing_geometry.to_owned())?;
+                match (&rd.buffers, self.is_inlined) {
+                    (StaticMeshLodBuffers::Inline { buffers, samplers }, true) => {
+                        buffers.write(ar)?;
+                        if samplers.per_section.len() != self.sections.len() {
+                            bail!(
+                                "{} per-section samplers for {} sections",
+                                samplers.per_section.len(),
+                                self.sections.len()
+                            );
+                        }
+                        for s in &samplers.per_section {
+                            s.write(ar)?;
+                        }
+                        samplers.area_weighted.write(ar)?;
+                    }
+                    (
+                        StaticMeshLodBuffers::Streamed {
+                            bulk_index,
+                            depth_only_and_flags,
+                            buffer_metadata,
+                        },
+                        false,
+                    ) => {
+                        ar.i32(&mut bulk_index.to_owned())?;
+                        ar.raw(&mut depth_only_and_flags.to_vec(), 8)?;
+                        ar.raw(&mut buffer_metadata.to_vec(), 72)?;
+                    }
+                    _ => bail!("buffer form disagrees with the inlined flag"),
+                }
+                ar.raw(&mut rd.buffers_size.to_vec(), 12)?;
+            }
+            (None, false) => {}
+            _ => bail!("LOD render data presence disagrees with its flags"),
+        }
+        Ok(())
+    }
+}
+
+/// `FNaniteResources` as cooked into a `UStaticMesh`.
+///
+/// `root_data` and the streaming pages are Nanite's own compressed cluster
+/// encoding — leaf data here, and their decoder is a separate module. Everything
+/// that *addresses* them is modeled: the page streaming states, the BVH
+/// hierarchy, the dependencies and the mesh statistics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NaniteResources {
+    pub strip_flags: [u8; 2],
+    pub resource_flags: u32,
+    /// `StreamablePages`: a bulk-data handle, never inline in this corpus.
+    pub streamable_pages_index: i32,
+    pub root_data: Vec<u8>,
+    /// 20 bytes each.
+    pub page_streaming_states: Vec<[u8; 20]>,
+    /// `FPackedHierarchyNode` — four BVH slices of 52 bytes.
+    pub hierarchy_nodes: Vec<[u8; 208]>,
+    pub hierarchy_root_offsets: Vec<u32>,
+    pub page_dependencies: Vec<u32>,
+    /// Two bytes per entry.
+    pub imposter_atlas: Vec<u8>,
+    /// `NumRootPages`, `PositionPrecision`, `NormalPrecision`,
+    /// `NumInputTriangles`, then `NumInputVertices`, the two `uint16` counts and
+    /// `NumClusters`.
+    pub stats: [u8; 28],
+}
+
+impl NaniteResources {
+    fn read(r: &mut Reader) -> Result<Self> {
+        let strip_flags = [r.u8()?, r.u8()?];
+        let resource_flags = r.u32()?;
+        let streamable_pages_index = r.i32()?;
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "Nanite RootData", r.o - 4)?
+        };
+        let root_data = r.take(n)?.to_vec();
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "PageStreamingStates", r.o - 4)?
+        };
+        let mut page_streaming_states = Vec::with_capacity(n.min(256));
+        for _ in 0..n {
+            page_streaming_states.push(r.take(20)?.try_into().expect("20 bytes"));
+        }
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "HierarchyNodes", r.o - 4)?
+        };
+        let mut hierarchy_nodes = Vec::with_capacity(n.min(256));
+        for _ in 0..n {
+            hierarchy_nodes.push(r.take(208)?.try_into().expect("208 bytes"));
+        }
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "HierarchyRootOffsets", r.o - 4)?
+        };
+        let hierarchy_root_offsets = (0..n).map(|_| r.u32()).collect::<Result<Vec<_>>>()?;
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "PageDependencies", r.o - 4)?
+        };
+        let page_dependencies = (0..n).map(|_| r.u32()).collect::<Result<Vec<_>>>()?;
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "ImposterAtlas", r.o - 4)?
+        };
+        let imposter_atlas = r.take(n * 2)?.to_vec();
+        Ok(NaniteResources {
+            strip_flags,
+            resource_flags,
+            streamable_pages_index,
+            root_data,
+            page_streaming_states,
+            hierarchy_nodes,
+            hierarchy_root_offsets,
+            page_dependencies,
+            imposter_atlas,
+            stats: r.take(28)?.try_into().expect("28 bytes"),
+        })
+    }
+
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.u8(&mut self.strip_flags[0].to_owned())?;
+        ar.u8(&mut self.strip_flags[1].to_owned())?;
+        ar.u32(&mut self.resource_flags.to_owned())?;
+        ar.i32(&mut self.streamable_pages_index.to_owned())?;
+        ar.i32(&mut (self.root_data.len() as i32))?;
+        let n = self.root_data.len();
+        ar.raw(&mut self.root_data.clone(), n)?;
+        ar.i32(&mut (self.page_streaming_states.len() as i32))?;
+        for s in &self.page_streaming_states {
+            ar.raw(&mut s.to_vec(), 20)?;
+        }
+        ar.i32(&mut (self.hierarchy_nodes.len() as i32))?;
+        for s in &self.hierarchy_nodes {
+            ar.raw(&mut s.to_vec(), 208)?;
+        }
+        write_u32_array(ar, &self.hierarchy_root_offsets)?;
+        write_u32_array(ar, &self.page_dependencies)?;
+        if self.imposter_atlas.len() % 2 != 0 {
+            bail!("imposter atlas has an odd byte count");
+        }
+        ar.i32(&mut ((self.imposter_atlas.len() / 2) as i32))?;
+        let n = self.imposter_atlas.len();
+        ar.raw(&mut self.imposter_atlas.clone(), n)?;
+        ar.raw(&mut self.stats.to_vec(), 28)
+    }
+}
+
+/// One LOD's ray-tracing proxy entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RayTracingProxyLod {
+    /// `bOwnsBuffers`, and the 40-byte sections it owns when set.
+    pub sections: Option<Vec<[u8; 40]>>,
+    pub owns_ray_tracing_geometry: u32,
+    pub bulk_index: i32,
+    /// The streamable payload, present only when the bulk map puts it here.
+    pub payload: Option<Vec<u8>>,
+}
+
+/// `FStaticMeshRayTracingProxy`, written only when `bHasRayTracingProxy`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RayTracingProxy {
+    pub strip_flags: [u8; 2],
+    pub using_rendering_lods: u32,
+    pub lods: Vec<RayTracingProxyLod>,
+}
+
+/// One LOD's Lumen card representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardRepresentation {
+    /// `Bounds` as an `FBox` — three doubles each way plus `IsValid`.
+    pub bounds: [u8; 49],
+    pub mostly_two_sided: u32,
+    /// `FLumenCardBuildData` — an `FLumenCardOBB` of five `FVector3f` plus the
+    /// axis-aligned direction index, 61 bytes.
+    pub cards: Vec<[u8; 61]>,
+}
+
+/// One LOD's distance-field volume (`FDistanceFieldVolumeData5`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistanceFieldVolume {
+    /// `LocalSpaceMeshBounds` is an `FBox3f` — six floats and `IsValid`, 25
+    /// bytes, not the 49-byte double-width `FBox`.
+    pub local_space_mesh_bounds: [u8; 25],
+    pub mostly_two_sided: u32,
+    /// Three `FSparseDistanceFieldMip` of 56 bytes.
+    pub mips: [u8; 168],
+    pub always_loaded_mip: Vec<u8>,
+    /// `StreamableMips`: a bulk-data handle.
+    pub streamable_mips_index: i32,
+}
+
+/// The whole tail of a `UStaticMesh` export: 15,231 exports and 1,310 MiB, the
+/// largest tail population in the corpus.
+// No `Eq`: LODs carry `f32` deviations and sampler weights.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StaticMeshTail {
+    pub strip_flags: [u8; 2],
+    pub cooked: u32,
+    pub body_setup: i32,
+    pub nav_collision: i32,
+    pub lighting_guid: [u8; 16],
+    pub sockets: Vec<i32>,
+    pub lods: Vec<StaticMeshLod>,
+    pub num_inlined_lods: u8,
+    pub nanite: NaniteResources,
+    pub ray_tracing_proxy: Option<RayTracingProxy>,
+    pub card_strip: [u8; 2],
+    /// Per LOD, `None` where the validity flag was zero. Absent entirely when
+    /// the strip flags dropped the whole section.
+    pub card_representations: Option<Vec<Option<CardRepresentation>>>,
+    pub distance_field_strip: [u8; 2],
+    pub distance_fields: Option<Vec<Option<DistanceFieldVolume>>>,
+    /// `Bounds`: an `FBoxSphereBounds`.
+    pub bounds: [u8; 56],
+    pub lods_share_static_lighting: u32,
+    /// `ScreenSize[MAX_STATIC_LODS_UE4]`, each an `FPerPlatformFloat`.
+    pub screen_sizes: [u8; 64],
+    pub render_data_strip: [u8; 2],
+    pub has_speed_tree_wind: u32,
+    /// `FStaticMaterial` — 36 bytes each.
+    pub materials: Vec<[u8; 36]>,
+}
+
+impl StaticMeshTail {
+    pub fn read(r: &mut Reader, ctx: TailContext) -> Result<Self> {
+        let strip_flags = [r.u8()?, r.u8()?];
+        let cooked = r.u32()?;
+        let body_setup = r.i32()?;
+        let nav_collision = r.i32()?;
+        let lighting_guid: [u8; 16] = r.take(16)?.try_into().expect("16 bytes");
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "Sockets", r.o - 4)?
+        };
+        let sockets = (0..n).map(|_| r.i32()).collect::<Result<Vec<_>>>()?;
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "LODs", r.o - 4)?
+        };
+        let mut lods = Vec::with_capacity(n.min(16));
+        for _ in 0..n {
+            lods.push(StaticMeshLod::read(r)?);
+        }
+        let num_inlined_lods = r.u8()?;
+        let nanite = NaniteResources::read(r)?;
+
+        let ray_tracing_proxy = (r.u32()? != 0)
+            .then(|| -> Result<RayTracingProxy> {
+                let strip_flags = [r.u8()?, r.u8()?];
+                let using_rendering_lods = r.u32()?;
+                let n = {
+                    let n = r.i32()?;
+                    super::limits::bounded(n, MAX_NATIVE_COUNT, "ray tracing proxy LODs", r.o - 4)?
+                };
+                let mut proxy_lods = Vec::with_capacity(n.min(16));
+                for _ in 0..n {
+                    let sections = (r.u32()? != 0)
+                        .then(|| -> Result<Vec<[u8; 40]>> {
+                            let n = {
+                                let n = r.i32()?;
+                                super::limits::bounded(
+                                    n,
+                                    MAX_NATIVE_COUNT,
+                                    "proxy sections",
+                                    r.o - 4,
+                                )?
+                            };
+                            (0..n)
+                                .map(|_| Ok(r.take(40)?.try_into().expect("40 bytes")))
+                                .collect()
+                        })
+                        .transpose()?;
+                    let owns_ray_tracing_geometry = r.u32()?;
+                    let bulk_index = r.i32()?;
+                    let payload = match ctx.bulk_data.get(bulk_index.max(0) as usize) {
+                        Some(&(offset, size)) if offset as usize == ctx.origin + r.o => {
+                            Some(r.take(size.max(0) as usize)?.to_vec())
+                        }
+                        _ => None,
+                    };
+                    proxy_lods.push(RayTracingProxyLod {
+                        sections,
+                        owns_ray_tracing_geometry,
+                        bulk_index,
+                        payload,
+                    });
+                }
+                Ok(RayTracingProxy { strip_flags, using_rendering_lods, lods: proxy_lods })
+            })
+            .transpose()?;
+
+        let card_strip = [r.u8()?, r.u8()?];
+        let card_representations = (card_strip[0] & 2 == 0 && card_strip[1] & 2 == 0)
+            .then(|| -> Result<Vec<Option<CardRepresentation>>> {
+                (0..lods.len())
+                    .map(|_| {
+                        if r.u32()? == 0 {
+                            return Ok(None);
+                        }
+                        let bounds: [u8; 49] = r.take(49)?.try_into().expect("49 bytes");
+                        let mostly_two_sided = r.u32()?;
+                        let n = {
+                            let n = r.i32()?;
+                            super::limits::bounded(n, MAX_NATIVE_COUNT, "CardBuildData", r.o - 4)?
+                        };
+                        let mut cards = Vec::with_capacity(n.min(64));
+                        for _ in 0..n {
+                            cards.push(r.take(61)?.try_into().expect("61 bytes"));
+                        }
+                        Ok(Some(CardRepresentation { bounds, mostly_two_sided, cards }))
+                    })
+                    .collect()
+            })
+            .transpose()?;
+
+        let distance_field_strip = [r.u8()?, r.u8()?];
+        let distance_fields = (distance_field_strip[0] & 2 == 0 && distance_field_strip[1] & 1 == 0)
+            .then(|| -> Result<Vec<Option<DistanceFieldVolume>>> {
+                (0..lods.len())
+                    .map(|_| {
+                        if r.u32()? == 0 {
+                            return Ok(None);
+                        }
+                        let local_space_mesh_bounds = r.take(25)?.try_into().expect("25 bytes");
+                        let mostly_two_sided = r.u32()?;
+                        let mips = r.take(168)?.try_into().expect("168 bytes");
+                        let n = {
+                            let n = r.i32()?;
+                            super::limits::bounded(n, MAX_NATIVE_COUNT, "AlwaysLoadedMip", r.o - 4)?
+                        };
+                        Ok(Some(DistanceFieldVolume {
+                            local_space_mesh_bounds,
+                            mostly_two_sided,
+                            mips,
+                            always_loaded_mip: r.take(n)?.to_vec(),
+                            streamable_mips_index: r.i32()?,
+                        }))
+                    })
+                    .collect()
+            })
+            .transpose()?;
+
+        let bounds = r.take(56)?.try_into().expect("56 bytes");
+        let lods_share_static_lighting = r.u32()?;
+        let screen_sizes = r.take(64)?.try_into().expect("64 bytes");
+        let render_data_strip = [r.u8()?, r.u8()?];
+        let has_speed_tree_wind = r.u32()?;
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "StaticMaterials", r.o - 4)?
+        };
+        let mut materials = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            materials.push(r.take(36)?.try_into().expect("36 bytes"));
+        }
+
+        Ok(StaticMeshTail {
+            strip_flags,
+            cooked,
+            body_setup,
+            nav_collision,
+            lighting_guid,
+            sockets,
+            lods,
+            num_inlined_lods,
+            nanite,
+            ray_tracing_proxy,
+            card_strip,
+            card_representations,
+            distance_field_strip,
+            distance_fields,
+            bounds,
+            lods_share_static_lighting,
+            screen_sizes,
+            render_data_strip,
+            has_speed_tree_wind,
+            materials,
+        })
+    }
+
+    pub fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.u8(&mut self.strip_flags[0].to_owned())?;
+        ar.u8(&mut self.strip_flags[1].to_owned())?;
+        ar.u32(&mut self.cooked.to_owned())?;
+        ar.i32(&mut self.body_setup.to_owned())?;
+        ar.i32(&mut self.nav_collision.to_owned())?;
+        ar.raw(&mut self.lighting_guid.to_vec(), 16)?;
+        ar.i32(&mut (self.sockets.len() as i32))?;
+        for s in &self.sockets {
+            ar.i32(&mut s.to_owned())?;
+        }
+        ar.i32(&mut (self.lods.len() as i32))?;
+        for l in &self.lods {
+            l.write(ar)?;
+        }
+        ar.u8(&mut self.num_inlined_lods.to_owned())?;
+        self.nanite.write(ar)?;
+
+        match &self.ray_tracing_proxy {
+            Some(p) => {
+                ar.u32(&mut 1)?;
+                ar.u8(&mut p.strip_flags[0].to_owned())?;
+                ar.u8(&mut p.strip_flags[1].to_owned())?;
+                ar.u32(&mut p.using_rendering_lods.to_owned())?;
+                ar.i32(&mut (p.lods.len() as i32))?;
+                for l in &p.lods {
+                    match &l.sections {
+                        Some(sec) => {
+                            ar.u32(&mut 1)?;
+                            ar.i32(&mut (sec.len() as i32))?;
+                            for s in sec {
+                                ar.raw(&mut s.to_vec(), 40)?;
+                            }
+                        }
+                        None => ar.u32(&mut 0)?,
+                    }
+                    ar.u32(&mut l.owns_ray_tracing_geometry.to_owned())?;
+                    ar.i32(&mut l.bulk_index.to_owned())?;
+                    if let Some(p) = &l.payload {
+                        let n = p.len();
+                        ar.raw(&mut p.clone(), n)?;
+                    }
+                }
+            }
+            None => ar.u32(&mut 0)?,
+        }
+
+        ar.u8(&mut self.card_strip[0].to_owned())?;
+        ar.u8(&mut self.card_strip[1].to_owned())?;
+        match (&self.card_representations, self.card_strip[0] & 2 == 0 && self.card_strip[1] & 2 == 0)
+        {
+            (Some(v), true) => {
+                if v.len() != self.lods.len() {
+                    bail!("{} card representations for {} LODs", v.len(), self.lods.len());
+                }
+                for c in v {
+                    match c {
+                        Some(c) => {
+                            ar.u32(&mut 1)?;
+                            ar.raw(&mut c.bounds.to_vec(), 49)?;
+                            ar.u32(&mut c.mostly_two_sided.to_owned())?;
+                            ar.i32(&mut (c.cards.len() as i32))?;
+                            for card in &c.cards {
+                                ar.raw(&mut card.to_vec(), 61)?;
+                            }
+                        }
+                        None => ar.u32(&mut 0)?,
+                    }
+                }
+            }
+            (None, false) => {}
+            _ => bail!("card representation presence disagrees with the strip flags"),
+        }
+
+        ar.u8(&mut self.distance_field_strip[0].to_owned())?;
+        ar.u8(&mut self.distance_field_strip[1].to_owned())?;
+        match (
+            &self.distance_fields,
+            self.distance_field_strip[0] & 2 == 0 && self.distance_field_strip[1] & 1 == 0,
+        ) {
+            (Some(v), true) => {
+                if v.len() != self.lods.len() {
+                    bail!("{} distance fields for {} LODs", v.len(), self.lods.len());
+                }
+                for d in v {
+                    match d {
+                        Some(d) => {
+                            ar.u32(&mut 1)?;
+                            ar.raw(&mut d.local_space_mesh_bounds.to_vec(), 25)?;
+                            ar.u32(&mut d.mostly_two_sided.to_owned())?;
+                            ar.raw(&mut d.mips.to_vec(), 168)?;
+                            ar.i32(&mut (d.always_loaded_mip.len() as i32))?;
+                            let n = d.always_loaded_mip.len();
+                            ar.raw(&mut d.always_loaded_mip.clone(), n)?;
+                            ar.i32(&mut d.streamable_mips_index.to_owned())?;
+                        }
+                        None => ar.u32(&mut 0)?,
+                    }
+                }
+            }
+            (None, false) => {}
+            _ => bail!("distance field presence disagrees with the strip flags"),
+        }
+
+        ar.raw(&mut self.bounds.to_vec(), 56)?;
+        ar.u32(&mut self.lods_share_static_lighting.to_owned())?;
+        ar.raw(&mut self.screen_sizes.to_vec(), 64)?;
+        ar.u8(&mut self.render_data_strip[0].to_owned())?;
+        ar.u8(&mut self.render_data_strip[1].to_owned())?;
+        ar.u32(&mut self.has_speed_tree_wind.to_owned())?;
+        ar.i32(&mut (self.materials.len() as i32))?;
+        for m in &self.materials {
+            ar.raw(&mut m.to_vec(), 36)?;
+        }
+        Ok(())
+    }
+}
+
 /// One entry of an `FFormatContainer`: a format name and the payload cooked for
 /// it.
 ///
@@ -1479,6 +2302,7 @@ pub const MODELED_TAILS: &[&str] = &[
     "LandscapeMaterialInstanceConstant",
     "MaterialInstanceDynamic",
     "BodySetup",
+    "StaticMesh",
 ];
 
 /// Decode a modeled tail and re-emit it, for verification against the span it
@@ -1545,6 +2369,16 @@ pub fn roundtrip_tail(
             }
             let mut w = super::archive::Writer::new();
             modeled.write(&mut w, block, ctx)?;
+            Ok(w.into_bytes())
+        })()),
+        "StaticMesh" => Some((|| {
+            let mut r = Reader::new(tail, names);
+            let modeled = StaticMeshTail::read(&mut r, ctx)?;
+            if r.o != tail.len() {
+                bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+            }
+            let mut w = super::archive::Writer::new();
+            modeled.write(&mut w)?;
             Ok(w.into_bytes())
         })()),
         "BodySetup" => Some((|| {

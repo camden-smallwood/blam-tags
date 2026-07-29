@@ -2880,11 +2880,12 @@ pub(super) fn read_static_mesh_buffers(r: &mut Reader, sections: usize) -> Resul
 /// 0xd8, where the stream reads `05 00 | Stride 12 | NumVertices 148 |
 /// bulk(12 × 148)`.
 ///
-/// **NOT verified end to end.** On that same mesh the walk finishes its two LODs
-/// at offset 7689, which lands in the middle of float vertex data — so something
-/// inside `read_static_mesh_buffers` still drifts. Do not wire `StaticMesh` into
-/// the byte-accounting metric until the LOD end lands on `FNaniteResources`
-/// (whose first field is a 2-byte `FStripDataFlags`, not floats).
+/// **Verified end to end** since `tail_models::StaticMeshTail`: all 15,231
+/// `UStaticMesh` exports decode to values and re-encode byte-identically, which
+/// a drifting reader cannot do. The warning that used to sit here — that
+/// something inside `read_static_mesh_buffers` still drifted, on the evidence of
+/// one mesh finishing mid-float — predated the strip-flag conditions being
+/// right, and no longer holds.
 pub(super) fn read_static_mesh_lod(r: &mut Reader) -> Result<()> {
     let t = trace_enabled();
     let start = r.o;
