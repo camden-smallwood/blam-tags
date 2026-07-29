@@ -660,6 +660,11 @@ pub struct TailContext<'a> {
     /// Needed by any tail that embeds a reflected struct — the material caches
     /// are property blocks, so they cannot be read or written without a schema.
     pub usmap: &'a Usmap,
+    /// How to find a layout the `.usmap` does not carry: a `UDataTable`'s row
+    /// struct, or a user-defined struct nested inside another package's block.
+    /// Both directions need it — regenerating a nested block's header needs the
+    /// nested schema just as much as reading it did.
+    pub resolver: Option<&'a dyn super::archive::PackageResolver>,
 }
 
 /// A texture's CPU-side copy (`FSharedImage`, an `FImage`; ImageCore.h:412).
@@ -818,6 +823,8 @@ impl TextureCookedData {
             ar.fname(&mut f.format_name.clone())?;
             // The skip offset is a delta to the end of this platform data, so
             // encode the body first and measure it.
+            // A scratch buffer only, to measure the body before writing the
+            // skip offset — it embeds no nested schema.
             let mut body = super::archive::Writer::new();
             f.write_body(&mut body, mip_data)?;
             let body = body.into_bytes();
@@ -5090,12 +5097,12 @@ pub fn roundtrip_tail(
 ) -> Option<Result<Vec<u8>>> {
     match class {
         "StaticMeshComponent" => Some((|| {
-            let mut r = Reader::new(tail, names);
+            let mut r = reader(tail, names, ctx);
             let modeled = StaticMeshComponentChainTail::read(&mut r, block)?;
             if r.o != tail.len() {
                 bail!("model consumed {} of {} tail bytes", r.o, tail.len());
             }
-            let mut w = super::archive::Writer::new();
+            let mut w = super::archive::Writer::with_resolver(ctx.resolver);
             modeled.write(&mut w, block)?;
             Ok(w.into_bytes())
         })()),
@@ -5103,13 +5110,13 @@ pub fn roundtrip_tail(
         | "FoliageInstancedStaticMeshComponent"
         | "HLODInstancedStaticMeshComponent"
         | "HierarchicalInstancedStaticMeshComponent" => Some((|| {
-            let mut r = Reader::new(tail, names);
+            let mut r = reader(tail, names, ctx);
             let modeled =
                 InstancedStaticMeshComponentChainTail::read(&mut r, block, is_hierarchical(class))?;
             if r.o != tail.len() {
                 bail!("model consumed {} of {} tail bytes", r.o, tail.len());
             }
-            let mut w = super::archive::Writer::new();
+            let mut w = super::archive::Writer::with_resolver(ctx.resolver);
             modeled.write(&mut w, block)?;
             Ok(w.into_bytes())
         })()),
@@ -5119,13 +5126,13 @@ pub fn roundtrip_tail(
         // a sibling of `UTextureCube` desynced all 7 of them.
         "Texture2D" | "TextureCube" | "VolumeTexture" | "Texture2DArray"
         | "TextureLightProfile" => Some((|| {
-            let mut r = Reader::new(tail, names);
+            let mut r = reader(tail, names, ctx);
             let derives_from_texture_2d = matches!(class, "Texture2D" | "TextureLightProfile");
             let modeled = TextureChainTail::read(&mut r, ctx, derives_from_texture_2d)?;
             if r.o != tail.len() {
                 bail!("model consumed {} of {} tail bytes", r.o, tail.len());
             }
-            let mut w = super::archive::Writer::new();
+            let mut w = super::archive::Writer::with_resolver(ctx.resolver);
             modeled.write(&mut w)?;
             Ok(w.into_bytes())
         })()),
@@ -5133,104 +5140,104 @@ pub fn roundtrip_tail(
         // writes its own cache first and defers to the property block.
         "Material" | "MaterialInstanceConstant" | "LandscapeMaterialInstanceConstant"
         | "MaterialInstanceDynamic" => Some((|| {
-            let mut r = Reader::new(tail, names);
+            let mut r = reader(tail, names, ctx);
             let is_instance = class != "Material";
             let modeled = MaterialChainTail::read(&mut r, block, ctx, is_instance)?;
             if r.o != tail.len() {
                 bail!("model consumed {} of {} tail bytes", r.o, tail.len());
             }
-            let mut w = super::archive::Writer::new();
+            let mut w = super::archive::Writer::with_resolver(ctx.resolver);
             modeled.write(&mut w, block, ctx)?;
             Ok(w.into_bytes())
         })()),
         // `AStaticMeshActor` adds nothing of its own; its whole tail is `AActor`'s.
         "StaticMeshActor" => Some((|| {
-            let mut r = Reader::new(tail, names);
+            let mut r = reader(tail, names, ctx);
             let modeled = ActorTail::read(&mut r)?;
             if r.o != tail.len() {
                 bail!("model consumed {} of {} tail bytes", r.o, tail.len());
             }
-            let mut w = super::archive::Writer::new();
+            let mut w = super::archive::Writer::with_resolver(ctx.resolver);
             modeled.write(&mut w)?;
             Ok(w.into_bytes())
         })()),
         "AkAudioEvent" => Some((|| {
-            let mut r = Reader::new(tail, names);
+            let mut r = reader(tail, names, ctx);
             let modeled = AkAudioEventTail::read(&mut r, ctx)?;
             if r.o != tail.len() {
                 bail!("model consumed {} of {} tail bytes", r.o, tail.len());
             }
-            let mut w = super::archive::Writer::new();
+            let mut w = super::archive::Writer::with_resolver(ctx.resolver);
             modeled.write(&mut w, ctx)?;
             Ok(w.into_bytes())
         })()),
         "Model" => Some((|| {
-            let mut r = Reader::new(tail, names);
+            let mut r = reader(tail, names, ctx);
             let modeled = ModelTail::read(&mut r)?;
             if r.o != tail.len() {
                 bail!("model consumed {} of {} tail bytes", r.o, tail.len());
             }
-            let mut w = super::archive::Writer::new();
+            let mut w = super::archive::Writer::with_resolver(ctx.resolver);
             modeled.write(&mut w)?;
             Ok(w.into_bytes())
         })()),
         "Level" => Some((|| {
-            let mut r = Reader::new(tail, names);
+            let mut r = reader(tail, names, ctx);
             let modeled = LevelTail::read(&mut r)?;
             if r.o != tail.len() {
                 bail!("model consumed {} of {} tail bytes", r.o, tail.len());
             }
-            let mut w = super::archive::Writer::new();
+            let mut w = super::archive::Writer::with_resolver(ctx.resolver);
             modeled.write(&mut w)?;
             Ok(w.into_bytes())
         })()),
         "AnimSequence" => Some((|| {
-            let mut r = Reader::new(tail, names);
+            let mut r = reader(tail, names, ctx);
             let modeled = AnimSequenceChainTail::read(&mut r)?;
             if r.o != tail.len() {
                 bail!("model consumed {} of {} tail bytes", r.o, tail.len());
             }
-            let mut w = super::archive::Writer::new();
+            let mut w = super::archive::Writer::with_resolver(ctx.resolver);
             modeled.write(&mut w)?;
             Ok(w.into_bytes())
         })()),
         "DNAAsset" => Some((|| {
-            let mut r = Reader::new(tail, names);
+            let mut r = reader(tail, names, ctx);
             let modeled = DnaAssetTail::read(&mut r)?;
             if r.o != tail.len() {
                 bail!("model consumed {} of {} tail bytes", r.o, tail.len());
             }
-            let mut w = super::archive::Writer::new();
+            let mut w = super::archive::Writer::with_resolver(ctx.resolver);
             modeled.write(&mut w)?;
             Ok(w.into_bytes())
         })()),
         "SkeletalMesh" => Some((|| {
-            let mut r = Reader::new(tail, names);
+            let mut r = reader(tail, names, ctx);
             let modeled = SkeletalMeshTail::read(&mut r, block, ctx)?;
             if r.o != tail.len() {
                 bail!("model consumed {} of {} tail bytes", r.o, tail.len());
             }
-            let mut w = super::archive::Writer::new();
+            let mut w = super::archive::Writer::with_resolver(ctx.resolver);
             modeled.write(&mut w, block)?;
             Ok(w.into_bytes())
         })()),
         "StaticMesh" => Some((|| {
-            let mut r = Reader::new(tail, names);
+            let mut r = reader(tail, names, ctx);
             let modeled = StaticMeshTail::read(&mut r, ctx)?;
             if r.o != tail.len() {
                 bail!("model consumed {} of {} tail bytes", r.o, tail.len());
             }
-            let mut w = super::archive::Writer::new();
+            let mut w = super::archive::Writer::with_resolver(ctx.resolver);
             modeled.write(&mut w)?;
             Ok(w.into_bytes())
         })()),
         "BodySetup" => Some((|| {
-            let mut r = Reader::new(tail, names);
+            let mut r = reader(tail, names, ctx);
             let modeled = BodySetupTail::read(&mut r, ctx)?;
             if r.o != tail.len() {
                 bail!("model consumed {} of {} tail bytes", r.o, tail.len());
             }
-            let mut w = super::archive::Writer::new();
+            let mut w = super::archive::Writer::with_resolver(ctx.resolver);
             modeled.write(&mut w)?;
             Ok(w.into_bytes())
         })()),
@@ -5243,7 +5250,7 @@ pub fn roundtrip_tail(
             // A landscape component's own data sits after the scene-component
             // layers, so the chain has to be read whole.
             "LandscapeComponent+SceneComponent+ActorComponent" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let base = SceneComponentChainTail::read(&mut r, block)?;
                 let num_elements = r.i32()?;
                 let grass_weight_offsets = FixedArray::read(&mut r, "grass weight offsets", 8)?;
@@ -5260,7 +5267,7 @@ pub fn roundtrip_tail(
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 base.write(&mut w, block)?;
                 w.i32(&mut own.num_elements.to_owned())?;
                 own.grass_weight_offsets.write(&mut w)?;
@@ -5271,7 +5278,7 @@ pub fn roundtrip_tail(
                 Ok(w.into_bytes())
             })()),
             "LandscapeHeightfieldCollisionComponent+SceneComponent+ActorComponent" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let base = SceneComponentChainTail::read(&mut r, block)?;
                 let own = LandscapeCollisionTail {
                     cooked_collision_data: (r.u32()? != 0)
@@ -5281,7 +5288,7 @@ pub fn roundtrip_tail(
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 base.write(&mut w, block)?;
                 match &own.cooked_collision_data {
                     Some(d) => {
@@ -5299,7 +5306,7 @@ pub fn roundtrip_tail(
             // the three-`FName` form the unversioned property reader uses.
             "PCGMetadata" => Some((|| {
                 use super::tails::{pcg_array_element_size, pcg_value_size};
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let n = {
                     let n = r.i32()?;
                     super::limits::bounded(n, MAX_NATIVE_COUNT, "PCG attributes", r.o - 4)?
@@ -5355,7 +5362,7 @@ pub fn roundtrip_tail(
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 w.i32(&mut (attrs.len() as i32))?;
                 for (name, type_id, entries, parent, name2, attribute_id, count, values) in &attrs {
                     w.raw(&mut name.clone(), 8)?;
@@ -5373,8 +5380,54 @@ pub fn roundtrip_tail(
                 parent_keys.write(&mut w)?;
                 Ok(w.into_bytes())
             })()),
+            // A `UDataTable`'s rows are instances of a row struct named by a
+            // *property*, and that struct usually lives in another package —
+            // hence the resolver. Both directions need it.
+            "DataTable" => Some((|| {
+                let Some(resolver) = ctx.resolver else {
+                    bail!("a data table's row struct needs a package resolver")
+                };
+                let Some(PropValue::Object(row_ref)) = block.get("RowStruct") else {
+                    bail!("data table has no RowStruct property")
+                };
+                let row_struct = resolver
+                    .struct_name(*row_ref)
+                    .with_context(|| format!("cannot resolve RowStruct {row_ref}"))?;
+                let mut r = Reader::with_ctx(
+                    tail,
+                    names,
+                    &super::archive::ExportContext { bulk_data: &[], resolver: Some(resolver) },
+                );
+                let n = {
+                    let n = r.i32()?;
+                    super::limits::bounded(n, MAX_NATIVE_COUNT, "DataTable rows", r.o - 4)?
+                };
+                let mut rows = Vec::with_capacity(n.min(4096));
+                for i in 0..n {
+                    let key = r.fname()?;
+                    let row = read_struct(&mut r, &row_struct, ctx.usmap, 0)
+                        .with_context(|| format!("row {i}"))?;
+                    rows.push((key, row));
+                }
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
+                w.i32(&mut (rows.len() as i32))?;
+                for (key, row) in &rows {
+                    w.fname(&mut key.clone())?;
+                    super::property::write_value(
+                        &mut w,
+                        &super::usmap::PropertyType::Struct(row_struct.clone()),
+                        &PropValue::Struct(row.clone()),
+                        false,
+                        ctx.usmap,
+                    )?;
+                }
+                Ok(w.into_bytes())
+            })()),
             "StringTable" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let namespace = r.fstring()?;
                 let n = {
                     let n = r.i32()?;
@@ -5404,7 +5457,7 @@ pub fn roundtrip_tail(
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 w.fstring(&mut namespace.clone())?;
                 w.i32(&mut (entries.len() as i32))?;
                 for (k, v) in &entries {
@@ -5427,7 +5480,7 @@ pub fn roundtrip_tail(
             // A class-default object writes none at all, which shows up as the
             // tail simply ending.
             "UserDefinedStruct+ScriptStruct+Struct" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let base = StructTail::read(&mut r)?;
                 let script_struct_flag = r.u32()?;
                 let fields = r.struct_fields.clone();
@@ -5457,7 +5510,7 @@ pub fn roundtrip_tail(
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 base.write(&mut w)?;
                 w.u32(&mut script_struct_flag.to_owned())?;
                 if let Some((blk, schema)) = &defaults {
@@ -5468,51 +5521,51 @@ pub fn roundtrip_tail(
                 Ok(w.into_bytes())
             })()),
             "MorphTarget" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let m = MorphTargetTail::read(&mut r)?;
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 m.write(&mut w)?;
                 Ok(w.into_bytes())
             })()),
             "SoundWave" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let m = SoundWaveTail::read(&mut r, ctx)?;
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 m.write(&mut w, ctx)?;
                 Ok(w.into_bytes())
             })()),
             "ModelComponent+SceneComponent+ActorComponent" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let base = SceneComponentChainTail::read(&mut r, block)?;
                 let m = ModelComponentTail::read(&mut r)?;
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 base.write(&mut w, block)?;
                 m.write(&mut w)?;
                 Ok(w.into_bytes())
             })()),
             "Skeleton" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let m = SkeletonTail::read(&mut r)?;
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 m.write(&mut w)?;
                 Ok(w.into_bytes())
             })()),
             // `ARecastNavMesh` writes a version then a self-sized blob whose
             // interior is Recast's own tile format.
             "RecastNavMesh+Actor" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let actor = ActorTail::read(&mut r)?;
                 let version = r.u32()?;
                 // The size is measured from its *own* offset, so it includes the
@@ -5523,7 +5576,7 @@ pub fn roundtrip_tail(
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 actor.write(&mut w)?;
                 w.u32(&mut version.to_owned())?;
                 w.u32(&mut ((data.len() + 4) as u32))?;
@@ -5532,7 +5585,7 @@ pub fn roundtrip_tail(
                 Ok(w.into_bytes())
             })()),
             "PCGLandscapeCache" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let n = {
                     let n = r.i32()?;
                     super::limits::bounded(n, MAX_NATIVE_COUNT, "PCG cache entries", r.o - 4)?
@@ -5549,7 +5602,7 @@ pub fn roundtrip_tail(
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 w.i32(&mut (entries.len() as i32))?;
                 for (key, half, stride, layers, bulk) in &entries {
                     w.raw(&mut key.clone(), 24)?;
@@ -5561,7 +5614,7 @@ pub fn roundtrip_tail(
                 Ok(w.into_bytes())
             })()),
             "InstancedFoliageActor+Actor" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let actor = ActorTail::read(&mut r)?;
                 let n = {
                     let n = r.i32()?;
@@ -5581,7 +5634,7 @@ pub fn roundtrip_tail(
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 actor.write(&mut w)?;
                 w.i32(&mut (infos.len() as i32))?;
                 for (ty, impl_type, component) in &infos {
@@ -5594,7 +5647,7 @@ pub fn roundtrip_tail(
                 Ok(w.into_bytes())
             })()),
             "ComputeGraph" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let n = {
                     let n = r.i32()?;
                     super::limits::bounded(n, MAX_NATIVE_COUNT, "compute kernels", r.o - 4)?
@@ -5622,7 +5675,7 @@ pub fn roundtrip_tail(
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 w.i32(&mut (kernels.len() as i32))?;
                 for res in &kernels {
                     w.i32(&mut (res.len() as i32))?;
@@ -5644,7 +5697,7 @@ pub fn roundtrip_tail(
             // `UDynamicMesh`'s interior is its own recursive attribute-set
             // format with no writer here, so the whole run stays a span.
             "DynamicMesh" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 super::tails::read_dynamic_mesh(&mut r)?;
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
@@ -5652,60 +5705,60 @@ pub fn roundtrip_tail(
                 Ok(tail.to_vec())
             })()),
             "Struct" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let modeled = StructTail::read(&mut r)?;
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 modeled.write(&mut w)?;
                 Ok(w.into_bytes())
             })()),
             "Function+Struct" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let base = StructTail::read(&mut r)?;
                 let own = FunctionTail::read(&mut r)?;
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 base.write(&mut w)?;
                 own.write(&mut w)?;
                 Ok(w.into_bytes())
             })()),
             "ScriptStruct+Struct" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let base = StructTail::read(&mut r)?;
                 let flag = r.u32()?;
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 base.write(&mut w)?;
                 w.u32(&mut flag.to_owned())?;
                 Ok(w.into_bytes())
             })()),
             "Class+Struct" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let base = StructTail::read(&mut r)?;
                 let own = ClassTail::read(&mut r)?;
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 base.write(&mut w)?;
                 own.write(&mut w)?;
                 Ok(w.into_bytes())
             })()),
             "BlueprintGeneratedClass+Class+Struct" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let base = StructTail::read(&mut r)?;
                 let cls = ClassTail::read(&mut r)?;
                 let bp = BlueprintGeneratedClassTail::read(&mut r)?;
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 base.write(&mut w)?;
                 cls.write(&mut w)?;
                 bp.write(&mut w)?;
@@ -5716,7 +5769,7 @@ pub fn roundtrip_tail(
             // `PublicFunctions` count after it is a value.
             "ControlRigBlueprintGeneratedClass+BlueprintGeneratedClass+Class+Struct" => {
                 Some((|| {
-                    let mut r = Reader::new(tail, names);
+                    let mut r = reader(tail, names, ctx);
                     let base = StructTail::read(&mut r)?;
                     let cls = ClassTail::read(&mut r)?;
                     let bp = BlueprintGeneratedClassTail::read(&mut r)?;
@@ -5727,7 +5780,7 @@ pub fn roundtrip_tail(
                     if r.o != tail.len() {
                         bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                     }
-                    let mut w = super::archive::Writer::new();
+                    let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                     base.write(&mut w)?;
                     cls.write(&mut w)?;
                     bp.write(&mut w)?;
@@ -5740,7 +5793,7 @@ pub fn roundtrip_tail(
             // `URigVMMemoryStorageGeneratorClass` adds its property-path
             // descriptions and the memory type.
             "RigVMMemoryStorageGeneratorClass+Class+Struct" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let base = StructTail::read(&mut r)?;
                 let cls = ClassTail::read(&mut r)?;
                 let n = {
@@ -5760,7 +5813,7 @@ pub fn roundtrip_tail(
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 base.write(&mut w)?;
                 cls.write(&mut w)?;
                 w.i32(&mut (paths.len() as i32))?;
@@ -5774,22 +5827,22 @@ pub fn roundtrip_tail(
             })()),
             // Subclasses of `UStaticMeshComponent` that add nothing of their own.
             "StaticMeshComponent+SceneComponent+ActorComponent" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let modeled = StaticMeshComponentChainTail::read(&mut r, block)?;
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 modeled.write(&mut w, block)?;
                 Ok(w.into_bytes())
             })()),
             "GeometryCollection" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let modeled = GeometryCollectionTail::read(&mut r)?;
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 modeled.write(&mut w)?;
                 Ok(w.into_bytes())
             })()),
@@ -5799,17 +5852,17 @@ pub fn roundtrip_tail(
                 if tail.is_empty() {
                     return Ok(Vec::new());
                 }
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let modeled = NiagaraScriptTail::read(&mut r)?;
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 modeled.write(&mut w)?;
                 Ok(w.into_bytes())
             })()),
             "NiagaraSystem" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let n = {
                     let n = r.i32()?;
                     super::limits::bounded(
@@ -5826,7 +5879,7 @@ pub fn roundtrip_tail(
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 w.i32(&mut (compiled.len() as i32))?;
                 let flat = flattened_schema("NiagaraEmitterCompiledData", ctx.usmap)?;
                 for b in &compiled {
@@ -5835,83 +5888,97 @@ pub fn roundtrip_tail(
                 Ok(w.into_bytes())
             })()),
             "VectorFieldStatic" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let modeled =
                     InlineBulkPayload::read(&mut r, ctx, "VectorFieldStatic SourceData")?;
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 modeled.write(&mut w)?;
                 Ok(w.into_bytes())
             })()),
             // `UWorldPartitionRuntimeCellData` writes its debug name.
             "WorldPartitionRuntimeCellData" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let mut name = r.fstring()?;
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 w.fstring(&mut name)?;
                 Ok(w.into_bytes())
             })()),
             // `USkeletalBodySetup` adds nothing over `UBodySetup`.
             "BodySetup" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let modeled = BodySetupTail::read(&mut r, ctx)?;
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 modeled.write(&mut w)?;
                 Ok(w.into_bytes())
             })()),
             "Actor" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let modeled = ActorTail::read(&mut r)?;
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 modeled.write(&mut w)?;
                 Ok(w.into_bytes())
             })()),
             "SceneComponent+ActorComponent" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let modeled = SceneComponentChainTail::read(&mut r, block)?;
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 modeled.write(&mut w, block)?;
                 Ok(w.into_bytes())
             })()),
             "Texture2D+Texture" => Some((|| {
-                let mut r = Reader::new(tail, names);
+                let mut r = reader(tail, names, ctx);
                 let modeled = TextureChainTail::read(&mut r, ctx, true)?;
                 if r.o != tail.len() {
                     bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                 }
-                let mut w = super::archive::Writer::new();
+                let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 modeled.write(&mut w)?;
                 Ok(w.into_bytes())
             })()),
             // Families declared as a piece sequence rather than a bespoke type.
             key => COMPOSED_TAILS.iter().find(|(k, _)| *k == key).map(|(_, pieces)| {
                 (|| {
-                    let mut r = Reader::new(tail, names);
+                    let mut r = reader(tail, names, ctx);
                     let values = read_pieces(&mut r, pieces, block, ctx)?;
                     if r.o != tail.len() {
                         bail!("model consumed {} of {} tail bytes", r.o, tail.len());
                     }
-                    let mut w = super::archive::Writer::new();
+                    let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                     write_pieces(&mut w, &values, pieces, block, ctx)?;
                     Ok(w.into_bytes())
                 })()
             }),
         },
     }
+}
+
+/// A reader over a tail that carries the package context.
+///
+/// Every tail model wants this: a nested `UUserDefinedStruct` property needs the
+/// resolver to find its layout, and a bulk payload needs the map. Building a
+/// bare `Reader` silently drops both, which reads as "unmodeled" when it is
+/// really "unasked".
+fn reader<'a>(tail: &'a [u8], names: &'a [String], ctx: TailContext<'a>) -> Reader<'a> {
+    Reader::with_ctx(
+        tail,
+        names,
+        &super::archive::ExportContext { bulk_data: ctx.bulk_data, resolver: ctx.resolver },
+    )
 }
 
 /// The ancestors of `class` — itself included — that append a tail of their own,

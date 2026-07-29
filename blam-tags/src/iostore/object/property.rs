@@ -3,12 +3,12 @@
 //! `in_container` distinguishes the two ways UE reaches a value, which matters
 //! for enums and only for enums — see [`read_value`].
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 use super::archive::{Ar, Reader, Writer};
 use super::block::{flattened_schema, read_struct, write_block};
-use super::usmap::{PropertyType, Usmap};
-use super::value::{PropValue, SoftObjectPath};
+use super::usmap::{PropertyType, Usmap, UsmapProperty};
+use super::value::{BlockLayout, PropValue, SoftObjectPath};
 use super::common::{read_container_removals, with_removals};
 use super::limits::{bounded, MAX_CONTAINER_ELEMENTS, PREALLOC_CAP};
 use super::native::NativeStruct;
@@ -379,8 +379,34 @@ pub(super) fn write_value(
         // regenerated from the *nested* class's schema, or a hand-written one,
         // which replays its retained bytes and needs no schema at all.
         (PropertyType::Struct(name), PropValue::Struct(b)) => {
+            // The block has to be written against the schema it was *read*
+            // against, and there are two possible sources: the `.usmap`, and the
+            // `FField` chain recovered from whichever package defines the struct.
+            // The block records how many slots that schema had, which is enough
+            // to tell them apart — a `UUserDefinedStruct` is in no `.usmap` at
+            // all, and some natively-serialized structs are in it with members
+            // the reader never used.
+            let BlockLayout::Unversioned { schema_len, .. } = b.layout;
+            let want = schema_len as usize;
+            let from_usmap = flattened_schema(name, usmap).ok().filter(|f| f.len() == want);
+            if let Some(flat) = from_usmap {
+                return write_block(ar, b, &flat, usmap);
+            }
+            // Resolve before borrowing `ar` mutably.
+            let recovered = ar.resolver().and_then(|p| p.struct_layout(name));
+            if let Some(fields) = recovered {
+                let schema: Vec<(&UsmapProperty, u8, &str)> = fields
+                    .iter()
+                    .flat_map(|f| (0..f.array_dim.max(1)).map(move |i| (f, i, name.as_str())))
+                    .collect();
+                if schema.len() == want {
+                    return write_block(ar, b, &schema, usmap);
+                }
+            }
+            // Neither matched: fall back to the `.usmap` so `write_block`'s own
+            // check reports the disagreement with both lengths named.
             let flat = flattened_schema(name, usmap)?;
-            write_block(ar, b, &flat, usmap)
+            write_block(ar, b, &flat, usmap).with_context(|| format!("struct {name}"))
         }
         // `FText::Serialize` is hand-written; it is typed now, not a span.
         (PropertyType::Text, PropValue::HandWritten(h)) => h.write(ar, "Text", usmap),
@@ -671,9 +697,12 @@ mod tests {
             false,
             &usmap,
         )
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        // The whole chain, not just the outermost context: the refusal now names
+        // the struct on the outside and the length disagreement underneath.
+        let e = format!("{e:#}");
         assert!(e.contains("schema"), "unhelpful refusal: {e}");
+        assert!(e.contains("Transform"), "refusal does not name the struct: {e}");
     }
 
 }

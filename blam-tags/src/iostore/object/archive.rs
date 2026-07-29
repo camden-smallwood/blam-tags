@@ -40,6 +40,17 @@ pub(super) trait Ar {
     fn fstring(&mut self, v: &mut FStr) -> Result<()>;
     /// Exactly `n` bytes, uninterpreted.
     fn raw(&mut self, v: &mut Vec<u8>, n: usize) -> Result<()>;
+
+    /// How to find a struct layout that is in no `.usmap`.
+    ///
+    /// A `UUserDefinedStruct` used as a property type has no schema under any
+    /// name; its layout comes back out of the package that defines it. The
+    /// reader has always had this — the writer needs it for the same reason,
+    /// because regenerating a nested block's header needs the nested schema.
+    /// `None` is the honest default for an archive with no package context.
+    fn resolver(&self) -> Option<&dyn PackageResolver> {
+        None
+    }
 }
 
 // An `is_loading` / `pos` pair belongs on this trait the moment a *single* body
@@ -251,20 +262,30 @@ impl<'a> ExportContext<'a> {
 /// can be re-emitted without interning anything; a writer that *introduces* new
 /// names is a package-level concern (growing `FNameMap`), not an export-level
 /// one.
-pub(super) struct Writer {
+pub(super) struct Writer<'a> {
     pub(super) b: Vec<u8>,
+    pub(super) resolver: Option<&'a dyn PackageResolver>,
 }
 
-impl Writer {
+impl<'a> Writer<'a> {
     pub(super) fn new() -> Self {
-        Writer { b: Vec::new() }
+        Writer { b: Vec::new(), resolver: None }
+    }
+
+    /// A writer that can resolve struct layouts the `.usmap` does not carry.
+    pub(super) fn with_resolver(resolver: Option<&'a dyn PackageResolver>) -> Self {
+        Writer { b: Vec::new(), resolver }
     }
     pub(super) fn into_bytes(self) -> Vec<u8> {
         self.b
     }
 }
 
-impl Ar for Writer {
+impl Ar for Writer<'_> {
+    fn resolver(&self) -> Option<&dyn PackageResolver> {
+        self.resolver
+    }
+
     fn u8(&mut self, v: &mut u8) -> Result<()> {
         self.b.push(*v);
         Ok(())
@@ -335,6 +356,10 @@ impl Ar for Writer {
 }
 
 impl Ar for Reader<'_> {
+    fn resolver(&self) -> Option<&dyn PackageResolver> {
+        self.resolver
+    }
+
     fn u8(&mut self, v: &mut u8) -> Result<()> {
         *v = Reader::u8(self)?;
         Ok(())

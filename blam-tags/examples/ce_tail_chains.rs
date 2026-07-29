@@ -108,6 +108,7 @@ fn main() {
                     bulk_data: &bulk,
                     origin: payloads[i].len() - parts.tail.len(),
                     usmap: &usmap,
+                    resolver: None,
                 };
                 if roundtrip_tail(short, &parts.tail, &names, block, ctx).is_some() {
                     continue;
