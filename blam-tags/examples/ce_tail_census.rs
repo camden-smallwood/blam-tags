@@ -110,7 +110,7 @@ fn main() {
         "class", "with tail", "MiB", "% of all", "median", "cum %"
     );
     let mut cum = 0u64;
-    for (class, s) in rows.iter_mut().take(30) {
+    for (class, s) in rows.iter_mut() {
         if s.bytes == 0 {
             break;
         }
