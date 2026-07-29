@@ -3,7 +3,7 @@
 //! `in_container` distinguishes the two ways UE reaches a value, which matters
 //! for enums and only for enums — see [`read_value`].
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 use super::archive::{Ar, Reader, Writer};
 use super::block::{flattened_schema, read_struct, write_block};

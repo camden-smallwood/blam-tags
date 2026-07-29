@@ -2,17 +2,14 @@
 //! than a property block. Fixed-size ones are a size table; the rest have a
 //! hand-written reader each, cited to the engine source it was read from.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use super::archive::Reader;
-use super::block::read_struct;
-use super::common::{native_count, read_bulk_array};
+use super::common::native_count;
 use super::limits::{MAX_DEPTH, PREALLOC_CAP};
-use super::text::locator_fragment_payload;
 use super::usmap::Usmap;
-use super::value::{BlockLayout, PropValue, PropertyBlock, SoftObjectPath};
+use super::value::{PropValue, SoftObjectPath};
 
 /// Fixed serialized byte sizes for engine structs that serialize *natively*
 /// (a `SerializeNative`/`Serialize` override), so unversioned serialization
@@ -134,10 +131,17 @@ pub fn native_struct_size(name: &str) -> Option<usize> {
         "Sphere" => 32,     // centre (3 × f64) + radius
         "TwoVectors" => 48, // 2 × FVector
         "Plane" => 32,      // FVector normal + f64 W
-        "Matrix" => 128,    // 4 × 4 × f64
+        // Four `FPlane`s, not sixteen bare doubles — the same 128 bytes, but the
+        // reflected members are planes (NoExportTypes.h:1743, 5.5.4). Cited
+        // rather than measured: six schemas declare an `FMatrix` and no export
+        // in the corpus ever serializes one.
+        "Matrix" => 128,
         "Matrix44f" => 64,
         "FrameNumber" | "MovieSceneTrackIdentifier" | "MovieSceneSequenceID"
         | "MovieSceneSegmentIdentifier" => 4,
+        // Both are a single `int64` — `FTimespan` is `int64 Ticks`
+        // (NoExportTypes.h:2229) and `FDateTime` a tick count likewise. Four
+        // schemas declare an `FTimespan`; none is serialized, so this is cited.
         "DateTime" | "Timespan" => 8,
         // `TRange<FFrameNumber>`: each bound is a `TEnumAsByte` type plus an
         // `int32`, so 5 bytes per bound and 10 in total — *not* the 16 a
