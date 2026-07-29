@@ -15,7 +15,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 
 use blam_tags::iostore::container_header::EIoContainerHeaderVersion;
-use blam_tags::iostore::object::unversioned::{read_export, CLASSES_WITH_OWN_TAIL, MODELED_TAILS};
+use blam_tags::iostore::object::unversioned::{
+    read_export, roundtrip_tail, TailContext, CLASSES_WITH_OWN_TAIL,
+};
 use blam_tags::iostore::package::builder::read_payloads;
 use blam_tags::iostore::script_objects::ScriptObjects;
 use blam_tags::iostore::ue_types::EIoStoreTocVersion;
@@ -87,7 +89,7 @@ fn main() {
             for (i, ex) in h.export_map.iter().enumerate() {
                 let Some(class) = by_hash.get(&ex.class_index.raw_index()) else { continue };
                 let short = class.rsplit('.').next().unwrap_or(class);
-                if MODELED_TAILS.contains(&short) || usmap.flattened_properties(short).is_none() {
+                if usmap.flattened_properties(short).is_none() {
                     continue;
                 }
                 let Ok(parts) = read_export(&payloads[i], &names, &usmap, short, ex.object_flags)
@@ -95,6 +97,19 @@ fn main() {
                     continue;
                 };
                 if parts.tail.is_empty() {
+                    continue;
+                }
+                // `roundtrip_tail` is the authority on whether a model exists —
+                // families are dispatched by chain, so no name list can be.
+                let Some(block) = parts.block.as_ref() else { continue };
+                let bulk: Vec<(i64, i64)> =
+                    h.bulk_data.iter().map(|x| (x.serial_offset, x.serial_size)).collect();
+                let ctx = TailContext {
+                    bulk_data: &bulk,
+                    origin: payloads[i].len() - parts.tail.len(),
+                    usmap: &usmap,
+                };
+                if roundtrip_tail(short, &parts.tail, &names, block, ctx).is_some() {
                     continue;
                 }
                 let e = unmodeled.entry(short.to_string()).or_default();

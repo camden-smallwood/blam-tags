@@ -2023,6 +2023,57 @@ impl StaticMeshTail {
     }
 }
 
+/// `ULandscapeComponent`'s tail: the grass weight offsets and the packed
+/// height/weight data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LandscapeComponentTail {
+    pub num_elements: i32,
+    /// An `FPackageIndex` and an `int32` per entry.
+    pub grass_weight_offsets: FixedArray,
+    pub height_weight_data: Vec<u8>,
+    pub cooked: u32,
+}
+
+/// `ULandscapeHeightfieldCollisionComponent`'s tail: the cooked Chaos
+/// heightfield, behind its own present flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LandscapeCollisionTail {
+    pub cooked_collision_data: Option<BulkArray>,
+}
+
+/// A payload referenced through the package's bulk-data map and inlined here.
+///
+/// `UVectorFieldStatic`'s volume source is the only user in this corpus, but the
+/// shape — an index, and the bytes when the map points at this very offset — is
+/// the one every inline bulk payload has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineBulkPayload {
+    pub bulk_index: i32,
+    pub payload: Option<Vec<u8>>,
+}
+
+impl InlineBulkPayload {
+    fn read(r: &mut Reader, ctx: TailContext, what: &str) -> Result<Self> {
+        let bulk_index = r.i32()?;
+        let Some(&(offset, size)) = ctx.bulk_data.get(bulk_index.max(0) as usize) else {
+            bail!("{what}: bulk data index {bulk_index} out of range");
+        };
+        let payload = (offset as usize == ctx.origin + r.o)
+            .then(|| r.take(size.max(0) as usize).map(<[u8]>::to_vec))
+            .transpose()?;
+        Ok(InlineBulkPayload { bulk_index, payload })
+    }
+
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.i32(&mut self.bulk_index.to_owned())?;
+        if let Some(p) = &self.payload {
+            let n = p.len();
+            ar.raw(&mut p.clone(), n)?;
+        }
+        Ok(())
+    }
+}
+
 /// `AActor`'s tail: an optional name string, then the actor and instance GUIDs.
 ///
 /// Modeled on its own because several actor classes add nothing of their own —
@@ -3813,6 +3864,91 @@ pub fn roundtrip_tail(
         // subclasses in this corpus, 242,647 exports between them, none of which
         // needs a model naming it.
         class => match owner_key(class, ctx.usmap).as_str() {
+            // A landscape component's own data sits after the scene-component
+            // layers, so the chain has to be read whole.
+            "LandscapeComponent+SceneComponent+ActorComponent" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let base = SceneComponentChainTail::read(&mut r, block)?;
+                let num_elements = r.i32()?;
+                let grass_weight_offsets = FixedArray::read(&mut r, "grass weight offsets", 8)?;
+                let n = {
+                    let n = r.i32()?;
+                    super::limits::bounded(n, MAX_NATIVE_COUNT, "HeightWeightData", r.o - 4)?
+                };
+                let own = LandscapeComponentTail {
+                    num_elements,
+                    grass_weight_offsets,
+                    height_weight_data: r.take(n)?.to_vec(),
+                    cooked: r.u32()?,
+                };
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                base.write(&mut w, block)?;
+                w.i32(&mut own.num_elements.to_owned())?;
+                own.grass_weight_offsets.write(&mut w)?;
+                w.i32(&mut (own.height_weight_data.len() as i32))?;
+                let n = own.height_weight_data.len();
+                w.raw(&mut own.height_weight_data.clone(), n)?;
+                w.u32(&mut own.cooked.to_owned())?;
+                Ok(w.into_bytes())
+            })()),
+            "LandscapeHeightfieldCollisionComponent+SceneComponent+ActorComponent" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let base = SceneComponentChainTail::read(&mut r, block)?;
+                let own = LandscapeCollisionTail {
+                    cooked_collision_data: (r.u32()? != 0)
+                        .then(|| BulkArray::read(&mut r, "CookedCollisionData"))
+                        .transpose()?,
+                };
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                base.write(&mut w, block)?;
+                match &own.cooked_collision_data {
+                    Some(d) => {
+                        w.u32(&mut 1)?;
+                        d.write(&mut w)?;
+                    }
+                    None => w.u32(&mut 0)?,
+                }
+                Ok(w.into_bytes())
+            })()),
+            "VectorFieldStatic" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let modeled =
+                    InlineBulkPayload::read(&mut r, ctx, "VectorFieldStatic SourceData")?;
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                modeled.write(&mut w)?;
+                Ok(w.into_bytes())
+            })()),
+            // `UWorldPartitionRuntimeCellData` writes its debug name.
+            "WorldPartitionRuntimeCellData" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let mut name = r.fstring()?;
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                w.fstring(&mut name)?;
+                Ok(w.into_bytes())
+            })()),
+            // `USkeletalBodySetup` adds nothing over `UBodySetup`.
+            "BodySetup" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let modeled = BodySetupTail::read(&mut r, ctx)?;
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                modeled.write(&mut w)?;
+                Ok(w.into_bytes())
+            })()),
             "Actor" => Some((|| {
                 let mut r = Reader::new(tail, names);
                 let modeled = ActorTail::read(&mut r)?;
