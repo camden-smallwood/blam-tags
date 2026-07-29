@@ -212,6 +212,27 @@ pub struct Export {
     pub tail: Vec<u8>,
 }
 
+impl Export {
+    /// Equality by *value* — the round-trip contract
+    /// `decode(encode(decode(x))) == decode(x)`.
+    ///
+    /// The bar every model must clear, and the only one a lossy payload can:
+    /// whatever could be read out originally must still read out after writing,
+    /// whether or not the bytes match.
+    ///
+    /// While a tail is a retained span its bytes *are* its value, so this is
+    /// byte comparison for it today and becomes a real value comparison as each
+    /// arm is modeled.
+    pub fn semantic_eq(&self, other: &Export) -> bool {
+        let block_eq = match (&self.block, &other.block) {
+            (Some(a), Some(b)) => a.semantic_eq(b),
+            (None, None) => true,
+            _ => false,
+        };
+        block_eq && self.trailer == other.trailer && self.tail == other.tail
+    }
+}
+
 /// Split an export into property block, `UObject` trailer and unmodeled tail.
 pub fn read_export(
     export: &[u8],

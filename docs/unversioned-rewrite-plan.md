@@ -965,12 +965,25 @@ codec.
 
 ### 7.2 Inventory (measured, `ce_foundation_inventory`)
 
+Measured by `ce_decode_coverage`, the starting point is **11.18% of export bytes
+behind a typed model** — 655,964,433 of 5,865,478,137. The other 88.82% is four
+populations, not the three the inventory first counted:
+
 | Population | Bytes | Units | Distinct |
 |---|---|---|---|
-| Class tails | 5,119,304,057 | 821,846 exports | **226 classes** |
-| Hand-written struct spans | 48,275,736 | 1,923,438 spans | **23 structs** |
+| Class tails | 5,119,304,057 | 821,846 exports | **226 classes / 64 arms** |
+| Hand-written struct spans | 48,275,967 | 1,923,438 spans | **23 structs** |
+| **Fixed native structs** | **41,922,310** | `PropValue::Native` | **27 struct types** |
+| Unmodeled (`PropValue::Raw`) | 11,370 | — | 12 classes |
 | Behind a walk stop | 90,066 | 14,894 exports | 3 classes |
 | Blueprint-class exports | — | 89,762 exports | schema from class package |
+
+The fourth was invisible until the coverage gate asked the right question.
+`FVector`, `FGuid`, `FQuat` and the other 24 fixed-size natives are held as
+`PropValue::Native(Vec<u8>)` — raw bytes, decoded on demand by helpers like
+`MeshTransform::from_prop`. They round-trip perfectly, which is why every
+byte-oriented gate was blind to them, and they are not typed. For "strongly
+typed" they have to become real structs.
 
 ### 7.3 The unit of work is 64 arms, not 226 classes
 
@@ -1051,6 +1064,12 @@ read. Read the *serializer*, not `sizeof`.
 but unreachable from the edit path; make the recovered `FField` chain a
 first-class schema source.
 
+**A2. Fixed native structs → typed (41.9 MB, 27 types).** `PropValue::Native`
+becomes a typed value per struct — `FVector { x, y, z }` rather than 24 bytes.
+Sizes and layouts are already known (`native_struct_size` plus §2.3), the
+population is closed and small, and `MeshTransform::from_prop` and its siblings
+collapse into ordinary field access. Cheapest item on the list by far.
+
 **H. Compressed payload codecs (Level 2).** Each is decode *and* re-encode,
 held to `ce_semantic_roundtrip` rather than to byte-identity:
 
@@ -1120,8 +1139,9 @@ never touches a `PropValue` unless they want to.
 1. **`ce_semantic_roundtrip`** — the contract every model must meet — and
    **`ce_decode_coverage`**, the number that says how far along Level 2 is.
    Build both first; everything after moves them.
-2. **A** (23 hand-written structs) — closes a whole population and deletes
-   `BlockLayout::Native`.
+2. **A** (23 hand-written structs) and **A2** (27 fixed native structs) — closes
+   two whole populations and deletes both `BlockLayout::Native` and
+   `PropValue::Native`.
 3. **C**, **D**, **G** — the three declining arms, the 22 citations, and the
    native-bool table. Small, and they clear every non-tail gap.
 4. **B1** — the arms behind the 9 heaviest classes, 90% of tail bytes. This is

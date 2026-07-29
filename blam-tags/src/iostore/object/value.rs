@@ -369,7 +369,47 @@ pub enum PropValue {
     Raw(Vec<u8>),
 }
 
+impl PropertyBlock {
+    /// Equality by *value*, for the round-trip contract
+    /// `decode(encode(decode(x))) == decode(x)`.
+    ///
+    /// Not `PartialEq`: floats are compared by their **bits**, because a round
+    /// trip has to give back the number that was there — `-0.0` and `0.0` are
+    /// different values here, and two `NaN`s with the same payload are the same
+    /// value. Derived equality gets both of those backwards.
+    pub fn semantic_eq(&self, other: &PropertyBlock) -> bool {
+        if self.entries.len() != other.entries.len() {
+            return false;
+        }
+        if !self.layout.semantic_eq(&other.layout) {
+            return false;
+        }
+        self.entries.iter().zip(&other.entries).all(|(a, b)| {
+            a.name == b.name && a.slot == b.slot && a.value.semantic_eq(&b.value)
+        })
+    }
+}
+
+impl BlockLayout {
+    pub fn semantic_eq(&self, other: &BlockLayout) -> bool {
+        match (self, other) {
+            (
+                BlockLayout::Unversioned { schema_len: a, leading_empty: b },
+                BlockLayout::Unversioned { schema_len: c, leading_empty: d },
+            ) => a == c && b == d,
+            // While a hand-written struct is still a retained span, its bytes
+            // *are* its value. This arm disappears with the last `Native` block.
+            (
+                BlockLayout::Native { name: a, bytes: b },
+                BlockLayout::Native { name: c, bytes: d },
+            ) => a == c && b == d,
+            _ => false,
+        }
+    }
+}
+
 impl PropValue {
+
     /// Look through a [`PropValue::WithRemovals`] wrapper to the container
     /// itself.
     ///
@@ -381,6 +421,58 @@ impl PropValue {
         match self {
             PropValue::WithRemovals { inner, .. } => inner.unwrapped(),
             other => other,
+        }
+    }
+
+    /// See [`PropertyBlock::semantic_eq`].
+    pub fn semantic_eq(&self, other: &PropValue) -> bool {
+        use PropValue::*;
+        match (self, other) {
+            (Bool(a), Bool(b)) => a == b,
+            (Int(a), Int(b)) => a == b,
+            // By bits: a round trip must return the same number, and `-0.0` is
+            // not `0.0` on the wire.
+            (Float(a), Float(b)) => a.to_bits() == b.to_bits(),
+            (Name(a), Name(b)) => a == b,
+            (Str(a), Str(b)) => a == b && a.wide == b.wide,
+            (Object(a), Object(b)) => a == b,
+            (SoftObject(a), SoftObject(b)) => {
+                a.package == b.package && a.asset == b.asset && a.sub_path == b.sub_path
+            }
+            (Array(a), Array(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.semantic_eq(y))
+            }
+            (Map(a), Map(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b)
+                        .all(|((ak, av), (bk, bv))| ak.semantic_eq(bk) && av.semantic_eq(bv))
+            }
+            (
+                WithRemovals { removals: ar, inner: ai },
+                WithRemovals { removals: br, inner: bi },
+            ) => {
+                let removals_eq = match (ar, br) {
+                    (Some(x), Some(y)) => {
+                        x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.semantic_eq(q))
+                    }
+                    (None, None) => true,
+                    _ => false,
+                };
+                removals_eq && ai.semantic_eq(bi)
+            }
+            (Struct(a), Struct(b)) => a.semantic_eq(b),
+            (Native(a), Native(b)) => a == b,
+            (Delegate { object: ao, function: af }, Delegate { object: bo, function: bf }) => {
+                ao == bo && af == bf
+            }
+            (MulticastDelegate(a), MulticastDelegate(b)) => a == b,
+            (FieldPath { path: ap, owner: ao }, FieldPath { path: bp, owner: bo }) => {
+                ap == bp && ao == bo
+            }
+            (Unset, Unset) => true,
+            (Raw(a), Raw(b)) => a == b,
+            _ => false,
         }
     }
 
