@@ -13,7 +13,7 @@ use super::archive::{trace_enabled, Ar, Reader};
 use super::usmap::{PropertyType, Usmap, UsmapProperty};
 use super::limits::MAX_DEPTH;
 use super::value::{BlockLayout, FName, PropValue, PropertyBlock, PropertyEntry, SchemaSlot};
-use super::native_bool::is_native_bool;
+use super::native_bool::{bool_is_known, is_native_bool};
 use super::property::{can_serialize_as_zero, read_value, should_save_as_zero, write_value};
 use super::native::NativeStruct;
 use super::structs::native_struct_size;
@@ -261,8 +261,17 @@ pub(super) fn write_block(
         // has proven that property is not maskable. `ce_zero_mask_census`
         // measures the residue this still covers for us -- 1,795 `Object` and
         // 194 `Name` entries, across 3 declarations.
+        // A bool whose declaration the dump *knows* derives its maskability from
+        // the table. One it has never seen — a field of a Blueprint-defined
+        // struct, say, which exists in no C++ header — falls back to replaying
+        // the file's bit, which is what every type did before the table existed.
+        // Answering "not native" for an unknown declaration is wrong in the
+        // expensive direction: it stops masking something the cooker masked, and
+        // that rewrites the fragment header.
         let maskable = match &prop.ty {
-            PropertyType::Bool => is_native_bool(owner, &prop.name),
+            PropertyType::Bool if bool_is_known(owner, &prop.name) => {
+                is_native_bool(owner, &prop.name)
+            }
             ty => slot.zero_masked && can_serialize_as_zero(ty),
         };
         let is_zero = maskable && should_save_as_zero(&prop.ty, &e.value, usmap);

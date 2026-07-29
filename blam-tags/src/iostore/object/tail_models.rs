@@ -5292,6 +5292,181 @@ pub fn roundtrip_tail(
                 }
                 Ok(w.into_bytes())
             })()),
+            // `UPCGMetadata`: attributes whose value width is decided by an
+            // `EPCGMetadataTypes` id, with strings and soft paths carrying their
+            // own lengths. Note a soft path here goes through
+            // `FSoftObjectPath::Serialize` — two `FName`s and an `FString` — not
+            // the three-`FName` form the unversioned property reader uses.
+            "PCGMetadata" => Some((|| {
+                use super::tails::{pcg_array_element_size, pcg_value_size};
+                let mut r = Reader::new(tail, names);
+                let n = {
+                    let n = r.i32()?;
+                    super::limits::bounded(n, MAX_NATIVE_COUNT, "PCG attributes", r.o - 4)?
+                };
+                let mut attrs = Vec::with_capacity(n.min(1024));
+                for _ in 0..n {
+                    let name = r.take(8)?.to_vec();
+                    let type_id = r.i32()?;
+                    let entries = FixedArray::read(&mut r, "EntryToValueKeyMap", 12)?;
+                    let parent = r.i32()?;
+                    let name2 = r.take(8)?.to_vec();
+                    let attribute_id = r.i32()?;
+                    let count = {
+                        let c = r.i32()?;
+                        super::limits::bounded(c, MAX_NATIVE_COUNT, "PCG values", r.o - 4)?
+                    };
+                    // `Values` then a single `DefaultValue`, both of that type.
+                    let values: Vec<Vec<u8>> = match pcg_value_size(type_id) {
+                        Some(size) => {
+                            let elem = pcg_array_element_size(type_id).unwrap_or(size);
+                            let mut v = Vec::with_capacity(count.min(4096) + 1);
+                            for _ in 0..count {
+                                v.push(r.take(elem)?.to_vec());
+                            }
+                            v.push(r.take(size)?.to_vec());
+                            v
+                        }
+                        None if type_id == 9 => {
+                            let mut v = Vec::with_capacity(count.min(4096) + 1);
+                            for _ in 0..=count {
+                                let at = r.o;
+                                r.fstring()?;
+                                v.push(r.b[at..r.o].to_vec());
+                            }
+                            v
+                        }
+                        None if type_id == 13 || type_id == 14 => {
+                            let mut v = Vec::with_capacity(count.min(4096) + 1);
+                            for _ in 0..=count {
+                                let at = r.o;
+                                r.take(16)?;
+                                r.fstring()?;
+                                v.push(r.b[at..r.o].to_vec());
+                            }
+                            v
+                        }
+                        None => bail!("unmodeled EPCGMetadataTypes id {type_id} @ {}", r.o),
+                    };
+                    attrs.push((name, type_id, entries, parent, name2, attribute_id, count, values));
+                }
+                // `ParentKeys` closes the metadata — an `int64` per entry.
+                let parent_keys = FixedArray::read(&mut r, "ParentKeys", 8)?;
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                w.i32(&mut (attrs.len() as i32))?;
+                for (name, type_id, entries, parent, name2, attribute_id, count, values) in &attrs {
+                    w.raw(&mut name.clone(), 8)?;
+                    w.i32(&mut type_id.to_owned())?;
+                    entries.write(&mut w)?;
+                    w.i32(&mut parent.to_owned())?;
+                    w.raw(&mut name2.clone(), 8)?;
+                    w.i32(&mut attribute_id.to_owned())?;
+                    w.i32(&mut (*count as i32))?;
+                    for v in values {
+                        let n = v.len();
+                        w.raw(&mut v.clone(), n)?;
+                    }
+                }
+                parent_keys.write(&mut w)?;
+                Ok(w.into_bytes())
+            })()),
+            "StringTable" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let namespace = r.fstring()?;
+                let n = {
+                    let n = r.i32()?;
+                    super::limits::bounded(n, MAX_NATIVE_COUNT, "StringTable entries", r.o - 4)?
+                };
+                let mut entries = Vec::with_capacity(n.min(4096));
+                for _ in 0..n {
+                    entries.push((r.fstring()?, r.fstring()?));
+                }
+                let n = {
+                    let n = r.i32()?;
+                    super::limits::bounded(n, MAX_NATIVE_COUNT, "meta-data keys", r.o - 4)?
+                };
+                let mut meta = Vec::with_capacity(n.min(4096));
+                for _ in 0..n {
+                    let key = r.fstring()?;
+                    let m = {
+                        let m = r.i32()?;
+                        super::limits::bounded(m, MAX_NATIVE_COUNT, "meta-data entries", r.o - 4)?
+                    };
+                    let mut vals = Vec::with_capacity(m.min(64));
+                    for _ in 0..m {
+                        vals.push((r.fname()?, r.fstring()?));
+                    }
+                    meta.push((key, vals));
+                }
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                w.fstring(&mut namespace.clone())?;
+                w.i32(&mut (entries.len() as i32))?;
+                for (k, v) in &entries {
+                    w.fstring(&mut k.clone())?;
+                    w.fstring(&mut v.clone())?;
+                }
+                w.i32(&mut (meta.len() as i32))?;
+                for (k, vals) in &meta {
+                    w.fstring(&mut k.clone())?;
+                    w.i32(&mut (vals.len() as i32))?;
+                    for (id, v) in vals {
+                        w.fname(&mut id.clone())?;
+                        w.fstring(&mut v.clone())?;
+                    }
+                }
+                Ok(w.into_bytes())
+            })()),
+            // A `UUserDefinedStruct` writes its default values against the very
+            // field chain `UStruct` just read, so the two cannot be separated.
+            // A class-default object writes none at all, which shows up as the
+            // tail simply ending.
+            "UserDefinedStruct+ScriptStruct+Struct" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let base = StructTail::read(&mut r)?;
+                let script_struct_flag = r.u32()?;
+                let fields = r.struct_fields.clone();
+                let defaults = if r.o == tail.len() {
+                    None
+                } else {
+                    let Some(fields) = fields else {
+                        bail!("no field chain for a user-defined struct's defaults")
+                    };
+                    let schema: Vec<(&super::usmap::UsmapProperty, u8, &str)> = fields
+                        .iter()
+                        .flat_map(|f| {
+                            (0..f.array_dim.max(1)).map(move |i| (f, i, "UserDefinedStruct"))
+                        })
+                        .collect();
+                    Some((
+                        super::block::read_struct_with_schema(
+                            &mut r,
+                            "UserDefinedStruct default",
+                            &schema,
+                            ctx.usmap,
+                            0,
+                        )?,
+                        schema.iter().map(|(p, i, o)| ((*p).clone(), *i, o.to_string())).collect::<Vec<_>>(),
+                    ))
+                };
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                base.write(&mut w)?;
+                w.u32(&mut script_struct_flag.to_owned())?;
+                if let Some((blk, schema)) = &defaults {
+                    let flat: Vec<(&super::usmap::UsmapProperty, u8, &str)> =
+                        schema.iter().map(|(p, i, o)| (p, *i, o.as_str())).collect();
+                    write_block(&mut w, blk, &flat, ctx.usmap)?;
+                }
+                Ok(w.into_bytes())
+            })()),
             "MorphTarget" => Some((|| {
                 let mut r = Reader::new(tail, names);
                 let m = MorphTargetTail::read(&mut r)?;
