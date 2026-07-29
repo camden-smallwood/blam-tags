@@ -225,6 +225,11 @@ pub(super) fn read_native_variable_struct(
     usmap: &Usmap,
     depth: usize,
 ) -> Result<Option<PropValue>> {
+    // Shapes that have a typed model are read straight into it and never take
+    // the retained-span path below.
+    if let Some(typed) = super::hand_written::HandWritten::read(r, name, usmap, depth)? {
+        return Ok(Some(PropValue::HandWritten(typed)));
+    }
     let start = r.o;
     let decoded = read_native_variable_struct_inner(r, name, usmap, depth)?;
     Ok(decoded.map(|v| match v {

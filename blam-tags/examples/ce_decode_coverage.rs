@@ -49,6 +49,8 @@ fn walk(v: &PropValue, u: &mut Untyped, by_struct: &mut BTreeMap<String, u64>, d
     match v {
         // Typed now (work item A2) — only an unmodeled `Opaque` still counts.
         PropValue::Native(n) => u.fixed_native += n.untyped_bytes() as u64,
+        // Typed as of work item A; nothing left untyped inside one.
+        PropValue::HandWritten(h) => u.fixed_native += h.untyped_bytes() as u64,
         PropValue::Raw(b) => u.raw += b.len() as u64,
         PropValue::Struct(block) => {
             if let BlockLayout::Native { name, bytes } = &block.layout {

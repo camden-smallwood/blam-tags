@@ -109,6 +109,7 @@ fn jprop(v: &PropValue, resolve: &dyn Fn(i32) -> Option<(String, u64)>) -> Strin
                 .join(",")
         ),
         PropValue::Native(n) => format!("{{\"k\":\"native\",\"v\":{}}}", jstr(&format!("{n:?}"))),
+        PropValue::HandWritten(h) => format!("{{\"k\":\"handwritten\",\"v\":{}}}", jstr(&format!("{h:?}"))),
         PropValue::Delegate { object, function } => {
             format!("{{\"k\":\"delegate\",\"o\":{object},\"f\":{}}}", jstr(function))
         }

@@ -5,6 +5,7 @@
 
 use std::ops::Deref;
 
+use super::hand_written::HandWritten;
 use super::native::NativeStruct;
 use std::sync::Arc;
 
@@ -352,6 +353,9 @@ pub enum PropValue {
     Struct(PropertyBlock),
     /// A fixed-size natively-serialized struct, decoded — see [`NativeStruct`].
     Native(NativeStruct),
+    /// A struct whose `Serialize` lives in engine code, decoded into typed
+    /// fields and written back from them — see [`HandWritten`].
+    HandWritten(HandWritten),
     /// `FScriptDelegate`: the bound object and the function it names.
     Delegate { object: i32, function: FName },
     /// `FMulticastScriptDelegate`: the invocation list.
@@ -464,6 +468,7 @@ impl PropValue {
             }
             (Struct(a), Struct(b)) => a.semantic_eq(b),
             (Native(a), Native(b)) => a.semantic_eq(b),
+            (HandWritten(a), HandWritten(b)) => a.semantic_eq(b),
             (Delegate { object: ao, function: af }, Delegate { object: bo, function: bf }) => {
                 ao == bo && af == bf
             }

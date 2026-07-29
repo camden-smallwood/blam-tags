@@ -374,6 +374,7 @@ pub(super) fn write_value(
             }
             Ok(())
         }
+        (PropertyType::Struct(name), PropValue::HandWritten(h)) => h.write(ar, name, usmap),
         // A nested struct: either a real property block, whose header is
         // regenerated from the *nested* class's schema, or a hand-written one,
         // which replays its retained bytes and needs no schema at all.
