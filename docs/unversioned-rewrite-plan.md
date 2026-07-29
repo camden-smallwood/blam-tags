@@ -912,22 +912,55 @@ The goal is total coverage: every byte of a cooked package produced from typed
 values, with an API that is pleasant to use. Retention is not acceptable as an
 end state; it was scaffolding that made each conversion verifiable.
 
-### 7.1 The number that defines done
+### 7.1 What done means, and why it is two numbers
 
-**5,167,579,793 bytes are currently retained rather than regenerated** —
-5,119,304,057 of class tails plus 48,275,736 of hand-written struct spans. Done
-is that number reaching zero, measured by a gate that rebuilds every export with
-**retention disabled**:
+The target is **Level 2**: every byte produced from typed models *and* the
+compressed payloads decoded into meaning, so a caller can edit geometry,
+collision, pixels and animation rather than replace them wholesale.
 
-> `ce_regeneration_gate` — rebuild every export from typed values only, with
-> span replay compiled out. Report bytes regenerated / bytes total, per class.
+That cannot be one number, and assuming it could is the trap to avoid. For a
+lossily-compressed payload, "regenerate the exact bytes" and "decode into
+values" are different goals and the second does not imply the first — BC texture
+compression is lossy by construction, so decoding a mip to pixels and
+re-compressing cannot reproduce the original blocks. Nanite re-encoding is
+deterministic in principle but would mean reproducing every heuristic in UE's
+encoder bit for bit.
 
-Build this gate *first*. Every item below moves it, and until it exists "how far
-along are we" is an opinion. It starts near 0% for tails and finishes at 100%.
+So the architecture has to keep both representations:
 
-Retention stays in the code as `BlockLayout::Native` and `Export.tail` until the
-matching model lands, because that is what lets each conversion be checked
-against the bytes it replaces — but the gate ignores it, so progress is honest.
+```rust
+/// A payload the engine stores compressed.
+pub struct Compressed<T> {
+    /// Exactly as the file stores it. Written back verbatim while clean, which
+    /// is what keeps the byte-exact gate at 100%.
+    source: Vec<u8>,
+    /// Decoded on demand.
+    decoded: OnceCell<T>,
+    /// Set once the decoded form is edited; the writer then re-encodes.
+    dirty: bool,
+}
+```
+
+Unmodified data round-trips byte-for-byte because the source is what goes out.
+Edited data is re-encoded and is *not* byte-identical to the original — which is
+correct, not a failure, and is exactly what a game's own cooker would produce
+from changed input.
+
+Three gates, measuring three different claims:
+
+| Gate | Claim | Now |
+|---|---|---|
+| `ce_export_roundtrip` | every export rebuilds byte-identically | **100%** |
+| `ce_decode_coverage` | share of bytes behind a *typed semantic model* rather than a blob | to build |
+| `ce_recode_stability` | per codec, decode→encode→decode is stable | to build |
+
+The second is the one that moves as Level 2 lands, and it is the honest measure
+of "covers everything". The third is how a lossy codec is held to account, since
+byte-idempotence is not available to it.
+
+Retention stays as `BlockLayout::Native` and `Export.tail` until a model
+replaces it, because that is what makes every conversion checkable against the
+bytes it replaces.
 
 ### 7.2 Inventory (measured, `ce_foundation_inventory`)
 
@@ -959,40 +992,31 @@ Measured on the dispatcher:
 There is no long tail of 190 small classes to grind through; that batch was an
 artifact of counting classes instead of arms.
 
-### 7.4 The layouts are already known — this is retention, not discovery
+### 7.4 Structure is solved; compression is the remaining work
 
-The expensive part of modeling a tail is normally working out its layout from
-engine source against a binary. That is **already done and already verified**:
-the coverage matrix accounts for every byte of 1,153,834 exports, and the
-tail-stop census says only 3 arms ever decline. `StaticMesh`'s arm walks strip
-flags, every LOD, the whole `FNaniteResources` block — root data, page streaming
-states, 208-byte hierarchy nodes, imposter atlas — and the ray-tracing proxy,
-field by field.
+The expensive part of modeling a tail is normally deriving its layout. That is
+**already done and verified**: the coverage matrix accounts for every byte of
+1,153,834 exports and only 3 arms decline. `StaticMesh`'s arm walks strip flags,
+every LOD, the whole `FNaniteResources` block — root data, page streaming states,
+208-byte hierarchy nodes, imposter atlas — and the ray-tracing proxy, field by
+field.
 
-So each conversion is the same mechanical change Phase 1 made to property values
-and the `StaticMeshComponent` pilot made to a tail: a walker that advances a
-cursor becomes one that fills a struct, plus a writer that puts it back. The 100
-`r.take(..)` calls are the concrete retention points.
+So converting an arm is the same mechanical change Phase 1 made to property
+values: a cursor-advancing walker becomes a struct-filler plus a writer. **That
+covers all of Level 1 and most of Level 2**, because most tail content is
+ordinary structured data, not compressed.
 
-That reframes the risk. **Nanite and Chaos are not blockers for serialization.**
-Their *container* layouts are already walked exactly; what `iostore/asset/nanite.rs`
-does beyond that — decoding cluster bitstreams into geometry — is needed to
-*extract meshes*, not to round-trip bytes.
+What is genuinely new work is the four compressed payloads underneath:
 
-Which raises a real choice worth making explicitly rather than by accident:
+| Payload | Class | Bytes | Existing start |
+|---|---|---|---|
+| Nanite cluster pages | `StaticMesh` | 1,309 MiB | `asset/nanite.rs`, 1,438 lines — bit-stream primitives done, cluster decode not |
+| Chaos cooked buffers | `BodySetup` | 1,051 MiB | walked only; no semantic decode |
+| Texture mips (BC/ASTC) | `Texture2D`, `TextureCube` | 584 MiB | `bitmap/decode.rs` + `format.rs` already decode BC/DXT for Halo bitmaps — reusable |
+| Compressed animation | `AnimSequence` | 172 MiB | `animation/codec.rs` exists but is Halo's codecs; UE uses ACL (in the UHT dump as `ACLPlugin`) |
 
-* **Level 1 — serialization complete.** Every byte regenerated from a typed
-  model. Compressed payloads the engine itself treats as opaque (Nanite page
-  data, cooked physics buffers, texture mips) are typed as sized, named blobs.
-  This is what "100% serialization support" means, and the regeneration gate
-  reaches 100%.
-* **Level 2 — semantics complete.** Those blobs decoded into meaningful values
-  too, so a caller can edit geometry and collision rather than replace them
-  wholesale. A superset of Level 1, and a much larger job.
-
-**Level 1 is the target here.** Level 2 is per-blob, on demand, and each piece
-of it is independently verifiable against the Level 1 blob it replaces — the
-same relationship Level 1 has with the retained span today.
+UE 5.5.4 source has the Nanite **encoder** as well as the decoder (§2.6), which
+is what makes a re-encode path possible at all rather than decode-only.
 
 ### 7.5 Work items, in dependency order
 
@@ -1025,6 +1049,23 @@ read. Read the *serializer*, not `sizeof`.
 **E. Blueprint-class exports (89,762).** Decoded today via their class package
 but unreachable from the edit path; make the recovered `FField` chain a
 first-class schema source.
+
+**H. Compressed payload codecs (Level 2).** Each is decode *and* re-encode,
+held to `ce_recode_stability` rather than to byte-identity:
+
+* **H1 Texture mips** (584 MiB, `Texture2D`/`TextureCube`). Cheapest by far —
+  `bitmap/decode.rs` and `bitmap/format.rs` already decode BC/DXT for Halo
+  bitmaps. Mostly wiring plus whatever formats CE uses that Halo did not.
+* **H2 Nanite** (1,309 MiB, `StaticMesh`). `asset/nanite.rs` has the bit-stream
+  primitives; cluster decode and assembly remain. UE 5.5.4 has the encoder as
+  well, so a write path exists to port rather than invent.
+* **H3 Chaos** (1,051 MiB, `BodySetup`). Implicit-object hierarchies behind
+  MOPP/list containers. The census-the-discriminator lesson applies: enumerate
+  the implicit-object types actually present before building a dispatch — the
+  last two times that was done here, an apparently deep hierarchy turned out to
+  use two variants.
+* **H4 ACL animation** (172 MiB, `AnimSequence`). `ACLPlugin` is in the UHT
+  dump; ACL itself is open source, so the codec is readable.
 
 **G. Make the zero mask fully derivable, using the UHT dump.**
 The writer currently decides masking as "the file masked it **and** the value is
@@ -1075,12 +1116,22 @@ never touches a `PropValue` unless they want to.
 
 ### 7.7 Sequencing
 
-1. `ce_regeneration_gate` — the number that says how far along we are.
-2. **A** (23 structs) — closes a whole population, deletes `BlockLayout::Native`.
-3. **C** and **D** — small, and they clear the last non-tail gaps.
-4. **B1** — 90% of tail bytes.
+1. **`ce_decode_coverage`** — the number that says how far along Level 2 is,
+   and **`ce_recode_stability`**, which is how a lossy codec gets held to
+   account. Build both first; everything after moves them.
+2. **A** (23 hand-written structs) — closes a whole population and deletes
+   `BlockLayout::Native`.
+3. **C**, **D**, **G** — the three declining arms, the 22 citations, and the
+   native-bool table. Small, and they clear every non-tail gap.
+4. **B1** — the arms behind the 9 heaviest classes, 90% of tail bytes. This is
+   the structural half of Level 2 and it lands the `Compressed<T>` fields with
+   their payloads still opaque.
 5. **API** — built on the typed models rather than retrofitted onto them.
-6. **B2**, **B3**, **E**, **F** — to a true 100%.
+6. **B2**, **B3**, **E**, **F** — every remaining arm, Blueprint exports, the
+   `TSet` variant, the `FStr` edge. At this point structure is 100%.
+7. **H1** → **H4** — the compressed payloads, cheapest first. `ce_decode_coverage`
+   climbs 584 MiB, then 1,309, then 1,051, then 172.
 
-Steps 2, 3 and 5 do not depend on step 4, so the API is not blocked behind the
-heaviest tail arms.
+Steps 2, 3 and 5 do not depend on 4, and every part of 7 is independent of the
+others — so the API and the long tail are never blocked behind Nanite or Chaos,
+and each codec can be verified against the `Compressed<T>` source it replaces.
