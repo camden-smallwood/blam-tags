@@ -24,7 +24,84 @@ use super::value::{BlockLayout, PropValue, PropertyBlock, SoftObjectPath};
 /// (`Rotation`/`Translation`/`Scale3D`), with zero-value components masked out
 /// — so it is parsed via the schema like any other reflected struct, and its
 /// `FQuat`/`FVector` members fall through to the native sizes below.
-pub(super) fn native_struct_size(name: &str) -> Option<usize> {
+
+/// Every struct name [`native_struct_size`] knows, so the table can be
+/// enumerated — by the test below, and by `ce_native_struct_census`, which
+/// reports which of these the shipped corpus actually exercises.
+///
+/// A size the corpus never exercises is an unverified guess: the coverage
+/// matrix proves every entry that *appears* in Campaign Evolved's data, and
+/// says nothing about the rest.
+///
+/// Measured by `ce_native_struct_census`: **27 of these 50 are exercised**, the
+/// most-read being `Guid` (788,623), `Vector` (597,297), `Rotator` (190,999)
+/// and `Quat` (43,320). The other 23 are claims:
+///
+/// ```text
+/// DateTime, Int32Point, Int32Vector2, Int64Point, Int64Vector4, IntVector4,
+/// Matrix, MovieSceneSegmentIdentifier, NavAgentSelector, PerPlatformBool,
+/// Plane, Rotator3f, SimpleCurveKey, Sphere, Timespan, TwoVectors,
+/// UInt64Point, UInt64Vector, UInt64Vector4, Uint32Point, UintVector,
+/// UintVector2, UintVector4
+/// ```
+///
+/// Most are integer-vector variants whose size is arithmetic (N components of a
+/// known width). The ones worth a citation are the rest, and `NavAgentSelector`
+/// now has one — see its entry.
+pub const NATIVE_STRUCT_NAMES: &[&str] = &[
+    "Box",
+    "Color",
+    "DateTime",
+    "DeprecateSlateVector2D",
+    "FontCharacter",
+    "FrameNumber",
+    "Guid",
+    "Int32Point",
+    "Int32Vector2",
+    "Int64Point",
+    "Int64Vector",
+    "Int64Vector4",
+    "IntPoint",
+    "IntVector",
+    "IntVector2",
+    "IntVector4",
+    "LinearColor",
+    "Matrix",
+    "Matrix44f",
+    "MovieSceneEvaluationKey",
+    "MovieSceneFrameRange",
+    "MovieSceneSegmentIdentifier",
+    "MovieSceneSequenceID",
+    "MovieSceneTrackIdentifier",
+    "NavAgentSelector",
+    "PerPlatformBool",
+    "PerPlatformFloat",
+    "PerPlatformFrameRate",
+    "PerPlatformInt",
+    "Plane",
+    "Quat",
+    "RichCurveKey",
+    "Rotator",
+    "Rotator3f",
+    "SimpleCurveKey",
+    "Sphere",
+    "Timespan",
+    "TwoVectors",
+    "UInt64Point",
+    "UInt64Vector",
+    "UInt64Vector4",
+    "Uint32Point",
+    "UintVector",
+    "UintVector2",
+    "UintVector4",
+    "Vector",
+    "Vector2D",
+    "Vector2f",
+    "Vector3f",
+    "Vector4",
+];
+
+pub fn native_struct_size(name: &str) -> Option<usize> {
     Some(match name {
         "Vector" | "Rotator" => 24,               // 3 × f64
         "Vector4" | "Quat" => 32,                 // 4 × f64
@@ -43,7 +120,10 @@ pub(super) fn native_struct_size(name: &str) -> Option<usize> {
         "IntVector4" | "UintVector4" => 16,
         "UintVector" => 12,
         // `FNavAgentSelector` is a single packed `uint32` bitfield, not the 16
-        // separate bools the `.usmap` advertises.
+        // separate bools the `.usmap` advertises: the bitfields sit in a union
+        // over `uint32 PackedBits` (NavAgentSelector.h:55). Cited rather than
+        // measured — Campaign Evolved never serializes one, so the corpus
+        // cannot confirm it.
         "NavAgentSelector" => 4,
         // `FRichCurveKey`: three `uint8` enums then six `float`s (Time, Value,
         // Arrive/LeaveTangent and their weights).
@@ -649,3 +729,42 @@ pub(super) fn read_weighted_random_sampler(r: &mut Reader) -> Result<PropValue> 
 // ---------------------------------------------------------------------------
 // Typed Campaign Evolved mesh-sync extraction
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod native_size_tests {
+    use super::*;
+
+    /// The enumerable list and the match must not drift apart. This catches a
+    /// name removed from the match; a name added to the match without being
+    /// listed is not detectable from here, which is why the list sits directly
+    /// above it.
+    #[test]
+    fn every_listed_native_struct_has_a_size() {
+        for name in NATIVE_STRUCT_NAMES {
+            assert!(
+                native_struct_size(name).is_some(),
+                "{name} is listed in NATIVE_STRUCT_NAMES but has no size"
+            );
+        }
+    }
+
+    /// A handful of sizes that are easy to get wrong by assuming the in-memory
+    /// layout, each one having actually desynced a real decode.
+    #[test]
+    fn the_sizes_that_are_not_what_they_look_like() {
+        // `FArchive` writes a bool as four bytes, so a cooked `FPerPlatformFloat`
+        // is 8, not 4. This single size blocked SkeletalMesh and StaticMesh.
+        assert_eq!(native_struct_size("PerPlatformFloat"), Some(8));
+        assert_eq!(native_struct_size("PerPlatformBool"), Some(8));
+        // `TRange<FFrameNumber>` is 5 bytes per bound, not the padded 8.
+        assert_eq!(native_struct_size("MovieSceneFrameRange"), Some(10));
+        // Deliberately unpadded.
+        assert_eq!(native_struct_size("FontCharacter"), Some(21));
+        assert_eq!(native_struct_size("RichCurveKey"), Some(27));
+        // A packed bitfield, not the 16 bools the .usmap advertises.
+        assert_eq!(native_struct_size("NavAgentSelector"), Some(4));
+        // UE5 large-world coordinates: doubles, not floats.
+        assert_eq!(native_struct_size("Vector"), Some(24));
+        assert_eq!(native_struct_size("Vector3f"), Some(12));
+    }
+}
