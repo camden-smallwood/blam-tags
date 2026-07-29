@@ -302,9 +302,295 @@ impl StaticMeshComponentChainTail {
     }
 }
 
+/// A `TArray` written with `BulkSerialize` whose element type is *known*, so it
+/// decodes into values instead of a span.
+///
+/// The declared element size is kept as a field rather than re-derived on write.
+/// It is real data in the stream, and an empty array still carries one — a
+/// cooked component with no instances writes a size the model has to reproduce,
+/// and deriving it from `items` would be guessing at a width nothing observed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedBulkArray<T> {
+    pub element_size: i32,
+    pub items: Vec<T>,
+}
+
+impl<T> TypedBulkArray<T> {
+    /// Read `count × element_size` bytes, decoding each element with `f`.
+    ///
+    /// `expect` is the element width the decoder produces. A mismatch is an
+    /// error rather than a fallback: the stream is self-describing here, so a
+    /// different width means the element is not what this model thinks it is,
+    /// and decoding it anyway would silently produce wrong values.
+    fn read(
+        r: &mut Reader,
+        what: &str,
+        expect: i32,
+        f: impl Fn(&[u8]) -> T,
+    ) -> Result<Self> {
+        let at = r.o;
+        let element_size =
+            r.b.get(at..at + 4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+        let count = read_bulk_array(r, what)?;
+        if count > 0 && element_size != expect {
+            bail!("{what} has {count} elements of {element_size} bytes, expected {expect}");
+        }
+        let start = at + 8;
+        let items = (0..count)
+            .map(|i| {
+                let o = start + i * element_size.max(0) as usize;
+                f(&r.b[o..o + element_size.max(0) as usize])
+            })
+            .collect();
+        Ok(TypedBulkArray { element_size, items })
+    }
+
+    fn write(&self, ar: &mut impl Ar, f: impl Fn(&T) -> Vec<u8>) -> Result<()> {
+        ar.i32(&mut self.element_size.to_owned())?;
+        ar.i32(&mut (self.items.len() as i32))?;
+        for it in &self.items {
+            let mut b = f(it);
+            if b.len() != self.element_size.max(0) as usize {
+                bail!(
+                    "element encoded to {} bytes but the array declares {}",
+                    b.len(),
+                    self.element_size
+                );
+            }
+            let n = b.len();
+            ar.raw(&mut b, n)?;
+        }
+        Ok(())
+    }
+}
+
+/// `FInstancedStaticMeshInstanceData::Transform` — an `FMatrix`, which at UE5
+/// large-world-coordinate precision is 16 `double`s, hence the 128-byte elements
+/// every cooked component in the corpus declares.
+pub type InstanceTransform = [f64; 16];
+
+fn read_matrix(b: &[u8]) -> InstanceTransform {
+    let mut m = [0f64; 16];
+    for (i, s) in m.iter_mut().enumerate() {
+        *s = f64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().expect("8 bytes"));
+    }
+    m
+}
+
+fn write_matrix(m: &InstanceTransform) -> Vec<u8> {
+    m.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+/// `UInstancedStaticMeshComponent`'s own tail: the per-instance transforms and
+/// custom float data, plus the cooked render buffers.
+///
+/// Measured over all 150,779 exports of the three ISMC classes: the transforms
+/// are 128-byte `FMatrix`es (3,425,245 of them) and the custom data is
+/// 4-byte floats (4,588,932). See `ce_ismc_probe`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstancedStaticMeshComponentTail {
+    pub cooked: bool,
+    /// The authoring instance buffers, written when the component did not skip
+    /// serializing them.
+    pub instances: Option<InstanceBuffers>,
+    /// The cooked render buffers. Empty in every export measured, so the element
+    /// type is not yet known and these stay `BulkArray` — the one place in this
+    /// model that would retain bytes, and it has never had any to retain.
+    pub render: Option<Option<(BulkArray, BulkArray)>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstanceBuffers {
+    pub transforms: TypedBulkArray<InstanceTransform>,
+    pub custom_data: TypedBulkArray<f32>,
+}
+
+impl InstancedStaticMeshComponentTail {
+    pub fn read(r: &mut Reader) -> Result<Self> {
+        let cooked = r.u32()? != 0;
+        let instances = if r.u32()? != 0 {
+            Some(InstanceBuffers {
+                transforms: TypedBulkArray::read(r, "PerInstanceSMData", 128, read_matrix)?,
+                custom_data: TypedBulkArray::read(r, "PerInstanceSMCustomData", 4, |b| {
+                    f32::from_le_bytes(b.try_into().expect("4 bytes"))
+                })?,
+            })
+        } else {
+            None
+        };
+        let render = if cooked {
+            Some(if r.u32()? != 0 {
+                Some((
+                    BulkArray::read(r, "instance render data")?,
+                    BulkArray::read(r, "instance render data")?,
+                ))
+            } else {
+                None
+            })
+        } else {
+            None
+        };
+        Ok(InstancedStaticMeshComponentTail { cooked, instances, render })
+    }
+
+    pub fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.u32(&mut u32::from(self.cooked))?;
+        match &self.instances {
+            Some(b) => {
+                ar.u32(&mut 1)?;
+                b.transforms.write(ar, write_matrix)?;
+                b.custom_data.write(ar, |v| v.to_le_bytes().to_vec())?;
+            }
+            None => ar.u32(&mut 0)?,
+        }
+        // `cooked` decides whether the render flag exists at all, so a model
+        // that disagrees with itself would write a different length.
+        match (&self.render, self.cooked) {
+            (Some(r), true) => match r {
+                Some((a, b)) => {
+                    ar.u32(&mut 1)?;
+                    a.write(ar)?;
+                    b.write(ar)?;
+                }
+                None => ar.u32(&mut 0)?,
+            },
+            (None, false) => {}
+            _ => bail!("render buffer presence disagrees with the cooked flag"),
+        }
+        Ok(())
+    }
+}
+
+/// One `FClusterNode` of a hierarchical component's cluster tree
+/// (HierarchicalInstancedStaticMeshComponent.h:71, 5.5.4). Bulk-serialized as a
+/// memory dump, so the 64 bytes are exactly these fields in order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClusterNode {
+    pub bound_min: [f32; 3],
+    pub first_child: i32,
+    pub bound_max: [f32; 3],
+    pub last_child: i32,
+    pub first_instance: i32,
+    pub last_instance: i32,
+    pub min_instance_scale: [f32; 3],
+    pub max_instance_scale: [f32; 3],
+}
+
+impl ClusterNode {
+    pub const SIZE: i32 = 64;
+
+    fn read(b: &[u8]) -> Self {
+        let f = |o: usize| f32::from_le_bytes(b[o..o + 4].try_into().expect("4 bytes"));
+        let i = |o: usize| i32::from_le_bytes(b[o..o + 4].try_into().expect("4 bytes"));
+        let v = |o: usize| [f(o), f(o + 4), f(o + 8)];
+        ClusterNode {
+            bound_min: v(0),
+            first_child: i(12),
+            bound_max: v(16),
+            last_child: i(28),
+            first_instance: i(32),
+            last_instance: i(36),
+            min_instance_scale: v(40),
+            max_instance_scale: v(52),
+        }
+    }
+
+    fn write(&self) -> Vec<u8> {
+        let mut o = Vec::with_capacity(64);
+        let mut v = |a: &[f32; 3]| a.iter().for_each(|x| o.extend_from_slice(&x.to_le_bytes()));
+        v(&self.bound_min);
+        o.extend_from_slice(&self.first_child.to_le_bytes());
+        let mut v = |a: &[f32; 3]| a.iter().for_each(|x| o.extend_from_slice(&x.to_le_bytes()));
+        v(&self.bound_max);
+        o.extend_from_slice(&self.last_child.to_le_bytes());
+        o.extend_from_slice(&self.first_instance.to_le_bytes());
+        o.extend_from_slice(&self.last_instance.to_le_bytes());
+        let mut v = |a: &[f32; 3]| a.iter().for_each(|x| o.extend_from_slice(&x.to_le_bytes()));
+        v(&self.min_instance_scale);
+        v(&self.max_instance_scale);
+        o
+    }
+}
+
+/// `UHierarchicalInstancedStaticMeshComponent`'s tail: the cluster tree.
+///
+/// It sits *between* `UInstancedStaticMeshComponent` and
+/// `UFoliageInstancedStaticMeshComponent` in the chain, which is why a model
+/// built from the ISMC layer alone came up exactly 8 bytes — one empty bulk
+/// array — short on every foliage export.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HierarchicalInstancedStaticMeshComponentTail {
+    pub cluster_tree: TypedBulkArray<ClusterNode>,
+}
+
+/// The whole tail of an `UInstancedStaticMeshComponent` export.
+///
+/// `UPrimitiveComponent` and `UMeshComponent` write nothing. `hierarchical` is
+/// present only for the classes that descend through
+/// `UHierarchicalInstancedStaticMeshComponent`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstancedStaticMeshComponentChainTail {
+    pub actor_component: ActorComponentTail,
+    pub scene_component: SceneComponentTail,
+    pub static_mesh_component: StaticMeshComponentTail,
+    pub instanced: InstancedStaticMeshComponentTail,
+    pub hierarchical: Option<HierarchicalInstancedStaticMeshComponentTail>,
+}
+
+impl InstancedStaticMeshComponentChainTail {
+    pub fn read(r: &mut Reader, block: &PropertyBlock, hierarchical: bool) -> Result<Self> {
+        let base = StaticMeshComponentChainTail::read(r, block)?;
+        let instanced = InstancedStaticMeshComponentTail::read(r)?;
+        let hierarchical = hierarchical
+            .then(|| {
+                TypedBulkArray::read(r, "ClusterTree", ClusterNode::SIZE, ClusterNode::read)
+                    .map(|cluster_tree| HierarchicalInstancedStaticMeshComponentTail {
+                        cluster_tree,
+                    })
+            })
+            .transpose()?;
+        Ok(InstancedStaticMeshComponentChainTail {
+            actor_component: base.actor_component,
+            scene_component: base.scene_component,
+            static_mesh_component: base.static_mesh_component,
+            instanced,
+            hierarchical,
+        })
+    }
+
+    pub fn write(&self, ar: &mut impl Ar, block: &PropertyBlock) -> Result<()> {
+        StaticMeshComponentChainTail {
+            actor_component: self.actor_component.clone(),
+            scene_component: self.scene_component.clone(),
+            static_mesh_component: self.static_mesh_component.clone(),
+        }
+        .write(ar, block)?;
+        self.instanced.write(ar)?;
+        if let Some(h) = &self.hierarchical {
+            h.cluster_tree.write(ar, |n| n.write())?;
+        }
+        Ok(())
+    }
+}
+
+/// Whether a class descends through `UHierarchicalInstancedStaticMeshComponent`,
+/// and so writes a cluster tree after the ISMC layer.
+fn is_hierarchical(class: &str) -> bool {
+    matches!(
+        class,
+        "HierarchicalInstancedStaticMeshComponent" | "FoliageInstancedStaticMeshComponent"
+    )
+}
+
 /// The classes whose whole tail chain this module models, for the gate to
 /// enumerate.
-pub const MODELED_TAILS: &[&str] = &["StaticMeshComponent"];
+pub const MODELED_TAILS: &[&str] = &[
+    "StaticMeshComponent",
+    "InstancedStaticMeshComponent",
+    "FoliageInstancedStaticMeshComponent",
+    "HLODInstancedStaticMeshComponent",
+    "HierarchicalInstancedStaticMeshComponent",
+];
 
 /// Decode a modeled tail and re-emit it, for verification against the span it
 /// would replace. `None` when the class has no model yet.
@@ -320,6 +606,20 @@ pub fn roundtrip_tail(
         "StaticMeshComponent" => Some((|| {
             let mut r = Reader::new(tail, names);
             let modeled = StaticMeshComponentChainTail::read(&mut r, block)?;
+            if r.o != tail.len() {
+                bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+            }
+            let mut w = super::archive::Writer::new();
+            modeled.write(&mut w, block)?;
+            Ok(w.into_bytes())
+        })()),
+        "InstancedStaticMeshComponent"
+        | "FoliageInstancedStaticMeshComponent"
+        | "HLODInstancedStaticMeshComponent"
+        | "HierarchicalInstancedStaticMeshComponent" => Some((|| {
+            let mut r = Reader::new(tail, names);
+            let modeled =
+                InstancedStaticMeshComponentChainTail::read(&mut r, block, is_hierarchical(class))?;
             if r.o != tail.len() {
                 bail!("model consumed {} of {} tail bytes", r.o, tail.len());
             }
