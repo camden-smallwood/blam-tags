@@ -2023,6 +2023,233 @@ impl StaticMeshTail {
     }
 }
 
+/// One element of a tail that is just a flat sequence of typed pieces.
+///
+/// Most of the long tail is this: 40-odd classes whose whole contribution is a
+/// couple of scalars, a reflected struct, or a fixed-width array. Writing a
+/// bespoke struct for each would be forty near-identical types, so the shape is
+/// declared as data in [`COMPOSED_TAILS`] and decoded generically. Nothing is
+/// retained — each piece becomes a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailPiece {
+    /// `UActorComponent`'s UCS-modified-property list — 28 bytes per entry.
+    UcsProperties,
+    /// `USceneComponent`'s baked bounds, which exist only when the property
+    /// block asks for them.
+    SceneBounds,
+    /// A four-byte present flag and, when set, an `FString`.
+    OptStr,
+    /// A fixed run of bytes whose interior another serializer owns.
+    Bytes(usize),
+    I32,
+    U32,
+    U16,
+    U8,
+    Str,
+    /// A reflected struct, read against the `.usmap`.
+    Struct(&'static str),
+    /// A `TArray` of fixed-width elements with a bare count.
+    Array(usize),
+    /// A `TArray` of `FString`s.
+    StrArray,
+    /// A `TArray` of `FString` pairs.
+    StrPairArray,
+}
+
+/// A decoded [`TailPiece`].
+#[derive(Debug, Clone)]
+pub enum TailValue {
+    UcsProperties(Vec<u8>),
+    SceneBounds(Option<Option<[u8; 56]>>),
+    OptStr(Option<FStr>),
+    Bytes(Vec<u8>),
+    I32(i32),
+    U32(u32),
+    U16(u16),
+    U8(u8),
+    Str(FStr),
+    Struct(PropertyBlock),
+    Array(FixedArray),
+    StrArray(Vec<FStr>),
+    StrPairArray(Vec<(FStr, FStr)>),
+}
+
+/// Families whose whole tail is a flat piece sequence, keyed the same way
+/// [`tail_owners`] reports them.
+///
+/// A key naming several classes is the inheritance chain, base last, so the
+/// pieces are listed base-first to match the order they are written in.
+pub const COMPOSED_TAILS: &[(&str, &[TailPiece])] = &[
+    // 52 classes, 19,506 exports: every component that is not a *scene*
+    // component and adds nothing of its own.
+    ("ActorComponent", &[TailPiece::UcsProperties]),
+    (
+        "SkyAtmosphereComponent+SceneComponent+ActorComponent",
+        &[TailPiece::UcsProperties, TailPiece::SceneBounds, TailPiece::Bytes(16)],
+    ),
+    ("LevelInstance+Actor", &[TailPiece::OptStr, TailPiece::Bytes(32), TailPiece::Bytes(16)]),
+    // `UWorld`: the persistent level, then two object arrays.
+    ("World", &[TailPiece::I32, TailPiece::Array(4), TailPiece::Array(4)]),
+    ("NiagaraDataInterfaceTexture", &[TailPiece::U32]),
+    ("Font", &[TailPiece::U32]),
+    ("FileMediaSource", &[TailPiece::Bytes(8)]),
+    // `UTexture` alone writes its strip flags.
+    ("Texture", &[TailPiece::Bytes(2)]),
+    ("AnimationAsset", &[TailPiece::Bytes(16)]),
+    ("AkRtpc", &[TailPiece::Struct("WwiseGameParameterCookedData")]),
+    ("AkStateValue", &[TailPiece::Struct("WwiseGroupValueCookedData")]),
+    ("AkSwitchValue", &[TailPiece::Struct("WwiseGroupValueCookedData")]),
+    ("AkInitBank", &[TailPiece::Struct("WwiseInitBankCookedData")]),
+    ("AkAuxBus", &[TailPiece::Struct("WwiseLocalizedAuxBusCookedData"), TailPiece::I32]),
+    // `UEnum`: an `FName` and an `int64` per entry, then `CppForm`.
+    ("Enum", &[TailPiece::Array(16), TailPiece::U8]),
+    ("FontFace", &[TailPiece::U32, TailPiece::U32]),
+];
+
+/// Read a piece sequence.
+fn read_pieces(
+    r: &mut Reader,
+    pieces: &[TailPiece],
+    block: &PropertyBlock,
+    ctx: TailContext,
+) -> Result<Vec<TailValue>> {
+    let mut out = Vec::with_capacity(pieces.len());
+    for p in pieces {
+        out.push(match *p {
+            TailPiece::UcsProperties => {
+                let n = {
+                    let n = r.i32()?;
+                    super::limits::bounded(n, MAX_NATIVE_COUNT, "UCSModifiedProperties", r.o - 4)?
+                };
+                TailValue::UcsProperties(r.take(n * 28)?.to_vec())
+            }
+            TailPiece::SceneBounds => TailValue::SceneBounds(
+                if scene_component_writes_bounds(block) {
+                    Some(if r.u32()? != 0 {
+                        Some(r.take(56)?.try_into().expect("56 bytes"))
+                    } else {
+                        None
+                    })
+                } else {
+                    None
+                },
+            ),
+            TailPiece::OptStr => {
+                TailValue::OptStr((r.u32()? != 0).then(|| r.fstring()).transpose()?)
+            }
+            TailPiece::Bytes(n) => TailValue::Bytes(r.take(n)?.to_vec()),
+            TailPiece::I32 => TailValue::I32(r.i32()?),
+            TailPiece::U32 => TailValue::U32(r.u32()?),
+            TailPiece::U16 => TailValue::U16(r.u16()?),
+            TailPiece::U8 => TailValue::U8(r.u8()?),
+            TailPiece::Str => TailValue::Str(r.fstring()?),
+            TailPiece::Struct(name) => TailValue::Struct(read_struct(r, name, ctx.usmap, 0)?),
+            TailPiece::Array(elem) => TailValue::Array(FixedArray::read(r, "tail array", elem)?),
+            TailPiece::StrArray => {
+                let n = {
+                    let n = r.i32()?;
+                    super::limits::bounded(n, MAX_NATIVE_COUNT, "tail string array", r.o - 4)?
+                };
+                TailValue::StrArray((0..n).map(|_| r.fstring()).collect::<Result<_>>()?)
+            }
+            TailPiece::StrPairArray => {
+                let n = {
+                    let n = r.i32()?;
+                    super::limits::bounded(n, MAX_NATIVE_COUNT, "tail string pairs", r.o - 4)?
+                };
+                let mut v = Vec::with_capacity(n.min(1024));
+                for _ in 0..n {
+                    v.push((r.fstring()?, r.fstring()?));
+                }
+                TailValue::StrPairArray(v)
+            }
+        });
+    }
+    Ok(out)
+}
+
+/// Write a piece sequence back. Errors rather than guessing if a value does not
+/// match the piece it was decoded from.
+fn write_pieces(
+    ar: &mut impl Ar,
+    values: &[TailValue],
+    pieces: &[TailPiece],
+    block: &PropertyBlock,
+    ctx: TailContext,
+) -> Result<()> {
+    if values.len() != pieces.len() {
+        bail!("{} values for {} tail pieces", values.len(), pieces.len());
+    }
+    for (v, p) in values.iter().zip(pieces) {
+        match (v, *p) {
+            (TailValue::UcsProperties(u), TailPiece::UcsProperties) => {
+                if u.len() % 28 != 0 {
+                    bail!("UCS modified properties is {} bytes, not a multiple of 28", u.len());
+                }
+                ar.i32(&mut ((u.len() / 28) as i32))?;
+                let n = u.len();
+                ar.raw(&mut u.clone(), n)?;
+            }
+            (TailValue::SceneBounds(b), TailPiece::SceneBounds) => {
+                match (b, scene_component_writes_bounds(block)) {
+                    (Some(b), true) => match b {
+                        Some(bounds) => {
+                            ar.u32(&mut 1)?;
+                            ar.raw(&mut bounds.to_vec(), 56)?;
+                        }
+                        None => ar.u32(&mut 0)?,
+                    },
+                    (None, false) => {}
+                    _ => bail!("scene component bounds disagree with the property block"),
+                }
+            }
+            (TailValue::OptStr(s), TailPiece::OptStr) => match s {
+                Some(s) => {
+                    ar.u32(&mut 1)?;
+                    ar.fstring(&mut s.clone())?;
+                }
+                None => ar.u32(&mut 0)?,
+            },
+            (TailValue::Bytes(b), TailPiece::Bytes(n)) => {
+                if b.len() != n {
+                    bail!("{} bytes for a {n}-byte piece", b.len());
+                }
+                ar.raw(&mut b.clone(), n)?;
+            }
+            (TailValue::I32(x), TailPiece::I32) => ar.i32(&mut x.to_owned())?,
+            (TailValue::U32(x), TailPiece::U32) => ar.u32(&mut x.to_owned())?,
+            (TailValue::U16(x), TailPiece::U16) => ar.u16(&mut x.to_owned())?,
+            (TailValue::U8(x), TailPiece::U8) => ar.u8(&mut x.to_owned())?,
+            (TailValue::Str(s), TailPiece::Str) => ar.fstring(&mut s.clone())?,
+            (TailValue::Struct(b), TailPiece::Struct(name)) => {
+                let flat = flattened_schema(name, ctx.usmap)?;
+                write_block(ar, b, &flat, ctx.usmap)?;
+            }
+            (TailValue::Array(a), TailPiece::Array(elem)) => {
+                if a.element_size != elem {
+                    bail!("array element size {} for a {elem}-byte piece", a.element_size);
+                }
+                a.write(ar)?;
+            }
+            (TailValue::StrArray(v), TailPiece::StrArray) => {
+                ar.i32(&mut (v.len() as i32))?;
+                for s in v {
+                    ar.fstring(&mut s.clone())?;
+                }
+            }
+            (TailValue::StrPairArray(v), TailPiece::StrPairArray) => {
+                ar.i32(&mut (v.len() as i32))?;
+                for (a, b) in v {
+                    ar.fstring(&mut a.clone())?;
+                    ar.fstring(&mut b.clone())?;
+                }
+            }
+            (v, p) => bail!("tail value {v:?} does not match piece {p:?}"),
+        }
+    }
+    Ok(())
+}
+
 /// A Chaos shared pointer as written by `FChaosArchive`.
 ///
 /// The tag is an object-graph identity: the *first* time a tag appears its object
@@ -4688,7 +4915,19 @@ pub fn roundtrip_tail(
                 modeled.write(&mut w)?;
                 Ok(w.into_bytes())
             })()),
-            _ => None,
+            // Families declared as a piece sequence rather than a bespoke type.
+            key => COMPOSED_TAILS.iter().find(|(k, _)| *k == key).map(|(_, pieces)| {
+                (|| {
+                    let mut r = Reader::new(tail, names);
+                    let values = read_pieces(&mut r, pieces, block, ctx)?;
+                    if r.o != tail.len() {
+                        bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                    }
+                    let mut w = super::archive::Writer::new();
+                    write_pieces(&mut w, &values, pieces, block, ctx)?;
+                    Ok(w.into_bytes())
+                })()
+            }),
         },
     }
 }
