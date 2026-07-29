@@ -3,8 +3,8 @@
 //! Kept separate from the machinery that produces them so that the reader, the
 //! writer and every typed decoder agree on one representation.
 
-use std::collections::BTreeMap;
 use std::ops::Deref;
+use std::sync::Arc;
 
 /// An `FName`: an index into the package's name map plus an instance number.
 ///
@@ -76,6 +76,170 @@ impl PartialEq<&str> for FName {
     }
 }
 
+/// One property block: the entries it holds, in the order the file stores
+/// them, plus what is needed to put the block back.
+///
+/// This replaces the `BTreeMap<String, PropValue>` a struct used to decode to.
+/// A map answers "what is this property's value", which is all a *reader* wants,
+/// but it cannot answer "what did this block look like" — it has no order, no
+/// schema slots, no zero-mask bits, and it silently merges a shadowed name. All
+/// four are required to emit the block byte-exactly, so the map was a lossy
+/// shape standing between the reader and any writer.
+///
+/// Reading is unaffected: [`PropertyBlock::get`] has the same signature as
+/// `BTreeMap::get`, and `&PropertyBlock` iterates as `(&str, &PropValue)`.
+#[derive(Debug, Clone, Default)]
+pub struct PropertyBlock {
+    /// In header order, which is schema order — not name order.
+    pub entries: Vec<PropertyEntry>,
+    pub layout: BlockLayout,
+}
+
+/// How a block's bytes are produced again.
+///
+/// The distinction is load-bearing and used to be invisible: `PropValue::Struct`
+/// meant *either* a cooked unversioned block *or* a map some hand-written
+/// decoder assembled, and those go back to bytes by completely different rules.
+/// Conflating them is why writing any struct at all had to be refused.
+#[derive(Debug, Clone)]
+pub enum BlockLayout {
+    /// A cooked unversioned property block. The header is regenerated from the
+    /// entries and the class's flattened schema length — proven byte-exact over
+    /// the whole shipped corpus — so nothing about it is retained.
+    Unversioned {
+        /// The class's flattened property count. Load-bearing even when nothing
+        /// is present: `Finalize` pops trailing skips only down to one, so an
+        /// empty block still encodes `min(schema_len, 127)` of them.
+        schema_len: u32,
+        /// Empty leading fragments, which `FUnversionedHeaderBuilder` cannot
+        /// emit but Campaign Evolved's tag wrappers all carry two of.
+        leading_empty: u8,
+    },
+    /// A struct with a hand-written `Serialize`, whose layout lives in code
+    /// rather than in a schema. The decoded fields are for readers; the bytes
+    /// are what goes back out, so the round trip is exact before the layout is
+    /// modeled. Converting one to a real writer is then verifiable against the
+    /// span it replaces.
+    Native { name: Arc<str>, bytes: Vec<u8> },
+}
+
+impl Default for BlockLayout {
+    fn default() -> Self {
+        BlockLayout::Unversioned { schema_len: 0, leading_empty: 0 }
+    }
+}
+
+/// One property inside a [`PropertyBlock`].
+#[derive(Debug, Clone)]
+pub struct PropertyEntry {
+    pub name: Arc<str>,
+    pub value: PropValue,
+    /// Where this entry sat in the class's flattened schema, or `None` for a
+    /// [`BlockLayout::Native`] block, which has no schema to index into.
+    pub slot: Option<SchemaSlot>,
+}
+
+/// An entry's position in the flattened schema the fragment stream indexes by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaSlot {
+    pub index: u32,
+    /// Which slot of a static array this is (`0` for a plain property). A
+    /// `UPROPERTY` declared `Thing[N]` occupies N consecutive schema indices,
+    /// each independently present.
+    pub array_index: u8,
+    /// The value serialized no bytes and is its type's zero. Kept because it is
+    /// not re-derivable: `CanSerializeAsZero` decides whether a zero value *may*
+    /// be masked, so a zero that was written out longhand and one that was
+    /// masked are the same value and different bytes.
+    pub zero_masked: bool,
+}
+
+impl PropertyBlock {
+    /// The value of the named property, or `None`. Same shape as
+    /// `BTreeMap::get`, which is how every existing reader keeps working.
+    ///
+    /// A static array's slots share one name; this returns the first, matching
+    /// what the map did for the `array_dim == 1` case that is all any current
+    /// caller reads. Use [`PropertyBlock::slots`] to see every slot.
+    pub fn get(&self, name: &str) -> Option<&PropValue> {
+        self.entries.iter().find(|e| &*e.name == name).map(|e| &e.value)
+    }
+
+    /// Every entry sharing `name`, in schema order — the static-array case.
+    pub fn slots<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a PropertyEntry> {
+        self.entries.iter().filter(move |e| &*e.name == name)
+    }
+
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &PropValue)> {
+        self.entries.iter().map(|e| (&*e.name, &e.value))
+    }
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|e| &*e.name)
+    }
+    pub fn values(&self) -> impl Iterator<Item = &PropValue> {
+        self.entries.iter().map(|e| &e.value)
+    }
+
+    /// The class's flattened schema length, for an unversioned block.
+    pub fn schema_len(&self) -> Option<u32> {
+        match self.layout {
+            BlockLayout::Unversioned { schema_len, .. } => Some(schema_len),
+            BlockLayout::Native { .. } => None,
+        }
+    }
+}
+
+/// Adopt a hand-assembled field map as a block.
+///
+/// The hand-written struct decoders name their fields themselves rather than
+/// walking a schema, so their entries have no [`SchemaSlot`]. Such a block is
+/// only writable once [`BlockLayout::Native`] bytes are attached to it, which
+/// [`read_native_variable_struct`](super::structs::read_native_variable_struct)
+/// does centrally for all of them.
+impl From<std::collections::BTreeMap<String, PropValue>> for PropertyBlock {
+    fn from(m: std::collections::BTreeMap<String, PropValue>) -> Self {
+        PropertyBlock {
+            entries: m
+                .into_iter()
+                .map(|(k, value)| PropertyEntry { name: Arc::from(k.as_str()), value, slot: None })
+                .collect(),
+            layout: BlockLayout::default(),
+        }
+    }
+}
+
+/// Consuming a block yields `(name, value)`, so it can be folded straight into
+/// a map — which is what the hand-written decoders that flatten a nested block
+/// into their own fields do.
+impl IntoIterator for PropertyBlock {
+    type Item = (String, PropValue);
+    type IntoIter = std::vec::IntoIter<(String, PropValue)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries
+            .into_iter()
+            .map(|e| (e.name.to_string(), e.value))
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a PropertyBlock {
+    type Item = (&'a str, &'a PropValue);
+    type IntoIter = std::vec::IntoIter<(&'a str, &'a PropValue)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter().collect::<Vec<_>>().into_iter()
+    }
+}
+
 /// A decoded property value. Only the shapes this reader needs are modeled;
 /// everything else is consumed for correct positioning and discarded.
 #[derive(Debug, Clone)]
@@ -92,8 +256,8 @@ pub enum PropValue {
     Array(Vec<PropValue>),
     /// A `TMap`, preserving insertion order.
     Map(Vec<(PropValue, PropValue)>),
-    /// A nested reflected struct: property name → value.
-    Struct(BTreeMap<String, PropValue>),
+    /// A nested struct — reflected or hand-written, see [`BlockLayout`].
+    Struct(PropertyBlock),
     /// A natively-serialized struct's raw bytes (e.g. `FVector`/`FQuat`), kept
     /// so transforms can be decoded on demand.
     Native(Vec<u8>),
@@ -135,7 +299,7 @@ impl PropValue {
             _ => None,
         }
     }
-    pub fn as_struct(&self) -> Option<&BTreeMap<String, PropValue>> {
+    pub fn as_struct(&self) -> Option<&PropertyBlock> {
         match self {
             PropValue::Struct(s) => Some(s),
             _ => None,

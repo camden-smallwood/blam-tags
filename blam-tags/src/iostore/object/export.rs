@@ -2,13 +2,12 @@
 //! the inheritance chain's natively serialized tail.
 
 use anyhow::{bail, Context, Result};
-use std::collections::BTreeMap;
 
 use super::archive::{tail_why, ExportContext, Reader};
 use super::block::read_struct;
 use super::tails::{read_class_native_tail, read_rig_hierarchy, read_rigvm};
 use super::usmap::Usmap;
-use super::value::PropValue;
+use super::value::PropertyBlock;
 
 /// Decode a cooked object export's unversioned property block for a known
 /// native `class` (present in the `.usmap`), returning present property
@@ -19,7 +18,7 @@ pub fn read_export_struct(
     names: &[String],
     usmap: &Usmap,
     class: &str,
-) -> Result<BTreeMap<String, PropValue>> {
+) -> Result<PropertyBlock> {
     read_export_struct_len(export, names, usmap, class).map(|(props, _)| props)
 }
 
@@ -37,7 +36,7 @@ pub fn read_export_struct_len(
     names: &[String],
     usmap: &Usmap,
     class: &str,
-) -> Result<(BTreeMap<String, PropValue>, usize)> {
+) -> Result<(PropertyBlock, usize)> {
     let mut r = Reader::new(export, names);
     let props = read_struct(&mut r, class, usmap, 0)?;
     Ok((props, r.o))
@@ -50,7 +49,7 @@ pub fn read_export_with_trailer(
     class: &str,
     object_flags: u32,
     ctx: &ExportContext<'_>,
-) -> Result<(BTreeMap<String, PropValue>, usize)> {
+) -> Result<(PropertyBlock, usize)> {
     /// `RF_ClassDefaultObject`.
     const RF_CLASS_DEFAULT_OBJECT: u32 = 0x10;
 
@@ -63,14 +62,14 @@ pub fn read_export_with_trailer(
     // counting; loading goes straight to `Load`.
     if class == "RigVM" || class == "RigHierarchy" {
         if class == "RigHierarchy" {
-            let props = BTreeMap::new();
+            let props = PropertyBlock::default();
             let at = r.o;
             if read_rig_hierarchy(&mut r).is_err() {
                 r.o = at;
             }
             return Ok((props, r.o));
         }
-        let props = BTreeMap::new();
+        let props = PropertyBlock::default();
         read_rigvm(&mut r, usmap)?;
         return Ok((props, r.o));
     }

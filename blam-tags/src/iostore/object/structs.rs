@@ -4,6 +4,7 @@
 
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use super::archive::Reader;
 use super::block::read_struct;
@@ -11,7 +12,7 @@ use super::common::{native_count, read_bulk_array};
 use super::limits::{MAX_DEPTH, PREALLOC_CAP};
 use super::text::locator_fragment_payload;
 use super::usmap::Usmap;
-use super::value::{PropValue, SoftObjectPath};
+use super::value::{BlockLayout, PropValue, PropertyBlock, SoftObjectPath};
 
 /// Fixed serialized byte sizes for engine structs that serialize *natively*
 /// (a `SerializeNative`/`Serialize` override), so unversioned serialization
@@ -129,7 +130,35 @@ pub(super) fn read_shader_value_type(r: &mut Reader, depth: usize) -> Result<()>
     Ok(())
 }
 
+/// A struct whose layout lives in hand-written `Serialize` code rather than in
+/// a schema.
+///
+/// The decoded fields are what readers want; the bytes are what a writer needs,
+/// because regenerating one of these means re-implementing its `Serialize` in
+/// the write direction and there are about thirty of them. Retaining the span
+/// makes the round trip exact today, and converting any single struct to a real
+/// writer later is then verifiable *against the span it replaces* — which is the
+/// opposite of having to trust a new layout model.
 pub(super) fn read_native_variable_struct(
+    r: &mut Reader,
+    name: &str,
+    usmap: &Usmap,
+    depth: usize,
+) -> Result<Option<PropValue>> {
+    let start = r.o;
+    let decoded = read_native_variable_struct_inner(r, name, usmap, depth)?;
+    Ok(decoded.map(|v| match v {
+        PropValue::Struct(mut b) => {
+            b.layout = BlockLayout::Native { name: Arc::from(name), bytes: r.since(start) };
+            PropValue::Struct(b)
+        }
+        // A few of these decode to a scalar rather than a struct; those are
+        // already writable by their own type's rules.
+        other => other,
+    }))
+}
+
+fn read_native_variable_struct_inner(
     r: &mut Reader,
     name: &str,
     usmap: &Usmap,
@@ -148,7 +177,7 @@ pub(super) fn read_native_variable_struct(
         // implies; all three counts are `uint8`.
         "ShaderValueTypeHandle" => {
             read_shader_value_type(r, depth)?;
-            PropValue::Struct(BTreeMap::new())
+            PropValue::Struct(PropertyBlock::default())
         }
         // `FMovieSceneTimeWarpVariant::Serialize` (MovieSceneTimeWarpVariant.cpp:171)
         // runs through `FMovieSceneNumericVariant::SerializeCustom`
@@ -186,7 +215,7 @@ pub(super) fn read_native_variable_struct(
                     );
                 }
             }
-            PropValue::Struct(s)
+            PropValue::Struct(s.into())
         }
         // `FPerQualityLevelProperty` looks like its `FPerPlatform*` sibling —
         // `bool bCooked` then `Default` — but its `PerQuality` override map is
@@ -210,7 +239,7 @@ pub(super) fn read_native_variable_struct(
             );
             let n = native_count(r, "PerQuality overrides")?;
             r.take(n * 8)?; // int32 quality level -> int32/float value
-            PropValue::Struct(s)
+            PropValue::Struct(s.into())
         }
         // `FInstancedPropertyBag` holds a struct type invented at runtime, so
         // there is no schema for its contents anywhere — it serializes the
@@ -263,7 +292,7 @@ pub(super) fn read_native_variable_struct(
                 r.u8()?; // LoadingPolicy
             }
             s.insert("SubFaceIndex".to_string(), PropValue::Int(r.i32()? as i64));
-            PropValue::Struct(s)
+            PropValue::Struct(s.into())
         }
         // A `Serialize` override that returns **false** means "I wrote a prefix
         // but did not consume the struct" — `UScriptStruct::SerializeItem` then
@@ -284,7 +313,7 @@ pub(super) fn read_native_variable_struct(
                 s.insert("OverrideMaterial".to_string(), PropValue::Object(r.i32()?));
             }
             s.extend(read_struct(r, name, usmap, depth + 1)?);
-            PropValue::Struct(s)
+            PropValue::Struct(s.into())
         }
         // `FSkeletalMeshAreaWeightedTriangleSampler`, i.e. an
         // `FWeightedRandomSampler`. Measured on `SK_Cov_BigDoor_rig`, whose
@@ -292,7 +321,7 @@ pub(super) fn read_native_variable_struct(
         "SkeletalMeshSamplingLODBuiltData" => {
             let mut s = BTreeMap::new();
             s.insert("AreaWeightedTriangleSampler".to_string(), read_weighted_random_sampler(r)?);
-            PropValue::Struct(s)
+            PropValue::Struct(s.into())
         }
         // `TArray<int32> TriangleIndices`, `TArray<int32> BoneIndices`, then the
         // region's area-weighted sampler. Measured on `SK_Manny`: 112 triangle
@@ -313,7 +342,7 @@ pub(super) fn read_native_variable_struct(
             s.insert("BoneIndices".to_string(), read_native_i32_array(r)?);
             s.insert("AreaWeightedSampler".to_string(), read_weighted_random_sampler(r)?);
             s.insert("Vertices".to_string(), read_native_i32_array(r)?);
-            PropValue::Struct(s)
+            PropValue::Struct(s.into())
         }
         // `FNiagaraVariableBase` writes its `Name` and `TypeDefHandle` natively;
         // the handle in turn serializes an `FNiagaraTypeDefinition` *by value*,
@@ -342,7 +371,7 @@ pub(super) fn read_native_variable_struct(
                 }
                 s.insert("VarData".to_string(), PropValue::Native(r.take(n as usize)?.to_vec()));
             }
-            PropValue::Struct(s)
+            PropValue::Struct(s.into())
         }
         // `FUniversalObjectLocatorFragment` is polymorphic: it writes the `FName`
         // of its registered fragment type, then that type's payload as an
@@ -359,7 +388,7 @@ pub(super) fn read_native_variable_struct(
             if !payload_struct.is_empty() {
                 s.extend(read_struct(r, payload_struct, usmap, depth + 1)?);
             }
-            PropValue::Struct(s)
+            PropValue::Struct(s.into())
         }
         // `FMaterialLayersFunctionsTree`: a node array (four int32 ids each), a
         // payload array (layer + blend), then the root index.
@@ -370,7 +399,7 @@ pub(super) fn read_native_variable_struct(
             r.take(payloads * 8)?;
             let mut s = BTreeMap::new();
             s.insert("Root".to_string(), PropValue::Int(r.i32()? as i64));
-            PropValue::Struct(s)
+            PropValue::Struct(s.into())
         }
         // `FSoftObjectPath` carries a custom serializer, so despite listing
         // `AssetPath`/`SubPathString` in the `.usmap` it writes its parts
@@ -419,7 +448,7 @@ pub(super) fn read_native_variable_struct(
                 fns.push(read_niagara_generated_function(r)?);
             }
             s.insert("GeneratedFunctions".to_string(), PropValue::Array(fns));
-            PropValue::Struct(s)
+            PropValue::Struct(s.into())
         }
         // `FMovieSceneChannel<T>`: two extrapolation enums, then the key times
         // and key values as **bulk** arrays — each preceded by its own
@@ -448,7 +477,7 @@ pub(super) fn read_native_variable_struct(
             s.insert("TickResolutionNumerator".to_string(), PropValue::Int(r.i32()? as i64));
             s.insert("TickResolutionDenominator".to_string(), PropValue::Int(r.i32()? as i64));
             s.insert("bShowCurve".to_string(), PropValue::Bool(r.u32()? != 0));
-            PropValue::Struct(s)
+            PropValue::Struct(s.into())
         }
         // `FPCGPoint` leads with a byte mask saying which of its fields were
         // written, then the transform, then only the flagged fields. The
@@ -483,7 +512,7 @@ pub(super) fn read_native_variable_struct(
             if mask & (1 << 6) != 0 {
                 s.insert("MetadataEntry".to_string(), PropValue::Int(r.u64()? as i64));
             }
-            PropValue::Struct(s)
+            PropValue::Struct(s.into())
         }
         // `FMovieSceneEvaluationFieldEntityTree` is a
         // `TMovieSceneEvaluationTree<FEntityAndMetaDataIndex>`: a root node,
@@ -511,7 +540,7 @@ pub(super) fn read_native_variable_struct(
                 let short = type_name.rsplit('.').next().unwrap_or(&type_name).to_string();
                 s.extend(read_struct(r, &short, usmap, depth + 1)?);
             }
-            PropValue::Struct(s)
+            PropValue::Struct(s.into())
         }
         _ => return Ok(None),
     }))
@@ -538,7 +567,7 @@ pub(super) fn read_evaluation_tree(r: &mut Reader, item_size: usize) -> Result<P
     r.take(items * item_size)?;
     s.insert("NumChildNodes".to_string(), PropValue::Int(nodes as i64));
     s.insert("NumItems".to_string(), PropValue::Int(items as i64));
-    Ok(PropValue::Struct(s))
+    Ok(PropValue::Struct(s.into()))
 }
 
 /// `FNiagaraDataInterfaceGeneratedFunction`: definition `FName`, instance
@@ -565,7 +594,7 @@ pub(super) fn read_niagara_generated_function(r: &mut Reader) -> Result<PropValu
             let mut e = BTreeMap::new();
             e.insert("Name".to_string(), PropValue::Name(r.fname()?));
             e.insert("UnderlyingType".to_string(), PropValue::Object(r.i32()?));
-            v.push(PropValue::Struct(e));
+            v.push(PropValue::Struct(e.into()));
         }
         s.insert(field.to_string(), PropValue::Array(v));
     }
@@ -573,7 +602,7 @@ pub(super) fn read_niagara_generated_function(r: &mut Reader) -> Result<PropValu
     // custom version than this build. Measured on `NS_collision`, where the
     // second generated function's `FName` begins immediately after the variadic
     // output count — two bytes earlier than the bitmask would allow.
-    Ok(PropValue::Struct(s))
+    Ok(PropValue::Struct(s.into()))
 }
 
 /// A natively-serialized `TArray<int32>`: count then that many `int32`s.
@@ -613,7 +642,7 @@ pub(super) fn read_weighted_random_sampler(r: &mut Reader) -> Result<PropValue> 
     s.insert("Prob".to_string(), PropValue::Array(prob));
     s.insert("Alias".to_string(), PropValue::Array(alias));
     s.insert("TotalWeight".to_string(), PropValue::Float(r.f32()? as f64));
-    Ok(PropValue::Struct(s))
+    Ok(PropValue::Struct(s.into()))
 }
 
 

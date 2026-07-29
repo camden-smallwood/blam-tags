@@ -228,7 +228,7 @@ fn main() {
     }
 }
 
-fn collect_objs(props: &BTreeMap<String, PropValue>, out: &mut BTreeSet<i32>) {
+fn collect_objs(props: &blam_tags::iostore::unversioned::PropertyBlock, out: &mut BTreeSet<i32>) {
     fn walk(v: &PropValue, out: &mut BTreeSet<i32>) {
         match v {
             PropValue::Object(i) => {

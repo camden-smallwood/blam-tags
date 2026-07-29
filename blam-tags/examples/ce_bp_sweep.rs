@@ -62,7 +62,7 @@ fn main(){
                 match read_export_struct(&b[off..end],&names,&usmap,"BlamMeshSynchronizationComponent"){
                     Ok(p)=>{
                         decode_ok+=1;
-                        for k in p.keys(){ *props_seen.entry(k.clone()).or_default()+=1; }
+                        for k in p.keys(){ *props_seen.entry(k.to_string()).or_default()+=1; }
                         match p.get("RuntimeRegions"){
                             Some(PropValue::Map(m))=>{*regions_hist.entry(m.len()).or_default()+=1;}
                             _=>{no_runtime+=1;}

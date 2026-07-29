@@ -2,10 +2,11 @@
 
 use anyhow::{bail, Result};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use super::archive::Reader;
 use super::common::native_count;
-use super::value::PropValue;
+use super::value::{BlockLayout, PropValue};
 
 /// The payload struct a universal-object-locator fragment type serializes, by
 /// its registered `FName`. An empty name means the fragment carries no payload.
@@ -33,6 +34,20 @@ pub(super) fn locator_fragment_payload(fragment_type: &str) -> Option<&'static s
 /// Unmodeled history types surface as an error naming the type number rather
 /// than silently mis-consuming the stream.
 pub(super) fn read_text(r: &mut Reader, depth: usize) -> Result<PropValue> {
+    let start = r.o;
+    let v = read_text_inner(r, depth)?;
+    Ok(match v {
+        PropValue::Struct(mut b) => {
+            b.layout = BlockLayout::Native { name: Arc::from("Text"), bytes: r.since(start) };
+            PropValue::Struct(b)
+        }
+        other => other,
+    })
+}
+
+/// `FText::Serialize` is hand-written, so like the structs in
+/// [`super::structs`] the block it decodes to carries its own bytes.
+fn read_text_inner(r: &mut Reader, depth: usize) -> Result<PropValue> {
     if depth > 16 {
         bail!("FText nesting too deep @ {}", r.o);
     }
@@ -87,7 +102,7 @@ pub(super) fn read_text(r: &mut Reader, depth: usize) -> Result<PropValue> {
                 let mut a = BTreeMap::new();
                 a.insert("ArgumentName".to_string(), PropValue::Str(r.fstring()?));
                 a.insert("ArgumentValue".to_string(), read_format_argument(r, depth + 1)?);
-                args.push(PropValue::Struct(a));
+                args.push(PropValue::Struct(a.into()));
             }
             s.insert("Arguments".to_string(), PropValue::Array(args));
         }
@@ -114,13 +129,13 @@ pub(super) fn read_text(r: &mut Reader, depth: usize) -> Result<PropValue> {
                 ] {
                     o.insert(f.to_string(), PropValue::Int(r.i32()? as i64));
                 }
-                s.insert("FormatOptions".to_string(), PropValue::Struct(o));
+                s.insert("FormatOptions".to_string(), PropValue::Struct(o.into()));
             }
             s.insert("TargetCulture".to_string(), PropValue::Str(r.fstring()?));
         }
         other => bail!("FText history type {other} not modeled (@ {})", r.o - 1),
     }
-    Ok(PropValue::Struct(s))
+    Ok(PropValue::Struct(s.into()))
 }
 
 /// `FFormatArgumentValue`: an `EFormatArgumentType` tag then the value.

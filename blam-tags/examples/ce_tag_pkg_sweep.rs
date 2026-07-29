@@ -110,7 +110,7 @@ fn main() {
                     match read_export_struct(&bytes[off..end], &names, &usmap, &class) {
                         Ok(props) => {
                             for (k, v) in &props {
-                                *st.props.entry(k.clone()).or_default() += 1;
+                                *st.props.entry(k.to_string()).or_default() += 1;
                                 if k == "AssetReference" {
                                     if let Some(idx) = obj_index(v) {
                                         if let Some(p) = import_pkg(&h, idx) {

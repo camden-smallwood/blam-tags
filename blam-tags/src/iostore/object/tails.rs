@@ -15,7 +15,7 @@ use super::common::{native_count, read_bulk_array, read_inline_bulk_data};
 use super::structs::*;
 use super::reflect::try_read_struct_fields_and_script;
 use super::usmap::{Usmap, UsmapProperty};
-use super::value::PropValue;
+use super::value::{PropValue, PropertyBlock};
 
 /// `Nanite::FResources::Serialize` (NaniteResources.cpp). The load path ignores
 /// the `bCooked` argument — it only changes what a save writes — so the same
@@ -1289,7 +1289,7 @@ pub(super) fn read_rig_hierarchy(r: &mut Reader) -> Result<()> {
 pub(super) fn read_class_native_tail(
     r: &mut Reader,
     class: &str,
-    props: &BTreeMap<String, PropValue>,
+    props: &PropertyBlock,
     usmap: &Usmap,
     ctx: &ExportContext<'_>,
     object_flags: u32,

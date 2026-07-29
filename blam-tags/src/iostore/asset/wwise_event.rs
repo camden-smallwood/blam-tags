@@ -17,11 +17,10 @@
 //! fragments in between, so [`read_event_cooked_data`] probes a small window of
 //! start offsets and accepts the first that is self-consistent.
 
-use std::collections::BTreeMap;
 
 use anyhow::{bail, Context, Result};
 
-use crate::iostore::object::unversioned::{read_export_struct, PropValue};
+use crate::iostore::object::unversioned::{read_export_struct, PropValue, PropertyBlock};
 use crate::iostore::object::usmap::Usmap;
 
 /// How far into the export body to look for the natively-written struct.
@@ -161,7 +160,7 @@ fn locate_cooked_struct(
     export: &[u8],
     names: &[String],
     usmap: &Usmap,
-) -> Option<BTreeMap<String, PropValue>> {
+) -> Option<PropertyBlock> {
     for off in 0..PROBE_WINDOW.min(export.len()) {
         let Ok(props) =
             read_export_struct(&export[off..], names, usmap, "WwiseLocalizedEventCookedData")

@@ -7,13 +7,13 @@
 //! every export in the shipped corpus.
 
 use anyhow::{bail, Context, Result};
-use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use super::archive::{trace_enabled, Reader};
+use super::archive::{trace_enabled, Ar, Reader};
 use super::usmap::{PropertyType, Usmap, UsmapProperty};
 use super::limits::MAX_DEPTH;
-use super::value::{FName, PropValue};
-use super::property::read_value;
+use super::value::{BlockLayout, FName, PropValue, PropertyBlock, PropertyEntry, SchemaSlot};
+use super::property::{read_value, write_value};
 use super::structs::native_struct_size;
 
 /// One `FUnversionedHeader` fragment (`FFragment`,
@@ -181,6 +181,91 @@ pub(super) fn write_header_inner(header: &Header, schema_len: usize) -> Vec<u8> 
     out
 }
 
+/// Emit a whole property block: its header, then its present values.
+///
+/// The header is *derived* from the entries rather than retained — each entry's
+/// [`SchemaSlot`] says where it sat and whether it was zero-masked, which is
+/// exactly the two things `FUnversionedHeaderBuilder` consumes. A zero-masked
+/// entry contributes a header bit and no bytes.
+///
+/// `flat` is the class's flattened schema, which supplies each value's declared
+/// type. It has to be passed in rather than looked up here because a block does
+/// not name its own class: the caller reaches a nested one *through* the
+/// property whose type named it.
+pub(super) fn write_block(
+    ar: &mut impl Ar,
+    block: &PropertyBlock,
+    flat: &[(&UsmapProperty, u8)],
+    usmap: &Usmap,
+) -> Result<()> {
+    let (schema_len, leading_empty) = match &block.layout {
+        // A hand-written struct goes back as the bytes it came from. See
+        // `BlockLayout::Native`.
+        BlockLayout::Native { bytes, .. } => {
+            let n = bytes.len();
+            return ar.raw(&mut bytes.clone(), n);
+        }
+        BlockLayout::Unversioned { schema_len, leading_empty } => (*schema_len, *leading_empty),
+    };
+
+    // The block records the schema length it was read against, and the caller
+    // resolved the schema independently. If those disagree the header would be
+    // silently wrong — a different `.usmap` than the data was cooked with, or a
+    // block attached to the wrong property. Say so instead.
+    if schema_len as usize != flat.len() {
+        bail!(
+            "block was read against a {schema_len}-property schema but the one supplied has {}",
+            flat.len()
+        );
+    }
+
+    let mut present = Vec::with_capacity(block.entries.len());
+    for e in &block.entries {
+        let slot = e.slot.with_context(|| {
+            format!("property {} has no schema slot, so its block cannot be written", e.name)
+        })?;
+        present.push((slot.index as usize, !slot.zero_masked));
+    }
+    // `HeaderBuilder` walks the schema in order, so the entries must be in it.
+    if present.windows(2).any(|w| w[0].0 >= w[1].0) {
+        bail!("property block entries are not in ascending schema order");
+    }
+    let header = write_header_inner(&Header { present, leading_empty }, schema_len as usize);
+    let n = header.len();
+    ar.raw(&mut header.clone(), n)?;
+
+    for e in &block.entries {
+        let slot = e.slot.expect("checked above");
+        if slot.zero_masked {
+            continue; // The zero *is* the encoding; no bytes follow.
+        }
+        let (prop, _) = *flat.get(slot.index as usize).with_context(|| {
+            format!("schema index {} beyond {} properties", slot.index, flat.len())
+        })?;
+        write_value(ar, &prop.ty, &e.value, false, usmap)
+            .with_context(|| format!("writing property {}", e.name))?;
+    }
+    Ok(())
+}
+
+/// Emit a whole property block for a named class — header and values.
+///
+/// The write counterpart to
+/// [`read_export_struct_len`](super::export::read_export_struct_len), and the
+/// gate `ce_block_roundtrip` measures: for an unmodified block this must
+/// reproduce the exact bytes it was read from.
+pub fn emit_block(class: &str, block: &PropertyBlock, usmap: &Usmap) -> Result<Vec<u8>> {
+    let mut w = super::archive::Writer::new();
+    match &block.layout {
+        BlockLayout::Native { .. } => write_block(&mut w, block, &[], usmap)?,
+        BlockLayout::Unversioned { .. } => {
+            let flat = flattened_schema(class, usmap)?;
+            write_block(&mut w, block, &flat, usmap)?;
+        }
+    }
+    Ok(w.into_bytes())
+}
+
 /// Read an `FUnversionedHeader`, returning `(present_schema_indices, ...)`
 /// where each present index is paired with whether its value is non-zero (a
 /// zero-masked property serializes no bytes — it is the zero value).
@@ -252,7 +337,7 @@ pub(super) fn read_header(r: &mut Reader) -> Result<Header> {
 
 /// Read a full reflected struct/class instance (its unversioned property
 /// block) named `class`, returning present property name→value.
-pub(super) fn read_struct(r: &mut Reader, class: &str, usmap: &Usmap, depth: usize) -> Result<BTreeMap<String, PropValue>> {
+pub(super) fn read_struct(r: &mut Reader, class: &str, usmap: &Usmap, depth: usize) -> Result<PropertyBlock> {
     if depth > MAX_DEPTH {
         bail!("unversioned struct nesting too deep at {class}");
     }
@@ -306,7 +391,7 @@ pub(super) fn read_struct_with_schema(
     flat: &[(&UsmapProperty, u8)],
     usmap: &Usmap,
     depth: usize,
-) -> Result<BTreeMap<String, PropValue>> {
+) -> Result<PropertyBlock> {
     let class = label;
     let header_start = r.o;
     let header = read_header(r)?;
@@ -319,7 +404,7 @@ pub(super) fn read_struct_with_schema(
             indent = depth * 2
         );
     }
-    let mut out = BTreeMap::new();
+    let mut entries = Vec::with_capacity(header.present.len());
     for (idx, non_zero) in header.present {
         let (prop, slot) = *flat
             .get(idx)
@@ -343,28 +428,27 @@ pub(super) fn read_struct_with_schema(
                 indent = depth * 2
             );
         }
-        let dim = prop.array_dim.max(1);
-        if dim == 1 {
-            out.insert(prop.name.clone(), value);
-        } else {
-            // A static array's slots are independent schema entries, each
-            // present or absent on its own. Keeping them under one name as an
-            // array is what stops the last one overwriting its siblings; slots
-            // the block never mentions stay `Unset` rather than being invented.
-            let entry = out
-                .entry(prop.name.clone())
-                .or_insert_with(|| PropValue::Array(vec![PropValue::Unset; dim as usize]));
-            match entry {
-                PropValue::Array(slots) if (slot as usize) < slots.len() => {
-                    slots[slot as usize] = value;
-                }
-                // Two properties sharing a name within one flattened schema —
-                // a shadowed field. Last write wins, as before.
-                other => *other = value,
-            }
-        }
+        // Each present schema index is its own entry, so a static array's slots
+        // and two properties that shadow a name stay distinct instead of one
+        // overwriting the other. Slots the block never mentions produce no
+        // entry at all — absent, rather than given an invented value.
+        entries.push(PropertyEntry {
+            name: Arc::from(prop.name.as_str()),
+            value,
+            slot: Some(SchemaSlot {
+                index: idx as u32,
+                array_index: slot,
+                zero_masked: !non_zero,
+            }),
+        });
     }
-    Ok(out)
+    Ok(PropertyBlock {
+        entries,
+        layout: BlockLayout::Unversioned {
+            schema_len: flat.len() as u32,
+            leading_empty: header.leading_empty,
+        },
+    })
 }
 
 /// The implicit value of a zero-masked property, which serialized no bytes.
@@ -409,7 +493,7 @@ pub(super) fn zero_value(ty: &PropertyType) -> PropValue {
         // instead of seeing an opaque hole.
         PropertyType::Struct(name) => match native_struct_size(name) {
             Some(size) => PropValue::Native(vec![0; size]),
-            None => PropValue::Struct(BTreeMap::new()),
+            None => PropValue::Struct(PropertyBlock::default()),
         },
         PropertyType::Optional(_) => PropValue::Unset,
         // Everything else is not zero-maskable per `CanSerializeAsZero`, so
@@ -636,24 +720,22 @@ mod tests {
         let (props, used) =
             read_export_struct_len(&export, &[], &usmap, "StaticArrayProbe").expect("decode");
         assert_eq!(used, export.len(), "walk did not consume the whole block");
-        match props.get("Tints") {
-            Some(PropValue::Array(v)) => {
-                let got: Vec<i64> = v
-                    .iter()
-                    .map(|e| match e {
-                        PropValue::Int(n) => *n,
-                        other => panic!("expected ints in the static array, got {other:?}"),
-                    })
-                    .collect();
-                assert_eq!(got, vec![11, 22, 33, 44]);
-            }
-            other => panic!("expected a 4-element static array, got {other:?}"),
-        }
+        // Each slot is its own entry, tagged with which slot it is, so none can
+        // overwrite a sibling and the block stays replayable.
+        let got: Vec<(u8, i64)> = props
+            .slots("Tints")
+            .map(|e| match (e.slot.expect("schema slot"), &e.value) {
+                (slot, PropValue::Int(n)) => (slot.array_index, *n),
+                (_, other) => panic!("expected ints in the static array, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(got, vec![(0, 11), (1, 22), (2, 33), (3, 44)]);
         assert!(matches!(props.get("After"), Some(PropValue::Int(0x5EED))));
     }
 
-    /// Slots the block never mentions stay `Unset` rather than being given an
-    /// invented value — absent is not the same as zero.
+    /// Slots the block never mentions produce no entry at all. Absent is not
+    /// the same as zero, and inventing a placeholder for one would put a value
+    /// into the block that the file never had.
     #[test]
     fn absent_static_array_slots_stay_unset() {
         let mut usmap = Usmap::meteorite().expect("bundled usmap");
@@ -672,14 +754,14 @@ mod tests {
         export.extend_from_slice(&(((1u16) << 9) | 0x0100 | 1).to_le_bytes());
         export.extend_from_slice(&7i32.to_le_bytes());
         let props = read_export_struct(&export, &[], &usmap, "SparseArrayProbe").expect("decode");
-        match props.get("Slots") {
-            Some(PropValue::Array(v)) => {
-                assert!(matches!(v[0], PropValue::Unset), "slot 0 was absent");
-                assert!(matches!(v[1], PropValue::Int(7)));
-                assert!(matches!(v[2], PropValue::Unset), "slot 2 was absent");
-            }
-            other => panic!("expected a 3-element static array, got {other:?}"),
-        }
+        let got: Vec<(u8, i64)> = props
+            .slots("Slots")
+            .map(|e| match (e.slot.expect("schema slot"), &e.value) {
+                (slot, PropValue::Int(n)) => (slot.array_index, *n),
+                (_, other) => panic!("expected an int, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(got, vec![(1, 7)], "only the slot the block mentions exists");
     }
 
     /// A non-empty set must still leave the stream aligned.

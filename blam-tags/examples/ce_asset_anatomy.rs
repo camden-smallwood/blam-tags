@@ -93,7 +93,7 @@ fn main(){
                         else if tail.iter().all(|&x|x==0){st.padded+=1}
                         else {st.native_tail+=1; st.tail_bytes.push(tail.len());}
                         for (k,v) in &p{
-                            let e2=st.props.entry(k.clone()).or_insert((0,BTreeSet::new()));
+                            let e2=st.props.entry(k.to_string()).or_insert((0,BTreeSet::new()));
                             e2.0+=1; e2.1.insert(kindof(v));
                             refs(v,k,&mut st.hard,&mut st.soft);
                         } }

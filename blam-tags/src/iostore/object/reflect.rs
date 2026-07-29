@@ -3,7 +3,6 @@
 //! `UFunction`'s Kismet bytecode.
 
 use anyhow::{bail, Context, Result};
-use std::collections::BTreeMap;
 
 use super::archive::{ExportContext, Reader};
 use super::limits::{bounded, MAX_FIELD_COUNT};
@@ -11,7 +10,7 @@ use super::block::{flattened_schema, read_header, read_struct, read_struct_with_
 use super::common::native_count;
 use super::export::read_uobject_trailer;
 use super::usmap::{PropertyType, Usmap, UsmapProperty};
-use super::value::PropValue;
+use super::value::PropertyBlock;
 
 /// Strip UE's `_<index>_<32-hex-guid>` decoration (and a trailing `_Value`/`_Key`
 /// map-element marker) from a `UUserDefinedStruct` field name, recovering the
@@ -298,7 +297,7 @@ pub fn read_datatable(
     usmap: &Usmap,
     row_struct: &str,
     object_flags: u32,
-) -> Result<Vec<(String, BTreeMap<String, PropValue>)>> {
+) -> Result<Vec<(String, PropertyBlock)>> {
     let mut r = Reader::new(export, names);
     // The DataTable's own reflected block (RowStruct ref, import flags, …).
     read_struct(&mut r, "DataTable", usmap, 0).context("DataTable header block")?;

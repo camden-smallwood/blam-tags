@@ -26,7 +26,9 @@
 pub use super::archive::{ExportContext, PackageResolver};
 pub use super::export::{read_export_struct, read_export_struct_len, read_export_with_trailer};
 pub use super::reflect::{read_datatable, read_ufunction_script, read_userdefined_struct_layout};
-pub use super::value::{MeshTransform, PropValue, SoftObjectPath};
+pub use super::value::{
+    BlockLayout, MeshTransform, PropValue, PropertyBlock, PropertyEntry, SchemaSlot, SoftObjectPath,
+};
 pub use crate::iostore::asset::mesh_sync::{
     read_material_slots, MaterialSlot, MeshRef, MeshSyncRegions, Permutation, Region,
 };

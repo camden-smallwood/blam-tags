@@ -6,9 +6,9 @@
 use anyhow::{bail, Context, Result};
 
 use super::archive::{Ar, Reader, Writer};
-use super::block::read_struct;
+use super::block::{flattened_schema, read_struct, write_block};
 use super::usmap::{PropertyType, Usmap};
-use super::value::{PropValue, SoftObjectPath};
+use super::value::{BlockLayout, PropValue, SoftObjectPath};
 use super::common::read_container_removals;
 use super::limits::{bounded, MAX_CONTAINER_ELEMENTS, PREALLOC_CAP};
 use super::structs::{native_struct_size, read_native_variable_struct};
@@ -183,6 +183,7 @@ pub(super) fn write_value(
     ty: &PropertyType,
     v: &PropValue,
     in_container: bool,
+    usmap: &Usmap,
 ) -> Result<()> {
     /// Widths follow the property's alignment, per `SerializeAsInteger`
     /// (UnversionedPropertySerialization.cpp:234) — the same rule `read_value`
@@ -223,7 +224,7 @@ pub(super) fn write_value(
                     other => bail!("expected an enum name in a container, have {other:?}"),
                 }
             } else {
-                write_value(ar, inner, v, false)
+                write_value(ar, inner, v, false, usmap)
             }
         }
         (
@@ -233,8 +234,15 @@ pub(super) fn write_value(
             | PropertyType::Interface,
             PropValue::Object(i),
         ) => ar.i32(&mut i.to_owned()),
+        // `FSoftObjectPath`/`FSoftClassPath` carry a custom serializer that
+        // writes their parts back-to-back with no property header, so as a
+        // *struct* type they take the same shape as the soft-object property
+        // above and share its writer. Missing this arm was 12,770 of the 14,304
+        // blocks the first round-trip run refused.
         (
-            PropertyType::SoftObject | PropertyType::AssetObject,
+            PropertyType::SoftObject
+            | PropertyType::AssetObject
+            | PropertyType::Struct(_),
             PropValue::SoftObject(p),
         ) => {
             ar.fname(&mut p.package.clone())?;
@@ -250,7 +258,7 @@ pub(super) fn write_value(
         (PropertyType::Array(inner), PropValue::Array(items)) => {
             ar.i32(&mut (items.len() as i32))?;
             for e in items {
-                write_value(ar, inner, e, true)?;
+                write_value(ar, inner, e, true, usmap)?;
             }
             Ok(())
         }
@@ -262,7 +270,7 @@ pub(super) fn write_value(
             ar.i32(&mut 0)?;
             ar.i32(&mut (items.len() as i32))?;
             for e in items {
-                write_value(ar, inner, e, true)?;
+                write_value(ar, inner, e, true, usmap)?;
             }
             Ok(())
         }
@@ -270,8 +278,8 @@ pub(super) fn write_value(
             ar.i32(&mut 0)?;
             ar.i32(&mut (entries.len() as i32))?;
             for (key, value) in entries {
-                write_value(ar, k, key, true)?;
-                write_value(ar, val, value, true)?;
+                write_value(ar, k, key, true, usmap)?;
+                write_value(ar, val, value, true, usmap)?;
             }
             Ok(())
         }
@@ -297,17 +305,41 @@ pub(super) fn write_value(
         (PropertyType::Optional(_), PropValue::Unset) => ar.u32(&mut 0),
         (PropertyType::Optional(inner), set) => {
             ar.u32(&mut 1)?;
-            write_value(ar, inner, set, true)
+            write_value(ar, inner, set, true, usmap)
         }
         // Anything the reader declined to interpret goes back as it came.
         (_, PropValue::Raw(b)) => {
             let n = b.len();
             ar.raw(&mut b.clone(), n)
         }
-        (PropertyType::Struct(name), _) => {
-            bail!("writing struct {name} needs the PropertyBlock model (per-slot presence)")
+        // `FGameplayTagContainer` writes a plain `int32` count then that many
+        // `FGameplayTag`s, each just its `FName` — no property header, so like
+        // the soft-object paths above it decodes to a bare value rather than a
+        // block and needs its own arm.
+        (PropertyType::Struct(name), PropValue::Array(tags))
+            if name == "GameplayTagContainer" =>
+        {
+            ar.i32(&mut (tags.len() as i32))?;
+            for t in tags {
+                match t {
+                    PropValue::Name(n) => ar.fname(&mut n.clone())?,
+                    other => bail!("expected a gameplay tag name, have {other:?}"),
+                }
+            }
+            Ok(())
         }
-        (PropertyType::Text, _) => bail!("writing FText is not modeled yet"),
+        // A nested struct: either a real property block, whose header is
+        // regenerated from the *nested* class's schema, or a hand-written one,
+        // which replays its retained bytes and needs no schema at all.
+        (PropertyType::Struct(name), PropValue::Struct(b)) => match &b.layout {
+            BlockLayout::Native { .. } => write_block(ar, b, &[], usmap),
+            BlockLayout::Unversioned { .. } => {
+                let flat = flattened_schema(name, usmap)?;
+                write_block(ar, b, &flat, usmap)
+            }
+        },
+        // `FText::Serialize` is hand-written, so it arrives as a native block.
+        (PropertyType::Text, PropValue::Struct(b)) => write_block(ar, b, &[], usmap),
         (t, other) => bail!("cannot write {other:?} as {t:?}"),
     }
 }
@@ -319,9 +351,9 @@ pub(super) fn write_value(
 /// [`emit_header`](super::block::emit_header). Errors — rather than guessing —
 /// for the shapes that still need the `PropertyBlock` model: a nested reflected
 /// struct, a hand-written native struct, and `FText`.
-pub fn emit_value(ty: &PropertyType, v: &PropValue) -> Result<Vec<u8>> {
+pub fn emit_value(ty: &PropertyType, v: &PropValue, usmap: &Usmap) -> Result<Vec<u8>> {
     let mut w = Writer::new();
-    write_value(&mut w, ty, v, false)?;
+    write_value(&mut w, ty, v, false, usmap)?;
     Ok(w.into_bytes())
 }
 
@@ -338,7 +370,7 @@ mod tests {
     fn round_trip(ty: &PropertyType, v: &PropValue, in_container: bool, names: &[String]) {
         let usmap = Usmap::meteorite().expect("bundled usmap");
         let mut w = Writer::new();
-        write_value(&mut w, ty, v, in_container).expect("write");
+        write_value(&mut w, ty, v, in_container, &usmap).expect("write");
         let first = w.into_bytes();
 
         let mut r = Reader::new(&first, names);
@@ -346,7 +378,7 @@ mod tests {
         assert_eq!(r.o, first.len(), "reader consumed {} of {} bytes for {ty:?}", r.o, first.len());
 
         let mut w2 = Writer::new();
-        write_value(&mut w2, ty, &back, in_container).expect("re-write");
+        write_value(&mut w2, ty, &back, in_container, &usmap).expect("re-write");
         assert_eq!(first, w2.into_bytes(), "value did not survive a round trip: {ty:?} = {v:?}");
     }
 
@@ -424,28 +456,82 @@ mod tests {
     fn unset_optional_round_trips() {
         let names: Vec<String> = vec!["None".into()];
         let ty = PropertyType::Optional(Box::new(PropertyType::Int));
+        let usmap = Usmap::meteorite().unwrap();
         let mut w = Writer::new();
-        write_value(&mut w, &ty, &PropValue::Unset, false).unwrap();
+        write_value(&mut w, &ty, &PropValue::Unset, false, &usmap).unwrap();
         let bytes = w.into_bytes();
         assert_eq!(bytes, [0, 0, 0, 0]);
-        let usmap = Usmap::meteorite().unwrap();
         let mut r = Reader::new(&bytes, &names);
         assert!(matches!(read_value(&mut r, &ty, &usmap, 0, false).unwrap(), PropValue::Unset));
     }
 
-    /// The arms that need the not-yet-built `PropertyBlock` say so, rather than
-    /// emitting something plausible and wrong.
+    /// A nested reflected struct now writes a real block rather than refusing.
+    /// An empty one still has to emit its class's schema length as skips — the
+    /// case that is easiest to encode as "nothing at all" and wrong for 62,606
+    /// exports.
     #[test]
-    fn unmodeled_arms_refuse_rather_than_guess() {
+    fn nested_reflected_struct_writes_its_block() {
+        use super::super::value::{BlockLayout, PropertyBlock};
+        let usmap = Usmap::meteorite().expect("bundled usmap");
+        let schema_len = flattened_schema("Transform", &usmap).unwrap().len();
+        let block = PropertyBlock {
+            entries: Vec::new(),
+            layout: BlockLayout::Unversioned { schema_len: schema_len as u32, leading_empty: 0 },
+        };
+        let mut w = Writer::new();
+        write_value(
+            &mut w,
+            &PropertyType::Struct("Transform".into()),
+            &PropValue::Struct(block),
+            false,
+            &usmap,
+        )
+        .expect("an empty nested block is writable");
+        assert_eq!(
+            w.into_bytes(),
+            super::super::block::emit_header(&Default::default(), schema_len),
+            "an empty block must still encode its schema length as skips"
+        );
+    }
+
+    /// A block carrying a schema length that disagrees with the schema it is
+    /// written against would emit a silently wrong header, so it is refused.
+    #[test]
+    fn schema_length_disagreement_is_refused() {
+        let usmap = Usmap::meteorite().expect("bundled usmap");
         let mut w = Writer::new();
         let e = write_value(
             &mut w,
             &PropertyType::Struct("Transform".into()),
             &PropValue::Struct(Default::default()),
             false,
+            &usmap,
         )
         .unwrap_err()
         .to_string();
-        assert!(e.contains("PropertyBlock"), "unhelpful refusal: {e}");
+        assert!(e.contains("schema"), "unhelpful refusal: {e}");
+    }
+
+    /// A hand-written struct replays the exact bytes it consumed, so it round
+    /// trips before its layout is modeled — and needs no schema to do it.
+    #[test]
+    fn native_layout_block_replays_its_bytes() {
+        use super::super::value::{BlockLayout, PropertyBlock};
+        let usmap = Usmap::meteorite().expect("bundled usmap");
+        let bytes: Vec<u8> = (0u8..9).collect();
+        let block = PropertyBlock {
+            entries: Vec::new(),
+            layout: BlockLayout::Native { name: "ShaderValueTypeHandle".into(), bytes: bytes.clone() },
+        };
+        let mut w = Writer::new();
+        write_value(
+            &mut w,
+            &PropertyType::Struct("ShaderValueTypeHandle".into()),
+            &PropValue::Struct(block),
+            false,
+            &usmap,
+        )
+        .expect("a native block writes its span");
+        assert_eq!(w.into_bytes(), bytes);
     }
 }

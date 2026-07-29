@@ -44,7 +44,7 @@ fn decode(
     struct_basename: &str,
     struct_name: &str,
     table_basename: &str,
-) -> Option<Vec<(String, std::collections::BTreeMap<String, PropValue>)>> {
+) -> Option<Vec<(String, blam_tags::iostore::unversioned::PropertyBlock)>> {
     let mut usmap = Usmap::meteorite().ok()?;
     let sbytes = find_uasset(archives, struct_basename)?;
     let shdr = FZenPackageHeader::deserialize(&mut Cursor::new(&sbytes[..]), None, CV, HV, None).ok()?;
