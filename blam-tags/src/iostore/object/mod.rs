@@ -15,6 +15,7 @@ mod limits;
 pub mod property;
 pub mod reflect;
 pub mod structs;
+pub mod tail_models;
 pub mod tails;
 pub mod text;
 pub mod unversioned;

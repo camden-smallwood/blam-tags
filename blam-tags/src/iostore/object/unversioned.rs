@@ -30,6 +30,9 @@ pub use super::export::{
     write_export, Export, Trailer, NO_PROPERTY_BLOCK,
 };
 pub use super::property::{can_serialize_as_zero, should_save_as_zero};
+pub use super::tail_models::{
+    roundtrip_tail, StaticMeshComponentChainTail, StaticMeshComponentTail, MODELED_TAILS,
+};
 pub use super::reflect::{read_datatable, read_ufunction_script, read_userdefined_struct_layout};
 pub use super::value::{
     BlockLayout, MeshTransform, PropValue, PropertyBlock, PropertyEntry, SchemaSlot, SoftObjectPath,
