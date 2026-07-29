@@ -100,6 +100,7 @@ fn main() {
                 let ctx = TailContext {
                     bulk_data: &bulk,
                     origin: payloads[i].len() - parts.tail.len(),
+                    usmap: &usmap,
                 };
                 match roundtrip_tail(short, &parts.tail, &names, block, ctx) {
                     Some(Ok(out)) if out == parts.tail => {

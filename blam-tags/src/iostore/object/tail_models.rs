@@ -36,8 +36,10 @@
 use anyhow::{bail, Context, Result};
 
 use super::archive::{Ar, Reader};
+use super::block::{flattened_schema, read_struct, write_block};
 use super::common::read_bulk_array;
 use super::limits::MAX_NATIVE_COUNT;
+use super::usmap::Usmap;
 use super::value::{FName, FStr, PropValue, PropertyBlock};
 
 /// A `TArray` written with `BulkSerialize`: element size, count, then
@@ -595,6 +597,9 @@ pub struct TailContext<'a> {
     pub bulk_data: &'a [(i64, i64)],
     /// The tail's offset within the export payload.
     pub origin: usize,
+    /// Needed by any tail that embeds a reflected struct — the material caches
+    /// are property blocks, so they cannot be read or written without a schema.
+    pub usmap: &'a Usmap,
 }
 
 /// A texture's CPU-side copy (`FSharedImage`, an `FImage`; ImageCore.h:412).
@@ -1135,6 +1140,207 @@ impl VirtualTextureBuiltData {
     }
 }
 
+/// One `FMaterialResourceLocOnDisk`: where a resource starts and which
+/// feature/quality level it was compiled for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaterialResourceLoc {
+    pub offset: u32,
+    pub feature_level: u8,
+    pub quality_level: u8,
+}
+
+/// The inline shader maps a material writes after its cached data
+/// (`FMaterialResourceProxyReader`).
+///
+/// `data` is the compiled shader-map payload. It stays a byte string for the
+/// same reason a texture mip does: compiled shader bytecode is the leaf datum,
+/// not an encoding of some richer value this codec could recover and re-emit.
+/// What *is* modeled is everything that addresses it — the name table and the
+/// per-resource locations, which is what a tool needs to find a resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineShaderMaps {
+    /// The resource count that leads the block. Zero or negative ends it
+    /// immediately, and nothing below is written at all.
+    pub resources: i32,
+    /// Per shader map: its name, then the non-case-preserving and
+    /// case-preserving hashes of it.
+    pub names: Vec<(FStr, u16, u16)>,
+    pub locs: Vec<MaterialResourceLoc>,
+    pub data: Vec<u8>,
+}
+
+impl InlineShaderMaps {
+    fn read(r: &mut Reader) -> Result<Self> {
+        let resources = r.i32()?;
+        if resources <= 0 {
+            return Ok(InlineShaderMaps {
+                resources,
+                names: Vec::new(),
+                locs: Vec::new(),
+                data: Vec::new(),
+            });
+        }
+        if resources > 1024 {
+            bail!("implausible inline shader map resource count {resources}");
+        }
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "shader map names", r.o - 4)?
+        };
+        let mut names = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            names.push((r.fstring()?, r.u16()?, r.u16()?));
+        }
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "material resource locs", r.o - 4)?
+        };
+        let mut locs = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            locs.push(MaterialResourceLoc {
+                offset: r.u32()?,
+                feature_level: r.u8()?,
+                quality_level: r.u8()?,
+            });
+        }
+        let num_bytes = r.u32()? as usize;
+        Ok(InlineShaderMaps { resources, names, locs, data: r.take(num_bytes)?.to_vec() })
+    }
+
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.i32(&mut self.resources.to_owned())?;
+        if self.resources <= 0 {
+            return Ok(());
+        }
+        ar.i32(&mut (self.names.len() as i32))?;
+        for (s, a, b) in &self.names {
+            ar.fstring(&mut s.clone())?;
+            ar.u16(&mut a.to_owned())?;
+            ar.u16(&mut b.to_owned())?;
+        }
+        ar.i32(&mut (self.locs.len() as i32))?;
+        for l in &self.locs {
+            ar.u32(&mut l.offset.to_owned())?;
+            ar.u8(&mut l.feature_level.to_owned())?;
+            ar.u8(&mut l.quality_level.to_owned())?;
+        }
+        ar.u32(&mut (self.data.len() as u32))?;
+        let n = self.data.len();
+        ar.raw(&mut self.data.clone(), n)
+    }
+}
+
+/// Read a reflected struct that a class appends to its tail, behind the
+/// four-byte "was it saved" flag that precedes it.
+fn read_flagged_struct(r: &mut Reader, name: &str, usmap: &Usmap) -> Result<Option<PropertyBlock>> {
+    (r.u32()? != 0).then(|| read_struct(r, name, usmap, 0)).transpose()
+}
+
+fn write_flagged_struct(
+    ar: &mut impl Ar,
+    block: &Option<PropertyBlock>,
+    name: &str,
+    usmap: &Usmap,
+) -> Result<()> {
+    match block {
+        Some(b) => {
+            ar.u32(&mut 1)?;
+            let flat = flattened_schema(name, usmap)?;
+            write_block(ar, b, &flat, usmap)
+        }
+        None => ar.u32(&mut 0),
+    }
+}
+
+/// The whole tail of a material export.
+///
+/// `UMaterialInterface` writes its cached expression data, then the concrete
+/// class adds its own: `UMaterial` always writes inline shader maps, while a
+/// `UMaterialInstance` writes its own cache and only writes shader maps when it
+/// has a static permutation resource — a condition that lives in the *property
+/// block*, not in the tail.
+// No `PartialEq`: a `PropertyBlock` is compared with `semantic_eq`, not `==`.
+#[derive(Debug, Clone)]
+pub struct MaterialChainTail {
+    pub cached_expression_data: Option<PropertyBlock>,
+    /// Present for a `UMaterialInstance`, absent for a `UMaterial`.
+    pub instance_cached_data: Option<Option<PropertyBlock>>,
+    pub shader_maps: Option<InlineShaderMaps>,
+    /// A `UMaterial` writes one more resource count after its shader maps, and
+    /// a `UMaterialInstance` does not.
+    ///
+    /// `SerializeInlineShaderMaps` emits a bare `int32 NumResourcesToSave = 0`
+    /// on the non-editor saving path (Material.cpp:825), which is what these
+    /// four bytes are. Stored rather than assumed zero, so a material that ever
+    /// carried a second resource set still round-trips.
+    pub trailing_resource_count: Option<i32>,
+}
+
+/// Whether an instance writes inline shader maps, which only the property block
+/// knows. Mirrors the condition in [`super::tails::read_class_native_tail`].
+fn has_static_permutation(block: &PropertyBlock) -> bool {
+    matches!(block.get("bHasStaticPermutationResource"), Some(PropValue::Bool(true)))
+}
+
+impl MaterialChainTail {
+    pub fn read(
+        r: &mut Reader,
+        block: &PropertyBlock,
+        ctx: TailContext,
+        is_instance: bool,
+    ) -> Result<Self> {
+        let cached_expression_data =
+            read_flagged_struct(r, "MaterialCachedExpressionData", ctx.usmap)?;
+        if !is_instance {
+            let shader_maps = Some(InlineShaderMaps::read(r)?);
+            return Ok(MaterialChainTail {
+                cached_expression_data,
+                instance_cached_data: None,
+                shader_maps,
+                trailing_resource_count: Some(r.i32()?),
+            });
+        }
+        let instance_cached_data =
+            Some(read_flagged_struct(r, "MaterialInstanceCachedData", ctx.usmap)?);
+        let shader_maps =
+            has_static_permutation(block).then(|| InlineShaderMaps::read(r)).transpose()?;
+        Ok(MaterialChainTail {
+            cached_expression_data,
+            instance_cached_data,
+            shader_maps,
+            trailing_resource_count: None,
+        })
+    }
+
+    pub fn write(&self, ar: &mut impl Ar, block: &PropertyBlock, ctx: TailContext) -> Result<()> {
+        write_flagged_struct(
+            ar,
+            &self.cached_expression_data,
+            "MaterialCachedExpressionData",
+            ctx.usmap,
+        )?;
+        match &self.instance_cached_data {
+            Some(b) => {
+                write_flagged_struct(ar, b, "MaterialInstanceCachedData", ctx.usmap)?;
+                // The property block decides whether shader maps exist at all.
+                match (&self.shader_maps, has_static_permutation(block)) {
+                    (Some(m), true) => m.write(ar)?,
+                    (None, false) => {}
+                    _ => bail!("shader map presence disagrees with the property block"),
+                }
+            }
+            None => match (&self.shader_maps, self.trailing_resource_count) {
+                (Some(m), Some(n)) => {
+                    m.write(ar)?;
+                    ar.i32(&mut n.to_owned())?;
+                }
+                _ => bail!("a UMaterial always writes inline shader maps and a resource count"),
+            },
+        }
+        Ok(())
+    }
+}
+
 /// The whole tail of a cooked texture export: `UTexture`'s strip flags, then the
 /// concrete class's cooked platform data.
 #[derive(Debug, Clone, PartialEq)]
@@ -1172,6 +1378,10 @@ pub const MODELED_TAILS: &[&str] = &[
     "VolumeTexture",
     "Texture2DArray",
     "TextureLightProfile",
+    "Material",
+    "MaterialInstanceConstant",
+    "LandscapeMaterialInstanceConstant",
+    "MaterialInstanceDynamic",
 ];
 
 /// Decode a modeled tail and re-emit it, for verification against the span it
@@ -1224,6 +1434,20 @@ pub fn roundtrip_tail(
             }
             let mut w = super::archive::Writer::new();
             modeled.write(&mut w)?;
+            Ok(w.into_bytes())
+        })()),
+        // `UMaterial` always writes inline shader maps; a `UMaterialInstance`
+        // writes its own cache first and defers to the property block.
+        "Material" | "MaterialInstanceConstant" | "LandscapeMaterialInstanceConstant"
+        | "MaterialInstanceDynamic" => Some((|| {
+            let mut r = Reader::new(tail, names);
+            let is_instance = class != "Material";
+            let modeled = MaterialChainTail::read(&mut r, block, ctx, is_instance)?;
+            if r.o != tail.len() {
+                bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+            }
+            let mut w = super::archive::Writer::new();
+            modeled.write(&mut w, block, ctx)?;
             Ok(w.into_bytes())
         })()),
         _ => None,

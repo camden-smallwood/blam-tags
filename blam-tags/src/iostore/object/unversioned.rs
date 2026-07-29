@@ -35,7 +35,8 @@ pub use super::export::{
 };
 pub use super::property::{can_serialize_as_zero, should_save_as_zero};
 pub use super::tail_models::{
-    roundtrip_tail, StaticMeshComponentChainTail, StaticMeshComponentTail, TailContext,
+    roundtrip_tail, InlineShaderMaps, MaterialChainTail, StaticMeshComponentChainTail,
+    StaticMeshComponentTail, TailContext,
     TextureChainTail, TextureCookedData, TextureMip, TexturePlatformData, MODELED_TAILS,
 };
 pub use super::reflect::{read_datatable, read_ufunction_script, read_userdefined_struct_layout};

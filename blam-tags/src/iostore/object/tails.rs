@@ -1386,6 +1386,13 @@ pub(super) fn read_class_native_tail(
                 r.o = at;
                 return Ok(false);
             }
+            // `SerializeInlineShaderMaps` ends by writing a bare
+            // `int32 NumResourcesToSave` (Material.cpp:825), zero on the
+            // non-editor path. Leaving it unread declined nothing and reported
+            // no stop -- the walk simply ended four bytes early on all 1,397
+            // materials, which is why `ce_tail_stop_census` now measures bytes
+            // consumed rather than only whether an arm gave up.
+            r.i32()?;
         }
         // `UWorld`: the persistent level, then the extra-referenced-object and
         // streaming-level arrays. Measured on `LI_Mangrove_A`, whose whole
@@ -1626,6 +1633,8 @@ pub(super) fn read_class_native_tail(
                 r.o = at;
                 return Ok(false);
             }
+            // A trailing empty container, zero on all 12 exports.
+            r.i32()?;
         }
         "AkInitBank" => {
             let at = r.o;
@@ -1950,6 +1959,20 @@ pub(super) fn read_class_native_tail(
                 r.o = at;
                 return Ok(false);
             }
+        }
+        // Three classes end with a trailing empty container that no arm read.
+        // Each is zero on every export in the corpus, and each was invisible
+        // until the census started measuring bytes *consumed* rather than only
+        // whether an arm declined: an arm that returns "kept going" while
+        // leaving bytes behind reports no stop at all.
+        //
+        // `UNiagaraDataInterfaceTexture` (3,260 exports) and `UFont` (6) leave
+        // one `int32`; `UFileMediaSource` (54) leaves two.
+        "NiagaraDataInterfaceTexture" | "Font" => {
+            r.i32()?;
+        }
+        "FileMediaSource" => {
+            r.take(8)?;
         }
         // `ALevelInstance::Serialize` appends `LevelInstanceActorGuid`; the
         // packed variant's own `PackedVersion` is editor-only.

@@ -86,7 +86,8 @@ fn main() {
                 }
                 let Some(class) = by_hash.get(&ex.class_index.raw_index()) else { continue };
                 let short = class.rsplit('.').next().unwrap_or(class);
-                if short != "Texture2D" {
+                let want = std::env::args().nth(2).unwrap_or_else(|| "Texture2D".into());
+                if short != want {
                     continue;
                 }
                 let Ok(parts) = read_export(&payloads[i], &names, &usmap, short, ex.object_flags)
@@ -98,9 +99,17 @@ fn main() {
                     continue;
                 }
                 let origin = payloads[i].len() - parts.tail.len();
-                let ctx = TailContext { bulk_data: &bulk, origin };
-                let Some(Ok(out)) = roundtrip_tail(short, &parts.tail, &names, block, ctx) else {
-                    continue;
+                let ctx = TailContext { bulk_data: &bulk, origin, usmap: &usmap };
+                let out = match roundtrip_tail(short, &parts.tail, &names, block, ctx) {
+                    Some(Ok(o)) => o,
+                    Some(Err(e)) => {
+                        shown += 1;
+                        println!("\n=== {} :: {short}[{i}] === {e:#}", h.package_name());
+                        println!("tail {} bytes; last 24: {:02x?}", parts.tail.len(),
+                            &parts.tail[parts.tail.len().saturating_sub(24)..]);
+                        continue;
+                    }
+                    None => continue,
                 };
                 if out == parts.tail {
                     continue;
