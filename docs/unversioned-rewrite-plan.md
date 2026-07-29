@@ -1042,10 +1042,13 @@ span count — the three Niagara variable types are 1.86M of the 1.92M spans, th
 and fifteen with under a thousand spans each. `BlockLayout::Native` is deleted
 when the last one lands.
 
-**B. Tail arms → typed models (64 arms + 42 helpers, 4.77 GiB).** *Started: the
-instanced-static-mesh family is done — 277,477 tails, 546 MB, 100% exact. The
-four heaviest classes above it are all behind a compression codec, so they are
-work item H.*
+**B. Tail arms → typed models (64 arms + 42 helpers, 4.77 GiB).** *Started.
+291,779 tails, 1.12 GiB, 100% exact — the instanced-static-mesh family (546 MB)
+and the whole texture family (628 MB, including virtual textures and CPU
+copies). What remains at the top of `ce_tail_census` is `StaticMesh` (Nanite,
+1,310 MiB), `BodySetup` (Chaos, 1,051), `SkeletalMesh` (470),
+`MaterialInstanceConstant` (249, inline shader maps), `AnimSequence` (ACL, 172)
+and `GeometryCollection` (144) — four of those six are work item H.*
 Sequence by bytes so the regeneration gate moves early, but the batches are
 arms, not classes:
 
