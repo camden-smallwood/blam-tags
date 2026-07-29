@@ -449,7 +449,7 @@ fn read_native_variable_struct_inner(
                 if !(0..=100_000_000).contains(&n) {
                     bail!("implausible NiagaraVariable VarData length {n} @ {}", r.o - 4);
                 }
-                s.insert("VarData".to_string(), PropValue::Native(r.take(n as usize)?.to_vec()));
+                s.insert("VarData".to_string(), PropValue::Raw(r.take(n as usize)?.to_vec()));
             }
             PropValue::Struct(s.into())
         }
@@ -571,17 +571,17 @@ fn read_native_variable_struct_inner(
             // bytes — unlike an `FTransform` *property*, which goes through the
             // unversioned schema. Measured here: identity rotation and unit
             // scale land exactly, and `BoundsMin` follows at the right offset.
-            s.insert("Transform".to_string(), PropValue::Native(r.take(80)?.to_vec()));
+            s.insert("Transform".to_string(), PropValue::Raw(r.take(80)?.to_vec()));
             if mask & (1 << 0) != 0 {
                 s.insert("Density".to_string(), PropValue::Float(r.f32()? as f64));
             }
             for (bit, field) in [(1usize, "BoundsMin"), (2, "BoundsMax")] {
                 if mask & (1 << bit) != 0 {
-                    s.insert(field.to_string(), PropValue::Native(r.take(24)?.to_vec()));
+                    s.insert(field.to_string(), PropValue::Raw(r.take(24)?.to_vec()));
                 }
             }
             if mask & (1 << 3) != 0 {
-                s.insert("Color".to_string(), PropValue::Native(r.take(32)?.to_vec()));
+                s.insert("Color".to_string(), PropValue::Raw(r.take(32)?.to_vec()));
             }
             if mask & (1 << 4) != 0 {
                 s.insert("Steepness".to_string(), PropValue::Float(r.f32()? as f64));
@@ -636,7 +636,7 @@ fn read_native_variable_struct_inner(
 pub(super) fn read_evaluation_tree(r: &mut Reader, item_size: usize) -> Result<PropValue> {
     const NODE: usize = 26;
     let mut s = BTreeMap::new();
-    s.insert("RootNode".to_string(), PropValue::Native(r.take(NODE)?.to_vec()));
+    s.insert("RootNode".to_string(), PropValue::Raw(r.take(NODE)?.to_vec()));
     let entries = native_count(r, "child node entries")?;
     r.take(entries * 12)?;
     let nodes = native_count(r, "child nodes")?;

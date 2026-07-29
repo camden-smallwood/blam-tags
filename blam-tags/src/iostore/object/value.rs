@@ -4,6 +4,8 @@
 //! writer and every typed decoder agree on one representation.
 
 use std::ops::Deref;
+
+use super::native::NativeStruct;
 use std::sync::Arc;
 
 /// An `FName`: an index into the package's name map plus an instance number.
@@ -348,9 +350,8 @@ pub enum PropValue {
     },
     /// A nested struct — reflected or hand-written, see [`BlockLayout`].
     Struct(PropertyBlock),
-    /// A natively-serialized struct's raw bytes (e.g. `FVector`/`FQuat`), kept
-    /// so transforms can be decoded on demand.
-    Native(Vec<u8>),
+    /// A fixed-size natively-serialized struct, decoded — see [`NativeStruct`].
+    Native(NativeStruct),
     /// `FScriptDelegate`: the bound object and the function it names.
     Delegate { object: i32, function: FName },
     /// `FMulticastScriptDelegate`: the invocation list.
@@ -462,7 +463,7 @@ impl PropValue {
                 removals_eq && ai.semantic_eq(bi)
             }
             (Struct(a), Struct(b)) => a.semantic_eq(b),
-            (Native(a), Native(b)) => a == b,
+            (Native(a), Native(b)) => a.semantic_eq(b),
             (Delegate { object: ao, function: af }, Delegate { object: bo, function: bf }) => {
                 ao == bo && af == bf
             }
@@ -507,9 +508,9 @@ impl PropValue {
             _ => None,
         }
     }
-    pub fn as_native(&self) -> Option<&[u8]> {
+    pub fn as_native(&self) -> Option<&NativeStruct> {
         match self {
-            PropValue::Native(b) => Some(b),
+            PropValue::Native(n) => Some(n),
             _ => None,
         }
     }
@@ -544,28 +545,21 @@ impl MeshTransform {
 
     /// Decode from a reflected `FTransform` struct value (`Rotation`/
     /// `Translation`/`Scale3D` as native `FQuat`/`FVector` blobs).
+    /// Decode from a reflected `FTransform` struct value.
+    ///
+    /// Its three fields are fixed-size native structs, so this is now field
+    /// access rather than the hand-rolled byte arithmetic it used to be.
     pub(crate) fn from_prop(v: &PropValue) -> Option<MeshTransform> {
         let s = v.as_struct()?;
-        let f64s = |name: &str, n: usize| -> Option<Vec<f64>> {
-            let b = s.get(name)?.as_native()?;
-            if b.len() < n * 8 {
-                return None;
-            }
-            Some(
-                (0..n)
-                    .map(|i| f64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap()))
-                    .collect(),
-            )
-        };
         let mut t = MeshTransform::default();
-        if let Some(r) = f64s("Rotation", 4) {
+        if let Some(NativeStruct::Vec4d(r)) = s.get("Rotation").and_then(PropValue::as_native) {
             t.rotation = [r[0] as f32, r[1] as f32, r[2] as f32, r[3] as f32];
         }
-        if let Some(tr) = f64s("Translation", 3) {
-            t.translation = [tr[0] as f32, tr[1] as f32, tr[2] as f32];
+        if let Some(NativeStruct::Vec3d(v)) = s.get("Translation").and_then(PropValue::as_native) {
+            t.translation = [v[0] as f32, v[1] as f32, v[2] as f32];
         }
-        if let Some(sc) = f64s("Scale3D", 3) {
-            t.scale = [sc[0] as f32, sc[1] as f32, sc[2] as f32];
+        if let Some(NativeStruct::Vec3d(v)) = s.get("Scale3D").and_then(PropValue::as_native) {
+            t.scale = [v[0] as f32, v[1] as f32, v[2] as f32];
         }
         Some(t)
     }

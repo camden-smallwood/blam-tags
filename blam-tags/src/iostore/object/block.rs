@@ -14,6 +14,7 @@ use super::usmap::{PropertyType, Usmap, UsmapProperty};
 use super::limits::MAX_DEPTH;
 use super::value::{BlockLayout, FName, PropValue, PropertyBlock, PropertyEntry, SchemaSlot};
 use super::property::{read_value, should_save_as_zero, write_value};
+use super::native::NativeStruct;
 use super::structs::native_struct_size;
 
 /// One `FUnversionedHeader` fragment (`FFragment`,
@@ -517,7 +518,9 @@ pub(super) fn zero_value(ty: &PropertyType) -> PropValue {
         // `MeshTransform::from_prop` and friends working on defaulted values
         // instead of seeing an opaque hole.
         PropertyType::Struct(name) => match native_struct_size(name) {
-            Some(size) => PropValue::Native(vec![0; size]),
+            Some(size) => NativeStruct::decode(name, &vec![0u8; size])
+                .map(PropValue::Native)
+                .unwrap_or(PropValue::Raw(vec![0; size])),
             None => PropValue::Struct(PropertyBlock::default()),
         },
         PropertyType::Optional(_) => PropValue::Unset,
@@ -940,11 +943,15 @@ mod zero_value_tests {
     #[test]
     fn zero_masked_atomic_structs_are_zero_bytes() {
         match zero_value(&PropertyType::Struct("Guid".to_string())) {
-            PropValue::Native(b) => assert_eq!(b, vec![0u8; 16]),
+            PropValue::Native(n) => {
+                assert_eq!(n, crate::iostore::object::native::NativeStruct::Guid([0; 4]))
+            }
             other => panic!("expected 16 zero bytes for a zero FGuid, got {other:?}"),
         }
         match zero_value(&PropertyType::Struct("Vector".to_string())) {
-            PropValue::Native(b) => assert_eq!(b.len(), 24),
+            PropValue::Native(n) => {
+                assert_eq!(n, crate::iostore::object::native::NativeStruct::Vec3d([0.0; 3]))
+            }
             other => panic!("expected a 24-byte zero FVector, got {other:?}"),
         }
     }

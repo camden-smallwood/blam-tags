@@ -11,6 +11,7 @@ use super::usmap::{PropertyType, Usmap};
 use super::value::{BlockLayout, PropValue, SoftObjectPath};
 use super::common::{read_container_removals, with_removals};
 use super::limits::{bounded, MAX_CONTAINER_ELEMENTS, PREALLOC_CAP};
+use super::native::NativeStruct;
 use super::structs::{native_struct_size, read_native_variable_struct};
 use super::text::read_text;
 
@@ -68,7 +69,7 @@ pub(super) fn read_value(
         }
         PropertyType::Struct(name) => {
             if let Some(size) = native_struct_size(name) {
-                PropValue::Native(r.take(size)?.to_vec())
+                PropValue::Native(NativeStruct::decode(name, r.take(size)?)?)
             } else if let Some(v) = read_native_variable_struct(r, name, usmap, depth)? {
                 v
             } else {
@@ -285,10 +286,10 @@ pub(super) fn write_value(
             ar.fstring(&mut p.sub_path.clone())
         }
         // A natively sized struct kept its bytes, so it goes back exactly.
-        (PropertyType::Struct(name), PropValue::Native(b)) => {
-            let size = native_struct_size(name)
-                .with_context(|| format!("no native size for struct {name}"))?;
-            ar.raw(&mut b.clone(), size)
+        (PropertyType::Struct(name), PropValue::Native(n)) => {
+            let mut bytes = n.encode(name)?;
+            let size = bytes.len();
+            ar.raw(&mut bytes, size)
         }
         (PropertyType::Array(inner), PropValue::Array(items)) => {
             ar.i32(&mut (items.len() as i32))?;
@@ -551,7 +552,7 @@ mod tests {
         // A natively sized struct goes back byte for byte.
         round_trip(
             &PropertyType::Struct("Guid".into()),
-            &PropValue::Native((0u8..16).collect()),
+            &PropValue::Native(NativeStruct::decode("Guid", &(0u8..16).collect::<Vec<u8>>()).unwrap()),
             false,
             &names,
         );

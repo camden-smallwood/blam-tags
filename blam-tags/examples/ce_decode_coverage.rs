@@ -12,10 +12,10 @@
 //!  * **`BlockLayout::Native`** — hand-written structs, decoded into fields but
 //!    written from their span.
 //!  * **`PropValue::Raw`** — values the reader declines to interpret.
-//!  * **`PropValue::Native`** — the *fixed-size* native structs. `FVector`,
-//!    `FGuid`, `FQuat` and friends are held as raw bytes and decoded on demand
-//!    by helpers like `MeshTransform::from_prop`. They round-trip perfectly and
-//!    are not typed, which is exactly the distinction this gate exists to make.
+//!  * **`NativeStruct::Opaque`** — a fixed-size native struct whose size is
+//!    known but whose fields are not modeled yet. The rest of that population
+//!    is typed as of work item A2, which is what took this gate off its
+//!    starting number.
 //!
 //! Run: `ce_decode_coverage [usmap-path]`
 use std::collections::{BTreeMap, HashMap};
@@ -47,14 +47,18 @@ fn walk(v: &PropValue, u: &mut Untyped, by_struct: &mut BTreeMap<String, u64>, d
         return;
     }
     match v {
-        PropValue::Native(b) => {
-            u.fixed_native += b.len() as u64;
-        }
+        // Typed now (work item A2) — only an unmodeled `Opaque` still counts.
+        PropValue::Native(n) => u.fixed_native += n.untyped_bytes() as u64,
         PropValue::Raw(b) => u.raw += b.len() as u64,
         PropValue::Struct(block) => {
             if let BlockLayout::Native { name, bytes } = &block.layout {
+                // The span already accounts for everything inside it, fields
+                // included. Walking in as well double-counts — the decoded
+                // fields of a retained struct are a *view* of those same bytes,
+                // not additional bytes.
                 u.native_struct_span += bytes.len() as u64;
                 *by_struct.entry(name.to_string()).or_default() += bytes.len() as u64;
+                return;
             }
             for (_, inner) in block.iter() {
                 walk(inner, u, by_struct, depth + 1);
@@ -161,6 +165,6 @@ fn main() {
     println!();
     println!("  class tails          {:>14}  ({} classes)", u.tail, tail_by_class.len());
     println!("  hand-written structs {:>14}  ({} structs)", u.native_struct_span, by_struct.len());
-    println!("  fixed native structs {:>14}  (FVector/FGuid/FQuat/... as raw bytes)", u.fixed_native);
+    println!("  unmodeled natives    {:>14}  (NativeStruct::Opaque)", u.fixed_native);
     println!("  unmodeled (Raw)      {:>14}", u.raw);
 }

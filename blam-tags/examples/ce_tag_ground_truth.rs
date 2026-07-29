@@ -108,7 +108,7 @@ fn jprop(v: &PropValue, resolve: &dyn Fn(i32) -> Option<(String, u64)>) -> Strin
                 .collect::<Vec<_>>()
                 .join(",")
         ),
-        PropValue::Native(b) => format!("{{\"k\":\"native\",\"len\":{}}}", b.len()),
+        PropValue::Native(n) => format!("{{\"k\":\"native\",\"v\":{}}}", jstr(&format!("{n:?}"))),
         PropValue::Delegate { object, function } => {
             format!("{{\"k\":\"delegate\",\"o\":{object},\"f\":{}}}", jstr(function))
         }
