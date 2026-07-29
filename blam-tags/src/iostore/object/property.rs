@@ -9,7 +9,7 @@ use super::archive::{Ar, Reader, Writer};
 use super::block::{flattened_schema, read_struct, write_block};
 use super::usmap::{PropertyType, Usmap};
 use super::value::{BlockLayout, PropValue, SoftObjectPath};
-use super::common::read_container_removals;
+use super::common::{read_container_removals, with_removals};
 use super::limits::{bounded, MAX_CONTAINER_ELEMENTS, PREALLOC_CAP};
 use super::structs::{native_struct_size, read_native_variable_struct};
 use super::text::read_text;
@@ -91,14 +91,15 @@ pub(super) fn read_value(
         // (PropertySet.cpp:258). A count of `INDEX_NONE` means "replace the
         // whole set" and carries no elements.
         PropertyType::Set(inner) => {
-            read_container_removals(r, "set", |r| read_value(r, inner, usmap, depth, true).map(|_| ()))?;
+            let removals =
+                read_container_removals(r, "set", |r| read_value(r, inner, usmap, depth, true))?;
             let n = r.i32()?;
             let n = bounded(n, MAX_CONTAINER_ELEMENTS, "set", r.o - 4)?;
             let mut v = Vec::with_capacity(n.min(PREALLOC_CAP));
             for _ in 0..n {
                 v.push(read_value(r, inner, usmap, depth, true)?);
             }
-            PropValue::Array(v)
+            with_removals(removals, PropValue::Array(v))
         }
         // `FMapProperty::SerializeItem`'s load path (PropertyMap.cpp:624):
         // `NumKeysToRemove`, then that many **keys**, then `NumEntries` and the
@@ -106,7 +107,8 @@ pub(super) fn read_value(
         // invisible while the count is zero — which it is for almost every
         // cooked asset — and desyncs catastrophically when it is not.
         PropertyType::Map(k, val) => {
-            read_container_removals(r, "map", |r| read_value(r, k, usmap, depth, true).map(|_| ()))?;
+            let removals =
+                read_container_removals(r, "map", |r| read_value(r, k, usmap, depth, true))?;
             let n = r.i32()?;
             let n = bounded(n, MAX_CONTAINER_ELEMENTS, "map", r.o - 4)?;
             let mut m = Vec::with_capacity(n.min(PREALLOC_CAP));
@@ -115,7 +117,7 @@ pub(super) fn read_value(
                 let value = read_value(r, val, usmap, depth, true)?;
                 m.push((key, value));
             }
-            PropValue::Map(m)
+            with_removals(removals, PropValue::Map(m))
         }
         // `FDelegateProperty::SerializeItem` (PropertyDelegate.cpp:85) is
         // `FScriptDelegate::Serialize`: the bound object as an `FPackageIndex`
@@ -164,6 +166,39 @@ pub(super) fn read_value(
     })
 }
 
+
+/// Separate a container's removal prefix from the container itself.
+///
+/// A plain container has an empty prefix; only a [`PropValue::WithRemovals`]
+/// carries one. Returning `Option<&Option<Vec<_>>>` keeps `INDEX_NONE`
+/// (`Some(None)`) distinct from "remove nothing" (`None`).
+fn split_removals(v: &PropValue) -> (Option<&Option<Vec<PropValue>>>, &PropValue) {
+    match v {
+        PropValue::WithRemovals { removals, inner } => (Some(removals), inner),
+        other => (None, other),
+    }
+}
+
+/// Emit the `NumElementsToRemove`/`NumKeysToRemove` prefix and its entries.
+fn write_removals(
+    ar: &mut impl Ar,
+    removals: Option<&Option<Vec<PropValue>>>,
+    ty: &PropertyType,
+    usmap: &Usmap,
+) -> Result<()> {
+    match removals {
+        // `INDEX_NONE` replaces the container wholesale and carries no entries.
+        Some(None) => ar.i32(&mut -1),
+        Some(Some(items)) => {
+            ar.i32(&mut (items.len() as i32))?;
+            for e in items {
+                write_value(ar, ty, e, true, usmap)?;
+            }
+            Ok(())
+        }
+        None => ar.i32(&mut 0),
+    }
+}
 
 /// Emit one property value, mirroring [`read_value`].
 ///
@@ -262,20 +297,30 @@ pub(super) fn write_value(
             }
             Ok(())
         }
-        // The removal prefix is reconstructible from the schema — a set or map
-        // always writes one — but its *contents* were not retained. Five exports
-        // in the shipped corpus have a non-empty one; they will surface as
-        // round-trip failures rather than as silently wrong bytes.
-        (PropertyType::Set(inner), PropValue::Array(items)) => {
-            ar.i32(&mut 0)?;
+        // A set or map always writes a delta-serialization prefix, and its
+        // contents are whatever the reader kept — empty for all but 5 exports
+        // in the corpus, `INDEX_NONE` for none of them.
+        (PropertyType::Set(inner), v) => {
+            let (removals, items) = split_removals(v);
+            let items = match items {
+                PropValue::Array(a) => a.as_slice(),
+                other => bail!("expected set elements, have {other:?}"),
+            };
+            write_removals(ar, removals, inner, usmap)?;
             ar.i32(&mut (items.len() as i32))?;
             for e in items {
                 write_value(ar, inner, e, true, usmap)?;
             }
             Ok(())
         }
-        (PropertyType::Map(k, val), PropValue::Map(entries)) => {
-            ar.i32(&mut 0)?;
+        (PropertyType::Map(k, val), v) => {
+            let (removals, entries) = split_removals(v);
+            let entries = match entries {
+                PropValue::Map(m) => m.as_slice(),
+                other => bail!("expected map entries, have {other:?}"),
+            };
+            // A map's removals are *keys*, so they serialize as the key type.
+            write_removals(ar, removals, k, usmap)?;
             ar.i32(&mut (entries.len() as i32))?;
             for (key, value) in entries {
                 write_value(ar, k, key, true, usmap)?;
@@ -509,6 +554,65 @@ mod tests {
             &PropValue::Native((0u8..16).collect()),
             false,
             &names,
+        );
+    }
+
+    /// A container's delta-serialization prefix must survive, contents and all.
+    ///
+    /// The count used to be read and its entries dropped, which is invisible
+    /// while the count is zero — as it is for all but 5 of the 1,153,836 exports
+    /// — and made exactly those 5 unwritable.
+    #[test]
+    fn container_removals_round_trip() {
+        let names: Vec<String> = vec!["None".into()];
+        let set = PropertyType::Set(Box::new(PropertyType::Int));
+        round_trip(
+            &set,
+            &PropValue::WithRemovals {
+                removals: Some(vec![PropValue::Int(7), PropValue::Int(9)]),
+                inner: Box::new(PropValue::Array(vec![PropValue::Int(1)])),
+            },
+            false,
+            &names,
+        );
+        // `INDEX_NONE` — replace wholesale — is a different instruction from
+        // "remove nothing" and must not flatten into it.
+        round_trip(
+            &set,
+            &PropValue::WithRemovals {
+                removals: None,
+                inner: Box::new(PropValue::Array(vec![PropValue::Int(1)])),
+            },
+            false,
+            &names,
+        );
+        let map = PropertyType::Map(Box::new(PropertyType::Int), Box::new(PropertyType::Int));
+        round_trip(
+            &map,
+            &PropValue::WithRemovals {
+                removals: Some(vec![PropValue::Int(3)]),
+                inner: Box::new(PropValue::Map(vec![(PropValue::Int(1), PropValue::Int(2))])),
+            },
+            false,
+            &names,
+        );
+    }
+
+    /// An empty removal prefix leaves the value unwrapped, so the shape 1,153,831
+    /// blocks decode to is exactly what it was before removals were modeled.
+    #[test]
+    fn an_empty_removal_prefix_does_not_wrap() {
+        let usmap = Usmap::meteorite().expect("bundled usmap");
+        let ty = PropertyType::Set(Box::new(PropertyType::Int));
+        let mut w = Writer::new();
+        write_value(&mut w, &ty, &PropValue::Array(vec![PropValue::Int(4)]), false, &usmap)
+            .expect("write");
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes, &[]);
+        let back = read_value(&mut r, &ty, &usmap, 0, false).expect("read");
+        assert!(
+            matches!(back, PropValue::Array(ref a) if a.len() == 1),
+            "an empty prefix should not produce a wrapper: {back:?}"
         );
     }
 

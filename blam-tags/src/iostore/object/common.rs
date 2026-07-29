@@ -4,6 +4,7 @@
 use anyhow::{bail, Result};
 
 use super::archive::Reader;
+use super::value::PropValue;
 use super::limits::{bounded, MAX_CONTAINER_ELEMENTS, MAX_ELEMENT_SIZE, MAX_NATIVE_COUNT};
 
 /// A `TArray` written with `BulkSerialize`: the element size, the count, then
@@ -51,20 +52,33 @@ pub(super) fn read_inline_bulk_data(r: &mut Reader, bulk_data: &[(i64, i64)], wh
 /// The delta-serialization prefix shared by `TSet` and `TMap`: a count of
 /// entries to remove, followed by that many keys/elements. `INDEX_NONE` means
 /// the container is replaced wholesale and nothing follows.
+/// Returns the removed entries, or `None` for `INDEX_NONE`. They used to be
+/// read and dropped, which is invisible while the count is zero — as it is for
+/// all but 5 of the 1,153,836 exports — and makes those 5 unwritable.
 pub(super) fn read_container_removals(
     r: &mut Reader,
     what: &str,
-    mut read_one: impl FnMut(&mut Reader) -> Result<()>,
-) -> Result<()> {
+    mut read_one: impl FnMut(&mut Reader) -> Result<PropValue>,
+) -> Result<Option<Vec<PropValue>>> {
     let n = r.i32()?;
     if n == -1 {
-        return Ok(());
+        return Ok(None);
     }
     let n = bounded(n, MAX_CONTAINER_ELEMENTS, &format!("{what} removal"), r.o - 4)? as i32;
+    let mut out = Vec::new();
     for _ in 0..n {
-        read_one(r)?;
+        out.push(read_one(r)?);
     }
-    Ok(())
+    Ok(Some(out))
+}
+
+/// Wrap a container in [`PropValue::WithRemovals`] only when its removal prefix
+/// actually carried something, so the overwhelmingly common shape is untouched.
+pub(super) fn with_removals(removals: Option<Vec<PropValue>>, inner: PropValue) -> PropValue {
+    match removals {
+        Some(r) if r.is_empty() => inner,
+        removals => PropValue::WithRemovals { removals, inner: Box::new(inner) },
+    }
 }
 
 pub(super) fn native_count(r: &mut Reader, what: &str) -> Result<usize> {

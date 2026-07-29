@@ -35,7 +35,7 @@ fn kindof(v:&PropValue)->&'static str{ match v{
     PropValue::Bool(_)=>"bool",PropValue::Int(_)=>"int",PropValue::Float(_)=>"float",
     PropValue::Name(_)=>"name",PropValue::Str(_)=>"str",PropValue::Object(_)=>"obj",
     PropValue::SoftObject(_)=>"soft",PropValue::Array(_)=>"arr",PropValue::Map(_)=>"map",
-    PropValue::Struct(_)=>"struct",PropValue::Native(_)=>"native",PropValue::Delegate{..}=>"delegate",PropValue::MulticastDelegate(_)=>"multicast",PropValue::FieldPath{..}=>"fieldpath",PropValue::Unset=>"unset",PropValue::Raw(_)=>"raw"} }
+    PropValue::Struct(_)=>"struct",PropValue::Native(_)=>"native",PropValue::Delegate{..}=>"delegate",PropValue::MulticastDelegate(_)=>"multicast",PropValue::FieldPath{..}=>"fieldpath",PropValue::Unset=>"unset",PropValue::Raw(_)=>"raw",PropValue::WithRemovals{inner,..}=>kindof(inner)} }
 fn refs(v:&PropValue, key:&str, hard:&mut BTreeMap<String,usize>, soft:&mut BTreeMap<String,usize>){
     match v{
         PropValue::Object(i)=>{ if *i!=0 { *hard.entry(key.into()).or_default()+=1; } }
@@ -43,6 +43,7 @@ fn refs(v:&PropValue, key:&str, hard:&mut BTreeMap<String,usize>, soft:&mut BTre
         PropValue::Array(a)=>for x in a{refs(x,key,hard,soft)},
         PropValue::Map(m)=>for (k,val) in m{refs(k,key,hard,soft);refs(val,key,hard,soft)},
         PropValue::Struct(s)=>for (kk,val) in s{refs(val,&format!("{key}.{kk}"),hard,soft)},
+        PropValue::WithRemovals{removals,inner}=>{ if let Some(r)=removals { for x in r{refs(x,key,hard,soft)} } refs(inner,key,hard,soft) }
         _=>{}
     }
 }

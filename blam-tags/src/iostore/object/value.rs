@@ -256,6 +256,23 @@ pub enum PropValue {
     Array(Vec<PropValue>),
     /// A `TMap`, preserving insertion order.
     Map(Vec<(PropValue, PropValue)>),
+    /// A `TSet`/`TMap` whose delta-serialization prefix was **not** empty.
+    ///
+    /// Both open with a count of entries the loader should remove before
+    /// applying the ones that follow, and that count is followed by that many
+    /// keys/elements. It is empty for all but **5 exports of the 1,153,836** in
+    /// the shipped corpus, so this wraps the container rather than widening
+    /// `Map`/`Set` — which a dozen call sites destructure positionally — and the
+    /// common shape stays exactly what it was.
+    ///
+    /// `removals: None` is `INDEX_NONE`, "replace the container wholesale",
+    /// which carries no elements. Measured: zero occurrences, but it is a
+    /// different instruction from "remove nothing" and is kept distinct rather
+    /// than flattened to an empty list.
+    WithRemovals {
+        removals: Option<Vec<PropValue>>,
+        inner: Box<PropValue>,
+    },
     /// A nested struct — reflected or hand-written, see [`BlockLayout`].
     Struct(PropertyBlock),
     /// A natively-serialized struct's raw bytes (e.g. `FVector`/`FQuat`), kept
@@ -280,6 +297,20 @@ pub enum PropValue {
 }
 
 impl PropValue {
+    /// Look through a [`PropValue::WithRemovals`] wrapper to the container
+    /// itself.
+    ///
+    /// Every accessor below goes through this, so a reader never has to know
+    /// that a container carried a removal prefix — which is the point of
+    /// wrapping rather than widening: the 5 exports that have one read exactly
+    /// like the 1,153,831 that do not.
+    pub fn unwrapped(&self) -> &PropValue {
+        match self {
+            PropValue::WithRemovals { inner, .. } => inner.unwrapped(),
+            other => other,
+        }
+    }
+
     pub fn as_str(&self) -> Option<&str> {
         match self {
             PropValue::Name(n) => Some(n.as_str()),
@@ -288,13 +319,13 @@ impl PropValue {
         }
     }
     pub fn as_map(&self) -> Option<&[(PropValue, PropValue)]> {
-        match self {
+        match self.unwrapped() {
             PropValue::Map(m) => Some(m),
             _ => None,
         }
     }
     pub fn as_array(&self) -> Option<&[PropValue]> {
-        match self {
+        match self.unwrapped() {
             PropValue::Array(a) => Some(a),
             _ => None,
         }

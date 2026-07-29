@@ -91,6 +91,16 @@ fn jprop(v: &PropValue, resolve: &dyn Fn(i32) -> Option<(String, u64)>) -> Strin
                 .collect::<Vec<_>>()
                 .join(",")
         ),
+        // A container carrying a non-empty removal prefix; the ground truth is
+        // about the container's contents, so report the count and unwrap.
+        PropValue::WithRemovals { removals, inner } => format!(
+            "{{\"k\":\"removals\",\"n\":{},\"v\":{}}}",
+            match removals {
+                Some(r) => r.len() as i64,
+                None => -1,
+            },
+            jprop(inner, resolve)
+        ),
         PropValue::Struct(s) => format!(
             "{{\"k\":\"struct\",\"v\":{{{}}}}}",
             s.iter()
