@@ -902,3 +902,120 @@ wrong, and each one is silent.
 * **Trusting `WithSerializer` in a source grep.** It matched commented-out code
   once and produced two confidently wrong "confirmed bugs". Strip comments first,
   and remember it usually means *hook*, not *format*.
+
+
+---
+
+## 7. The road to 100% — full typed serialization
+
+The goal is total coverage: every byte of a cooked package produced from typed
+values, with an API that is pleasant to use. Retention is not acceptable as an
+end state; it was scaffolding that made each conversion verifiable.
+
+### 7.1 The number that defines done
+
+**5,167,579,793 bytes are currently retained rather than regenerated** —
+5,119,304,057 of class tails plus 48,275,736 of hand-written struct spans. Done
+is that number reaching zero, measured by a gate that rebuilds every export with
+**retention disabled**:
+
+> `ce_regeneration_gate` — rebuild every export from typed values only, with
+> span replay compiled out. Report bytes regenerated / bytes total, per class.
+
+Build this gate *first*. Every item below moves it, and until it exists "how far
+along are we" is an opinion. It starts near 0% for tails and finishes at 100%.
+
+Retention stays in the code as `BlockLayout::Native` and `Export.tail` until the
+matching model lands, because that is what lets each conversion be checked
+against the bytes it replaces — but the gate ignores it, so progress is honest.
+
+### 7.2 Inventory (measured, `ce_foundation_inventory`)
+
+| Population | Bytes | Units | Distinct |
+|---|---|---|---|
+| Class tails | 5,119,304,057 | 821,846 exports | **226 classes** |
+| Hand-written struct spans | 48,275,736 | 1,923,438 spans | **23 structs** |
+| Behind a walk stop | 90,066 | 14,894 exports | 3 classes |
+| Blueprint-class exports | — | 89,762 exports | schema from class package |
+
+### 7.3 Work items, in dependency order
+
+**A. Hand-written structs → typed models (23 structs, 48 MB).**
+Cheapest population and the one that unblocks the value model: while any
+`PropValue::Struct` can be a `Native` span, no struct is fully typed. Ordered by
+span count: the three Niagara variable types are 1.86M of the 1.92M spans, then
+`NiagaraDataInterfaceGPUParamInfo`, `PCGPoint`, `Text`, the MovieScene channels,
+and a tail of fifteen with under a thousand spans each. Each gets a typed struct
+plus a writer, verified against its retained span. `BlockLayout::Native` is
+deleted when the last one lands.
+
+**B. Class tails → typed models (226 classes, 4.77 GiB).**
+The distribution says how to sequence it, not whether to finish it:
+
+| Batch | Classes | Cumulative bytes | Character |
+|---|---|---|---|
+| B1 | 9 | 90.45% | the heavy hitters — `StaticMesh` (Nanite), `BodySetup` (Chaos), `SkeletalMesh`, `Texture2D`, `InstancedStaticMeshComponent`, `MaterialInstanceConstant`, `AnimSequence`, `GeometryCollection`, `TextureCube` |
+| B2 | 13 more | 99.09% | mid-size, conventional layouts |
+| B3 | 14 more | 99.85% | small |
+| B4 | 190 more | 100.00% | 0.15% of bytes; mostly a few hundred bytes each |
+
+B1 is where the engineering is. `StaticMesh` needs the Nanite decoder (already
+started, `iostore/nanite.rs`) and `BodySetup` needs Chaos implicit objects. B4 is
+volume, not difficulty — and it is the batch that makes the claim "100%" true, so
+it is not optional.
+
+Each class is verified by `ce_tail_model_roundtrip` against the span it replaces,
+which is the property that makes this safe to do incrementally: a tail model
+never has to be trusted.
+
+**C. Close the 3 walk stops (90 KB).**
+`DataTable` (89 exports, 87 KB), `UserDefinedStruct` (38, 2.9 KB), and
+`NiagaraScript` (14,767 exports, **0 bytes** — it declines exactly at the end, so
+it is a no-op to remove). Small, and they are the last places the reader gives up.
+
+**D. Cite the remaining 22 struct sizes.**
+Four are declared by schemas Campaign Evolved uses but never present in a block —
+`Matrix`, `Timespan`, `PerPlatformBool`, `NavAgentSelector` (cited) — so they are
+one edited property from being read. Eighteen are not declared by any class the
+game uses. Source citations from UE 5.5.4; read the *serializer*, not `sizeof`.
+
+**E. Blueprint-class exports (89,762).**
+Already decoded via their class package for the coverage matrix, but not
+reachable through the edit path. Make the recovered `FField` schema a first-class
+schema source so these are editable like any other export.
+
+**F. Format edges.**
+`TSet` decodes as `PropValue::Array`, indistinguishable from `TArray` — give it
+its own variant. `FStr` drops trailing bytes when a declared length exceeds
+text-plus-terminator. Neither occurs in the shipped corpus; both are reachable
+from a mod.
+
+### 7.4 The API, which is a requirement and not a finishing touch
+
+Typed models are only half of "strongly typed" — the other half is that a caller
+never touches a `PropValue` unless they want to.
+
+* **Typed accessors** on `PropertyBlock`: `get_i32`, `get_str`, `get_name`,
+  `get_struct::<T>`, each returning `Result` with the property name in the error
+  rather than an `Option` the caller has to interpret.
+* **Typed tails**: `Export::tail_as::<StaticMeshComponentTail>()`, so a modeled
+  class is reached by type rather than by matching on a name.
+* **`PackageEditor`** — open a package, enumerate exports with their resolved
+  class, edit, save. The class-resolution dance (`ScriptObjects` → hash → short
+  name → schema) is currently reimplemented by every caller, including six of the
+  examples in this repo. That is the strongest signal it belongs in the library.
+* **One error type** for the object layer, so a caller can distinguish "this is
+  not that format" from "this format is corrupt" from "this codec has a gap".
+
+### 7.5 Sequencing
+
+1. `ce_regeneration_gate` — the number that says how far along we are.
+2. **A** (23 structs) — closes a whole population, deletes `BlockLayout::Native`.
+3. **C** and **D** — small, and they clear the last non-tail gaps.
+4. **B1** — 90% of tail bytes; the real engineering.
+5. **API** — once the typed models exist, the surface can be built on them
+   rather than retrofitted.
+6. **B2–B4**, **E**, **F** — volume work to reach a true 100%.
+
+Steps 2, 3 and 5 are independent of the hard decoding in step 4, so the API and
+the long tail are not blocked behind Nanite and Chaos.
