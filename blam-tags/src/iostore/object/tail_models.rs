@@ -2023,6 +2023,288 @@ impl StaticMeshTail {
     }
 }
 
+/// One vtable patch table inside a shader map's pointer table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VTablePatchTable {
+    pub type_name_hash: [u8; 8],
+    /// `VTableOffset` and `Offset` per patch.
+    pub patches: FixedArray,
+}
+
+/// One name patch table — script names and memory-image names share the shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamePatchTable {
+    pub name: [u8; 8],
+    pub offsets: FixedArray,
+}
+
+/// Where a shader map's bytecode lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShaderCode {
+    /// In a shared shader library; only the hash is in the package.
+    Shared { hash: [u8; 20] },
+    /// Inlined — `FShaderMapResourceCode::Serialize`.
+    Inline {
+        resource_hash: [u8; 20],
+        /// One `FSHAHash` per shader.
+        shader_hashes: FixedArray,
+        /// Each entry is two `FSharedBuffer`s, each a `uint64` length then that
+        /// many bytes. The bytecode itself is leaf data.
+        resources: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+}
+
+/// `FMemoryImageResult::LoadFromArchive` plus the pointer and patch tables — a
+/// compiled shader map as it sits in a package.
+///
+/// The frozen memory image and the compiled bytecode stay byte strings; the
+/// tables that address and relocate them are values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShaderMap {
+    /// `FPlatformTypeLayoutParameters`: max field alignment and flags.
+    pub layout_params: [u8; 8],
+    pub frozen_image: Vec<u8>,
+    /// An `FName`, a layout size and an `FSHAHash` per dependency.
+    pub type_dependencies: FixedArray,
+    /// `FHashedName` per entry. The two *counts* are written adjacently and only
+    /// then the combined run of hashes, so these cannot be read as two
+    /// independent count-then-payload arrays — doing so put a vertex-factory
+    /// count of 466,651,457 in the middle of the hash data.
+    pub shader_types: Vec<[u8; 8]>,
+    pub vertex_factory_types: Vec<[u8; 8]>,
+    /// Niagara's pointer table adds the data-interface type names.
+    pub data_interface_types: Option<Vec<FStr>>,
+    pub vtable_patches: Vec<VTablePatchTable>,
+    pub script_name_patches: Vec<NamePatchTable>,
+    pub image_name_patches: Vec<NamePatchTable>,
+    pub shader_platform_name: [u8; 8],
+    pub code: ShaderCode,
+}
+
+impl ShaderMap {
+    fn read(r: &mut Reader, niagara_pointer_table: bool) -> Result<Self> {
+        let layout_params: [u8; 8] = r.take(8)?.try_into().expect("8 bytes");
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "frozen memory image", r.o - 4)?
+        };
+        let frozen_image = r.take(n)?.to_vec();
+        let type_dependencies = FixedArray::read(r, "memory image type dependencies", 32)?;
+        let n_types = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "shader types", r.o - 4)?
+        };
+        let n_vf = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "vertex factory types", r.o - 4)?
+        };
+        let mut hashed = |r: &mut Reader, n: usize| -> Result<Vec<[u8; 8]>> {
+            (0..n).map(|_| Ok(r.take(8)?.try_into().expect("8 bytes"))).collect()
+        };
+        let shader_types = hashed(r, n_types)?;
+        let vertex_factory_types = hashed(r, n_vf)?;
+        let data_interface_types = niagara_pointer_table
+            .then(|| -> Result<Vec<FStr>> {
+                let n = {
+                    let n = r.i32()?;
+                    super::limits::bounded(n, MAX_NATIVE_COUNT, "data interface types", r.o - 4)?
+                };
+                (0..n).map(|_| r.fstring()).collect()
+            })
+            .transpose()?;
+        // The three patch-table counts are written up front, then the tables
+        // follow in order — so all three counts must be read before any table.
+        let count = |r: &mut Reader, what: &str| -> Result<usize> {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, what, r.o - 4)
+        };
+        let n_vtable = count(r, "vtable patch tables")?;
+        let n_script = count(r, "script name patch tables")?;
+        let n_image = count(r, "memory image name patch tables")?;
+        let mut vtable_patches = Vec::with_capacity(n_vtable.min(64));
+        for _ in 0..n_vtable {
+            vtable_patches.push(VTablePatchTable {
+                type_name_hash: r.take(8)?.try_into().expect("8 bytes"),
+                patches: FixedArray::read(r, "vtable patches", 8)?,
+            });
+        }
+        let mut name_table = |r: &mut Reader, n: usize| -> Result<Vec<NamePatchTable>> {
+            let mut out = Vec::with_capacity(n.min(64));
+            for _ in 0..n {
+                out.push(NamePatchTable {
+                    name: r.take(8)?.try_into().expect("8 bytes"),
+                    offsets: FixedArray::read(r, "name patches", 4)?,
+                });
+            }
+            Ok(out)
+        };
+        let script_name_patches = name_table(r, n_script)?;
+        let image_name_patches = name_table(r, n_image)?;
+        let share_code = r.u32()? != 0;
+        let shader_platform_name = r.take(8)?.try_into().expect("8 bytes");
+        let code = if share_code {
+            ShaderCode::Shared { hash: r.take(20)?.try_into().expect("20 bytes") }
+        } else {
+            let resource_hash = r.take(20)?.try_into().expect("20 bytes");
+            let shader_hashes = FixedArray::read(r, "shader hashes", 20)?;
+            let n = {
+                let n = r.i32()?;
+                super::limits::bounded(n, MAX_NATIVE_COUNT, "shader code resources", r.o - 4)?
+            };
+            let mut resources = Vec::with_capacity(n.min(64));
+            for _ in 0..n {
+                let mut buf = || -> Result<Vec<u8>> {
+                    let len = usize::try_from(r.u64()?).context("implausible shader buffer")?;
+                    Ok(r.take(len)?.to_vec())
+                };
+                let a = buf()?;
+                let b = buf()?;
+                resources.push((a, b));
+            }
+            ShaderCode::Inline { resource_hash, shader_hashes, resources }
+        };
+        Ok(ShaderMap {
+            layout_params,
+            frozen_image,
+            type_dependencies,
+            shader_types,
+            vertex_factory_types,
+            data_interface_types,
+            vtable_patches,
+            script_name_patches,
+            image_name_patches,
+            shader_platform_name,
+            code,
+        })
+    }
+
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.raw(&mut self.layout_params.to_vec(), 8)?;
+        ar.i32(&mut (self.frozen_image.len() as i32))?;
+        let n = self.frozen_image.len();
+        ar.raw(&mut self.frozen_image.clone(), n)?;
+        self.type_dependencies.write(ar)?;
+        ar.i32(&mut (self.shader_types.len() as i32))?;
+        ar.i32(&mut (self.vertex_factory_types.len() as i32))?;
+        for h in self.shader_types.iter().chain(&self.vertex_factory_types) {
+            ar.raw(&mut h.to_vec(), 8)?;
+        }
+        if let Some(v) = &self.data_interface_types {
+            ar.i32(&mut (v.len() as i32))?;
+            for s in v {
+                ar.fstring(&mut s.clone())?;
+            }
+        }
+        ar.i32(&mut (self.vtable_patches.len() as i32))?;
+        ar.i32(&mut (self.script_name_patches.len() as i32))?;
+        ar.i32(&mut (self.image_name_patches.len() as i32))?;
+        for t in &self.vtable_patches {
+            ar.raw(&mut t.type_name_hash.to_vec(), 8)?;
+            t.patches.write(ar)?;
+        }
+        for t in self.script_name_patches.iter().chain(&self.image_name_patches) {
+            ar.raw(&mut t.name.to_vec(), 8)?;
+            t.offsets.write(ar)?;
+        }
+        match &self.code {
+            ShaderCode::Shared { hash } => {
+                ar.u32(&mut 1)?;
+                ar.raw(&mut self.shader_platform_name.to_vec(), 8)?;
+                ar.raw(&mut hash.to_vec(), 20)?;
+            }
+            ShaderCode::Inline { resource_hash, shader_hashes, resources } => {
+                ar.u32(&mut 0)?;
+                ar.raw(&mut self.shader_platform_name.to_vec(), 8)?;
+                ar.raw(&mut resource_hash.to_vec(), 20)?;
+                shader_hashes.write(ar)?;
+                ar.i32(&mut (resources.len() as i32))?;
+                for (a, b) in resources {
+                    for buf in [a, b] {
+                        ar.u64(&mut (buf.len() as u64))?;
+                        let n = buf.len();
+                        ar.raw(&mut buf.clone(), n)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One of a `UNiagaraScript`'s compiled shader resources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NiagaraShaderResource {
+    pub cooked: bool,
+    pub num_permutations: i32,
+    pub base_compile_hash: Vec<u8>,
+    /// An uncooked resource writes nothing more; a cooked one says whether a map
+    /// compiled, and only then is there a map.
+    pub shader_map: Option<Option<Box<ShaderMap>>>,
+}
+
+/// `UNiagaraScript`'s tail: its compiled shader maps, or nothing at all.
+///
+/// A script with no shader maps ends at the property block, so the tail is empty
+/// — which is not the same as a script whose resource count is zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NiagaraScriptTail {
+    pub resources: Vec<NiagaraShaderResource>,
+}
+
+impl NiagaraScriptTail {
+    pub fn read(r: &mut Reader) -> Result<Self> {
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "Niagara shader resources", r.o - 4)?
+        };
+        let mut resources = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            let cooked = r.u32()? != 0;
+            let num_permutations = r.i32()?;
+            let h = {
+                let h = r.i32()?;
+                super::limits::bounded(h, MAX_NATIVE_COUNT, "BaseCompileHash", r.o - 4)?
+            };
+            let base_compile_hash = r.take(h)?.to_vec();
+            let shader_map = cooked
+                .then(|| -> Result<Option<Box<ShaderMap>>> {
+                    Ok((r.u32()? != 0).then(|| ShaderMap::read(r, true).map(Box::new)).transpose()?)
+                })
+                .transpose()?;
+            resources.push(NiagaraShaderResource {
+                cooked,
+                num_permutations,
+                base_compile_hash,
+                shader_map,
+            });
+        }
+        Ok(NiagaraScriptTail { resources })
+    }
+
+    pub fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.i32(&mut (self.resources.len() as i32))?;
+        for res in &self.resources {
+            ar.u32(&mut u32::from(res.cooked))?;
+            ar.i32(&mut res.num_permutations.to_owned())?;
+            ar.i32(&mut (res.base_compile_hash.len() as i32))?;
+            let n = res.base_compile_hash.len();
+            ar.raw(&mut res.base_compile_hash.clone(), n)?;
+            match (&res.shader_map, res.cooked) {
+                (Some(m), true) => match m {
+                    Some(map) => {
+                        ar.u32(&mut 1)?;
+                        map.write(ar)?;
+                    }
+                    None => ar.u32(&mut 0)?,
+                },
+                (None, false) => {}
+                _ => bail!("shader map presence disagrees with the cooked flag"),
+            }
+        }
+        Ok(())
+    }
+}
+
 /// `ULandscapeComponent`'s tail: the grass weight offsets and the packed
 /// height/weight data.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3913,6 +4195,47 @@ pub fn roundtrip_tail(
                         d.write(&mut w)?;
                     }
                     None => w.u32(&mut 0)?,
+                }
+                Ok(w.into_bytes())
+            })()),
+            "NiagaraScript" => Some((|| {
+                // An empty tail is a script with no shader maps at all, not a
+                // resource count of zero.
+                if tail.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let mut r = Reader::new(tail, names);
+                let modeled = NiagaraScriptTail::read(&mut r)?;
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                modeled.write(&mut w)?;
+                Ok(w.into_bytes())
+            })()),
+            "NiagaraSystem" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let n = {
+                    let n = r.i32()?;
+                    super::limits::bounded(
+                        n,
+                        MAX_NATIVE_COUNT,
+                        "NiagaraEmitterCompiledData",
+                        r.o - 4,
+                    )?
+                };
+                let mut compiled = Vec::with_capacity(n.min(64));
+                for _ in 0..n {
+                    compiled.push(read_struct(&mut r, "NiagaraEmitterCompiledData", ctx.usmap, 0)?);
+                }
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                w.i32(&mut (compiled.len() as i32))?;
+                let flat = flattened_schema("NiagaraEmitterCompiledData", ctx.usmap)?;
+                for b in &compiled {
+                    write_block(&mut w, b, &flat, ctx.usmap)?;
                 }
                 Ok(w.into_bytes())
             })()),
