@@ -14,6 +14,7 @@ pub mod export;
 pub mod hand_written;
 mod limits;
 pub mod native;
+pub mod native_bool;
 pub mod property;
 pub mod reflect;
 pub mod structs;

@@ -70,7 +70,7 @@ pub fn set_property_slot(
     let flat = flattened_schema(class, usmap)?;
     let schema_index = flat
         .iter()
-        .position(|(p, slot)| p.name == property && *slot == array_index)
+        .position(|(p, slot, _)| p.name == property && *slot == array_index)
         .with_context(|| {
             if array_index == 0 {
                 format!("class {class} has no property {property}")

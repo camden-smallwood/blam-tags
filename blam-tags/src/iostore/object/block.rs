@@ -13,7 +13,8 @@ use super::archive::{trace_enabled, Ar, Reader};
 use super::usmap::{PropertyType, Usmap, UsmapProperty};
 use super::limits::MAX_DEPTH;
 use super::value::{BlockLayout, FName, PropValue, PropertyBlock, PropertyEntry, SchemaSlot};
-use super::property::{read_value, should_save_as_zero, write_value};
+use super::native_bool::is_native_bool;
+use super::property::{can_serialize_as_zero, read_value, should_save_as_zero, write_value};
 use super::native::NativeStruct;
 use super::structs::native_struct_size;
 
@@ -196,7 +197,7 @@ pub(super) fn write_header_inner(header: &Header, schema_len: usize) -> Vec<u8> 
 pub(super) fn write_block(
     ar: &mut impl Ar,
     block: &PropertyBlock,
-    flat: &[(&UsmapProperty, u8)],
+    flat: &[(&UsmapProperty, u8, &str)],
     usmap: &Usmap,
 ) -> Result<()> {
     let BlockLayout::Unversioned { schema_len, leading_empty } = block.layout;
@@ -240,10 +241,31 @@ pub(super) fn write_block(
         let slot = e.slot.with_context(|| {
             format!("property {} has no schema slot, so its block cannot be written", e.name)
         })?;
-        let (prop, _) = *flat.get(slot.index as usize).with_context(|| {
+        let (prop, _, owner) = *flat.get(slot.index as usize).with_context(|| {
             format!("schema index {} beyond {} properties", slot.index, flat.len())
         })?;
-        let is_zero = slot.zero_masked && should_save_as_zero(&prop.ty, &e.value, usmap);
+        // Maskability comes from two different kinds of evidence.
+        //
+        // For a `bool` it is now a *derived* fact: `native_bool` records which
+        // declarations are real `bool`s and which are `: 1` bitfields, scraped
+        // from the game's own UHT headers, and `ce_native_bool_check` measured
+        // it against all 1,412,525 bool entries in the corpus with zero
+        // disagreements in either direction. Deriving it is strictly better than
+        // replaying the file's bit, because a *newly inserted* property has no
+        // bit to replay — it would otherwise always write longhand.
+        //
+        // Everything else still has to replay it. `CanSerializeAsZero` gates
+        // non-bool, non-struct properties on `CPF_ZeroConstructor |
+        // CPF_NoDestructor`, and the `.usmap` carries neither flag, so the file
+        // remains the only evidence: a cooked block that wrote a zero longhand
+        // has proven that property is not maskable. `ce_zero_mask_census`
+        // measures the residue this still covers for us -- 1,795 `Object` and
+        // 194 `Name` entries, across 3 declarations.
+        let maskable = match &prop.ty {
+            PropertyType::Bool => is_native_bool(owner, &prop.name),
+            ty => slot.zero_masked && can_serialize_as_zero(ty),
+        };
+        let is_zero = maskable && should_save_as_zero(&prop.ty, &e.value, usmap);
         plan.push((e, &prop.ty, slot.index as usize, is_zero));
     }
     let present: Vec<(usize, bool)> =
@@ -360,9 +382,11 @@ pub(super) fn read_struct(r: &mut Reader, class: &str, usmap: &Usmap, depth: usi
         if let Some(fields) = r.resolver.and_then(|p| p.struct_layout(class)) {
             // A recovered `FField` chain occupies `array_dim` slots too, the
             // same as a `.usmap` one.
-            let schema: Vec<(&UsmapProperty, u8)> = fields
+            // A user-defined struct declares every field itself, so it is its
+            // own owner for the purposes of the native-bool lookup.
+            let schema: Vec<(&UsmapProperty, u8, &str)> = fields
                 .iter()
-                .flat_map(|f| (0..f.array_dim.max(1)).map(move |i| (f, i)))
+                .flat_map(|f| (0..f.array_dim.max(1)).map(move |i| (f, i, class)))
                 .collect();
             return read_struct_with_schema(r, class, &schema, usmap, depth);
         }
@@ -376,17 +400,17 @@ pub(super) fn read_struct(r: &mut Reader, class: &str, usmap: &Usmap, depth: usi
 pub(super) fn flattened_schema<'u>(
     class: &str,
     usmap: &'u Usmap,
-) -> Result<Vec<(&'u UsmapProperty, u8)>> {
+) -> Result<Vec<(&'u UsmapProperty, u8, &'u str)>> {
     // Campaign Evolved ships `Blam*TagDataAsset` classes that appear in neither
     // the `.usmap` nor the UHT dump (`BlamFrameEventListTagDataAsset` alone
     // covers 130 exports). They add no properties of their own over the shared
     // base, so decoding them against `BlamTagDataAssetBase` recovers the whole
     // property block rather than failing outright.
     usmap
-        .flattened_slots(class)
+        .flattened_owned_slots(class)
         .or_else(|| {
             (class.starts_with("Blam") && class.ends_with("TagDataAsset"))
-                .then(|| usmap.flattened_slots("BlamTagDataAssetBase"))
+                .then(|| usmap.flattened_owned_slots("BlamTagDataAssetBase"))
                 .flatten()
         })
         .with_context(|| format!("no .usmap schema for struct {class}"))
@@ -401,7 +425,7 @@ pub(super) fn flattened_schema<'u>(
 pub(super) fn read_struct_with_schema(
     r: &mut Reader,
     label: &str,
-    flat: &[(&UsmapProperty, u8)],
+    flat: &[(&UsmapProperty, u8, &str)],
     usmap: &Usmap,
     depth: usize,
 ) -> Result<PropertyBlock> {
@@ -419,7 +443,7 @@ pub(super) fn read_struct_with_schema(
     }
     let mut entries = Vec::with_capacity(header.present.len());
     for (idx, non_zero) in header.present {
-        let (prop, slot) = *flat
+        let (prop, slot, _) = *flat
             .get(idx)
             .with_context(|| format!("{class}: present schema index {idx} beyond {} props", flat.len()))?;
         let start = r.o;

@@ -2156,9 +2156,11 @@ pub(super) fn read_class_native_tail(
                 return Ok(true);
             }
             let Some(fields) = r.struct_fields.clone() else { return Ok(false) };
-            let schema: Vec<(&UsmapProperty, u8)> = fields
+            // The struct owns every field it declares, so it names itself as
+            // the owner for the native-bool lookup.
+            let schema: Vec<(&UsmapProperty, u8, &str)> = fields
                 .iter()
-                .flat_map(|f| (0..f.array_dim.max(1)).map(move |i| (f, i)))
+                .flat_map(|f| (0..f.array_dim.max(1)).map(move |i| (f, i, "UserDefinedStruct")))
                 .collect();
             let at = r.o;
             if read_struct_with_schema(r, "UserDefinedStruct default", &schema, usmap, 0).is_err() {

@@ -183,18 +183,31 @@ impl Usmap {
     /// happened to `MaterialInstance::PhysicalMaterialMap[8]` and the 90 other
     /// static-array properties the mappings declare.
     pub fn flattened_slots(&self, name: &str) -> Option<Vec<(&UsmapProperty, u8)>> {
+        Some(self.flattened_owned_slots(name)?.into_iter().map(|(p, i, _)| (p, i)).collect())
+    }
+
+    /// As [`Self::flattened_slots`], but also naming the struct that *declares*
+    /// each slot.
+    ///
+    /// Flattening deliberately loses this, and for reading it does not matter.
+    /// It matters for any fact that is a property of the declaration rather than
+    /// of the value — `bool` versus bitfield `uint8 b:1` being the one that
+    /// forced this, since a flattened name alone is ambiguous: 133 bool property
+    /// names in the engine headers are declared both ways by different structs.
+    pub fn flattened_owned_slots(&self, name: &str) -> Option<Vec<(&UsmapProperty, u8, &str)>> {
         // Walk from the most-derived class up to the root, emitting each
         // struct's own properties as we go (derived→base).
-        let mut out: Vec<(&UsmapProperty, u8)> = Vec::new();
+        let mut out: Vec<(&UsmapProperty, u8, &str)> = Vec::new();
         let mut cur = self.get(name)?;
         loop {
+            let owner: &str = &cur.name;
             // Each struct's own properties, in schema-index order, each
             // occupying `array_dim` slots.
             let mut own: Vec<&UsmapProperty> = cur.properties.iter().collect();
             own.sort_by_key(|p| p.schema_index);
             for p in own {
                 for i in 0..p.array_dim.max(1) {
-                    out.push((p, i));
+                    out.push((p, i, owner));
                 }
             }
             match cur.super_name.as_deref().and_then(|s| self.get(s)) {

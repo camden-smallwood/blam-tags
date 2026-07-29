@@ -93,6 +93,11 @@ fn main() {
     let archives: Vec<IoStoreArchive> =
         utocs.iter().filter_map(|u| IoStoreArchive::open(u).ok()).collect();
 
+    // Which *declaration* over-masks, not just which type. A type-level count
+    // says "1,795 object properties disagree"; a declaration-level one says
+    // which property to go read, which is the difference between a number and
+    // a lead.
+    let mut over_by_decl: BTreeMap<String, u64> = BTreeMap::new();
     // kind -> (agree, over-mask, under-mask)
     let mut tally: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
 
@@ -111,7 +116,7 @@ fn main() {
             for ex in &h.export_map {
                 let Some(class) = by_hash.get(&ex.class_index.raw_index()) else { continue };
                 let short = class.rsplit('.').next().unwrap_or(class);
-                let Some(flat) = usmap.flattened_slots(short) else { continue };
+                let Some(flat) = usmap.flattened_owned_slots(short) else { continue };
                 let off = h.summary.header_size as usize + ex.cooked_serial_offset as usize;
                 let end = (off + ex.cooked_serial_size as usize).min(b.len());
                 if off >= b.len() || off > end {
@@ -123,12 +128,17 @@ fn main() {
                 };
                 for entry in &block.entries {
                     let Some(slot) = entry.slot else { continue };
-                    let Some((prop, _)) = flat.get(slot.index as usize) else { continue };
+                    let Some((prop, _, owner)) = flat.get(slot.index as usize) else { continue };
                     let derived = should_save_as_zero(&prop.ty, &entry.value, &usmap);
                     let t = tally.entry(kind(&prop.ty)).or_default();
                     match (slot.zero_masked, derived) {
                         (a, b) if a == b => t.0 += 1,
-                        (false, true) => t.1 += 1,
+                        (false, true) => {
+                            t.1 += 1;
+                            *over_by_decl
+                                .entry(format!("{owner}::{} ({})", prop.name, kind(&prop.ty)))
+                                .or_default() += 1u64;
+                        }
                         (true, false) => t.2 += 1,
                         _ => unreachable!(),
                     }
@@ -150,6 +160,14 @@ fn main() {
 
     let mut rows: Vec<_> = tally.iter().filter(|(_, (_, o, u))| *o > 0 || *u > 0).collect();
     rows.sort_by_key(|(_, (_, o, u))| std::cmp::Reverse(o + u));
+    if !over_by_decl.is_empty() {
+        println!("\nover-masking declarations ({} distinct):", over_by_decl.len());
+        let mut v: Vec<_> = over_by_decl.iter().collect();
+        v.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+        for (k, n) in v.iter().take(30) {
+            println!("  {n:>10}  {k}");
+        }
+    }
     println!("\n{:<34} {:>12} {:>12} {:>12}", "type", "agree", "over", "under");
     for (k, (a, o, u)) in rows.iter().take(30) {
         println!("{k:<34} {a:>12} {o:>12} {u:>12}");
