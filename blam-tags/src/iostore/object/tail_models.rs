@@ -33,12 +33,12 @@
 //! is set, so the tail cannot be written without the property block — the two
 //! are not independent, and any tail model has to take the block as an input.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 use super::archive::{Ar, Reader};
 use super::common::read_bulk_array;
 use super::limits::MAX_NATIVE_COUNT;
-use super::value::{PropValue, PropertyBlock};
+use super::value::{FName, FStr, PropValue, PropertyBlock};
 
 /// A `TArray` written with `BulkSerialize`: element size, count, then
 /// `count × size` blittable bytes.
@@ -582,6 +582,300 @@ fn is_hierarchical(class: &str) -> bool {
     )
 }
 
+/// What a tail model needs beyond its own bytes.
+///
+/// Bulk payloads are referenced by an index into the *package's* bulk-data map,
+/// and whether one is inline is decided by comparing that entry's offset against
+/// the reader's position — which is a position in the whole export, not in the
+/// tail. So a model that touches bulk data needs both the map and where its
+/// slice starts.
+#[derive(Clone, Copy)]
+pub struct TailContext<'a> {
+    /// `(serial offset, serial size)` per bulk-data index.
+    pub bulk_data: &'a [(i64, i64)],
+    /// The tail's offset within the export payload.
+    pub origin: usize,
+}
+
+/// `FOptTexturePlatformData` (Texture.h:801, 5.5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OptTexturePlatformData {
+    pub ext_data: u32,
+    pub num_mips_in_tail: u32,
+}
+
+/// One mip of a cooked texture (`FTexture2DMipMap::Serialize`,
+/// Texture2D.cpp:150): the bulk-data handle, then the three dimensions.
+///
+/// `payload` holds the mip's actual pixel bytes when the cook inlined them. For
+/// a streaming mip the payload lives in the container's separate bulk chunk and
+/// only the index is written here, so there is nothing in the tail to hold.
+///
+/// The bytes are block-compressed and stay that way. They *are* the stored
+/// representation — decoding them to RGBA is a lossy interpretation that belongs
+/// in an API on top, not in the codec, and re-encoding could not reproduce them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextureMip {
+    pub bulk_index: i32,
+    pub payload: Option<Vec<u8>>,
+    pub size_x: i32,
+    pub size_y: i32,
+    pub size_z: i32,
+}
+
+/// One entry of `UTexture::SerializeCookedPlatformData`'s format list: a pixel
+/// format name, a skip offset, and the `FTexturePlatformData` behind it.
+///
+/// The skip offset is *not* stored. It is a delta from its own position to the
+/// end of the platform data, so it is a function of what follows and is
+/// recomputed on write — retaining it would let the model disagree with its own
+/// contents.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TexturePlatformData {
+    pub format_name: FName,
+    /// The cook can emit a derived-data *reference* instead of the data. Not
+    /// observed in this corpus; the model reports it rather than guessing.
+    pub using_derived_data: bool,
+    pub size_x: i32,
+    pub size_y: i32,
+    /// Packed slice count and the cube-map / opt-data / cpu-copy bits
+    /// (Texture.h:973).
+    pub packed_data: u32,
+    pub pixel_format: FStr,
+    pub opt_data: Option<OptTexturePlatformData>,
+    pub first_mip_to_serialize: i32,
+    pub mips: Vec<TextureMip>,
+    pub is_virtual: bool,
+}
+
+impl TexturePlatformData {
+    const BIT_HAS_OPT_DATA: u32 = 1 << 30;
+    const BIT_HAS_CPU_COPY: u32 = 1 << 29;
+
+    /// The 15 zero bytes the engine writes and then `check()`s are all zero
+    /// (TextureDerivedData.cpp). Regenerated rather than kept — a constant is
+    /// not data.
+    const PLACEHOLDER: usize = 15;
+}
+
+/// The cooked platform-data list shared by every texture class.
+///
+/// `UTexture2D` alone writes a `bSerializeMipData` flag between the cooked flag
+/// and the list; the other classes call the shared serializer directly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextureCookedData {
+    pub strip_flags: [u8; 2],
+    pub cooked: bool,
+    pub serialize_mip_data: Option<bool>,
+    pub formats: Vec<TexturePlatformData>,
+}
+
+impl TextureCookedData {
+    pub fn read(r: &mut Reader, ctx: TailContext, has_mip_data_flag: bool) -> Result<Self> {
+        let strip_flags = [r.u8()?, r.u8()?];
+        let cooked = r.u32()? != 0;
+        if !cooked {
+            return Ok(TextureCookedData {
+                strip_flags,
+                cooked,
+                serialize_mip_data: None,
+                formats: Vec::new(),
+            });
+        }
+        let serialize_mip_data = has_mip_data_flag.then(|| r.u32()).transpose()?.map(|v| v != 0);
+        let mip_data = serialize_mip_data.unwrap_or(true);
+        let mut formats = Vec::new();
+        loop {
+            let format_name = r.fname()?;
+            if format_name.as_str() == "None" {
+                return Ok(TextureCookedData {
+                    strip_flags,
+                    cooked,
+                    serialize_mip_data,
+                    formats,
+                });
+            }
+            let loc = r.o;
+            let skip = r.u64()? as i64;
+            let end = loc
+                .checked_add_signed(skip as isize)
+                .filter(|e| *e > r.o && *e <= r.b.len())
+                .with_context(|| format!("implausible texture SkipOffset {skip} @ {loc}"))?;
+            let mut pd = TexturePlatformData::read(r, ctx, mip_data, end)?;
+            pd.format_name = format_name;
+            formats.push(pd);
+            if r.o != end {
+                bail!("platform data ended at {} but its SkipOffset says {end}", r.o);
+            }
+        }
+    }
+
+    pub fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.u8(&mut self.strip_flags[0].to_owned())?;
+        ar.u8(&mut self.strip_flags[1].to_owned())?;
+        ar.u32(&mut u32::from(self.cooked))?;
+        if !self.cooked {
+            return Ok(());
+        }
+        match self.serialize_mip_data {
+            Some(v) => ar.u32(&mut u32::from(v))?,
+            None => {}
+        }
+        let mip_data = self.serialize_mip_data.unwrap_or(true);
+        for f in &self.formats {
+            ar.fname(&mut f.format_name.clone())?;
+            // The skip offset is a delta to the end of this platform data, so
+            // encode the body first and measure it.
+            let mut body = super::archive::Writer::new();
+            f.write_body(&mut body, mip_data)?;
+            let body = body.into_bytes();
+            ar.u64(&mut ((body.len() + 8) as u64))?;
+            let n = body.len();
+            ar.raw(&mut body.clone(), n)?;
+        }
+        ar.fname(&mut FName::none())?;
+        Ok(())
+    }
+}
+
+impl TexturePlatformData {
+    /// The caller owns the format name — it is read before the skip offset that
+    /// bounds this block — and assigns it after.
+    fn read(r: &mut Reader, ctx: TailContext, mip_data: bool, end: usize) -> Result<Self> {
+        let format_name = FName::none();
+        let using_derived_data = r.u8()? != 0;
+        if using_derived_data {
+            bail!("texture cooked to a derived-data reference, which is not modeled");
+        }
+        let placeholder = r.take(Self::PLACEHOLDER)?;
+        if placeholder.iter().any(|&b| b != 0) {
+            bail!("texture placeholder derived data is not zero");
+        }
+        let size_x = r.i32()?;
+        let size_y = r.i32()?;
+        let packed_data = r.u32()?;
+        let pixel_format = r.fstring()?;
+        let opt_data = if packed_data & Self::BIT_HAS_OPT_DATA != 0 {
+            Some(OptTexturePlatformData { ext_data: r.u32()?, num_mips_in_tail: r.u32()? })
+        } else {
+            None
+        };
+        if packed_data & Self::BIT_HAS_CPU_COPY != 0 {
+            bail!("texture carries a CPU copy, which is not modeled");
+        }
+        let first_mip_to_serialize = r.i32()?;
+        let num_mips = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "texture mips", r.o - 4)?
+        };
+        let mut mips = Vec::with_capacity(num_mips.min(32));
+        for _ in 0..num_mips {
+            mips.push(TextureMip::read(r, ctx, mip_data)?);
+        }
+        let is_virtual = r.u32()? != 0;
+        if is_virtual {
+            bail!("virtual texture data is not modeled");
+        }
+        let _ = end;
+        Ok(TexturePlatformData {
+            format_name,
+            using_derived_data,
+            size_x,
+            size_y,
+            packed_data,
+            pixel_format,
+            opt_data,
+            first_mip_to_serialize,
+            mips,
+            is_virtual,
+        })
+    }
+
+    fn write_body(&self, ar: &mut impl Ar, mip_data: bool) -> Result<()> {
+        ar.u8(&mut u8::from(self.using_derived_data))?;
+        ar.raw(&mut vec![0u8; Self::PLACEHOLDER], Self::PLACEHOLDER)?;
+        ar.i32(&mut self.size_x.to_owned())?;
+        ar.i32(&mut self.size_y.to_owned())?;
+        ar.u32(&mut self.packed_data.to_owned())?;
+        ar.fstring(&mut self.pixel_format.clone())?;
+        match (&self.opt_data, self.packed_data & Self::BIT_HAS_OPT_DATA != 0) {
+            (Some(o), true) => {
+                ar.u32(&mut o.ext_data.to_owned())?;
+                ar.u32(&mut o.num_mips_in_tail.to_owned())?;
+            }
+            (None, false) => {}
+            _ => bail!("opt data presence disagrees with the packed-data bit"),
+        }
+        ar.i32(&mut self.first_mip_to_serialize.to_owned())?;
+        ar.i32(&mut (self.mips.len() as i32))?;
+        for m in &self.mips {
+            m.write(ar, mip_data)?;
+        }
+        ar.u32(&mut u32::from(self.is_virtual))
+    }
+}
+
+impl TextureMip {
+    fn read(r: &mut Reader, ctx: TailContext, mip_data: bool) -> Result<Self> {
+        let mut bulk_index = 0;
+        let mut payload = None;
+        if mip_data {
+            bulk_index = r.i32()?;
+            let Some(&(offset, size)) = ctx.bulk_data.get(bulk_index.max(0) as usize) else {
+                bail!("texture mip: bulk data index {bulk_index} out of range");
+            };
+            // Inline exactly when the map says this payload lives here.
+            if offset as usize == ctx.origin + r.o {
+                payload = Some(r.take(size.max(0) as usize)?.to_vec());
+            }
+        }
+        Ok(TextureMip {
+            bulk_index,
+            payload,
+            size_x: r.i32()?,
+            size_y: r.i32()?,
+            size_z: r.i32()?,
+        })
+    }
+
+    fn write(&self, ar: &mut impl Ar, mip_data: bool) -> Result<()> {
+        if mip_data {
+            ar.i32(&mut self.bulk_index.to_owned())?;
+            if let Some(p) = &self.payload {
+                let n = p.len();
+                ar.raw(&mut p.clone(), n)?;
+            }
+        }
+        ar.i32(&mut self.size_x.to_owned())?;
+        ar.i32(&mut self.size_y.to_owned())?;
+        ar.i32(&mut self.size_z.to_owned())
+    }
+}
+
+/// The whole tail of a cooked texture export: `UTexture`'s strip flags, then the
+/// concrete class's cooked platform data.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextureChainTail {
+    /// `UTexture::Serialize` writes only its strip flags in a cooked stream.
+    pub texture_strip_flags: [u8; 2],
+    pub cooked: TextureCookedData,
+}
+
+impl TextureChainTail {
+    pub fn read(r: &mut Reader, ctx: TailContext, has_mip_data_flag: bool) -> Result<Self> {
+        Ok(TextureChainTail {
+            texture_strip_flags: [r.u8()?, r.u8()?],
+            cooked: TextureCookedData::read(r, ctx, has_mip_data_flag)?,
+        })
+    }
+
+    pub fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.u8(&mut self.texture_strip_flags[0].to_owned())?;
+        ar.u8(&mut self.texture_strip_flags[1].to_owned())?;
+        self.cooked.write(ar)
+    }
+}
+
 /// The classes whose whole tail chain this module models, for the gate to
 /// enumerate.
 pub const MODELED_TAILS: &[&str] = &[
@@ -590,6 +884,11 @@ pub const MODELED_TAILS: &[&str] = &[
     "FoliageInstancedStaticMeshComponent",
     "HLODInstancedStaticMeshComponent",
     "HierarchicalInstancedStaticMeshComponent",
+    "Texture2D",
+    "TextureCube",
+    "VolumeTexture",
+    "Texture2DArray",
+    "TextureLightProfile",
 ];
 
 /// Decode a modeled tail and re-emit it, for verification against the span it
@@ -601,6 +900,7 @@ pub fn roundtrip_tail(
     tail: &[u8],
     names: &[String],
     block: &PropertyBlock,
+    ctx: TailContext,
 ) -> Option<Result<Vec<u8>>> {
     match class {
         "StaticMeshComponent" => Some((|| {
@@ -625,6 +925,22 @@ pub fn roundtrip_tail(
             }
             let mut w = super::archive::Writer::new();
             modeled.write(&mut w, block)?;
+            Ok(w.into_bytes())
+        })()),
+        // `UTexture2D` alone writes a `bSerializeMipData` flag; the other cooked
+        // texture shapes call the shared serializer directly. `UTextureLightProfile`
+        // *derives* from `UTexture2D`, so it writes the flag too — treating it as
+        // a sibling of `UTextureCube` desynced all 7 of them.
+        "Texture2D" | "TextureCube" | "VolumeTexture" | "Texture2DArray"
+        | "TextureLightProfile" => Some((|| {
+            let mut r = Reader::new(tail, names);
+            let derives_from_texture_2d = matches!(class, "Texture2D" | "TextureLightProfile");
+            let modeled = TextureChainTail::read(&mut r, ctx, derives_from_texture_2d)?;
+            if r.o != tail.len() {
+                bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+            }
+            let mut w = super::archive::Writer::new();
+            modeled.write(&mut w)?;
             Ok(w.into_bytes())
         })()),
         _ => None,

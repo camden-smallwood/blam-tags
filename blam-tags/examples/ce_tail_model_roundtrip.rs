@@ -16,7 +16,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 
 use blam_tags::iostore::container_header::EIoContainerHeaderVersion;
-use blam_tags::iostore::object::unversioned::{read_export, roundtrip_tail, MODELED_TAILS};
+use blam_tags::iostore::object::unversioned::{
+    read_export, roundtrip_tail, TailContext, MODELED_TAILS,
+};
 use blam_tags::iostore::package::builder::read_payloads;
 use blam_tags::iostore::script_objects::ScriptObjects;
 use blam_tags::iostore::ue_types::EIoStoreTocVersion;
@@ -72,6 +74,10 @@ fn main() {
             };
             let Ok(payloads) = read_payloads(&h, &b) else { continue };
             let names = h.name_map.copy_raw_names();
+            // Texture mips reference their payloads through the package's
+            // bulk-data map, so the model needs it as context.
+            let bulk: Vec<(i64, i64)> =
+                h.bulk_data.iter().map(|x| (x.serial_offset, x.serial_size)).collect();
             for (i, ex) in h.export_map.iter().enumerate() {
                 let Some(class) = by_hash.get(&ex.class_index.raw_index()) else { continue };
                 let short = class.rsplit('.').next().unwrap_or(class);
@@ -91,7 +97,11 @@ fn main() {
                 let s = stats.entry(short.to_string()).or_default();
                 s.0 += 1;
                 let Some(block) = parts.block.as_ref() else { continue };
-                match roundtrip_tail(short, &parts.tail, &names, block) {
+                let ctx = TailContext {
+                    bulk_data: &bulk,
+                    origin: payloads[i].len() - parts.tail.len(),
+                };
+                match roundtrip_tail(short, &parts.tail, &names, block, ctx) {
                     Some(Ok(out)) if out == parts.tail => {
                         s.1 += 1;
                         s.3 += parts.tail.len() as u64;
