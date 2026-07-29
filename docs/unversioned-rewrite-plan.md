@@ -912,55 +912,56 @@ The goal is total coverage: every byte of a cooked package produced from typed
 values, with an API that is pleasant to use. Retention is not acceptable as an
 end state; it was scaffolding that made each conversion verifiable.
 
-### 7.1 What done means, and why it is two numbers
+### 7.1 What done means: the model is the truth, and nothing is retained
 
 The target is **Level 2**: every byte produced from typed models *and* the
-compressed payloads decoded into meaning, so a caller can edit geometry,
-collision, pixels and animation rather than replace them wholesale.
+compressed payloads decoded into meaning, so geometry, collision, pixels and
+animation can be edited rather than replaced wholesale.
 
-That cannot be one number, and assuming it could is the trap to avoid. For a
-lossily-compressed payload, "regenerate the exact bytes" and "decode into
-values" are different goals and the second does not imply the first — BC texture
-compression is lossy by construction, so decoding a mip to pixels and
-re-compressing cannot reproduce the original blocks. Nanite re-encoding is
-deterministic in principle but would mean reproducing every heuristic in UE's
-encoder bit for bit.
+**The typed model is the only source of truth. Nothing is retained.** An earlier
+draft of this section proposed keeping the original bytes alongside the decoded
+form and writing them back while a dirty flag stayed clear. That is wrong twice
+over. It makes the bytes the real representation and the model a cache, which is
+the opposite of a codec — and the flag is a correctness landmine, because
+anything that mutates a nested field without setting it silently writes stale
+data. Mutability and serialization are the whole point; a design that only works
+while nobody edits anything defeats both.
 
-So the architecture has to keep both representations:
+So `Export.tail` and `BlockLayout::Native` are **scaffolding**. They exist today
+so each conversion can be checked against the bytes it replaces, and each one is
+deleted as its model lands. The end state retains nothing.
 
-```rust
-/// A payload the engine stores compressed.
-pub struct Compressed<T> {
-    /// Exactly as the file stores it. Written back verbatim while clean, which
-    /// is what keeps the byte-exact gate at 100%.
-    source: Vec<u8>,
-    /// Decoded on demand.
-    decoded: OnceCell<T>,
-    /// Set once the decoded form is edited; the writer then re-encodes.
-    dirty: bool,
-}
+#### The contract for a lossy payload
+
+Byte-identity with the original cooker output is not the contract, because for a
+lossy codec it is not achievable — BC compression discards information by
+construction. The contract is that **the data survives a round trip**:
+
+```text
+decode(encode(decode(bytes))) == decode(bytes)
 ```
 
-Unmodified data round-trips byte-for-byte because the source is what goes out.
-Edited data is re-encoded and is *not* byte-identical to the original — which is
-correct, not a failure, and is exactly what a game's own cooker would produce
-from changed input.
+Whatever we could read out originally, we can still read out after writing. That
+is what makes the model trustworthy as the source of truth, and it holds whether
+or not the bytes match.
 
-Three gates, measuring three different claims:
+Where an encoder is deterministic and faithfully ported, byte-identity comes out
+as a *bonus* and is worth measuring — it is the strongest evidence a model is
+complete. It is simply not the bar every payload has to clear.
 
-| Gate | Claim | Now |
-|---|---|---|
-| `ce_export_roundtrip` | every export rebuilds byte-identically | **100%** |
-| `ce_decode_coverage` | share of bytes behind a *typed semantic model* rather than a blob | to build |
-| `ce_recode_stability` | per codec, decode→encode→decode is stable | to build |
+#### The gates
 
-The second is the one that moves as Level 2 lands, and it is the honest measure
-of "covers everything". The third is how a lossy codec is held to account, since
-byte-idempotence is not available to it.
+| Gate | Claim | Applies to | Now |
+|---|---|---|---|
+| `ce_semantic_roundtrip` | `decode(encode(decode(x))) == decode(x)` | **everything** — the required bar | to build |
+| `ce_export_roundtrip` | bytes identical to the cooker's | everything lossless | 100% |
+| `ce_decode_coverage` | share of bytes behind a typed model rather than a blob | tracks Level 2 progress | to build |
 
-Retention stays as `BlockLayout::Native` and `Export.tail` until a model
-replaces it, because that is what makes every conversion checkable against the
-bytes it replaces.
+Every class must reach `ce_semantic_roundtrip`. Every class *without* a lossy
+payload should also hold `ce_export_roundtrip`, and a regression there is a real
+failure rather than an accepted cost — so that gate reports per class, and a
+class moving out of byte-exactness has to be one that genuinely contains a lossy
+codec.
 
 ### 7.2 Inventory (measured, `ce_foundation_inventory`)
 
@@ -1051,7 +1052,7 @@ but unreachable from the edit path; make the recovered `FField` chain a
 first-class schema source.
 
 **H. Compressed payload codecs (Level 2).** Each is decode *and* re-encode,
-held to `ce_recode_stability` rather than to byte-identity:
+held to `ce_semantic_roundtrip` rather than to byte-identity:
 
 * **H1 Texture mips** (584 MiB, `Texture2D`/`TextureCube`). Cheapest by far —
   `bitmap/decode.rs` and `bitmap/format.rs` already decode BC/DXT for Halo
@@ -1116,9 +1117,9 @@ never touches a `PropValue` unless they want to.
 
 ### 7.7 Sequencing
 
-1. **`ce_decode_coverage`** — the number that says how far along Level 2 is,
-   and **`ce_recode_stability`**, which is how a lossy codec gets held to
-   account. Build both first; everything after moves them.
+1. **`ce_semantic_roundtrip`** — the contract every model must meet — and
+   **`ce_decode_coverage`**, the number that says how far along Level 2 is.
+   Build both first; everything after moves them.
 2. **A** (23 hand-written structs) — closes a whole population and deletes
    `BlockLayout::Native`.
 3. **C**, **D**, **G** — the three declining arms, the 22 citations, and the
