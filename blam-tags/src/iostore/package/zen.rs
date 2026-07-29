@@ -41,6 +41,43 @@ pub struct FZenPackageSummary {
     graph_data_size: i32,
 }
 impl FZenPackageSummary {
+    /// The header's sections and the offset each starts at, in file order.
+    ///
+    /// Read-only on purpose: every one of these is *derived* by
+    /// [`FZenPackageHeader::serialize`], which seeks back and patches them once
+    /// the real positions are known, so a caller that set one would only be
+    /// overwritten — or, worse, believed. Exposing them as a view gives
+    /// diagnostics (which section did a byte difference land in?) what it needs
+    /// without implying they are inputs.
+    pub fn section_offsets(&self) -> [(&'static str, i32); 9] {
+        [
+            ("name-map-names", self.name_map_names_offset),
+            ("name-map-hashes", self.name_map_hashes_offset),
+            ("imported-public-export-hashes", self.imported_public_export_hashes_offset),
+            ("import-map", self.import_map_offset),
+            ("export-map", self.export_map_offset),
+            ("export-bundle-entries", self.export_bundle_entries_offset),
+            ("graph-data", self.graph_data_offset),
+            ("dependency-bundle-headers", self.dependency_bundle_headers_offset),
+            ("dependency-bundle-entries", self.dependency_bundle_entries_offset),
+        ]
+    }
+
+    /// Which header section a byte offset falls in — the last section that
+    /// starts at or before it. `None` once past the header entirely.
+    pub fn section_at(&self, at: usize) -> Option<&'static str> {
+        if at >= self.header_size as usize {
+            return None;
+        }
+        let mut best: Option<(&'static str, i32)> = None;
+        for (name, off) in self.section_offsets() {
+            if off > 0 && (off as usize) <= at && best.is_none_or(|(_, b)| off >= b) {
+                best = Some((name, off));
+            }
+        }
+        Some(best.map_or("summary", |(n, _)| n))
+    }
+
     fn deserialize<S: Read>(s: &mut S, container_header_version: EIoContainerHeaderVersion) -> Result<Self> {
         let mut has_versioning_info: u32 = 0;
         let mut header_size: u32 = 0;

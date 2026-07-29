@@ -5,6 +5,7 @@
 //! knows the *extent* of each export's serial data but nothing about the bytes
 //! inside it; that is [`super::object`]'s business.
 
+pub mod builder;
 pub mod name_map;
 pub mod script_objects;
 pub mod ser;
