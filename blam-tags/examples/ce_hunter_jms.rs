@@ -115,7 +115,7 @@ fn main(){
     }
     eprintln!("[T] collect {:.2}s = read {:.2}s ({n_read}) + bulk {:.2}s ({n_bulk}) + decode {:.2}s ; {} uniq SK, {} uniq SM",t_collect.elapsed().as_secs_f32(),t_read.as_secs_f32(),t_bulk.as_secs_f32(),t_dec.as_secs_f32(),skc.len(),smc.len());
     let parts:Vec<UeMeshPart>=sk.iter().map(|(r,p,n,m,mt)|UeMeshPart{mesh:&**m,region:r.clone(),permutation:p.clone(),name:n.clone(),material_names:mt.clone()}).collect();
-    let sparts:Vec<UeStaticPart>=sm.iter().map(|(r,p,n,m,b,mt,x)|UeStaticPart{mesh:&**m,bone_name:b.clone(),region:r.clone(),permutation:p.clone(),name:n.clone(),material_names:mt.clone(),rel_transform:*x}).collect();
+    let sparts:Vec<UeStaticPart>=sm.iter().map(|(r,p,n,m,b,mt,x)|UeStaticPart{mesh:&**m,bone_name:b.clone(),region:r.clone(),permutation:p.clone(),name:n.clone(),material_names:mt.clone(),rel_transform:*x,world_anchor:None}).collect();
     println!("{key}: {} sk + {} sm parts",parts.len(),sparts.len());
     if std::env::var("PARTS").is_ok(){
         println!("=== SKELETAL parts (region/perm | asset | verts | bbox centroid) ===");
@@ -152,11 +152,11 @@ fn main(){
         }
     }
     let t_rm=std::time::Instant::now();
-    let (_rm,rmeshes)=blam_tags::render_model::RenderModel::from_ue_meshes(&parts,&sparts,&skel).expect("rm");
+    let (_rm,rmeshes)=blam_tags::render_model::RenderModel::from_ue_meshes(&parts,&sparts,&[],&skel).expect("rm");
     let rmtris:usize=rmeshes.iter().map(|m|m.vertices.len()).sum();
     eprintln!("[T] RenderModel bake {:.2}s ({} meshes, {rmtris} verts)",t_rm.elapsed().as_secs_f32(),rmeshes.len());
     let t_jms=std::time::Instant::now();
-    let jms=JmsFile::from_ue_meshes(&parts,&sparts,&skel).expect("jms");
+    let jms=JmsFile::from_ue_meshes(&parts,&sparts,&[],&skel).expect("jms");
     eprintln!("[T] jms bake {:.2}s",t_jms.elapsed().as_secs_f32());
     println!("jms: {} nodes, {} materials, {} markers, {} verts, {} tris",jms.nodes.len(),jms.materials.len(),jms.markers.len(),jms.vertices.len(),jms.triangles.len());
     // check for empty/space material names

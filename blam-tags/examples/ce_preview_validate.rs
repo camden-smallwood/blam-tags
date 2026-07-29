@@ -40,9 +40,9 @@ fn main(){
         for m in regions.static_meshes(region,perm){if let Some(b)=read_pkg(&m.package){if let Ok(h)=FZenPackageHeader::deserialize(&mut Cursor::new(&b[..]),None,CV,HV,None){if let Ok(mesh)=StaticMesh::from_package(&b,h.summary.header_size as usize){sm_store.push((region.clone(),perm.clone(),m.asset.clone(),mesh,m.parent_bone.clone()));}}}}
     }
     let parts:Vec<UeMeshPart>=sk_store.iter().map(|(r,p,n,m)|UeMeshPart{mesh:m,region:r.clone(),permutation:p.clone(),name:n.clone(),material_names:vec![]}).collect();
-    let sparts:Vec<UeStaticPart>=sm_store.iter().map(|(r,p,n,m,b)|UeStaticPart{mesh:m,bone_name:b.clone(),region:r.clone(),permutation:p.clone(),name:n.clone(),material_names:vec![]}).collect();
+    let sparts:Vec<UeStaticPart>=sm_store.iter().map(|(r,p,n,m,b)|UeStaticPart{mesh:m,bone_name:b.clone(),region:r.clone(),permutation:p.clone(),name:n.clone(),material_names:vec![],rel_transform:Default::default(),world_anchor:None}).collect();
     println!("collected {} skeletal + {} static parts",parts.len(),sparts.len());
-    let (rm,meshes)=RenderModel::from_ue_meshes(&parts,&sparts,&skel).expect("synth");
+    let (rm,meshes)=RenderModel::from_ue_meshes(&parts,&sparts,&[],&skel).expect("synth");
     println!("render_model: {} meshes, {} nodes, {} regions",meshes.len(),rm.nodes.len(),rm.regions.len());
     for reg in &rm.regions{ for p in &reg.permutations{ if p.mesh_count>0 && needed.contains(&(reg.name.to_ascii_lowercase(),p.name.to_ascii_lowercase())){ println!("  {}/{}: mesh[{}..{}] ({} meshes)",reg.name,p.name,p.mesh_index,p.mesh_index+p.mesh_count,p.mesh_count);}}}
     // bbox of all meshes referenced by needed perms
