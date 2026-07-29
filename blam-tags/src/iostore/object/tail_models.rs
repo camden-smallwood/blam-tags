@@ -2023,6 +2023,382 @@ impl StaticMeshTail {
     }
 }
 
+/// A Chaos shared pointer as written by `FChaosArchive`.
+///
+/// The tag is an object-graph identity: the *first* time a tag appears its object
+/// follows, and a repeat is a back-reference with nothing behind it. So the model
+/// records whether the payload was there rather than re-deriving it, which is
+/// what lets a single pointer be written without replaying the whole graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChaosPtr {
+    pub present: bool,
+    pub tag: Option<i32>,
+    /// The object's own bytes — Chaos's recursive implicit-object or BVH
+    /// encoding, kept whole. Its own serializer owns the interior.
+    pub payload: Option<Vec<u8>>,
+}
+
+impl ChaosPtr {
+    fn read(
+        r: &mut Reader,
+        seen: &mut std::collections::HashSet<i32>,
+        read_body: impl FnOnce(&mut Reader) -> Result<()>,
+    ) -> Result<Self> {
+        if r.u32()? == 0 {
+            return Ok(ChaosPtr { present: false, tag: None, payload: None });
+        }
+        let tag = r.i32()?;
+        if !seen.insert(tag) {
+            return Ok(ChaosPtr { present: true, tag: Some(tag), payload: None });
+        }
+        let at = r.o;
+        read_body(r)?;
+        Ok(ChaosPtr { present: true, tag: Some(tag), payload: Some(r.b[at..r.o].to_vec()) })
+    }
+
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        if !self.present {
+            return ar.u32(&mut 0);
+        }
+        ar.u32(&mut 1)?;
+        let Some(tag) = self.tag else { bail!("a present Chaos pointer has no tag") };
+        ar.i32(&mut tag.to_owned())?;
+        if let Some(p) = &self.payload {
+            let n = p.len();
+            ar.raw(&mut p.clone(), n)?;
+        }
+        Ok(())
+    }
+}
+
+/// One attribute's values inside an `FManagedArrayCollection`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedArrayValues {
+    /// Written with `BulkSerialize`, so it carries its own element size.
+    Bulk { element_size: i32, data: Vec<u8> },
+    Strings(Vec<FStr>),
+    /// An array of arrays of fixed-width elements.
+    Nested { element_size: usize, arrays: Vec<Vec<u8>> },
+    Fixed(FixedArray),
+    /// Chaos implicit objects or BVH particles, one shared pointer each.
+    ChaosPointers(Vec<ChaosPtr>),
+}
+
+/// One attribute of an `FManagedArrayCollection`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedArrayAttribute {
+    /// The attribute `FName` then the group `FName`.
+    pub key: [u8; 16],
+    pub value_type_version: i32,
+    pub type_id: i32,
+    /// `GroupIndexDependency` `FName` and `bPersistent`.
+    pub group_dependency: [u8; 12],
+    pub array_version: i32,
+    pub values: ManagedArrayValues,
+}
+
+/// `FManagedArrayCollection` — the attribute store a geometry collection is
+/// built out of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedArrayCollection {
+    pub version: i32,
+    /// An `FName` key and an `FGroupInfo` per group.
+    pub groups: FixedArray,
+    pub attributes: Vec<ManagedArrayAttribute>,
+}
+
+impl ManagedArrayCollection {
+    fn read(r: &mut Reader) -> Result<Self> {
+        use super::tails::{
+            managed_array_elem, managed_array_is_bulk, managed_array_nested_elem,
+            read_bvh_particles, read_chaos_implicit_object, MANAGED_ARRAY_TYPES,
+        };
+        let version = r.i32()?;
+        let groups = FixedArray::read(r, "collection groups", 16)?;
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "collection attributes", r.o - 4)?
+        };
+        // One dedup set for the whole collection: a Chaos tag seen under one
+        // attribute is a back-reference when it reappears under another.
+        let mut seen = std::collections::HashSet::new();
+        let mut attributes = Vec::with_capacity(n.min(256));
+        for _ in 0..n {
+            let key: [u8; 16] = r.take(16)?.try_into().expect("16 bytes");
+            let value_type_version = r.i32()?;
+            let type_id = r.i32()?;
+            let group_dependency = r.take(12)?.try_into().expect("12 bytes");
+            let name = MANAGED_ARRAY_TYPES.get(type_id as usize).copied().unwrap_or("?");
+            let array_version = r.i32()?;
+            let count = |r: &mut Reader, what: &str| -> Result<usize> {
+                let n = r.i32()?;
+                super::limits::bounded(n, MAX_NATIVE_COUNT, what, r.o - 4)
+            };
+            let values = if managed_array_is_bulk(name) {
+                let element_size = r.i32()?;
+                let n = r.i32()?;
+                if element_size < 0 || n < 0 {
+                    bail!("implausible bulk managed array {element_size}x{n} @ {}", r.o - 8);
+                }
+                let bytes = (element_size as usize) * (n as usize);
+                ManagedArrayValues::Bulk { element_size, data: r.take(bytes)?.to_vec() }
+            } else if name == "String" {
+                let n = count(r, "collection strings")?;
+                ManagedArrayValues::Strings((0..n).map(|_| r.fstring()).collect::<Result<_>>()?)
+            } else if let Some(inner) = managed_array_nested_elem(name) {
+                let n = count(r, "collection nested array")?;
+                let mut arrays = Vec::with_capacity(n.min(256));
+                for _ in 0..n {
+                    let m = count(r, "collection nested element")?;
+                    arrays.push(r.take(m * inner)?.to_vec());
+                }
+                ManagedArrayValues::Nested { element_size: inner, arrays }
+            } else if let Some(sz) = managed_array_elem(name) {
+                ManagedArrayValues::Fixed(FixedArray::read(r, "collection array", sz)?)
+            } else if name == "ImplicitObjectRefCountedPtr" || name == "ConvexRefCountedPtr" {
+                let n = count(r, "collection implicit objects")?;
+                let mut ptrs = Vec::with_capacity(n.min(256));
+                for _ in 0..n {
+                    ptrs.push(ChaosPtr::read(r, &mut seen, read_chaos_implicit_object)?);
+                }
+                ManagedArrayValues::ChaosPointers(ptrs)
+            } else if name == "BVHParticlesFloat3UniquePointer" {
+                let n = count(r, "collection BVH particles")?;
+                let mut ptrs = Vec::with_capacity(n.min(256));
+                for _ in 0..n {
+                    ptrs.push(ChaosPtr::read(r, &mut seen, read_bvh_particles)?);
+                }
+                ManagedArrayValues::ChaosPointers(ptrs)
+            } else {
+                bail!("unmodeled managed array type {name} ({type_id}) @ {}", r.o);
+            };
+            attributes.push(ManagedArrayAttribute {
+                key,
+                value_type_version,
+                type_id,
+                group_dependency,
+                array_version,
+                values,
+            });
+        }
+        Ok(ManagedArrayCollection { version, groups, attributes })
+    }
+
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.i32(&mut self.version.to_owned())?;
+        self.groups.write(ar)?;
+        ar.i32(&mut (self.attributes.len() as i32))?;
+        for a in &self.attributes {
+            ar.raw(&mut a.key.to_vec(), 16)?;
+            ar.i32(&mut a.value_type_version.to_owned())?;
+            ar.i32(&mut a.type_id.to_owned())?;
+            ar.raw(&mut a.group_dependency.to_vec(), 12)?;
+            ar.i32(&mut a.array_version.to_owned())?;
+            match &a.values {
+                ManagedArrayValues::Bulk { element_size, data } => {
+                    if *element_size > 0 && data.len() % *element_size as usize != 0 {
+                        bail!("bulk managed array of {element_size} has {} bytes", data.len());
+                    }
+                    ar.i32(&mut element_size.to_owned())?;
+                    let n = if *element_size > 0 {
+                        (data.len() / *element_size as usize) as i32
+                    } else {
+                        0
+                    };
+                    ar.i32(&mut n.to_owned())?;
+                    let len = data.len();
+                    ar.raw(&mut data.clone(), len)?;
+                }
+                ManagedArrayValues::Strings(v) => {
+                    ar.i32(&mut (v.len() as i32))?;
+                    for s in v {
+                        ar.fstring(&mut s.clone())?;
+                    }
+                }
+                ManagedArrayValues::Nested { element_size, arrays } => {
+                    ar.i32(&mut (arrays.len() as i32))?;
+                    for inner in arrays {
+                        if *element_size == 0 || inner.len() % element_size != 0 {
+                            bail!("nested managed array element size disagrees with its bytes");
+                        }
+                        ar.i32(&mut ((inner.len() / element_size) as i32))?;
+                        let n = inner.len();
+                        ar.raw(&mut inner.clone(), n)?;
+                    }
+                }
+                ManagedArrayValues::Fixed(f) => f.write(ar)?,
+                ManagedArrayValues::ChaosPointers(v) => {
+                    ar.i32(&mut (v.len() as i32))?;
+                    for p in v {
+                        p.write(ar)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `FGeometryCollectionMeshResources` plus its description.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeometryCollectionMesh {
+    /// The index buffer comes **first** here, unlike `FStaticMeshLODResources`,
+    /// and each buffer writes its own strip flags because they are serialized
+    /// individually rather than under one shared set.
+    pub index_buffer: RawStaticIndexBuffer,
+    /// `FPositionVertexBuffer::Serialize` has **no** strip flags.
+    pub position_stride: i32,
+    pub position_num_vertices: i32,
+    pub positions: BulkArray,
+    pub vertex_strip: [u8; 2],
+    pub vertex_header: [u8; 16],
+    pub tangents_and_uvs: Option<(BulkArray, BulkArray)>,
+    pub color_strip: [u8; 2],
+    pub color_stride: i32,
+    pub color_num_vertices: i32,
+    pub colors: Option<BulkArray>,
+    /// `FBoneMapVertexBuffer::Serialize` has no strip flags either.
+    pub bone_map_num_vertices: i32,
+    pub bone_map: BulkArray,
+    pub description_num_vertices: i32,
+    pub description_num_triangles: i32,
+    pub pre_skinned_bounds: [u8; 56],
+    /// `Sections`, `SectionsNoInternal`, `SubSections` — 20-byte
+    /// `FGeometryCollectionMeshElement` each.
+    pub sections: [FixedArray; 3],
+}
+
+/// `UGeometryCollection`'s tail: the managed array collection, then the cooked
+/// render data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeometryCollectionTail {
+    pub is_cooked_or_cooking: u32,
+    pub collection: ManagedArrayCollection,
+    pub cooked: bool,
+    pub mesh: Option<GeometryCollectionMesh>,
+    pub nanite: Option<NaniteResources>,
+}
+
+impl GeometryCollectionTail {
+    pub fn read(r: &mut Reader) -> Result<Self> {
+        let is_cooked_or_cooking = r.u32()?;
+        let collection = ManagedArrayCollection::read(r)?;
+        let cooked = r.u32()? != 0;
+        let (mut mesh, mut nanite) = (None, None);
+        if cooked {
+            let has_mesh = r.u32()? != 0;
+            let has_nanite = r.u32()? != 0;
+            if has_mesh {
+                let index_buffer = RawStaticIndexBuffer::read(r)?;
+                let position_stride = r.i32()?;
+                let position_num_vertices = r.i32()?;
+                let positions = BulkArray::read(r, "collection positions")?;
+                let vertex_strip = [r.u8()?, r.u8()?];
+                let vertex_header: [u8; 16] = r.take(16)?.try_into().expect("16 bytes");
+                let tangents_and_uvs = (vertex_strip[0] & 2 == 0)
+                    .then(|| -> Result<(BulkArray, BulkArray)> {
+                        Ok((
+                            BulkArray::read(r, "collection tangents")?,
+                            BulkArray::read(r, "collection UVs")?,
+                        ))
+                    })
+                    .transpose()?;
+                let color_strip = [r.u8()?, r.u8()?];
+                let color_stride = r.i32()?;
+                let color_num_vertices = r.i32()?;
+                let colors = (color_strip[0] & 2 == 0 && color_num_vertices > 0)
+                    .then(|| BulkArray::read(r, "collection vertex colours"))
+                    .transpose()?;
+                let bone_map_num_vertices = r.i32()?;
+                let bone_map = BulkArray::read(r, "collection bone map")?;
+                let description_num_vertices = r.i32()?;
+                let description_num_triangles = r.i32()?;
+                let pre_skinned_bounds = r.take(56)?.try_into().expect("56 bytes");
+                let sections = [
+                    FixedArray::read(r, "Sections", 20)?,
+                    FixedArray::read(r, "SectionsNoInternal", 20)?,
+                    FixedArray::read(r, "SubSections", 20)?,
+                ];
+                mesh = Some(GeometryCollectionMesh {
+                    index_buffer,
+                    position_stride,
+                    position_num_vertices,
+                    positions,
+                    vertex_strip,
+                    vertex_header,
+                    tangents_and_uvs,
+                    color_strip,
+                    color_stride,
+                    color_num_vertices,
+                    colors,
+                    bone_map_num_vertices,
+                    bone_map,
+                    description_num_vertices,
+                    description_num_triangles,
+                    pre_skinned_bounds,
+                    sections,
+                });
+            }
+            if has_nanite {
+                nanite = Some(NaniteResources::read(r)?);
+            }
+        }
+        Ok(GeometryCollectionTail { is_cooked_or_cooking, collection, cooked, mesh, nanite })
+    }
+
+    pub fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.u32(&mut self.is_cooked_or_cooking.to_owned())?;
+        self.collection.write(ar)?;
+        ar.u32(&mut u32::from(self.cooked))?;
+        if !self.cooked {
+            if self.mesh.is_some() || self.nanite.is_some() {
+                bail!("render data present on an uncooked geometry collection");
+            }
+            return Ok(());
+        }
+        ar.u32(&mut u32::from(self.mesh.is_some()))?;
+        ar.u32(&mut u32::from(self.nanite.is_some()))?;
+        if let Some(m) = &self.mesh {
+            m.index_buffer.write(ar)?;
+            ar.i32(&mut m.position_stride.to_owned())?;
+            ar.i32(&mut m.position_num_vertices.to_owned())?;
+            m.positions.write(ar)?;
+            ar.u8(&mut m.vertex_strip[0].to_owned())?;
+            ar.u8(&mut m.vertex_strip[1].to_owned())?;
+            ar.raw(&mut m.vertex_header.to_vec(), 16)?;
+            match (&m.tangents_and_uvs, m.vertex_strip[0] & 2 == 0) {
+                (Some((t, u)), true) => {
+                    t.write(ar)?;
+                    u.write(ar)?;
+                }
+                (None, false) => {}
+                _ => bail!("tangent/UV presence disagrees with the vertex strip flags"),
+            }
+            ar.u8(&mut m.color_strip[0].to_owned())?;
+            ar.u8(&mut m.color_strip[1].to_owned())?;
+            ar.i32(&mut m.color_stride.to_owned())?;
+            ar.i32(&mut m.color_num_vertices.to_owned())?;
+            match (&m.colors, m.color_strip[0] & 2 == 0 && m.color_num_vertices > 0) {
+                (Some(c), true) => c.write(ar)?,
+                (None, false) => {}
+                _ => bail!("colour presence disagrees with the colour buffer's flags"),
+            }
+            ar.i32(&mut m.bone_map_num_vertices.to_owned())?;
+            m.bone_map.write(ar)?;
+            ar.i32(&mut m.description_num_vertices.to_owned())?;
+            ar.i32(&mut m.description_num_triangles.to_owned())?;
+            ar.raw(&mut m.pre_skinned_bounds.to_vec(), 56)?;
+            for s in &m.sections {
+                s.write(ar)?;
+            }
+        }
+        if let Some(n) = &self.nanite {
+            n.write(ar)?;
+        }
+        Ok(())
+    }
+}
+
 /// One vtable patch table inside a shader map's pointer table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VTablePatchTable {
@@ -4196,6 +4572,16 @@ pub fn roundtrip_tail(
                     }
                     None => w.u32(&mut 0)?,
                 }
+                Ok(w.into_bytes())
+            })()),
+            "GeometryCollection" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let modeled = GeometryCollectionTail::read(&mut r)?;
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                modeled.write(&mut w)?;
                 Ok(w.into_bytes())
             })()),
             "NiagaraScript" => Some((|| {
