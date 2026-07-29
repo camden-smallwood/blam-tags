@@ -1043,12 +1043,17 @@ and fifteen with under a thousand spans each. `BlockLayout::Native` is deleted
 when the last one lands.
 
 **B. Tail arms → typed models (64 arms + 42 helpers, 4.77 GiB).** *Started.
-291,779 tails, 1.12 GiB, 100% exact — the instanced-static-mesh family (546 MB)
-and the whole texture family (628 MB, including virtual textures and CPU
-copies). What remains at the top of `ce_tail_census` is `StaticMesh` (Nanite,
-1,310 MiB), `BodySetup` (Chaos, 1,051), `SkeletalMesh` (470),
-`MaterialInstanceConstant` (249, inline shader maps), `AnimSequence` (ACL, 172)
-and `GeometryCollection` (144) — four of those six are work item H.*
+333,264 tails, 1.48 GiB, 100% exact — the instanced-static-mesh family (546 MB),
+the whole texture family (628 MB, virtual textures and CPU copies included), and
+the whole material family (385 MB). What remains at the top of `ce_tail_census`
+is `StaticMesh` (Nanite, 1,310 MiB), `BodySetup` (Chaos, 1,051), `SkeletalMesh`
+(470), `AnimSequence` (ACL, 172) and `GeometryCollection` (144) — four of those
+five are work item H.*
+
+*Also: `walk_export`'s `stopped` only ever meant "an arm declined", never "the
+walk reached the end". `ce_tail_stop_census` now measures bytes consumed, which
+found five classes silently leaving 19,132 bytes unread. Both measures are now
+100%.*
 Sequence by bytes so the regeneration gate moves early, but the batches are
 arms, not classes:
 
