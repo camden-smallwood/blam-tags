@@ -597,6 +597,20 @@ pub struct TailContext<'a> {
     pub origin: usize,
 }
 
+/// A texture's CPU-side copy (`FSharedImage`, an `FImage`; ImageCore.h:412).
+///
+/// `RawData` is a `TArray64<uint8>`, so its count is 64-bit — the one place in
+/// the texture tail that is not a 32-bit count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextureCpuCopy {
+    pub size_x: i32,
+    pub size_y: i32,
+    pub num_slices: i32,
+    pub format: u8,
+    pub gamma_space: u8,
+    pub raw_data: Vec<u8>,
+}
+
 /// `FOptTexturePlatformData` (Texture.h:801, 5.5.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OptTexturePlatformData {
@@ -643,9 +657,12 @@ pub struct TexturePlatformData {
     pub packed_data: u32,
     pub pixel_format: FStr,
     pub opt_data: Option<OptTexturePlatformData>,
+    pub cpu_copy: Option<TextureCpuCopy>,
     pub first_mip_to_serialize: i32,
     pub mips: Vec<TextureMip>,
-    pub is_virtual: bool,
+    /// A virtual texture writes no mips at all; its data is the built-data block
+    /// that follows the flag.
+    pub virtual_data: Option<VirtualTextureBuiltData>,
 }
 
 impl TexturePlatformData {
@@ -760,9 +777,22 @@ impl TexturePlatformData {
         } else {
             None
         };
-        if packed_data & Self::BIT_HAS_CPU_COPY != 0 {
-            bail!("texture carries a CPU copy, which is not modeled");
-        }
+        let cpu_copy = if packed_data & Self::BIT_HAS_CPU_COPY != 0 {
+            let (size_x, size_y, num_slices) = (r.i32()?, r.i32()?, r.i32()?);
+            let format = r.u8()?;
+            let gamma_space = r.u8()?;
+            let n = r.u64()? as usize;
+            Some(TextureCpuCopy {
+                size_x,
+                size_y,
+                num_slices,
+                format,
+                gamma_space,
+                raw_data: r.take(n)?.to_vec(),
+            })
+        } else {
+            None
+        };
         let first_mip_to_serialize = r.i32()?;
         let num_mips = {
             let n = r.i32()?;
@@ -772,10 +802,8 @@ impl TexturePlatformData {
         for _ in 0..num_mips {
             mips.push(TextureMip::read(r, ctx, mip_data)?);
         }
-        let is_virtual = r.u32()? != 0;
-        if is_virtual {
-            bail!("virtual texture data is not modeled");
-        }
+        let virtual_data =
+            (r.u32()? != 0).then(|| VirtualTextureBuiltData::read(r, ctx)).transpose()?;
         let _ = end;
         Ok(TexturePlatformData {
             format_name,
@@ -785,9 +813,10 @@ impl TexturePlatformData {
             packed_data,
             pixel_format,
             opt_data,
+            cpu_copy,
             first_mip_to_serialize,
             mips,
-            is_virtual,
+            virtual_data,
         })
     }
 
@@ -806,12 +835,32 @@ impl TexturePlatformData {
             (None, false) => {}
             _ => bail!("opt data presence disagrees with the packed-data bit"),
         }
+        match (&self.cpu_copy, self.packed_data & Self::BIT_HAS_CPU_COPY != 0) {
+            (Some(c), true) => {
+                ar.i32(&mut c.size_x.to_owned())?;
+                ar.i32(&mut c.size_y.to_owned())?;
+                ar.i32(&mut c.num_slices.to_owned())?;
+                ar.u8(&mut c.format.to_owned())?;
+                ar.u8(&mut c.gamma_space.to_owned())?;
+                ar.u64(&mut (c.raw_data.len() as u64))?;
+                let n = c.raw_data.len();
+                ar.raw(&mut c.raw_data.clone(), n)?;
+            }
+            (None, false) => {}
+            _ => bail!("CPU copy presence disagrees with the packed-data bit"),
+        }
         ar.i32(&mut self.first_mip_to_serialize.to_owned())?;
         ar.i32(&mut (self.mips.len() as i32))?;
         for m in &self.mips {
             m.write(ar, mip_data)?;
         }
-        ar.u32(&mut u32::from(self.is_virtual))
+        match &self.virtual_data {
+            Some(v) => {
+                ar.u32(&mut 1)?;
+                v.write(ar)
+            }
+            None => ar.u32(&mut 0),
+        }
     }
 }
 
@@ -849,6 +898,230 @@ impl TextureMip {
         ar.i32(&mut self.size_x.to_owned())?;
         ar.i32(&mut self.size_y.to_owned())?;
         ar.i32(&mut self.size_z.to_owned())
+    }
+}
+
+/// A `TArray<uint32>` written by the *default* `TArray` operator — a count and
+/// then the elements, with no element size. Distinct from [`BulkArray`], which
+/// is what `BulkSerialize` writes.
+fn read_u32_array(r: &mut Reader, what: &str) -> Result<Vec<u32>> {
+    let n = {
+        let n = r.i32()?;
+        super::limits::bounded(n, MAX_NATIVE_COUNT, what, r.o - 4)?
+    };
+    (0..n).map(|_| r.u32()).collect()
+}
+
+fn write_u32_array(ar: &mut impl Ar, v: &[u32]) -> Result<()> {
+    ar.i32(&mut (v.len() as i32))?;
+    for x in v {
+        ar.u32(&mut x.to_owned())?;
+    }
+    Ok(())
+}
+
+/// `FVirtualTextureTileOffsetData` (VirtualTextureBuiltData.h:89, 5.5.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualTextureTileOffsetData {
+    pub width: u32,
+    pub height: u32,
+    /// Upper-bound Morton address for the managed area.
+    pub max_address: u32,
+    /// Sorted list of contiguous tile block addresses.
+    pub addresses: Vec<u32>,
+    /// Offset for each block in `addresses`; an empty block is `!0`.
+    pub offsets: Vec<u32>,
+}
+
+/// One streamed chunk of a virtual texture's built data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualTextureDataChunk {
+    pub bulk_data_hash: [u8; 20],
+    pub size_in_bytes: u32,
+    pub codec_payload_size: u32,
+    /// Per layer, in the order the engine writes them: the codec type then its
+    /// payload offset.
+    pub codecs: Vec<(u8, u32)>,
+    pub bulk_index: i32,
+    pub payload: Option<Vec<u8>>,
+}
+
+/// `FVirtualTextureBuiltData::Serialize` (VirtualTextureBuiltData.cpp:222).
+///
+/// The mip-stripping branch is a *save-side* path taken only when
+/// `FirstMipToSerialize > 0`, which the engine asserts cannot happen on load, so
+/// a cooked stream always carries the unstripped field order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VirtualTextureBuiltData {
+    pub cooked: bool,
+    pub num_layers: u32,
+    pub width_in_blocks: u32,
+    pub height_in_blocks: u32,
+    pub tile_size: u32,
+    pub tile_border_size: u32,
+    pub tile_data_offset_per_layer: Vec<u32>,
+    pub num_mips: u32,
+    pub width: u32,
+    pub height: u32,
+    pub chunk_index_per_mip: Vec<u32>,
+    pub base_offset_per_mip: Vec<u32>,
+    pub tile_offset_data: Vec<VirtualTextureTileOffsetData>,
+    pub tile_index_per_chunk: Vec<u32>,
+    pub tile_index_per_mip: Vec<u32>,
+    pub tile_offset_in_chunk: Vec<u32>,
+    /// One pixel-format name per layer.
+    pub layer_types: Vec<FStr>,
+    /// One `FLinearColor` per layer, four floats.
+    pub layer_fallback_colors: Vec<[f32; 4]>,
+    pub chunks: Vec<VirtualTextureDataChunk>,
+}
+
+impl VirtualTextureBuiltData {
+    fn read(r: &mut Reader, ctx: TailContext) -> Result<Self> {
+        let cooked = r.u32()? != 0;
+        let num_layers = r.u32()?;
+        let width_in_blocks = r.u32()?;
+        let height_in_blocks = r.u32()?;
+        let tile_size = r.u32()?;
+        let tile_border_size = r.u32()?;
+        let tile_data_offset_per_layer = read_u32_array(r, "TileDataOffsetPerLayer")?;
+        let num_mips = r.u32()?;
+        let width = r.u32()?;
+        let height = r.u32()?;
+        let chunk_index_per_mip = read_u32_array(r, "ChunkIndexPerMip")?;
+        let base_offset_per_mip = read_u32_array(r, "BaseOffsetPerMip")?;
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "TileOffsetData", r.o - 4)?
+        };
+        let mut tile_offset_data = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            tile_offset_data.push(VirtualTextureTileOffsetData {
+                width: r.u32()?,
+                height: r.u32()?,
+                max_address: r.u32()?,
+                addresses: read_u32_array(r, "tile addresses")?,
+                offsets: read_u32_array(r, "tile offsets")?,
+            });
+        }
+        let tile_index_per_chunk = read_u32_array(r, "TileIndexPerChunk")?;
+        let tile_index_per_mip = read_u32_array(r, "TileIndexPerMip")?;
+        let tile_offset_in_chunk = read_u32_array(r, "TileOffsetInChunk")?;
+
+        // Layer arrays are fixed-size in memory but only `num_layers` entries
+        // are written, so the count comes from the header rather than the wire.
+        let layers = super::limits::bounded(
+            num_layers.min(i32::MAX as u32) as i32,
+            64,
+            "virtual texture layers",
+            r.o,
+        )?;
+        let layer_types = (0..layers).map(|_| r.fstring()).collect::<Result<Vec<_>>>()?;
+        let mut layer_fallback_colors = Vec::with_capacity(layers);
+        for _ in 0..layers {
+            layer_fallback_colors.push([r.f32()?, r.f32()?, r.f32()?, r.f32()?]);
+        }
+
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "virtual texture chunks", r.o - 4)?
+        };
+        let mut chunks = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            let bulk_data_hash: [u8; 20] = r.take(20)?.try_into().expect("20 bytes");
+            let size_in_bytes = r.u32()?;
+            let codec_payload_size = r.u32()?;
+            let mut codecs = Vec::with_capacity(layers);
+            for _ in 0..layers {
+                codecs.push((r.u8()?, r.u32()?));
+            }
+            let bulk_index = r.i32()?;
+            let Some(&(offset, size)) = ctx.bulk_data.get(bulk_index.max(0) as usize) else {
+                bail!("virtual texture chunk: bulk data index {bulk_index} out of range");
+            };
+            let payload = (offset as usize == ctx.origin + r.o)
+                .then(|| r.take(size.max(0) as usize).map(<[u8]>::to_vec))
+                .transpose()?;
+            chunks.push(VirtualTextureDataChunk {
+                bulk_data_hash,
+                size_in_bytes,
+                codec_payload_size,
+                codecs,
+                bulk_index,
+                payload,
+            });
+        }
+        Ok(VirtualTextureBuiltData {
+            cooked,
+            num_layers,
+            width_in_blocks,
+            height_in_blocks,
+            tile_size,
+            tile_border_size,
+            tile_data_offset_per_layer,
+            num_mips,
+            width,
+            height,
+            chunk_index_per_mip,
+            base_offset_per_mip,
+            tile_offset_data,
+            tile_index_per_chunk,
+            tile_index_per_mip,
+            tile_offset_in_chunk,
+            layer_types,
+            layer_fallback_colors,
+            chunks,
+        })
+    }
+
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.u32(&mut u32::from(self.cooked))?;
+        ar.u32(&mut self.num_layers.to_owned())?;
+        ar.u32(&mut self.width_in_blocks.to_owned())?;
+        ar.u32(&mut self.height_in_blocks.to_owned())?;
+        ar.u32(&mut self.tile_size.to_owned())?;
+        ar.u32(&mut self.tile_border_size.to_owned())?;
+        write_u32_array(ar, &self.tile_data_offset_per_layer)?;
+        ar.u32(&mut self.num_mips.to_owned())?;
+        ar.u32(&mut self.width.to_owned())?;
+        ar.u32(&mut self.height.to_owned())?;
+        write_u32_array(ar, &self.chunk_index_per_mip)?;
+        write_u32_array(ar, &self.base_offset_per_mip)?;
+        ar.i32(&mut (self.tile_offset_data.len() as i32))?;
+        for t in &self.tile_offset_data {
+            ar.u32(&mut t.width.to_owned())?;
+            ar.u32(&mut t.height.to_owned())?;
+            ar.u32(&mut t.max_address.to_owned())?;
+            write_u32_array(ar, &t.addresses)?;
+            write_u32_array(ar, &t.offsets)?;
+        }
+        write_u32_array(ar, &self.tile_index_per_chunk)?;
+        write_u32_array(ar, &self.tile_index_per_mip)?;
+        write_u32_array(ar, &self.tile_offset_in_chunk)?;
+        for s in &self.layer_types {
+            ar.fstring(&mut s.clone())?;
+        }
+        for c in &self.layer_fallback_colors {
+            for v in c {
+                ar.f32(&mut v.to_owned())?;
+            }
+        }
+        ar.i32(&mut (self.chunks.len() as i32))?;
+        for c in &self.chunks {
+            ar.raw(&mut c.bulk_data_hash.to_vec(), 20)?;
+            ar.u32(&mut c.size_in_bytes.to_owned())?;
+            ar.u32(&mut c.codec_payload_size.to_owned())?;
+            for (ty, off) in &c.codecs {
+                ar.u8(&mut ty.to_owned())?;
+                ar.u32(&mut off.to_owned())?;
+            }
+            ar.i32(&mut c.bulk_index.to_owned())?;
+            if let Some(p) = &c.payload {
+                let n = p.len();
+                ar.raw(&mut p.clone(), n)?;
+            }
+        }
+        Ok(())
     }
 }
 
