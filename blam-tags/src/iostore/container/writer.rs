@@ -525,6 +525,56 @@ pub fn write_new_tag_container(
     w.write(out_utoc)
 }
 
+/// One rebuilt package to bundle as a same-name override.
+///
+/// The difference from a tag override is what is being replaced: that path
+/// swaps a tag's `.ubulk` blob and patches the paired `.uasset`'s recorded
+/// length, leaving the package structure alone. This replaces the *package* —
+/// the Zen header, export map and every export payload — which is what an edit
+/// to a reflected property produces, since changing a property can move every
+/// export after it.
+pub struct PackageOverride<'a> {
+    /// The container the package came from, used for its chunk id so the
+    /// override lands on the same chunk the base container defines.
+    pub archive: &'a IoStoreArchive,
+    /// The package's `.uasset` path in that container.
+    pub uasset_path: &'a str,
+    /// The rebuilt package and its store entry, as returned together by
+    /// [`write_package`](crate::iostore::package::builder::write_package).
+    pub bytes: Vec<u8>,
+    pub store: StoreEntry,
+}
+
+/// Bundle rebuilt packages into an override (mod) container.
+///
+/// The store entry is re-declared rather than inherited, because an edit can
+/// change `export_bundles_size` and the base container's entry would then
+/// describe the old layout. The override container has higher priority, so its
+/// entry is the one the engine uses.
+pub fn write_package_mod_container(
+    overrides: &[PackageOverride<'_>],
+    out_utoc: &std::path::Path,
+) -> Result<()> {
+    use crate::iostore::package::ue_types::EIoStoreTocVersion;
+    use crate::iostore::package::zen::FZenPackageHeader;
+    const HV: EIoContainerHeaderVersion = EIoContainerHeaderVersion::SoftPackageReferences;
+    const CV: EIoStoreTocVersion = EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash;
+
+    let mut w = OverrideContainerWriter::new("../../../");
+    for over in overrides {
+        let id = over.archive.chunk_id_for(over.uasset_path)?;
+        // The package's own name is the identity the store is keyed by, and it
+        // is inside the bytes we are about to write — so take it from there
+        // rather than from the path, which is a filename convention.
+        let header =
+            FZenPackageHeader::deserialize(&mut std::io::Cursor::new(&over.bytes), None, CV, HV, None)
+                .map_err(|_| IoStoreError::Package("rebuilt package did not parse"))?;
+        let package_id = FPackageId::from_name(&header.package_name());
+        w.add_package(id, over.bytes.clone(), package_id, over.store.clone());
+    }
+    w.write(out_utoc)
+}
+
 /// Bundle several edited tags into ONE override (mod) container — a portable,
 /// non-destructive overlay the game loads on top of the base. Each tag is a
 /// same-name override: `(source_archive, ubulk_rel_path, new_tag_bytes)`. The
