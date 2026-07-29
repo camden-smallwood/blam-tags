@@ -2023,6 +2023,177 @@ impl StaticMeshTail {
     }
 }
 
+/// `UStruct::Serialize` — the layer under every function, class and script
+/// struct: 11,250 exports across seven classes.
+///
+/// The `FField` chain and the Kismet bytecode are both their own sub-formats with
+/// no writer in this crate, so they stay spans. What the model owns is the
+/// framing: the super-struct reference, the child list, and the two sizes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructTail {
+    pub super_struct: i32,
+    /// `ChildArray` — an `FPackageIndex` per entry.
+    pub children: FixedArray,
+    /// The `FField` chain, exactly as `read_field_chain` consumed it.
+    pub field_chain: Vec<u8>,
+    /// Written ahead of the script and *not* equal to its length — the engine
+    /// writes a bytecode size and a separate storage size.
+    pub bytecode_size: i32,
+    pub script: Vec<u8>,
+}
+
+impl StructTail {
+    fn read(r: &mut Reader) -> Result<Self> {
+        let super_struct = r.i32()?;
+        let children = FixedArray::read(r, "ChildArray", 4)?;
+        let at = r.o;
+        r.struct_fields = Some(super::reflect::read_field_chain(r)?);
+        let field_chain = r.b[at..r.o].to_vec();
+        let bytecode_size = r.i32()?;
+        let storage = r.i32()?;
+        if !(0..=16_000_000).contains(&storage) {
+            bail!("implausible ScriptStorageSize {storage}");
+        }
+        Ok(StructTail {
+            super_struct,
+            children,
+            field_chain,
+            bytecode_size,
+            script: r.take(storage as usize)?.to_vec(),
+        })
+    }
+
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.i32(&mut self.super_struct.to_owned())?;
+        self.children.write(ar)?;
+        let n = self.field_chain.len();
+        ar.raw(&mut self.field_chain.clone(), n)?;
+        ar.i32(&mut self.bytecode_size.to_owned())?;
+        ar.i32(&mut (self.script.len() as i32))?;
+        let n = self.script.len();
+        ar.raw(&mut self.script.clone(), n)
+    }
+}
+
+/// `UFunction::Serialize`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionTail {
+    pub function_flags: u32,
+    /// `RepOffset`, written only for `FUNC_Net`.
+    pub rep_offset: Option<u16>,
+    pub event_graph_function: i32,
+    pub event_graph_call_offset: i32,
+}
+
+impl FunctionTail {
+    const FUNC_NET: u32 = 0x0040;
+
+    fn read(r: &mut Reader) -> Result<Self> {
+        let function_flags = r.u32()?;
+        Ok(FunctionTail {
+            function_flags,
+            rep_offset: (function_flags & Self::FUNC_NET != 0).then(|| r.u16()).transpose()?,
+            event_graph_function: r.i32()?,
+            event_graph_call_offset: r.i32()?,
+        })
+    }
+
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        ar.u32(&mut self.function_flags.to_owned())?;
+        match (self.rep_offset, self.function_flags & Self::FUNC_NET != 0) {
+            (Some(v), true) => ar.u16(&mut v.to_owned())?,
+            (None, false) => {}
+            _ => bail!("RepOffset presence disagrees with FUNC_Net"),
+        }
+        ar.i32(&mut self.event_graph_function.to_owned())?;
+        ar.i32(&mut self.event_graph_call_offset.to_owned())
+    }
+}
+
+/// `UClass::Serialize`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassTail {
+    /// `FuncMap` — an `FName` and an `FPackageIndex` per entry.
+    pub func_map: FixedArray,
+    pub class_flags: u32,
+    pub class_within: i32,
+    pub class_config_name: FName,
+    pub class_generated_by: i32,
+    /// `Interfaces` — 12 bytes each.
+    pub interfaces: FixedArray,
+    pub deprecated_flag: u32,
+    pub deprecated_name: FName,
+    pub cooked: u32,
+    pub class_default_object: i32,
+}
+
+impl ClassTail {
+    fn read(r: &mut Reader) -> Result<Self> {
+        Ok(ClassTail {
+            func_map: FixedArray::read(r, "FuncMap", 12)?,
+            class_flags: r.u32()?,
+            class_within: r.i32()?,
+            class_config_name: r.fname()?,
+            class_generated_by: r.i32()?,
+            interfaces: FixedArray::read(r, "Interfaces", 12)?,
+            deprecated_flag: r.u32()?,
+            deprecated_name: r.fname()?,
+            cooked: r.u32()?,
+            class_default_object: r.i32()?,
+        })
+    }
+
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        self.func_map.write(ar)?;
+        ar.u32(&mut self.class_flags.to_owned())?;
+        ar.i32(&mut self.class_within.to_owned())?;
+        ar.fname(&mut self.class_config_name.clone())?;
+        ar.i32(&mut self.class_generated_by.to_owned())?;
+        self.interfaces.write(ar)?;
+        ar.u32(&mut self.deprecated_flag.to_owned())?;
+        ar.fname(&mut self.deprecated_name.clone())?;
+        ar.u32(&mut self.cooked.to_owned())?;
+        ar.i32(&mut self.class_default_object.to_owned())
+    }
+}
+
+/// `UBlueprintGeneratedClass::Serialize`'s editor tags.
+///
+/// Only read when more than four bytes remain, which is the engine's own guard
+/// against reading a short tail's last word as a count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlueprintGeneratedClassTail {
+    pub editor_tags: Option<Vec<(FName, FStr)>>,
+}
+
+impl BlueprintGeneratedClassTail {
+    fn read(r: &mut Reader) -> Result<Self> {
+        if r.b.len().saturating_sub(r.o) <= 4 {
+            return Ok(BlueprintGeneratedClassTail { editor_tags: None });
+        }
+        let n = {
+            let n = r.i32()?;
+            super::limits::bounded(n, MAX_NATIVE_COUNT, "EditorTags", r.o - 4)?
+        };
+        let mut tags = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            tags.push((r.fname()?, r.fstring()?));
+        }
+        Ok(BlueprintGeneratedClassTail { editor_tags: Some(tags) })
+    }
+
+    fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        if let Some(tags) = &self.editor_tags {
+            ar.i32(&mut (tags.len() as i32))?;
+            for (n, v) in tags {
+                ar.fname(&mut n.clone())?;
+                ar.fstring(&mut v.clone())?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One element of a tail that is just a flat sequence of typed pieces.
 ///
 /// Most of the long tail is this: 40-odd classes whose whole contribution is a
@@ -2054,6 +2225,8 @@ pub enum TailPiece {
     StrArray,
     /// A `TArray` of `FString` pairs.
     StrPairArray,
+    /// A four-byte present flag and, when set, an `int32`.
+    OptI32,
 }
 
 /// A decoded [`TailPiece`].
@@ -2072,6 +2245,7 @@ pub enum TailValue {
     Array(FixedArray),
     StrArray(Vec<FStr>),
     StrPairArray(Vec<(FStr, FStr)>),
+    OptI32(Option<i32>),
 }
 
 /// Families whose whole tail is a flat piece sequence, keyed the same way
@@ -2104,6 +2278,12 @@ pub const COMPOSED_TAILS: &[(&str, &[TailPiece])] = &[
     // `UEnum`: an `FName` and an `int64` per entry, then `CppForm`.
     ("Enum", &[TailPiece::Array(16), TailPiece::U8]),
     ("FontFace", &[TailPiece::U32, TailPiece::U32]),
+    ("NiagaraSpriteRendererProperties", &[TailPiece::Array(8)]),
+    ("PhysicsAsset", &[TailPiece::Array(12)]),
+    ("WorldPartition", &[TailPiece::OptI32]),
+    ("SoundNode", &[TailPiece::Bytes(2)]),
+    ("SoundCue", &[TailPiece::Bytes(2)]),
+    ("SoundNodeWavePlayer+SoundNode", &[TailPiece::Bytes(2), TailPiece::I32]),
 ];
 
 /// Read a piece sequence.
@@ -2151,6 +2331,9 @@ fn read_pieces(
                     super::limits::bounded(n, MAX_NATIVE_COUNT, "tail string array", r.o - 4)?
                 };
                 TailValue::StrArray((0..n).map(|_| r.fstring()).collect::<Result<_>>()?)
+            }
+            TailPiece::OptI32 => {
+                TailValue::OptI32((r.u32()? != 0).then(|| r.i32()).transpose()?)
             }
             TailPiece::StrPairArray => {
                 let n = {
@@ -2244,6 +2427,13 @@ fn write_pieces(
                     ar.fstring(&mut b.clone())?;
                 }
             }
+            (TailValue::OptI32(x), TailPiece::OptI32) => match x {
+                Some(v) => {
+                    ar.u32(&mut 1)?;
+                    ar.i32(&mut v.to_owned())?;
+                }
+                None => ar.u32(&mut 0)?,
+            },
             (v, p) => bail!("tail value {v:?} does not match piece {p:?}"),
         }
     }
@@ -4799,6 +4989,138 @@ pub fn roundtrip_tail(
                     }
                     None => w.u32(&mut 0)?,
                 }
+                Ok(w.into_bytes())
+            })()),
+            "Struct" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let modeled = StructTail::read(&mut r)?;
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                modeled.write(&mut w)?;
+                Ok(w.into_bytes())
+            })()),
+            "Function+Struct" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let base = StructTail::read(&mut r)?;
+                let own = FunctionTail::read(&mut r)?;
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                base.write(&mut w)?;
+                own.write(&mut w)?;
+                Ok(w.into_bytes())
+            })()),
+            "ScriptStruct+Struct" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let base = StructTail::read(&mut r)?;
+                let flag = r.u32()?;
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                base.write(&mut w)?;
+                w.u32(&mut flag.to_owned())?;
+                Ok(w.into_bytes())
+            })()),
+            "Class+Struct" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let base = StructTail::read(&mut r)?;
+                let own = ClassTail::read(&mut r)?;
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                base.write(&mut w)?;
+                own.write(&mut w)?;
+                Ok(w.into_bytes())
+            })()),
+            "BlueprintGeneratedClass+Class+Struct" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let base = StructTail::read(&mut r)?;
+                let cls = ClassTail::read(&mut r)?;
+                let bp = BlueprintGeneratedClassTail::read(&mut r)?;
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                base.write(&mut w)?;
+                cls.write(&mut w)?;
+                bp.write(&mut w)?;
+                Ok(w.into_bytes())
+            })()),
+            // `UControlRigBlueprintGeneratedClass` appends a whole `URigVM`.
+            // That has its own reader and no writer, so it stays a span; the
+            // `PublicFunctions` count after it is a value.
+            "ControlRigBlueprintGeneratedClass+BlueprintGeneratedClass+Class+Struct" => {
+                Some((|| {
+                    let mut r = Reader::new(tail, names);
+                    let base = StructTail::read(&mut r)?;
+                    let cls = ClassTail::read(&mut r)?;
+                    let bp = BlueprintGeneratedClassTail::read(&mut r)?;
+                    let at = r.o;
+                    super::tails::read_rigvm(&mut r, ctx.usmap)?;
+                    let rigvm = r.b[at..r.o].to_vec();
+                    let public_functions = r.i32()?;
+                    if r.o != tail.len() {
+                        bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                    }
+                    let mut w = super::archive::Writer::new();
+                    base.write(&mut w)?;
+                    cls.write(&mut w)?;
+                    bp.write(&mut w)?;
+                    let n = rigvm.len();
+                    w.raw(&mut rigvm.clone(), n)?;
+                    w.i32(&mut public_functions.to_owned())?;
+                    Ok(w.into_bytes())
+                })())
+            }
+            // `URigVMMemoryStorageGeneratorClass` adds its property-path
+            // descriptions and the memory type.
+            "RigVMMemoryStorageGeneratorClass+Class+Struct" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let base = StructTail::read(&mut r)?;
+                let cls = ClassTail::read(&mut r)?;
+                let n = {
+                    let n = r.i32()?;
+                    super::limits::bounded(
+                        n,
+                        MAX_NATIVE_COUNT,
+                        "PropertyPathDescriptions",
+                        r.o - 4,
+                    )?
+                };
+                let mut paths = Vec::with_capacity(n.min(256));
+                for _ in 0..n {
+                    paths.push((r.i32()?, r.fstring()?, r.fstring()?));
+                }
+                let memory_type = r.u8()?;
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                base.write(&mut w)?;
+                cls.write(&mut w)?;
+                w.i32(&mut (paths.len() as i32))?;
+                for (idx, head, seg) in &paths {
+                    w.i32(&mut idx.to_owned())?;
+                    w.fstring(&mut head.clone())?;
+                    w.fstring(&mut seg.clone())?;
+                }
+                w.u8(&mut memory_type.to_owned())?;
+                Ok(w.into_bytes())
+            })()),
+            // Subclasses of `UStaticMeshComponent` that add nothing of their own.
+            "StaticMeshComponent+SceneComponent+ActorComponent" => Some((|| {
+                let mut r = Reader::new(tail, names);
+                let modeled = StaticMeshComponentChainTail::read(&mut r, block)?;
+                if r.o != tail.len() {
+                    bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+                }
+                let mut w = super::archive::Writer::new();
+                modeled.write(&mut w, block)?;
                 Ok(w.into_bytes())
             })()),
             "GeometryCollection" => Some((|| {
