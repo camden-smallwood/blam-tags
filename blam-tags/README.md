@@ -187,7 +187,7 @@ Schemas live under `definitions/<game>/<group>.json`, dumped from the engine DLL
 - guerilla.exe: `halo3_mcc`, `halo3odst_mcc`
 - sapien.exe: `haloreach_mcc`, `halo4_mcc`, `halo2amp_mcc`
 
-Fresh sapien dumps need two idempotent post-processing passes before they'll load — see [`examples/dedupe_definitions.rs`](./examples/dedupe_definitions.rs) and [`examples/inline_parent_struct.rs`](./examples/inline_parent_struct.rs).
+Fresh sapien dumps need two idempotent post-processing passes before they'll load: deduplicate repeated definitions, then inline parent structs.
 
 The library builds a zero-filled tag directly from a schema:
 
@@ -204,12 +204,7 @@ tag.write("my_biped.biped")?;
 
 `TagFile::new` validates every struct's computed size against the dumped `size` field. If the computed sum is short, it resolves any `tmpl` custom fields in that struct by loading the target group's sibling JSON, walks the target's parent chain, and adds each ancestor's root-struct size — matching Reach's factored shader layout (where `shader_decal_struct_definition` is 4 bytes of decal-specific data and `render_method_struct_definition` is inlined via the `tmpl` custom to supply the 100 bytes of common shader fields). H3 schemas keep the common fields inlined directly, so no expansion kicks in and the size check passes as-is.
 
-A helper example validates every dumped schema against a sample real tag:
-
-```sh
-cargo run --release -p blam-tags --example schema_match -- \
-    definitions/halo3_mcc /path/to/halo3_mcc/tags
-```
+Every dumped schema was validated against a sample real tag from the matching game's tag root.
 
 ### Bitmap → TIFF / DDS extraction
 
@@ -256,12 +251,7 @@ Format coverage (validated against 25,908 / 25,908 bitmap-tag images across halo
 
 Pure-tag-file: pixels come from the top-level `processed pixel data` blob, no resource cache lookup. Errors surface as `BitmapError::PixelSliceOutOfBounds` / `FormatNotSupported` / `UnsupportedTextureType` / `Tiff` / `TiffLayoutDeferred`.
 
-Corpus-wide validators in [`examples/extract_bitmap_sweep.rs`](examples/extract_bitmap_sweep.rs) (DDS path) and [`examples/extract_tiff_sweep.rs`](examples/extract_tiff_sweep.rs) (TIFF path):
-
-```sh
-cargo run --release -p blam-tags --example extract_tiff_sweep -- \
-    /path/to/halo3_mcc/tags /path/to/haloreach_mcc/tags
-```
+Both the DDS and the TIFF path were validated by corpus-wide sweeps over the Halo 3 and Reach MCC tag roots.
 
 #### Mip / layout caveats
 
@@ -335,17 +325,7 @@ Engine-aware blob layout: H3 uses a hardcoded section ordering; Reach uses cumul
 
 JMA-family export applies the per-format conventions at write time only — translation `× 100` (cm convention), quaternion **conjugate** serialization, and Foundry-style local→world `dx/dy` rotation by accumulated yaw (per Foundry commit `850d680d`, which fixes TagTool's actor-slides-backwards bug on yawed-during-walk animations). The codec-decoded values stay in raw engine units so callers can render or re-encode without unwinding.
 
-Two corpus-wide validators live in `examples/`:
-
-```sh
-# Decode every animation, tally per-codec status:
-cargo run --release -p blam-tags --example jmad_decode_sweep -- \
-    out_dir /path/to/halo3_mcc/tags /path/to/haloreach_mcc/tags
-
-# Run the JMA writer end-to-end against a sink:
-cargo run --release -p blam-tags --example jmad_export_sweep -- \
-    /path/to/halo3_mcc/tags /path/to/haloreach_mcc/tags
-```
+Both halves were validated corpus-wide against the Halo 3 and Reach MCC tag roots: every animation decoded with a per-codec status tally, and the JMA writer run end-to-end against a sink.
 
 ### JMS / ASS (render / collision / physics → JMS, with ASS for instance-bearing render_models)
 
@@ -379,11 +359,6 @@ Render path walks `regions × permutations × meshes × parts`, decompresses bou
 
 Validated across the H3 MCC corpus: 4,354 / 4,354 reconstructions clean across `render_model`, `collision_model`, and `physics_model`. 89.7% of render-model JMSes have ≥99% bounding-box match against the embedded source JMS; 86.8% have ≥99% position coverage at 10 cm precision.
 
-```sh
-cargo run --release -p blam-tags --example jms_corpus_sweep -- \
-    /path/to/halo3_mcc/tags
-```
-
 ### ASS (scenario_structure_bsp → ASS)
 
 `AssFile` reconstructs a Bungie Amalgam scene (`.ASS`, version 7) from a parsed `scenario_structure_bsp` tag. ASS is the level-geometry counterpart to JMS — same family but for static scene structure rather than rigged objects. The reconstruction walks every category needed for re-import as artist source:
@@ -408,11 +383,6 @@ ass.write(&mut out)?;
 Categories emitted: cluster MESHes (one per cluster), per-IGD-def MESHes (one per `instanced geometries definitions[]` entry, content-deduped) plus per-placement INSTANCEs, cluster portals (each as `+portal_N` MESH), weather polyhedra (convex hull from plane set, as `+weather_N`), structure collision BSP (one merged `@CollideOnly` MESH using the same edge-ring walker the JMS path uses), sbsp markers (SPHERE primitives), `environment_objects[]` xref-only OBJECTs, and SPOT/DIRECT/OMNI/AMBIENT generic lights from the `.stli`. Special-marker materials (`+portal`, `+weather`, `@collision_only`) are auto-appended so Tool.exe re-extracts each category back into its proper tag block on recompile.
 
 Validated across the H3 MCC corpus: 147 / 147 BSPs across 49 scenarios clean — 20,747 MESH + 6,605 GENERIC_LIGHT + ~150 SPHERE markers, 82k INSTANCEs, 19.9M verts, 14.9M tris. Source ASS files have a different mesh granularity (artist-named meshes vs our cluster aggregates) — that's compile-time information the tag doesn't carry.
-
-```sh
-cargo run --release -p blam-tags --example ass_corpus_sweep -- \
-    /path/to/halo3_mcc/tags
-```
 
 ### Halo: Campaign Evolved (UE5 IoStore containers)
 
@@ -518,13 +488,7 @@ let round_bytes = tag.write_to_bytes()?;
 assert_eq!(bytes, round_bytes);
 ```
 
-The corpus-wide sweep lives in [`examples/roundtrip.rs`](examples/roundtrip.rs).
-Run against one or more tag roots:
-
-```sh
-cargo run --release -p blam-tags --example roundtrip -- \
-    /path/to/halo3_mcc/tags /path/to/haloreach_mcc/tags
-```
+The same assertion was run corpus-wide across every supported MCC tag root.
 
 ### Error handling on the read path
 
@@ -628,8 +592,7 @@ Plus two H4-platform layers (read-side only — no roundtrip):
 
   Validated against the H4 X360 development cache: a 9,140-tag
   hydration sweep across `mode` / `sbsp` / `pmdf` / `impo` /
-  `iimz` / `Lbsp` / `rmla` groups runs without panic. See
-  [`examples/hydration_sweep.rs`](examples/hydration_sweep.rs).
+  `iimz` / `Lbsp` / `rmla` groups runs without panic.
 
 A small private [`geometry`] module carries the format-specific
 helpers shared between `jms` and `ass`: `CompressionBounds`

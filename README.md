@@ -95,12 +95,7 @@ blam-tags/          — workspace root
 │   │                   reader + xsync), render_geometry (X360 vertex /
 │   │                   index buffer hydration into author-format)
 │   │                 — typed walkers for narrow groups: render_method,
-│   │                   render_model, scenario, scenario_lightmap,
-│   │                   structure_bsp, structure_lighting_info, light,
-│   │                   sky_atmosphere, wind, decal_system, decorator_set,
-│   │                   area_screen_effect, camera_fx_settings,
-│   │                   chocolate_mountain, rasterizer_globals,
-│   │                   tag_function
+│   │                   render_model, tag_function
 │   └── tests/      — integration tests (corruption suite, etc)
 └── blam-tag-shell/ — CLI crate
     └── src/        — Clap entry point + per-command implementations

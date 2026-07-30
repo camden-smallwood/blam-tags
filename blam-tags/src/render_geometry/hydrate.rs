@@ -57,7 +57,7 @@ impl std::fmt::Display for HydrateError {
 impl std::error::Error for HydrateError {}
 
 /// Geometry-struct paths to inspect, keyed by tag group. Mirrors the
-/// table in `examples/vertex_type_survey.rs` but stored as
+/// table used by the vertex-type survey, but stored as
 /// struct-paths (where `api resource` and `meshes` siblings live)
 /// rather than mesh-block paths.
 fn geometry_struct_paths(group_tag: u32) -> &'static [&'static str] {

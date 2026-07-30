@@ -87,70 +87,19 @@ pub mod ass;
 pub mod extract;
 pub mod render_geometry;
 pub mod render_model;
-pub mod skeleton;
 pub mod monolithic;
 pub mod tag_function;
 pub mod render_method;
-pub mod shader;
-pub mod scenario;
-pub mod scenario_lightmap;
-pub mod sky_atmosphere;
-pub mod decal_system;
-pub mod decorator_set;
-pub mod structure_lighting_info;
-pub mod biped;
-pub mod crate_definition;
-pub mod creature;
-pub mod device;
-pub mod device_control;
-pub mod device_machine;
-pub mod device_terminal;
-pub mod effect;
-pub mod effect_scenery;
-pub mod equipment;
-pub mod game_globals;
-pub mod giant;
-pub mod item;
-pub mod light;
-pub mod model;
-pub mod multiplayer_globals;
-pub mod object;
-pub mod particle;
-pub mod projectile;
-pub mod scenery;
-pub mod sound_scenery;
-pub mod unit;
-pub mod vehicle;
-pub mod weapon;
-pub mod area_screen_effect;
-pub mod camera_fx_settings;
-pub mod shield_impact;
-pub mod effect_globals;
-pub mod particle_model;
-pub mod damage_effect;
-pub mod particle_physics;
-pub mod lens_flare;
-pub mod material_effects;
-pub mod effects_properties;
-pub mod light_volume_system;
-pub mod beam_system;
-pub mod contrail_system;
-pub mod chocolate_mountain;
-pub mod rasterizer_globals;
-pub mod structure_bsp;
-pub mod wind;
 pub mod paths;
 pub mod typed_enums;
 
-/// Sound-tag audio decoding for every supported game: classic inline codecs
-/// (CE Ogg Vorbis; H2 Opus / Xbox-ADPCM / PCM), FMOD FSB5 banks (Halo 3 /
-/// Reach), and Wwise packages (Halo 4). Gated behind the `audio` feature.
+// Both of these carry their own `//!` docs. An outer doc comment here would be
+// *merged* with those, and rustdoc then resolves the merged text against the
+// crate root — silently breaking every intra-doc link the module writes to its
+// own children. Describe the module in the module.
 #[cfg(feature = "audio")]
 pub mod audio;
 
-/// Read-only reader for UE5 IoStore containers (`.utoc`/`.ucas`), used to mount
-/// Halo: Campaign Evolved's packaged Reach `.ubulk` tags as a virtual
-/// filesystem. Gated behind the `iostore` feature.
 #[cfg(feature = "iostore")]
 pub mod iostore;
 
@@ -188,7 +137,6 @@ pub use ass::{
     AssError, AssFile, AssInstance, AssLight, AssLightKind, AssMaterial, AssObject,
     AssObjectPayload, AssTriangle, AssVertex,
 };
-pub use model::{Model, ModelError, ModelVariant, ModelVariantObject, ModelVariantRegion};
 pub use render_model::{
     extract_per_instance_lightmap_uvs, Geometry, Marker, MarkerGroup, Material, MaterialProperty,
     Mesh, Node, Part, PerInstanceLightmapUvs, Permutation, Region, RenderMesh, RenderMeshPart,

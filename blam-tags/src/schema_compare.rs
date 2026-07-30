@@ -4,8 +4,8 @@
 //! [`TagFile::read`] / [`TagFile::read_from_bytes`], carrying its own
 //! embedded `blay` layout).
 //!
-//! This is the reusable core behind the `schema_match` /
-//! `schema_match_full` example binaries and behind the app's
+//! This is the reusable core behind the corpus-wide schema-match sweeps
+//! and behind the app's
 //! "does this imported tag match the definitions we ship?" check. It
 //! compares the two tags' **root structs**: header group + version,
 //! root-struct byte size, field count, and a normalized,

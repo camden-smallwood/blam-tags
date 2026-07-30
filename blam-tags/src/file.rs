@@ -596,8 +596,8 @@ impl TagFile {
     /// stream first via `schema_path` if missing.
     ///
     /// Matches 98.8% of observed tag bytes exactly; the rest are
-    /// covered by the `impo` filter. See `examples/want_vs_deps.rs`
-    /// for the corpus correlation study.
+    /// covered by the `impo` filter (measured by a corpus-wide
+    /// want-vs-dependencies correlation study).
     pub fn rebuild_dependency_list<P: AsRef<Path>>(
         &mut self,
         schema_path: P,

@@ -1,7 +1,7 @@
 //! Reader for cooked UE5 `USkeletalMesh` render geometry inside IoStore
 //! packages — positions, indices, UVs, normals, and skin weights — for the
 //! highest LOD. Campaign Evolved (UE 5.5.4) layout, validated byte-exact
-//! against real meshes (see `examples/ce_mesh_parse.rs`).
+//! against real meshes.
 //!
 //! We reach the native `FSkeletalMeshRenderData` by ANCHORING on the
 //! `FReferenceSkeleton` (a recognizable `numBones` + valid `FMeshBoneInfo`
