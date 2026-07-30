@@ -241,13 +241,31 @@ pub fn read_export(
     class: &str,
     object_flags: u32,
 ) -> Result<Export> {
+    read_export_in(export, names, usmap, class, object_flags, &ExportContext::new(&[]))
+}
+
+/// As [`read_export`], but with the package context.
+///
+/// Some property values cannot be decoded without it. A `UUserDefinedStruct`
+/// used as a property type has no `.usmap` schema, and an `FInstancedPropertyBag`
+/// names its members' struct types by *object reference* — both need the
+/// package to resolve a layout. Without a resolver those exports fail to read,
+/// which is the honest outcome: the data is there, the schema is elsewhere.
+pub fn read_export_in(
+    export: &[u8],
+    names: &[String],
+    usmap: &Usmap,
+    class: &str,
+    object_flags: u32,
+    ctx: &ExportContext<'_>,
+) -> Result<Export> {
     /// `RF_ClassDefaultObject`.
     const RF_CLASS_DEFAULT_OBJECT: u32 = 0x10;
 
     if NO_PROPERTY_BLOCK.contains(&class) {
         return Ok(Export { block: None, trailer: Trailer::Absent, tail: export.to_vec() });
     }
-    let mut r = Reader::new(export, names);
+    let mut r = Reader::with_ctx(export, names, ctx);
     let block = read_struct(&mut r, class, usmap, 0)?;
     let mut trailer = Trailer::Absent;
     if object_flags & RF_CLASS_DEFAULT_OBJECT == 0 && export.len() >= r.o + 4 {
@@ -269,8 +287,20 @@ pub fn read_export(
 /// Inverse by construction, and measured as such: `ce_export_roundtrip` runs it
 /// over every export in the shipped corpus.
 pub fn write_export(class: &str, ex: &Export, usmap: &Usmap) -> Result<Vec<u8>> {
+    write_export_in(class, ex, usmap, None)
+}
+
+/// As [`write_export`], with the package context. Regenerating a nested block's
+/// header needs the same layout the reader used, and for a property bag or a
+/// user-defined struct that layout lives in another package.
+pub fn write_export_in(
+    class: &str,
+    ex: &Export,
+    usmap: &Usmap,
+    resolver: Option<&dyn super::archive::PackageResolver>,
+) -> Result<Vec<u8>> {
     let mut out = match &ex.block {
-        Some(b) => emit_block(class, b, usmap)?,
+        Some(b) => super::block::emit_block_in(class, b, usmap, resolver)?,
         None => Vec::new(),
     };
     match &ex.trailer {

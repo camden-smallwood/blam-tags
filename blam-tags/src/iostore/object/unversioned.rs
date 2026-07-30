@@ -29,9 +29,9 @@ pub use super::edit::{
     set_string_property,
 };
 pub use super::export::{
-    read_export, read_export_struct, read_export_struct_len, read_export_with_trailer,
+    read_export, read_export_in, read_export_struct, read_export_struct_len, read_export_with_trailer,
     walk_export, TailStop, TailWalk,
-    write_export, Export, Trailer, NO_PROPERTY_BLOCK,
+    write_export, write_export_in, Export, Trailer, NO_PROPERTY_BLOCK,
 };
 pub use super::property::{can_serialize_as_zero, should_save_as_zero};
 pub use super::tails::CLASSES_WITH_OWN_TAIL;

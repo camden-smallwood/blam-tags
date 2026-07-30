@@ -17,7 +17,7 @@ use anyhow::Result;
 
 use super::archive::{Ar, Reader};
 use super::block::{flattened_schema, read_struct, write_block};
-use super::usmap::Usmap;
+use super::usmap::{PropertyType, Usmap, UsmapProperty};
 use super::value::{FName, FStr, PropertyBlock};
 
 /// A hand-written struct, decoded.
@@ -62,16 +62,92 @@ pub enum HandWritten {
     MaterialLayersTree(MaterialLayersTree),
 }
 
-/// `FInstancedPropertyBag`: a bag of descriptors and an opaque payload laid out
-/// by them. Nothing in Campaign Evolved ships one, so this is modeled from the
-/// layout rather than measured against data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `FInstancedPropertyBag`: a struct type invented at runtime.
+///
+/// The payload is **not** a `TArray<uint8>`. `Serialize` (PropertyBag.cpp:2295)
+/// reads the descriptors, builds a `UPropertyBag` from them with
+/// `GetOrCreateFromDescs`, and then calls `SerializeItem` on that struct — so
+/// the bytes are an ordinary unversioned property block against a schema the
+/// file carries with it. `SerialSize` exists so a loader that *cannot* build the
+/// struct can skip it, which is the only reason it looks skippable.
+// No `PartialEq`: a `PropertyBlock` is compared with `semantic_eq`.
+#[derive(Debug, Clone)]
 pub struct InstancedPropertyBag {
     /// Absent when the bag was written empty.
     pub descriptors: Option<Vec<PropertyBagDesc>>,
-    /// The values, laid out by the descriptors. Opaque until a bag turns up to
-    /// model it against.
-    pub payload: Vec<u8>,
+    /// The size the file declares for the block below. Kept because it is what
+    /// a loader without the schema seeks past, and it is not derivable from the
+    /// decoded values.
+    pub serial_size: i32,
+    /// The values, decoded against the schema the descriptors describe.
+    pub values: Option<PropertyBlock>,
+}
+
+/// Build the schema a `UPropertyBag` would have been created with.
+///
+/// `UPropertyBag::GetOrCreateFromDescs` turns the descriptors into a real
+/// `UStruct` whose properties are in descriptor order, so the block that follows
+/// indexes them exactly like any other schema.
+/// `resolver` names the `Struct` and `Enum` descriptors' types: a descriptor
+/// carries a `ValueTypeObject` reference, not a name, so the schema cannot be
+/// built without the package context — the same dependency `UDataTable`'s row
+/// struct has.
+pub fn property_bag_schema(
+    descs: &[PropertyBagDesc],
+    resolver: Option<&dyn super::archive::PackageResolver>,
+) -> Vec<UsmapProperty> {
+    descs
+        .iter()
+        .enumerate()
+        .map(|(i, d)| UsmapProperty {
+            name: d.name.as_str().to_string(),
+            schema_index: i as u16,
+            array_dim: 1,
+            ty: property_bag_type(d, resolver),
+        })
+        .collect()
+}
+
+/// `EPropertyBagPropertyType` (PropertyBag.h:13) wrapped by its container types,
+/// innermost last — a descriptor lists `Array`/`Set` outermost first.
+fn property_bag_type(
+    d: &PropertyBagDesc,
+    resolver: Option<&dyn super::archive::PackageResolver>,
+) -> PropertyType {
+    // A `Struct` or `Enum` descriptor names its type by object reference.
+    let named = || {
+        resolver.and_then(|p| p.struct_name(d.value_type_object)).unwrap_or_default()
+    };
+    let mut ty = match d.value_type {
+        1 => PropertyType::Bool,
+        2 => PropertyType::Byte { enum_name: Option::None },
+        3 => PropertyType::Int,
+        4 => PropertyType::Int64,
+        5 => PropertyType::Float,
+        6 => PropertyType::Double,
+        7 => PropertyType::Name,
+        8 => PropertyType::Str,
+        9 => PropertyType::Text,
+        10 => PropertyType::Enum {
+            inner: Box::new(PropertyType::Byte { enum_name: Option::None }),
+            enum_name: named(),
+        },
+        11 => PropertyType::Struct(named()),
+        12 | 14 => PropertyType::Object,
+        13 | 15 => PropertyType::SoftObject,
+        16 => PropertyType::UInt32,
+        17 => PropertyType::UInt64,
+        // `None`, and anything a later engine adds.
+        other => PropertyType::Unknown(other),
+    };
+    for c in d.container_types.iter().rev() {
+        ty = match c {
+            1 => PropertyType::Array(Box::new(ty)),
+            2 => PropertyType::Set(Box::new(ty)),
+            _ => ty,
+        };
+    }
+    ty
 }
 
 /// `FPropertyBagPropertyDesc`.
@@ -1118,7 +1194,7 @@ impl HandWritten {
                 Some(HandWritten::LocatorFragment(LocatorFragment { fragment_type, payload }))
             }
             "InstancedPropertyBag" => {
-                let (descriptors, payload) = if r.u32()? != 0 {
+                let (descriptors, serial_size, values) = if r.u32()? != 0 {
                     let n = count(r, "property bag descriptors")?;
                     let mut descs = Vec::with_capacity(n.min(super::limits::PREALLOC_CAP));
                     for _ in 0..n {
@@ -1141,14 +1217,27 @@ impl HandWritten {
                             container_types,
                         });
                     }
-                    let serial = count(r, "property bag payload")?;
-                    (Some(descs), r.take(serial)?.to_vec())
+                    let serial = r.i32()?;
+                    let at = r.o;
+                    let schema = property_bag_schema(&descs, r.resolver);
+                    let slots: Vec<(&UsmapProperty, u8, &str)> =
+                        schema.iter().map(|p| (p, 0u8, "PropertyBag")).collect();
+                    let values =
+                        super::block::read_struct_with_schema(r, "PropertyBag", &slots, usmap, 0)?;
+                    if r.o - at != serial.max(0) as usize {
+                        anyhow::bail!(
+                            "property bag block consumed {} bytes, the file declares {serial}",
+                            r.o - at
+                        );
+                    }
+                    (Some(descs), serial, Some(values))
                 } else {
-                    (Option::None, Vec::new())
+                    (Option::None, 0, Option::None)
                 };
                 Some(HandWritten::InstancedPropertyBag(InstancedPropertyBag {
                     descriptors,
-                    payload,
+                    serial_size,
+                    values,
                 }))
             }
             "MaterialLayersFunctionsTree" => {
@@ -1390,9 +1479,14 @@ impl HandWritten {
                             ar.raw(&mut d.container_types.clone(), n)?;
                             ar.u32(&mut 0)?;
                         }
-                        ar.i32(&mut (b.payload.len() as i32))?;
-                        let n = b.payload.len();
-                        ar.raw(&mut b.payload.clone(), n)?;
+                        ar.i32(&mut b.serial_size.to_owned())?;
+                        let Some(values) = &b.values else {
+                            anyhow::bail!("a property bag with descriptors has no values")
+                        };
+                        let schema = property_bag_schema(descs, ar.resolver());
+                        let slots: Vec<(&UsmapProperty, u8, &str)> =
+                            schema.iter().map(|p| (p, 0u8, "PropertyBag")).collect();
+                        write_block(ar, values, &slots, usmap)?;
                     }
                     Option::None => ar.u32(&mut 0)?,
                 }
@@ -1548,7 +1642,15 @@ impl HandWritten {
                 }
                 _ => false,
             },
-            (HandWritten::InstancedPropertyBag(a), HandWritten::InstancedPropertyBag(b)) => a == b,
+            (HandWritten::InstancedPropertyBag(a), HandWritten::InstancedPropertyBag(b)) => {
+                a.descriptors == b.descriptors
+                    && a.serial_size == b.serial_size
+                    && match (&a.values, &b.values) {
+                        (Some(x), Some(y)) => x.semantic_eq(y),
+                        (Option::None, Option::None) => true,
+                        _ => false,
+                    }
+            }
             (HandWritten::MaterialLayersTree(a), HandWritten::MaterialLayersTree(b)) => a == b,
             (HandWritten::LocatorFragment(a), HandWritten::LocatorFragment(b)) => {
                 a.fragment_type == b.fragment_type
@@ -1592,7 +1694,8 @@ impl HandWritten {
     /// model it against.
     pub fn untyped_bytes(&self) -> usize {
         match self {
-            HandWritten::InstancedPropertyBag(b) => b.payload.len(),
+            // Nothing: the bag's values are a property block now, not a span.
+            HandWritten::InstancedPropertyBag(_) => 0,
             _ => 0,
         }
     }

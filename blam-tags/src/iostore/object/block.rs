@@ -304,7 +304,17 @@ pub(super) fn write_block(
 /// gate `ce_block_roundtrip` measures: for an unmodified block this must
 /// reproduce the exact bytes it was read from.
 pub fn emit_block(class: &str, block: &PropertyBlock, usmap: &Usmap) -> Result<Vec<u8>> {
-    let mut w = super::archive::Writer::new();
+    emit_block_in(class, block, usmap, None)
+}
+
+/// As [`emit_block`], with the package context a nested layout may need.
+pub fn emit_block_in(
+    class: &str,
+    block: &PropertyBlock,
+    usmap: &Usmap,
+    resolver: Option<&dyn super::archive::PackageResolver>,
+) -> Result<Vec<u8>> {
+    let mut w = super::archive::Writer::with_resolver(resolver);
     let flat = flattened_schema(class, usmap)?;
     write_block(&mut w, block, &flat, usmap)?;
     Ok(w.into_bytes())

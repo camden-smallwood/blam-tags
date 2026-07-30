@@ -24,7 +24,7 @@ use std::io::Cursor;
 
 use blam_tags::iostore::container_header::EIoContainerHeaderVersion;
 use blam_tags::iostore::object::unversioned::{
-    read_export, read_userdefined_struct_layout, roundtrip_tail, ExportContext, PackageResolver,
+    read_export_in, read_userdefined_struct_layout, roundtrip_tail, ExportContext, PackageResolver,
     PropValue, PropertyBlock, TailContext,
 };
 use blam_tags::iostore::package::ue_types::FPackageObjectIndexType;
@@ -278,13 +278,25 @@ fn main() {
             };
             let Ok(payloads) = read_payloads(&h, &b) else { continue };
             let names = h.name_map.copy_raw_names();
+            let pkg_bulk: Vec<(i64, i64)> =
+                h.bulk_data.iter().map(|x| (x.serial_offset, x.serial_size)).collect();
+            let pkg_layouts = RefCell::new(HashMap::new());
+            let pkg_resolver = PkgResolver {
+                world: &world,
+                layouts: &pkg_layouts,
+                header: &h,
+                bytes: &b,
+                names: &names,
+            };
+            let read_ctx =
+                ExportContext { bulk_data: &pkg_bulk, resolver: Some(&pkg_resolver) };
             for (i, ex) in h.export_map.iter().enumerate() {
                 let Some(class) = by_hash.get(&ex.class_index.raw_index()) else { continue };
                 let short = class.rsplit('.').next().unwrap_or(class);
                 if usmap.flattened_properties(short).is_none() {
                     continue;
                 }
-                let Ok(parts) = read_export(&payloads[i], &names, &usmap, short, ex.object_flags)
+                let Ok(parts) = read_export_in(&payloads[i], &names, &usmap, short, ex.object_flags, &read_ctx)
                 else {
                     continue;
                 };
