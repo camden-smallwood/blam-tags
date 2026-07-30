@@ -729,6 +729,27 @@ pub struct PackageOverride<'a> {
     pub store: StoreEntry,
 }
 
+fn add_package_override_to_writer(
+    writer: &mut OverrideContainerWriter,
+    over: &PackageOverride<'_>,
+) -> Result<()> {
+    use crate::iostore::package::ue_types::EIoStoreTocVersion;
+    use crate::iostore::package::zen::FZenPackageHeader;
+    const HV: EIoContainerHeaderVersion = EIoContainerHeaderVersion::SoftPackageReferences;
+    const CV: EIoStoreTocVersion = EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash;
+
+    let id = over.archive.chunk_id_for(over.uasset_path)?;
+    // The package's own name is the identity the store is keyed by, and it is
+    // inside the bytes we are about to write — so take it from there rather
+    // than from the path, which is a filename convention.
+    let header =
+        FZenPackageHeader::deserialize(&mut std::io::Cursor::new(&over.bytes), None, CV, HV, None)
+            .map_err(|_| IoStoreError::Package("rebuilt package did not parse"))?;
+    let package_id = FPackageId::from_name(&header.package_name());
+    writer.add_package(id, over.bytes.clone(), package_id, over.store.clone());
+    Ok(())
+}
+
 /// Bundle rebuilt packages into an override (mod) container.
 ///
 /// The store entry is re-declared rather than inherited, because an edit can
@@ -739,24 +760,7 @@ pub fn write_package_mod_container(
     overrides: &[PackageOverride<'_>],
     out_utoc: &std::path::Path,
 ) -> Result<()> {
-    use crate::iostore::package::ue_types::EIoStoreTocVersion;
-    use crate::iostore::package::zen::FZenPackageHeader;
-    const HV: EIoContainerHeaderVersion = EIoContainerHeaderVersion::SoftPackageReferences;
-    const CV: EIoStoreTocVersion = EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash;
-
-    let mut w = OverrideContainerWriter::new("../../../");
-    for over in overrides {
-        let id = over.archive.chunk_id_for(over.uasset_path)?;
-        // The package's own name is the identity the store is keyed by, and it
-        // is inside the bytes we are about to write — so take it from there
-        // rather than from the path, which is a filename convention.
-        let header =
-            FZenPackageHeader::deserialize(&mut std::io::Cursor::new(&over.bytes), None, CV, HV, None)
-                .map_err(|_| IoStoreError::Package("rebuilt package did not parse"))?;
-        let package_id = FPackageId::from_name(&header.package_name());
-        w.add_package(id, over.bytes.clone(), package_id, over.store.clone());
-    }
-    w.write(out_utoc)
+    write_combined_mod_container(&[], overrides, &[], out_utoc)
 }
 
 /// Bundle several edited tags into ONE override (mod) container — a portable,
@@ -815,8 +819,24 @@ pub fn write_mod_container_full(
     new_packages: &[NewPackage],
     out_utoc: &std::path::Path,
 ) -> Result<()> {
+    write_combined_mod_container(overrides, &[], new_packages, out_utoc)
+}
+
+/// Build one mod container from Halo tag overrides, rebuilt ordinary Unreal
+/// packages, and new tag packages.
+///
+/// Baboon's Campaign Evolved project can carry both kinds of edit at once. Two
+/// independently written `_P` containers would make their relative priority a
+/// filename accident and could not be published as one reviewed mod, so the
+/// backend owns the combined operation.
+pub fn write_combined_mod_container(
+    tag_overrides: &[TagOverride<'_>],
+    package_overrides: &[PackageOverride<'_>],
+    new_packages: &[NewPackage],
+    out_utoc: &std::path::Path,
+) -> Result<()> {
     let mut w = OverrideContainerWriter::new("../../../");
-    for over in overrides {
+    for over in tag_overrides {
         add_override_to_writer(
             &mut w,
             over.archive,
@@ -824,6 +844,9 @@ pub fn write_mod_container_full(
             over.tag_bytes,
             over.uasset_bytes,
         )?;
+    }
+    for over in package_overrides {
+        add_package_override_to_writer(&mut w, over)?;
     }
     for pkg in new_packages {
         add_new_package_to_writer(&mut w, pkg)?;
@@ -1389,6 +1412,120 @@ mod tests {
 
         for ext in ["utoc", "ucas", "pak"] {
             let _ = std::fs::remove_file(utoc.with_extension(ext));
+        }
+    }
+
+    #[test]
+    fn combined_mod_carries_tag_and_ordinary_package_overrides() {
+        use crate::iostore::IoStoreArchive;
+        use crate::iostore::package::builder::{read_payloads, write_package};
+        use crate::iostore::package::ue_types::EIoStoreTocVersion;
+        use crate::iostore::package::zen::FZenPackageHeader;
+        use std::io::Cursor;
+
+        const HV: EIoContainerHeaderVersion = EIoContainerHeaderVersion::SoftPackageReferences;
+        const CV: EIoStoreTocVersion = EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash;
+        let tag_package =
+            include_bytes!("../../../tests/fixtures/ce/leading-empty.uasset").to_vec();
+        let ordinary_package = include_bytes!("../../../tests/fixtures/ce/text.uasset").to_vec();
+        let parse = |bytes: &[u8]| {
+            let header =
+                FZenPackageHeader::deserialize(&mut Cursor::new(bytes), None, CV, HV, None)
+                    .expect("parse fixture package");
+            let payloads = read_payloads(&header, bytes).expect("fixture payloads");
+            let (rebuilt, store) =
+                write_package(&header, &payloads, HV).expect("fixture package rebuild");
+            assert_eq!(rebuilt, bytes, "fixture must rebuild exactly");
+            (header, store)
+        };
+        let (tag_header, tag_store) = parse(&tag_package);
+        let (ordinary_header, ordinary_store) = parse(&ordinary_package);
+        let tag_id = FPackageId::from_name(&tag_header.package_name());
+        let ordinary_id = FPackageId::from_name(&ordinary_header.package_name());
+
+        let ipeh = i32::from_le_bytes(tag_package[0x18..0x1c].try_into().unwrap()) as usize;
+        let old_tag_len =
+            u64::from_le_bytes(tag_package[ipeh - 16..ipeh - 8].try_into().unwrap()) as usize;
+        let old_tag = vec![0x31; old_tag_len];
+        let mut new_tag = old_tag.clone();
+        new_tag[old_tag_len / 2] ^= 0xff;
+
+        let base_utoc = std::env::temp_dir().join(format!(
+            "blamtags_combined_base_{}.utoc",
+            std::process::id()
+        ));
+        let out_utoc = std::env::temp_dir().join(format!(
+            "blamtags_combined_output_{}_P.utoc",
+            std::process::id()
+        ));
+        let mut base_writer = OverrideContainerWriter::new("../../../");
+        base_writer.add_package(
+            make_chunk_id(tag_id.0, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA),
+            tag_package,
+            tag_id,
+            tag_store,
+        );
+        base_writer.add_chunk(make_chunk_id(tag_id.0, 0, CHUNK_TYPE_BULK_DATA), old_tag);
+        base_writer.add_package(
+            make_chunk_id(ordinary_id.0, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA),
+            ordinary_package.clone(),
+            ordinary_id,
+            ordinary_store.clone(),
+        );
+        base_writer.write(&base_utoc).expect("write synthetic base");
+
+        let mut base = IoStoreArchive::open(&base_utoc).expect("open synthetic base");
+        assert!(base.recover_entries(&[], Some("Meteorite/Content/")) >= 3);
+        let tag_ubulk = base.entries().iter().find(|entry| {
+            entry.path.ends_with(".ubulk")
+                && base.chunk_id(entry.chunk_index).is_ok_and(|id| {
+                    id.package_id() == tag_id.0.to_le_bytes()
+                })
+        }).expect("tag bulk path").path.clone();
+        let ordinary_uasset = base.entries().iter().find(|entry| {
+            entry.path.ends_with(".uasset")
+                && base.chunk_id(entry.chunk_index).is_ok_and(|id| {
+                    id.package_id() == ordinary_id.0.to_le_bytes()
+                })
+        }).expect("ordinary package path").path.clone();
+
+        write_combined_mod_container(
+            &[TagOverride {
+                archive: &base,
+                ubulk_path: &tag_ubulk,
+                tag_bytes: &new_tag,
+                uasset_bytes: None,
+            }],
+            &[PackageOverride {
+                archive: &base,
+                uasset_path: &ordinary_uasset,
+                bytes: ordinary_package.clone(),
+                store: ordinary_store,
+            }],
+            &[],
+            &out_utoc,
+        ).expect("write combined mod");
+
+        let output = IoStoreArchive::open(&out_utoc).expect("open combined mod");
+        let tag_chunk = (0..output.chunk_count()).find(|&index| {
+            output.chunk_id(index).is_ok_and(|id| {
+                id.package_id() == tag_id.0.to_le_bytes()
+                    && id.chunk_type() == CHUNK_TYPE_BULK_DATA
+            })
+        }).expect("combined tag chunk");
+        let package_chunk = (0..output.chunk_count()).find(|&index| {
+            output.chunk_id(index).is_ok_and(|id| {
+                id.package_id() == ordinary_id.0.to_le_bytes()
+                    && id.chunk_type() == CHUNK_TYPE_EXPORT_BUNDLE_DATA
+            })
+        }).expect("combined package chunk");
+        assert_eq!(output.read_chunk(tag_chunk).unwrap(), new_tag);
+        assert_eq!(output.read_chunk(package_chunk).unwrap(), ordinary_package);
+
+        for path in [&base_utoc, &out_utoc] {
+            for extension in ["utoc", "ucas", "pak"] {
+                let _ = std::fs::remove_file(path.with_extension(extension));
+            }
         }
     }
 
