@@ -151,7 +151,12 @@ pub enum RenderMethodAnimatedParameterType {
 }
 
 /// Engine-bound parameter source. Mirrors Ares `e_render_method_extern`
-/// — 49 H3 entries. ODST/Reach add more; use that game's enum there.
+/// — 49 H3 entries — then the Gen3 remaster additions, then the names the
+/// shipped H3 tags turn out to offer that Ares' list does not.
+///
+/// The set is the union across games on purpose: `source extern` resolves by the
+/// name embedded in the tag, so a name with no variant here is a panic, not a
+/// fallback. Add rather than reorder.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash,
          num_derive::FromPrimitive, num_derive::ToPrimitive,
@@ -231,10 +236,35 @@ pub enum RenderMethodExtern {
     #[strum(serialize = "wrinkle weights b")]                WrinkleWeightsB                      = 66,
     #[strum(serialize = "static lighting previs")]           StaticLightingPrevis                 = 67,
     #[strum(serialize = "emblem bitmaps and data")]          EmblemBitmapsAndData                 = 68,
+    // Names the *shipped H3 tags* offer that the Ares list above does not, taken
+    // from the option lists embedded in the H3 editing kit's
+    // `render_method_option` tags. Those are a different vintage of the schema: H3
+    // predates the lightprobe/dominant-light externs and binds lightmaps and
+    // irradiance maps instead, and its change-color set has animated variants.
+    //
+    // Appended, like the block above, because the decode matches by name. Missing
+    // one is not a degraded read but a panic in `Enum::resolve`: three H3 option
+    // tags select `bounding sphere` / `change color primary anim` / `change color
+    // secondary anim`, and reading any of them took the caller down.
+    #[strum(serialize = "unused 0")]                         TextureUnused0                       = 69,
+    #[strum(serialize = "lightmap")]                         TextureLightmap                      = 70,
+    #[strum(serialize = "irradiance map red")]               TextureIrradianceMapRed              = 71,
+    #[strum(serialize = "irradiance map green")]             TextureIrradianceMapGreen            = 72,
+    #[strum(serialize = "irradiance map blue")]              TextureIrradianceMapBlue             = 73,
+    #[strum(serialize = "irradiance map extra red")]         TextureIrradianceMapExtraRed         = 74,
+    #[strum(serialize = "irradiance map extra green")]       TextureIrradianceMapExtraGreen       = 75,
+    #[strum(serialize = "irradiance map extra blue")]        TextureIrradianceMapExtraBlue        = 76,
+    #[strum(serialize = "ibr target")]                       TextureGlobalTargetIbr               = 77,
+    #[strum(serialize = "cheap texture camera Z")]            TextureGlobalTargetCheapTextureCameraZ = 78,
+    #[strum(serialize = "emblem clan chest texture")]        TextureEmblemClanChest               = 79,
+    #[strum(serialize = "emblem player shoulder texture")]   TextureEmblemPlayerShoulder          = 80,
+    #[strum(serialize = "bounding sphere")]                  ObjectBoundingSphere                 = 81,
+    #[strum(serialize = "change color primary anim")]        ObjectChangeColorPrimaryAnim         = 82,
+    #[strum(serialize = "change color secondary anim")]      ObjectChangeColorSecondaryAnim       = 83,
 }
 
 impl RenderMethodExtern {
-    pub const COUNT: usize = 69;
+    pub const COUNT: usize = 84;
 
     /// Map by index. **Only for raw integer fields that carry no embedded
     /// name** — the rmsh `bitmap extern RTT mode` / postprocess `extern
@@ -242,13 +272,14 @@ impl RenderMethodExtern {
     /// upgraded runtime indices, rebuilt by the tools on save), so the
     /// index is the current-schema index. The name-bearing rmop `source
     /// extern` field is resolved by name instead (drift-immune) via the
-    /// typed [`Enum`] wrapper. Discriminants now match the JSON schema
-    /// (0..49, including `emblem color background` at 20).
+    /// typed [`Enum`] wrapper. Discriminants 0..49 match the JSON schema
+    /// (including `emblem color background` at 20); everything above that is
+    /// appended name-only space, which an index-only field never reaches.
     pub fn from_index(i: i128) -> Option<Self> {
         if !(0..Self::COUNT as i128).contains(&i) {
             return None;
         }
-        // Safe: enum is `repr(u32)` with sequential 0..50 discriminants.
+        // Safe: enum is `repr(u32)` with sequential discriminants from 0.
         Some(unsafe { std::mem::transmute::<u32, Self>(i as u32) })
     }
 }
@@ -1661,5 +1692,61 @@ mod alpha_blend_mode_tests {
         assert_eq!(AlphaBlendMode::from_str("add src times dstalpha"), Ok(AlphaBlendMode::AddSrcTimesDstAlpha));
         assert_eq!(AlphaBlendMode::from_str("ALPHA_BLEND"), Ok(AlphaBlendMode::AlphaBlend));
         assert!(AlphaBlendMode::from_str("nonsense").is_err());
+    }
+}
+
+#[cfg(test)]
+mod render_method_extern_tests {
+    use super::RenderMethodExtern;
+
+    /// Every `source extern` name the shipped H3 editing kit's option tags offer.
+    ///
+    /// Collected from the option lists embedded in all 176 `render_method_option`
+    /// and `render_method_definition` tags in the H3 kit. This is not decoration:
+    /// `Enum::resolve` panics on a name with no variant, so a missing one takes
+    /// down whatever was reading the tag. Three of these are selected by shipped
+    /// tags today; the rest are one user edit away from being selected.
+    #[test]
+    fn every_h3_source_extern_name_resolves() {
+        use std::str::FromStr;
+        const H3_EMBEDDED_NAMES: &[&str] = &[
+            "none", "texaccum target", "z target", "shadow 1 target", "shadow 2 target",
+            "shadow 3 target", "shadow 4 target", "texture camera target", "reflection target",
+            "refraction target", "lightmap", "irradiance map red", "irradiance map green",
+            "irradiance map blue", "change color primary", "change color secondary",
+            "change color tertiary", "change color quaternary", "dynamic environment map 1",
+            "dynamic environment map 2", "cook torrance cc0236", "cook torrance dd0236",
+            "cook torrance c78d78", "light dir 0", "light color 0", "light dir 1",
+            "light color 1", "light dir 2", "light color 2", "light dir 3", "light color 3",
+            "irradiance map extra red", "irradiance map extra green",
+            "irradiance map extra blue", "dynamic light gel 0", "flat envmap matrix x",
+            "flat envmap matrix y", "flat envmap matrix z", "debug tint", "screen constants",
+            // Offered by the longer lists other option tags in the same kit embed.
+            "unused 0", "ibr target", "cheap texture camera Z", "emblem clan chest texture",
+            "emblem player shoulder texture", "bounding sphere", "change color primary anim",
+            "change color secondary anim",
+        ];
+        for name in H3_EMBEDDED_NAMES {
+            assert!(
+                RenderMethodExtern::from_str(name).is_ok(),
+                "no RenderMethodExtern variant for the shipped H3 name {name:?}"
+            );
+        }
+    }
+
+    /// The appended name-only space must not disturb index-only decoding, which
+    /// reads the same enum by position.
+    #[test]
+    fn appended_externs_leave_the_indexed_range_alone() {
+        assert_eq!(RenderMethodExtern::from_index(0), Some(RenderMethodExtern::None));
+        assert_eq!(
+            RenderMethodExtern::from_index(20),
+            Some(RenderMethodExtern::ObjectEmblemColorBackground)
+        );
+        assert_eq!(
+            RenderMethodExtern::from_index(68),
+            Some(RenderMethodExtern::EmblemBitmapsAndData)
+        );
+        assert_eq!(RenderMethodExtern::from_index(RenderMethodExtern::COUNT as i128), None);
     }
 }
