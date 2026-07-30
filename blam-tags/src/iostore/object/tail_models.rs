@@ -3742,6 +3742,97 @@ impl ActorTail {
     }
 }
 
+/// `UAnimInstance`'s tail: the proxy's required-bone container.
+///
+/// `UAnimInstance::Serialize` (AnimInstance.cpp) writes
+/// `GetProxyOnAnyThread<FAnimInstanceProxy>().GetRequiredBones()` under
+/// `if (!Ar.IsLoading() || !Ar.IsSaving())` — a guard true for both, so it
+/// always writes.
+///
+/// **NOT WIRED INTO `roundtrip_tail`, on purpose.** The layout below is read
+/// straight off `operator<<` and is believed right, but it cannot be what the
+/// 117 animation-Blueprint CDOs hold: their span begins `04 00 00 00`, and the
+/// first four bytes after a property block are the object-guid presence bool,
+/// which is 0 or 1. A non-boolean there means the *block* ended in the wrong
+/// place, so those bytes are unread property data and not a tail at all.
+/// Wiring this up made the gate report 117 "modeled" failures in place of 117
+/// honest "no model"s, which is strictly worse: it asserts a layout for bytes
+/// whose identity is not yet established. Fix the block decode for
+/// `AnimBlueprintGeneratedClass` first — the suspects are its own
+/// `FAnimNode_*`/`FAnimSubsystemInstance` properties — then wire this in and
+/// let the gate judge it.
+#[derive(Debug, Clone, PartialEq)]
+/// Mirrors `operator<<(FArchive&, FBoneContainer&)` (BoneContainer.h:487).
+pub struct BoneContainerTail {
+    /// `BoneIndicesArray` — `TArray<FBoneIndexType>`, and `FBoneIndexType` is
+    /// `uint16`.
+    pub bone_indices: Vec<u16>,
+    /// `BoneSwitchArray` — a `TBitArray`, which serializes its bit *count* and
+    /// then `ceil(bits / 32)` whole words. The count is not recoverable from
+    /// the words, so both are kept.
+    pub bone_switch_bits: i32,
+    pub bone_switch_words: Vec<u32>,
+    /// `Asset`, `AssetSkeletalMesh`, `AssetSkeleton` — `TWeakObjectPtr`s, each
+    /// an `FPackageIndex` in a package archive.
+    pub asset: i32,
+    pub asset_skeletal_mesh: i32,
+    pub asset_skeleton: i32,
+    pub skeleton_to_pose_bone_index: Vec<i32>,
+    pub pose_to_skeleton_bone_index: Vec<i32>,
+    /// Three `bool`s, four bytes each — `FArchive`'s bool is an `int32`.
+    pub disable_retargeting: u32,
+    pub use_raw_data: u32,
+    pub use_source_data: u32,
+}
+
+impl BoneContainerTail {
+    pub fn read(r: &mut Reader) -> Result<Self> {
+        let bone_indices = read_u16_array(r, "FBoneContainer::BoneIndicesArray")?;
+        let bone_switch_bits = r.i32()?;
+        let words = bounded_count(
+            ((bone_switch_bits.max(0) as i64 + 31) / 32) as i32,
+            "FBoneContainer::BoneSwitchArray",
+            r.o - 4,
+        )?;
+        let bone_switch_words = (0..words).map(|_| r.u32()).collect::<Result<Vec<_>>>()?;
+        Ok(BoneContainerTail {
+            bone_indices,
+            bone_switch_bits,
+            bone_switch_words,
+            asset: r.i32()?,
+            asset_skeletal_mesh: r.i32()?,
+            asset_skeleton: r.i32()?,
+            skeleton_to_pose_bone_index: read_i32_array(
+                r,
+                "FBoneContainer::SkeletonToPoseBoneIndexArray",
+            )?,
+            pose_to_skeleton_bone_index: read_i32_array(
+                r,
+                "FBoneContainer::PoseToSkeletonBoneIndexArray",
+            )?,
+            disable_retargeting: r.u32()?,
+            use_raw_data: r.u32()?,
+            use_source_data: r.u32()?,
+        })
+    }
+
+    pub fn write(&self, ar: &mut impl Ar) -> Result<()> {
+        write_u16_array(ar, &self.bone_indices)?;
+        ar.i32(&mut self.bone_switch_bits.to_owned())?;
+        for w in &self.bone_switch_words {
+            ar.u32(&mut w.to_owned())?;
+        }
+        ar.i32(&mut self.asset.to_owned())?;
+        ar.i32(&mut self.asset_skeletal_mesh.to_owned())?;
+        ar.i32(&mut self.asset_skeleton.to_owned())?;
+        write_i32_array(ar, &self.skeleton_to_pose_bone_index)?;
+        write_i32_array(ar, &self.pose_to_skeleton_bone_index)?;
+        ar.u32(&mut self.disable_retargeting.to_owned())?;
+        ar.u32(&mut self.use_raw_data.to_owned())?;
+        ar.u32(&mut self.use_source_data.to_owned())
+    }
+}
+
 /// `UAkAudioEvent`'s tail: the localized cooked event data, then its durations
 /// and attenuation radius.
 #[derive(Debug, Clone)]
@@ -5500,7 +5591,40 @@ pub const MODELED_TAILS: &[&str] = &[
 /// would replace. `None` when the class has no model yet.
 ///
 /// Takes the property block because the tail's *shape* depends on it.
+///
+/// A class that appends no tail of its own serializes exactly its nearest
+/// tail-owning ancestor's chain, so when nothing matches by name this retries
+/// as that ancestor. Every Blueprint-generated class is in that position — it
+/// overrides no `Serialize` — and the literal-name arms hid the fact: because
+/// `UInstancedStaticMeshComponent` is dispatched by name, no *family* key was
+/// ever registered for it, so `TC_InstancedStaticMesh_Sprites_C` matched
+/// neither and 2,349 of its exports reported "no model" for a chain that has
+/// been modeled all along.
+///
+/// Deliberately a last resort rather than a normalisation up front: reducing
+/// every class to its nearest owner first would re-route the native classes
+/// that currently resolve through the family key, and those already pass.
 pub fn roundtrip_tail(
+    class: &str,
+    tail: &[u8],
+    names: &[String],
+    block: &PropertyBlock,
+    ctx: TailContext,
+) -> Option<Result<Vec<u8>>> {
+    if let Some(got) = roundtrip_tail_exact(class, tail, names, block, ctx) {
+        return Some(got);
+    }
+    match tail_owners(class, ctx.usmap).first() {
+        Some(nearest) if nearest != class => {
+            roundtrip_tail_exact(nearest, tail, names, block, ctx)
+        }
+        _ => None,
+    }
+}
+
+/// [`roundtrip_tail`] without the ancestor fallback: dispatch on this exact
+/// class name, then on its tail-owner family key.
+fn roundtrip_tail_exact(
     class: &str,
     tail: &[u8],
     names: &[String],
