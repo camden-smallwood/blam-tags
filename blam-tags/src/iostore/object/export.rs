@@ -161,6 +161,15 @@ pub fn walk_export(
     let why = tail_why();
     let mut stopped = None;
     for c in &chain {
+        // Nothing left to walk. A class-default object is block + trailer and
+        // no native tail at all, so running `AActor`'s arm on zero bytes made
+        // the walker refuse 1,801 exports the reader reads fine. An arm may
+        // legitimately consume nothing, but none can consume *less* than
+        // nothing, so stopping here cannot hide a tail that is really there —
+        // and if one were, the bytes-consumed check would still report it.
+        if r.o >= export.len() {
+            break;
+        }
         let at = r.o;
         let keep_going = read_class_native_tail(&mut r, c, &props, usmap, ctx, object_flags)
             .with_context(|| format!("native tail of {c} (in {class})"))?;

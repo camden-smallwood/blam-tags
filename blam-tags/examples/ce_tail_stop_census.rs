@@ -55,6 +55,9 @@ fn main() {
     // an arm is short, the bytes say what it is short *of*.
     let mut short_sample: BTreeMap<String, String> = BTreeMap::new();
     let (mut to_the_end, mut leftover_total) = (0u64, 0u64);
+    let mut seen = 0u64;
+    let mut skipped: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut refusals: BTreeMap<String, u64> = BTreeMap::new();
 
     for a in world.archives() {
         for e in a.entries() {
@@ -81,12 +84,24 @@ fn main() {
                 .map(|b| (b.serial_offset, b.serial_size))
                 .collect();
             for (i, ex) in h.export_map.iter().enumerate() {
+                // Count first, filter second: a `continue` above the counter is
+                // invisible in the output, which is how "100.0000%" came to mean
+                // "100% of what got far enough to be counted".
+                seen += 1;
                 let Some(class) = world.class_key(&h, ex.class_index) else {
+                    *skipped.entry("class index unresolvable").or_insert(0u64) += 1;
                     continue;
                 };
-                let class = class.as_str();
-                let short = class.rsplit('.').next().unwrap_or(class);
+                // `World::class_key` already returns exactly what the `.usmap`
+                // is keyed by — a bare name for a native class, a `pkg#hash` or
+                // `pkg.object` for a generated one. Truncating at the last `.`
+                // was left over from before `class_key` existed and turned
+                // `/Game/…/WBP_PauseMenu.WBP_PauseMenu_C` into
+                // `WBP_PauseMenu_C`, which resolves to a *different* schema and
+                // reported the resulting one-byte shortfall as a codec defect.
+                let short = class.as_str();
                 if !has_schema(short, usmap) {
+                    *skipped.entry("no schema (unreflected class)").or_insert(0u64) += 1;
                     continue;
                 }
                 let resolver = world.resolver(&h, &b, &names);
@@ -94,10 +109,17 @@ fn main() {
                     bulk_data: &bulk,
                     resolver: Some(&resolver),
                 };
-                let Ok(walk) =
-                    walk_export(&payloads[i], &names, usmap, short, ex.object_flags, &ctx)
-                else {
-                    continue;
+                let walk = match walk_export(
+                    &payloads[i], &names, usmap, short, ex.object_flags, &ctx,
+                ) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        *skipped.entry("walk_export refused").or_insert(0u64) += 1;
+                        let chain = format!("{:#}", e);
+                        let key = chain.lines().next().unwrap_or("").to_string();
+                        *refusals.entry(key).or_insert(0u64) += 1;
+                        continue;
+                    }
                 };
                 walked += 1;
                 let leftover = payloads[i].len().saturating_sub(walk.consumed);
@@ -132,7 +154,19 @@ fn main() {
         }
     }
 
+    println!("exports in the corpus {seen}");
     println!("exports walked        {walked}");
+    for (why, n) in &skipped {
+        println!("  skipped {n:>8}  {why}");
+    }
+    if !refusals.is_empty() {
+        println!("\nwhy the walker refused (the reader accepts all of these):");
+        let mut v: Vec<_> = refusals.iter().collect();
+        v.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+        for (why, n) in v.iter().take(12) {
+            println!("  {n:>8}  {why}");
+        }
+    }
     println!(
         "chain fully modeled   {complete} ({:.2}%)",
         100.0 * complete as f64 / walked.max(1) as f64
