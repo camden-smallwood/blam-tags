@@ -55,6 +55,11 @@ use super::archive::{Ar, Reader};
 use super::block::{flattened_schema, read_struct, write_block};
 use super::common::read_bulk_array;
 use super::limits::MAX_NATIVE_COUNT;
+use super::ue_struct::{
+    bounded_count, read_vec, write_run, write_vec, BoxSphereBounds, ClothingSectionData, FuncMapEntry,
+    Guid, ImplementedInterface, MeshBoneInfo, NameToIndex, ShaHash, StaticMaterial,
+    StaticMeshSection, StripDataFlags,
+};
 use super::usmap::Usmap;
 use super::value::{FName, FStr, PropValue, PropertyBlock};
 
@@ -1433,8 +1438,7 @@ fn write_optional_index_buffer(
 pub struct StaticMeshLod {
     pub global_strip: u8,
     pub class_strip: u8,
-    /// `FStaticMeshSection` — five `int32`s then five four-byte flags.
-    pub sections: Vec<[u8; 40]>,
+    pub sections: Vec<StaticMeshSection>,
     pub max_deviation: f32,
     pub is_lod_cooked_out: bool,
     pub is_inlined: bool,
@@ -1465,14 +1469,8 @@ impl StaticMeshLod {
     fn read(r: &mut Reader) -> Result<Self> {
         let global_strip = r.u8()?;
         let class_strip = r.u8()?;
-        let n = {
-            let n = r.i32()?;
-            super::limits::bounded(n, MAX_NATIVE_COUNT, "mesh sections", r.o - 4)?
-        };
-        let mut sections = Vec::with_capacity(n.min(64));
-        for _ in 0..n {
-            sections.push(r.take(40)?.try_into().expect("40 bytes"));
-        }
+        let n = bounded_count(r.i32()?, "mesh sections", r.o - 4)?;
+        let sections: Vec<StaticMeshSection> = read_vec(r, "mesh sections", n)?;
         let max_deviation = r.f32()?;
         let is_lod_cooked_out = r.u32()? != 0;
         let is_inlined = r.u32()? != 0;
@@ -1520,10 +1518,7 @@ impl StaticMeshLod {
     fn write(&self, ar: &mut impl Ar) -> Result<()> {
         ar.u8(&mut self.global_strip.to_owned())?;
         ar.u8(&mut self.class_strip.to_owned())?;
-        ar.i32(&mut (self.sections.len() as i32))?;
-        for s in &self.sections {
-            ar.raw(&mut s.to_vec(), 40)?;
-        }
+        write_vec(ar, &self.sections)?;
         ar.f32(&mut self.max_deviation.to_owned())?;
         ar.u32(&mut u32::from(self.is_lod_cooked_out))?;
         ar.u32(&mut u32::from(self.is_inlined))?;
@@ -1751,8 +1746,7 @@ pub struct StaticMeshTail {
     pub screen_sizes: [u8; 64],
     pub render_data_strip: [u8; 2],
     pub has_speed_tree_wind: u32,
-    /// `FStaticMaterial` — 36 bytes each.
-    pub materials: Vec<[u8; 36]>,
+    pub materials: Vec<StaticMaterial>,
 }
 
 impl StaticMeshTail {
@@ -1879,14 +1873,8 @@ impl StaticMeshTail {
         let screen_sizes = r.take(64)?.try_into().expect("64 bytes");
         let render_data_strip = [r.u8()?, r.u8()?];
         let has_speed_tree_wind = r.u32()?;
-        let n = {
-            let n = r.i32()?;
-            super::limits::bounded(n, MAX_NATIVE_COUNT, "StaticMaterials", r.o - 4)?
-        };
-        let mut materials = Vec::with_capacity(n.min(64));
-        for _ in 0..n {
-            materials.push(r.take(36)?.try_into().expect("36 bytes"));
-        }
+        let n = bounded_count(r.i32()?, "StaticMaterials", r.o - 4)?;
+        let materials: Vec<StaticMaterial> = read_vec(r, "StaticMaterials", n)?;
 
         Ok(StaticMeshTail {
             strip_flags,
@@ -2022,10 +2010,7 @@ impl StaticMeshTail {
         ar.u8(&mut self.render_data_strip[0].to_owned())?;
         ar.u8(&mut self.render_data_strip[1].to_owned())?;
         ar.u32(&mut self.has_speed_tree_wind.to_owned())?;
-        ar.i32(&mut (self.materials.len() as i32))?;
-        for m in &self.materials {
-            ar.raw(&mut m.to_vec(), 36)?;
-        }
+        write_vec(ar, &self.materials)?;
         Ok(())
     }
 }
@@ -2259,8 +2244,8 @@ impl ModelComponentTail {
 /// One `FReferencePose` of a `USkeleton`'s retarget sources.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetargetSource {
-    pub key: [u8; 8],
-    pub pose_name: [u8; 8],
+    pub key: FName,
+    pub pose_name: FName,
     pub reference_pose: Vec<u8>,
 }
 
@@ -2285,8 +2270,8 @@ impl SkeletonTail {
         };
         let mut retarget_sources = Vec::with_capacity(n.min(64));
         for _ in 0..n {
-            let key = r.take(8)?.try_into().expect("8 bytes");
-            let pose_name = r.take(8)?.try_into().expect("8 bytes");
+            let key = r.fname()?;
+            let pose_name = r.fname()?;
             let m = {
                 let m = r.i32()?;
                 super::limits::bounded(m, MAX_NATIVE_COUNT, "FReferencePose", r.o - 4)?
@@ -2315,8 +2300,8 @@ impl SkeletonTail {
         let tsize = self.reference_skeleton.transform_size;
         ar.i32(&mut (self.retarget_sources.len() as i32))?;
         for s in &self.retarget_sources {
-            ar.raw(&mut s.key.to_vec(), 8)?;
-            ar.raw(&mut s.pose_name.to_vec(), 8)?;
+            ar.fname(&mut s.key.clone())?;
+            ar.fname(&mut s.pose_name.clone())?;
             if tsize == 0 || s.reference_pose.len() % tsize != 0 {
                 bail!("retarget pose is {} bytes for {tsize}-byte transforms", s.reference_pose.len());
             }
@@ -2421,14 +2406,12 @@ impl FunctionTail {
 /// `UClass::Serialize`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassTail {
-    /// `FuncMap` — an `FName` and an `FPackageIndex` per entry.
-    pub func_map: FixedArray,
+    pub func_map: Vec<FuncMapEntry>,
     pub class_flags: u32,
     pub class_within: i32,
     pub class_config_name: FName,
     pub class_generated_by: i32,
-    /// `Interfaces` — 12 bytes each.
-    pub interfaces: FixedArray,
+    pub interfaces: Vec<ImplementedInterface>,
     pub deprecated_flag: u32,
     pub deprecated_name: FName,
     pub cooked: u32,
@@ -2438,12 +2421,18 @@ pub struct ClassTail {
 impl ClassTail {
     fn read(r: &mut Reader) -> Result<Self> {
         Ok(ClassTail {
-            func_map: FixedArray::read(r, "FuncMap", 12)?,
+            func_map: {
+                let n = bounded_count(r.i32()?, "FuncMap", r.o - 4)?;
+                read_vec(r, "FuncMap", n)?
+            },
             class_flags: r.u32()?,
             class_within: r.i32()?,
             class_config_name: r.fname()?,
             class_generated_by: r.i32()?,
-            interfaces: FixedArray::read(r, "Interfaces", 12)?,
+            interfaces: {
+                let n = bounded_count(r.i32()?, "Interfaces", r.o - 4)?;
+                read_vec(r, "Interfaces", n)?
+            },
             deprecated_flag: r.u32()?,
             deprecated_name: r.fname()?,
             cooked: r.u32()?,
@@ -2452,12 +2441,12 @@ impl ClassTail {
     }
 
     fn write(&self, ar: &mut impl Ar) -> Result<()> {
-        self.func_map.write(ar)?;
+        write_vec(ar, &self.func_map)?;
         ar.u32(&mut self.class_flags.to_owned())?;
         ar.i32(&mut self.class_within.to_owned())?;
         ar.fname(&mut self.class_config_name.clone())?;
         ar.i32(&mut self.class_generated_by.to_owned())?;
-        self.interfaces.write(ar)?;
+        write_vec(ar, &self.interfaces)?;
         ar.u32(&mut self.deprecated_flag.to_owned())?;
         ar.fname(&mut self.deprecated_name.clone())?;
         ar.u32(&mut self.cooked.to_owned())?;
@@ -4021,8 +4010,7 @@ impl FixedArray {
 /// `FReferenceSkeleton` — the rig the renderer skins against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReferenceSkeleton {
-    /// `FMeshBoneInfo`: an `FName` and an `int32` parent index.
-    pub bone_info: FixedArray,
+    pub bone_info: Vec<MeshBoneInfo>,
     /// How wide an `FTransform` is in this cook, 80 or 40 bytes.
     ///
     /// It is not written anywhere, so the reader finds it by checking which
@@ -4030,14 +4018,14 @@ pub struct ReferenceSkeleton {
     /// answer is what lets the writer reproduce the pose without probing again.
     pub transform_size: usize,
     pub bone_pose: Vec<u8>,
-    /// `RawRefBoneNameToIndexMap`: an `FName` and an `int32`.
-    pub name_to_index: FixedArray,
+    pub name_to_index: Vec<NameToIndex>,
 }
 
 impl ReferenceSkeleton {
     fn read(r: &mut Reader) -> Result<Self> {
-        let bone_info = FixedArray::read(r, "RawRefBoneInfo", 12)?;
-        let nbones = bone_info.data.len() / 12;
+        let n = bounded_count(r.i32()?, "RawRefBoneInfo", r.o - 4)?;
+        let bone_info: Vec<MeshBoneInfo> = read_vec(r, "RawRefBoneInfo", n)?;
+        let nbones = bone_info.len();
         let npose = {
             let n = r.i32()?;
             super::limits::bounded(n, MAX_NATIVE_COUNT, "RawRefBonePose", r.o - 4)?
@@ -4059,12 +4047,15 @@ impl ReferenceSkeleton {
             bone_info,
             transform_size,
             bone_pose: r.take(npose * transform_size)?.to_vec(),
-            name_to_index: FixedArray::read(r, "RawRefBoneNameToIndexMap", 12)?,
+            name_to_index: {
+                let n = bounded_count(r.i32()?, "RawRefBoneNameToIndexMap", r.o - 4)?;
+                read_vec(r, "RawRefBoneNameToIndexMap", n)?
+            },
         })
     }
 
     fn write(&self, ar: &mut impl Ar) -> Result<()> {
-        self.bone_info.write(ar)?;
+        write_vec(ar, &self.bone_info)?;
         if self.transform_size == 0 || self.bone_pose.len() % self.transform_size != 0 {
             bail!(
                 "bone pose is {} bytes for {}-byte transforms",
@@ -4075,7 +4066,7 @@ impl ReferenceSkeleton {
         ar.i32(&mut ((self.bone_pose.len() / self.transform_size) as i32))?;
         let n = self.bone_pose.len();
         ar.raw(&mut self.bone_pose.clone(), n)?;
-        self.name_to_index.write(ar)
+        write_vec(ar, &self.name_to_index)
     }
 }
 
@@ -4095,8 +4086,7 @@ pub struct SkelRenderSection {
     pub num_vertices: u32,
     pub max_bone_influences: i32,
     pub correspond_cloth_asset_index: [u8; 2],
-    /// `FClothingSectionData`: an `FGuid` and an `int32`.
-    pub clothing_section_data: [u8; 20],
+    pub clothing_section_data: ClothingSectionData,
     /// The duplicated-vertex buffers, stripped from cooks that do not need them.
     pub dup_verts: Option<(FixedArray, FixedArray)>,
     pub disabled: u32,
@@ -4125,7 +4115,11 @@ impl SkelRenderSection {
         let num_vertices = r.u32()?;
         let max_bone_influences = r.i32()?;
         let correspond_cloth_asset_index = r.take(2)?.try_into().expect("2 bytes");
-        let clothing_section_data = r.take(20)?.try_into().expect("20 bytes");
+        let clothing_section_data = {
+            let mut c = ClothingSectionData::default();
+            c.serialize(r)?;
+            c
+        };
         let dup_verts = (class_strip & 1 == 0)
             .then(|| -> Result<(FixedArray, FixedArray)> {
                 Ok((
@@ -4161,7 +4155,7 @@ impl SkelRenderSection {
         ar.u32(&mut self.num_vertices.to_owned())?;
         ar.i32(&mut self.max_bone_influences.to_owned())?;
         ar.raw(&mut self.correspond_cloth_asset_index.to_vec(), 2)?;
-        ar.raw(&mut self.clothing_section_data.to_vec(), 20)?;
+        self.clothing_section_data.clone().serialize(ar)?;
         match (&self.dup_verts, self.class_strip & 1 == 0) {
             (Some((a, b)), true) => {
                 a.write(ar)?;
@@ -4177,7 +4171,7 @@ impl SkelRenderSection {
 /// One skin-weight profile's override data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkinWeightProfile {
-    pub name: [u8; 8],
+    pub name: FName,
     pub bone_ids: FixedArray,
     pub bone_weights: FixedArray,
     pub num_weights_per_vertex: u8,
@@ -4187,7 +4181,7 @@ pub struct SkinWeightProfile {
 /// One named per-vertex attribute buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VertexAttributeBuffer {
-    pub name: [u8; 8],
+    pub name: FName,
     pub component_count: i32,
     pub pixel_format: i32,
     pub component_stride: i32,
@@ -4284,7 +4278,7 @@ impl SkelStreamedData {
         let mut skin_weight_profiles = Vec::with_capacity(n.min(16));
         for _ in 0..n {
             skin_weight_profiles.push(SkinWeightProfile {
-                name: r.take(8)?.try_into().expect("8 bytes"),
+                name: r.fname()?,
                 bone_ids: FixedArray::read(r, "profile BoneIDs", 1)?,
                 bone_weights: FixedArray::read(r, "profile BoneWeights", 1)?,
                 num_weights_per_vertex: r.u8()?,
@@ -4319,7 +4313,7 @@ impl SkelStreamedData {
         let mut vertex_attributes = Vec::with_capacity(n.min(16));
         for _ in 0..n {
             vertex_attributes.push(VertexAttributeBuffer {
-                name: r.take(8)?.try_into().expect("8 bytes"),
+                name: r.fname()?,
                 component_count: r.i32()?,
                 pixel_format: r.i32()?,
                 component_stride: r.i32()?,
@@ -4411,7 +4405,7 @@ impl SkelStreamedData {
         }
         ar.i32(&mut (self.skin_weight_profiles.len() as i32))?;
         for p in &self.skin_weight_profiles {
-            ar.raw(&mut p.name.to_vec(), 8)?;
+            ar.fname(&mut p.name.clone())?;
             p.bone_ids.write(ar)?;
             p.bone_weights.write(ar)?;
             ar.u8(&mut p.num_weights_per_vertex.to_owned())?;
@@ -4432,7 +4426,7 @@ impl SkelStreamedData {
         }
         ar.i32(&mut (self.vertex_attributes.len() as i32))?;
         for a in &self.vertex_attributes {
-            ar.raw(&mut a.name.to_vec(), 8)?;
+            ar.fname(&mut a.name.clone())?;
             ar.i32(&mut a.component_count.to_owned())?;
             ar.i32(&mut a.pixel_format.to_owned())?;
             ar.i32(&mut a.component_stride.to_owned())?;
@@ -4636,9 +4630,9 @@ pub struct SkeletalMeshTail {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkeletalMeshMaterial {
     pub material_interface: i32,
-    pub slot_name: [u8; 8],
+    pub slot_name: FName,
     /// The imported slot name only survives a cook that keeps editor data.
-    pub imported_slot_name: Option<[u8; 8]>,
+    pub imported_slot_name: Option<FName>,
     /// `FMeshUVChannelInfo`: two 32-bit bools and four floats.
     pub uv_channel_info: [u8; 24],
 }
@@ -4663,10 +4657,8 @@ impl SkeletalMeshTail {
         let mut materials = Vec::with_capacity(n.min(64));
         for _ in 0..n {
             let material_interface = r.i32()?;
-            let slot_name = r.take(8)?.try_into().expect("8 bytes");
-            let imported_slot_name = (r.u32()? != 0)
-                .then(|| -> Result<[u8; 8]> { Ok(r.take(8)?.try_into().expect("8 bytes")) })
-                .transpose()?;
+            let slot_name = r.fname()?;
+            let imported_slot_name = (r.u32()? != 0).then(|| r.fname()).transpose()?;
             materials.push(SkeletalMeshMaterial {
                 material_interface,
                 slot_name,
@@ -4716,11 +4708,11 @@ impl SkeletalMeshTail {
         ar.i32(&mut (self.materials.len() as i32))?;
         for m in &self.materials {
             ar.i32(&mut m.material_interface.to_owned())?;
-            ar.raw(&mut m.slot_name.to_vec(), 8)?;
+            ar.fname(&mut m.slot_name.clone())?;
             match &m.imported_slot_name {
                 Some(n) => {
                     ar.u32(&mut 1)?;
-                    ar.raw(&mut n.to_vec(), 8)?;
+                    ar.fname(&mut n.clone())?;
                 }
                 None => ar.u32(&mut 0)?,
             }

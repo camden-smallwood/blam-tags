@@ -15,6 +15,7 @@ pub mod hand_written;
 mod limits;
 pub mod native;
 pub mod native_bool;
+pub mod ue_struct;
 pub mod property;
 pub mod reflect;
 pub mod structs;
