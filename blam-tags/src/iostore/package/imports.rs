@@ -512,6 +512,148 @@ mod edit_corpus {
         assert_eq!(neighbours_ok, with_ref, "an edit disturbed its neighbours");
     }
 
+    /// The whole chain: repoint a real tag's `AssetReference`, ship it in a mod
+    /// container, and read it back out of that container.
+    ///
+    /// The corpus gate above stops at the rebuilt package bytes. This is the
+    /// step that has its own trap: an override container carries **no directory
+    /// index**, so reading it back by path returns `NotFound` and the edit looks
+    /// lost. Chunk ids are the only handle, and the base container is where they
+    /// come from.
+    ///
+    ///   CE_PAKS=... cargo test --features iostore imports::edit_corpus -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires a Campaign Evolved install; set CE_PAKS"]
+    fn a_repointed_reference_survives_a_mod_container() {
+        use crate::iostore::writer::{write_mod_container_full, TagOverride};
+
+        let root = std::env::var("CE_PAKS").expect("set CE_PAKS to the game's Content/Paks");
+        let mut utocs: Vec<PathBuf> = std::fs::read_dir(&root)
+            .expect("read paks dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("utoc")))
+            .filter(|p| !p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("global.utoc")))
+            .collect();
+        utocs.sort();
+        let usmap = Usmap::meteorite().expect("bundled usmap");
+        const NEW_TARGET: &str = "/Game/_Prototypes/Blueprints/BP_EmptyActor";
+
+        // The first tag carrying an AssetReference, whatever it is.
+        let mut picked = None;
+        'outer: for utoc in &utocs {
+            let Ok(archive) = IoStoreArchive::open(utoc) else { continue };
+            for entry in archive.entries() {
+                let lower = entry.path.to_ascii_lowercase().replace('\\', "/");
+                if !lower.ends_with(".uasset") || !lower.contains("/content/tags/") {
+                    continue;
+                }
+                let Some((_, group)) = lower
+                    .trim_end_matches(".uasset")
+                    .rsplit('/')
+                    .next()
+                    .and_then(|f| f.rsplit_once('-'))
+                else {
+                    continue;
+                };
+                let class = class_for(group);
+                if usmap.get(&class).is_none() {
+                    continue;
+                }
+                let ubulk = entry.path.replace(".uasset", ".ubulk");
+                if !archive.contains(&ubulk) {
+                    continue;
+                }
+                let Ok(bytes) = archive.read(&entry.path) else { continue };
+                let Ok(header) =
+                    FZenPackageHeader::deserialize(&mut Cursor::new(&bytes[..]), None, CV, HV, None)
+                else {
+                    continue;
+                };
+                let Ok(payloads) = read_payloads(&header, &bytes) else { continue };
+                let Some(export_entry) = header.export_map.first() else { continue };
+                let names = header.name_map.copy_raw_names();
+                let Ok(export) = read_export(
+                    &payloads[0],
+                    &names,
+                    &usmap,
+                    &class,
+                    export_entry.object_flags,
+                ) else {
+                    continue;
+                };
+                let has_ref = export
+                    .properties()
+                    .and_then(|b| b.get("AssetReference"))
+                    .is_some();
+                if has_ref {
+                    picked = Some((utoc.clone(), entry.path.clone(), ubulk, class, header, payloads, export));
+                    break 'outer;
+                }
+            }
+        }
+        let (utoc, uasset_path, ubulk_path, class, header, payloads, export) =
+            picked.expect("no tag with an AssetReference");
+
+        let target = ImportTarget {
+            package: NEW_TARGET.to_owned(),
+            object_hash: public_export_hash("BP_EmptyActor_C"),
+        };
+        let rebuilt = rebuild(&header, &payloads, &export, &class, &usmap, target)
+            .expect("rebuild the wrapper");
+
+        let archive = IoStoreArchive::open(&utoc).expect("reopen base");
+        let tag_bytes = archive.read(&ubulk_path).expect("read tag body");
+        let dir = std::env::temp_dir().join(format!("blam-wrapper-mod-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let out = dir.join("wrappertest-WinGDK_P.utoc");
+        write_mod_container_full(
+            &[TagOverride {
+                archive: &archive,
+                ubulk_path: &ubulk_path,
+                tag_bytes: &tag_bytes,
+                uasset_bytes: Some(&rebuilt),
+            }],
+            &[],
+            &out,
+        )
+        .expect("write mod container");
+
+        // Read it back BY CHUNK ID: an override container ships no directory
+        // index, so every path lookup in it fails.
+        let modded = IoStoreArchive::open(&out).expect("open the mod");
+        let id = archive.chunk_id_for(&uasset_path).expect("base chunk id");
+        let index = modded.find_chunk(&id).expect("the mod carries the .uasset chunk");
+        let back_bytes = modded.read_chunk(index).expect("read the chunk back");
+
+        let back_header =
+            FZenPackageHeader::deserialize(&mut Cursor::new(&back_bytes[..]), None, CV, HV, None)
+                .expect("parse the shipped wrapper");
+        let back_payloads = read_payloads(&back_header, &back_bytes).expect("payloads");
+        let back_names = back_header.name_map.copy_raw_names();
+        let back = read_export(
+            &back_payloads[0],
+            &back_names,
+            &usmap,
+            &class,
+            back_header.export_map[0].object_flags,
+        )
+        .expect("decode the shipped wrapper");
+        let slots = read_import_slots(&back_header).expect("slots");
+        let resolved = match back.properties().and_then(|b| b.get("AssetReference")).map(PropValue::unwrapped) {
+            Some(PropValue::Object(i)) => import_slot_of(*i)
+                .and_then(|s| slots.get(s))
+                .and_then(|s| match s {
+                    ImportSlot::Package(t) => Some(t.package.clone()),
+                    _ => None,
+                }),
+            _ => None,
+        };
+        println!("{ubulk_path}\n  AssetReference -> {resolved:?}");
+        assert_eq!(resolved.as_deref(), Some(NEW_TARGET));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Apply one `AssetReference` change and put the package back together.
     fn rebuild(
         header: &FZenPackageHeader,

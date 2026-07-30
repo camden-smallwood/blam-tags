@@ -396,7 +396,7 @@ pub fn write_tag_override(
     out_utoc: &std::path::Path,
 ) -> Result<()> {
     let mut writer = OverrideContainerWriter::new("../../../");
-    add_override_to_writer(&mut writer, base, ubulk_path, new_tag_bytes)?;
+    add_override_to_writer(&mut writer, base, ubulk_path, new_tag_bytes, None)?;
     writer.write(out_utoc)
 }
 
@@ -434,6 +434,7 @@ fn add_override_to_writer(
     archive: &IoStoreArchive,
     ubulk_path: &str,
     new_bytes: &[u8],
+    new_uasset: Option<&[u8]>,
 ) -> Result<()> {
     let ub_id = archive.chunk_id_for(ubulk_path)?;
     let old_len = archive.uncompressed_len(ubulk_path)?;
@@ -443,21 +444,33 @@ fn add_override_to_writer(
         .map(|s| format!("{s}.uasset"))
         .ok_or(IoStoreError::Package("path is not a .ubulk"))?;
     if !archive.contains(&ua_path) {
-        // Only fatal when the length actually has to be rewritten.
-        if size_changed {
+        // Only fatal when something actually has to be written into it.
+        if size_changed || new_uasset.is_some() {
             return Err(IoStoreError::Package(
                 "size-changing edit but no paired .uasset to patch",
             ));
         }
     } else {
         let ua_id = archive.chunk_id_for(&ua_path)?;
-        let mut ua = archive.read(&ua_path)?;
+        // A rebuilt wrapper replaces the shipped one outright. Its bulk-data
+        // entry still declares the *original* tag length -- rebuilding changed
+        // properties, not the payload it points at -- so the same patch applies
+        // to either source.
+        let mut ua = match new_uasset {
+            Some(bytes) => bytes.to_vec(),
+            None => archive.read(&ua_path)?,
+        };
         match patch_uasset_serial_size(&mut ua, old_len, new_bytes.len() as u64) {
             Ok(()) => w.add_chunk(ua_id, ua),
-            // A same-length edit needs nothing from the `.uasset`, so an
-            // unrecognised one is not worth failing the export over.
+            // A same-length edit needs nothing patched into the `.uasset`, so an
+            // unrecognised one is not worth failing the export over -- but a
+            // rebuilt wrapper still has to ship, or the edit is silently lost.
             Err(e) if size_changed => return Err(e),
-            Err(_) => {}
+            Err(_) => {
+                if new_uasset.is_some() {
+                    w.add_chunk(ua_id, ua);
+                }
+            }
         }
     }
     w.add_chunk(ub_id, new_bytes.to_vec());
@@ -605,9 +618,50 @@ pub fn write_mod_container_ex(
     new_packages: &[NewPackage],
     out_utoc: &std::path::Path,
 ) -> Result<()> {
+    let full: Vec<TagOverride<'_>> = overrides
+        .iter()
+        .map(|&(archive, ubulk_path, tag_bytes)| TagOverride {
+            archive,
+            ubulk_path,
+            tag_bytes,
+            uasset_bytes: None,
+        })
+        .collect();
+    write_mod_container_full(&full, new_packages, out_utoc)
+}
+
+/// One tag in an override container: its body, and optionally a rebuilt Unreal
+/// wrapper to ship beside it.
+///
+/// `uasset_bytes` is what makes a *bridge* edit expressible. Without it an
+/// override can only replace the `.ubulk`, so repointing a tag's
+/// `AssetReference` at a different Blueprint -- a change that lives entirely in
+/// the `.uasset` -- had nowhere to go and would export as a no-op.
+pub struct TagOverride<'a> {
+    pub archive: &'a IoStoreArchive,
+    /// The `.ubulk` path in `archive`, which also names the paired `.uasset`.
+    pub ubulk_path: &'a str,
+    pub tag_bytes: &'a [u8],
+    /// A rebuilt package replacing the shipped `.uasset`, or `None` to patch
+    /// the shipped one as before.
+    pub uasset_bytes: Option<&'a [u8]>,
+}
+
+/// As [`write_mod_container_ex`], with per-tag control over the wrapper.
+pub fn write_mod_container_full(
+    overrides: &[TagOverride<'_>],
+    new_packages: &[NewPackage],
+    out_utoc: &std::path::Path,
+) -> Result<()> {
     let mut w = OverrideContainerWriter::new("../../../");
-    for &(archive, ubulk_path, new_bytes) in overrides {
-        add_override_to_writer(&mut w, archive, ubulk_path, new_bytes)?;
+    for over in overrides {
+        add_override_to_writer(
+            &mut w,
+            over.archive,
+            over.ubulk_path,
+            over.tag_bytes,
+            over.uasset_bytes,
+        )?;
     }
     for pkg in new_packages {
         add_new_package_to_writer(&mut w, pkg)?;
@@ -663,10 +717,21 @@ pub fn plan_tag_overwrite(
     ubulk_rel_path: &str,
     new_tag_bytes: &[u8],
 ) -> Result<Vec<(u32, Vec<u8>)>> {
+    plan_tag_overwrite_with(archive, ubulk_rel_path, new_tag_bytes, None)
+}
+
+/// As [`plan_tag_overwrite`], optionally replacing the paired `.uasset` with a
+/// rebuilt one -- see [`TagOverride::uasset_bytes`].
+pub fn plan_tag_overwrite_with(
+    archive: &IoStoreArchive,
+    ubulk_rel_path: &str,
+    new_tag_bytes: &[u8],
+    new_uasset: Option<&[u8]>,
+) -> Result<Vec<(u32, Vec<u8>)>> {
     let ub_idx = archive.chunk_index_for(ubulk_rel_path)?;
     let old_len = archive.uncompressed_len(ubulk_rel_path)?;
     let mut updates = vec![(ub_idx, new_tag_bytes.to_vec())];
-    if new_tag_bytes.len() as u64 != old_len {
+    if new_tag_bytes.len() as u64 != old_len || new_uasset.is_some() {
         let ua_path = ubulk_rel_path
             .strip_suffix(".ubulk")
             .map(|s| format!("{s}.uasset"))
@@ -677,8 +742,17 @@ pub fn plan_tag_overwrite(
             ));
         }
         let ua_idx = archive.chunk_index_for(&ua_path)?;
-        let mut ua = archive.read(&ua_path)?;
-        patch_uasset_serial_size(&mut ua, old_len, new_tag_bytes.len() as u64)?;
+        let mut ua = match new_uasset {
+            Some(bytes) => bytes.to_vec(),
+            None => archive.read(&ua_path)?,
+        };
+        // A rebuilt wrapper whose tag did not change length needs no patch, and
+        // an unrecognised bulk entry must not stop it shipping.
+        match patch_uasset_serial_size(&mut ua, old_len, new_tag_bytes.len() as u64) {
+            Ok(()) => {}
+            Err(e) if new_uasset.is_none() => return Err(e),
+            Err(_) => {}
+        }
         updates.push((ua_idx, ua));
     }
     Ok(updates)
