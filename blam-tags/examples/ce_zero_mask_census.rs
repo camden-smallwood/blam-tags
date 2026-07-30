@@ -1,7 +1,7 @@
 //! Which property types does our `ShouldSaveAsZero` derivation get wrong?
 //!
 //! The cooked file records, per present property, whether it was zero-masked.
-//! `should_save_as_zero` claims to re-derive that from the value. For an
+//! the writer's own rule re-derives that from the value. For an
 //! unmodified block the two must agree everywhere — so tallying the
 //! disagreements by property *type* says exactly which types the derivation is
 //! wrong about, instead of guessing from the engine source which flags a given
@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 
 use blam_tags::iostore::container_header::EIoContainerHeaderVersion;
-use blam_tags::iostore::object::unversioned::{read_export_struct_len, should_save_as_zero};
+use blam_tags::iostore::object::unversioned::{is_masked, read_export_struct_len};
 use blam_tags::iostore::script_objects::ScriptObjects;
 use blam_tags::iostore::ue_types::EIoStoreTocVersion;
 use blam_tags::iostore::usmap::{PropertyType, Usmap};
@@ -129,7 +129,17 @@ fn main() {
                 for entry in &block.entries {
                     let Some(slot) = entry.slot else { continue };
                     let Some((prop, _, owner)) = flat.get(slot.index as usize) else { continue };
-                    let derived = should_save_as_zero(&prop.ty, &entry.value, &usmap);
+                    // Ask the *writer's* rule, not a re-derivation of it. This census
+                    // reported a residue the writer never had for exactly as
+                    // long as it computed its own answer here.
+                    let derived = is_masked(
+                        &prop.ty,
+                        &prop.name,
+                        owner,
+                        slot.zero_masked,
+                        &entry.value,
+                        &usmap,
+                    );
                     let t = tally.entry(kind(&prop.ty)).or_default();
                     match (slot.zero_masked, derived) {
                         (a, b) if a == b => t.0 += 1,

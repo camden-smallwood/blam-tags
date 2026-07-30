@@ -268,13 +268,7 @@ pub(super) fn write_block(
         // Answering "not native" for an unknown declaration is wrong in the
         // expensive direction: it stops masking something the cooker masked, and
         // that rewrites the fragment header.
-        let maskable = match &prop.ty {
-            PropertyType::Bool if bool_is_known(owner, &prop.name) => {
-                is_native_bool(owner, &prop.name)
-            }
-            ty => slot.zero_masked && can_serialize_as_zero(ty),
-        };
-        let is_zero = maskable && should_save_as_zero(&prop.ty, &e.value, usmap);
+        let is_zero = is_masked(&prop.ty, &prop.name, owner, slot.zero_masked, &e.value, usmap);
         plan.push((e, &prop.ty, slot.index as usize, is_zero));
     }
     let present: Vec<(usize, bool)> =
@@ -433,6 +427,34 @@ pub(super) fn flattened_schema<'u>(
                 .flatten()
         })
         .with_context(|| format!("no .usmap schema for struct {class}"))
+}
+
+/// Whether this property is written as a mask bit rather than as bytes.
+///
+/// The single source of truth for masking, called by the writer and by
+/// `ce_zero_mask_census`. Having the census re-derive it separately is how it
+/// spent this whole refactor reporting a residue the writer did not have.
+///
+/// Two kinds of evidence. For a `bool` whose declaration the UHT dump knows,
+/// maskability is *derived* — `CanSerializeAsZero` gates bools on
+/// `IsNativeBool()` and `native_bool` records which are which. For everything
+/// else, and for a bool the dump has never seen (a Blueprint-defined struct's
+/// field exists in no C++ header), the file's own bit is the only evidence:
+/// the engine gates those on `CPF_ZeroConstructor | CPF_NoDestructor`, and the
+/// `.usmap` carries neither flag.
+pub fn is_masked(
+    ty: &PropertyType,
+    name: &str,
+    owner: &str,
+    file_masked: bool,
+    value: &PropValue,
+    usmap: &Usmap,
+) -> bool {
+    let maskable = match ty {
+        PropertyType::Bool if bool_is_known(owner, name) => is_native_bool(owner, name),
+        ty => file_masked && can_serialize_as_zero(ty),
+    };
+    maskable && should_save_as_zero(ty, value, usmap)
 }
 
 /// Walk one unversioned property block against an explicit schema.

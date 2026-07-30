@@ -1156,7 +1156,17 @@ held to `ce_semantic_roundtrip` rather than to byte-identity:
 * **H4 ACL animation** (172 MiB, `AnimSequence`). `ACLPlugin` is in the UHT
   dump; ACL itself is open source, so the codec is readable.
 
-**G. Make the zero mask fully derivable, using the UHT dump. — DONE for bools.**
+**G. Make the zero mask fully derivable, using the UHT dump. — DONE.** Bools
+derive from `native_bool`; everything else replays the file's bit, which is the
+only evidence there is because the engine gates those on
+`CPF_ZeroConstructor | CPF_NoDestructor` and the `.usmap` carries neither flag.
+
+The "1,989 entry residue" this section used to report **did not exist**.
+`ce_zero_mask_census` computed its own masking rule instead of asking the
+writer's, so it measured a decision nothing made. Both now call
+`block::is_masked`, and the answer is **0 over-masked and 0 under-masked across
+6,304,754 entries**. That is the fifth measurement in this refactor to be wrong
+because the harness did not reproduce the real call.
 `native_bool` is scraped from the shipped `UHTHeaderDump`: 4,393 native and 3,192
 bitfield declarations, keyed by *declaring* struct because 133 bool names are
 declared both ways by different structs. `ce_native_bool_check` measured it
