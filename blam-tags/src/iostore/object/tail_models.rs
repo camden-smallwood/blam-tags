@@ -56,7 +56,7 @@ use super::block::{flattened_schema, read_struct, write_block};
 use super::common::read_bulk_array;
 use super::limits::MAX_NATIVE_COUNT;
 use super::ue_struct::{
-    bounded_count, read_vec, write_run, write_vec, BoxSphereBounds, ClothingSectionData, FuncMapEntry,
+    bounded_count, LumenCardBuildData, PackedHierarchyNode, PageStreamingState, read_vec, write_run, write_vec, BoxSphereBounds, ClothingSectionData, FuncMapEntry,
     Guid, ImplementedInterface, MeshBoneInfo, NameToIndex, ShaHash, StaticMaterial,
     StaticMeshSection, StripDataFlags,
 };
@@ -1567,17 +1567,16 @@ impl StaticMeshLod {
 /// encoding — leaf data here, and their decoder is a separate module. Everything
 /// that *addresses* them is modeled: the page streaming states, the BVH
 /// hierarchy, the dependencies and the mesh statistics.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// No `Eq`: the hierarchy nodes carry float bounds.
+#[derive(Debug, Clone, PartialEq)]
 pub struct NaniteResources {
     pub strip_flags: StripDataFlags,
     pub resource_flags: u32,
     /// `StreamablePages`: a bulk-data handle, never inline in this corpus.
     pub streamable_pages_index: i32,
     pub root_data: Vec<u8>,
-    /// 20 bytes each.
-    pub page_streaming_states: Vec<[u8; 20]>,
-    /// `FPackedHierarchyNode` — four BVH slices of 52 bytes.
-    pub hierarchy_nodes: Vec<[u8; 208]>,
+    pub page_streaming_states: Vec<PageStreamingState>,
+    pub hierarchy_nodes: Vec<PackedHierarchyNode>,
     pub hierarchy_root_offsets: Vec<u32>,
     pub page_dependencies: Vec<u32>,
     /// Two bytes per entry.
@@ -1602,18 +1601,13 @@ impl NaniteResources {
             let n = r.i32()?;
             super::limits::bounded(n, MAX_NATIVE_COUNT, "PageStreamingStates", r.o - 4)?
         };
-        let mut page_streaming_states = Vec::with_capacity(n.min(256));
-        for _ in 0..n {
-            page_streaming_states.push(r.take(20)?.try_into().expect("20 bytes"));
-        }
+        let page_streaming_states: Vec<PageStreamingState> =
+            read_vec(r, "PageStreamingStates", n)?;
         let n = {
             let n = r.i32()?;
             super::limits::bounded(n, MAX_NATIVE_COUNT, "HierarchyNodes", r.o - 4)?
         };
-        let mut hierarchy_nodes = Vec::with_capacity(n.min(256));
-        for _ in 0..n {
-            hierarchy_nodes.push(r.take(208)?.try_into().expect("208 bytes"));
-        }
+        let hierarchy_nodes: Vec<PackedHierarchyNode> = read_vec(r, "HierarchyNodes", n)?;
         let n = {
             let n = r.i32()?;
             super::limits::bounded(n, MAX_NATIVE_COUNT, "HierarchyRootOffsets", r.o - 4)?
@@ -1650,14 +1644,8 @@ impl NaniteResources {
         ar.i32(&mut (self.root_data.len() as i32))?;
         let n = self.root_data.len();
         ar.raw(&mut self.root_data.clone(), n)?;
-        ar.i32(&mut (self.page_streaming_states.len() as i32))?;
-        for s in &self.page_streaming_states {
-            ar.raw(&mut s.to_vec(), 20)?;
-        }
-        ar.i32(&mut (self.hierarchy_nodes.len() as i32))?;
-        for s in &self.hierarchy_nodes {
-            ar.raw(&mut s.to_vec(), 208)?;
-        }
+        write_vec(ar, &self.page_streaming_states)?;
+        write_vec(ar, &self.hierarchy_nodes)?;
         write_u32_array(ar, &self.hierarchy_root_offsets)?;
         write_u32_array(ar, &self.page_dependencies)?;
         if self.imposter_atlas.len() % 2 != 0 {
@@ -1690,14 +1678,13 @@ pub struct RayTracingProxy {
 }
 
 /// One LOD's Lumen card representation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// No `Eq`: a Lumen card's OBB is floats.
+#[derive(Debug, Clone, PartialEq)]
 pub struct CardRepresentation {
     /// `Bounds` as an `FBox` — three doubles each way plus `IsValid`.
     pub bounds: [u8; 49],
     pub mostly_two_sided: u32,
-    /// `FLumenCardBuildData` — an `FLumenCardOBB` of five `FVector3f` plus the
-    /// axis-aligned direction index, 61 bytes.
-    pub cards: Vec<[u8; 61]>,
+    pub cards: Vec<LumenCardBuildData>,
 }
 
 /// One LOD's distance-field volume (`FDistanceFieldVolumeData5`).
@@ -1827,10 +1814,7 @@ impl StaticMeshTail {
                             let n = r.i32()?;
                             super::limits::bounded(n, MAX_NATIVE_COUNT, "CardBuildData", r.o - 4)?
                         };
-                        let mut cards = Vec::with_capacity(n.min(64));
-                        for _ in 0..n {
-                            cards.push(r.take(61)?.try_into().expect("61 bytes"));
-                        }
+                        let cards: Vec<LumenCardBuildData> = read_vec(r, "CardBuildData", n)?;
                         Ok(Some(CardRepresentation { bounds, mostly_two_sided, cards }))
                     })
                     .collect()
@@ -1954,10 +1938,7 @@ impl StaticMeshTail {
                             ar.u32(&mut 1)?;
                             ar.raw(&mut c.bounds.to_vec(), 49)?;
                             ar.u32(&mut c.mostly_two_sided.to_owned())?;
-                            ar.i32(&mut (c.cards.len() as i32))?;
-                            for card in &c.cards {
-                                ar.raw(&mut card.to_vec(), 61)?;
-                            }
+                            write_vec(ar, &c.cards)?;
                         }
                         None => ar.u32(&mut 0)?,
                     }
@@ -4637,7 +4618,8 @@ pub struct SkeletalMeshMaterial {
     pub uv_channel_info: [u8; 24],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// No `Eq`: the Nanite hierarchy carries float bounds.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SkeletalMeshRenderData {
     pub lods: Vec<SkeletalMeshLod>,
     pub nanite: NaniteResources,

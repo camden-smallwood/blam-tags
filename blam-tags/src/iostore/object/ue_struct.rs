@@ -26,16 +26,16 @@ use anyhow::{bail, Result};
 use super::archive::Ar;
 use super::value::FName;
 
-/// A four-word `FGuid`.
+/// `FGuid` — four `int32`s named A, B, C, D (NoExportTypes.h:528).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Guid(pub [u32; 4]);
+pub struct Guid(pub [i32; 4]);
 
 impl Guid {
     pub const SIZE: usize = 16;
 
     pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
         for w in &mut self.0 {
-            ar.u32(w)?;
+            ar.i32(w)?;
         }
         Ok(())
     }
@@ -339,7 +339,13 @@ impl ImplementedInterface {
     }
 }
 
-/// `FStaticMeshSection` — five indices then five four-byte flags.
+/// `FStaticMeshSection` (StaticMeshResources.h:198).
+///
+/// The field order here is the **wire** order from `operator<<`
+/// (StaticMesh.cpp:300), which is *not* the declaration order: `bForceOpaque`
+/// is serialized third of the flags and declared fifth. The editor-only UV
+/// densities sit between `bForceOpaque` and `bVisibleInRayTracing` and are
+/// absent from a cook.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StaticMeshSection {
     pub material_index: i32,
@@ -380,7 +386,8 @@ impl StaticMeshSection {
     }
 }
 
-/// `FClothingSectionData` — which clothing asset a section uses.
+/// `FClothingSectionData` (SkeletalMeshTypes.h:105) — the clothing asset a
+/// section uses, and which of its LODs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ClothingSectionData {
     pub asset_guid: Guid,
@@ -416,7 +423,121 @@ macro_rules! ue_structs {
     )* };
 }
 
+/// `FPageStreamingState` (NaniteResources.h:185) — where one Nanite page lives
+/// in the streaming bulk data and what it depends on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PageStreamingState {
+    pub bulk_offset: u32,
+    pub bulk_size: u32,
+    pub page_size: u32,
+    pub dependencies_start: u32,
+    pub dependencies_num: u16,
+    pub max_hierarchy_depth: u8,
+    pub flags: u8,
+}
+
+impl PageStreamingState {
+    pub const SIZE: usize = 20;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        ar.u32(&mut self.bulk_offset)?;
+        ar.u32(&mut self.bulk_size)?;
+        ar.u32(&mut self.page_size)?;
+        ar.u32(&mut self.dependencies_start)?;
+        ar.u16(&mut self.dependencies_num)?;
+        ar.u8(&mut self.max_hierarchy_depth)?;
+        ar.u8(&mut self.flags)
+    }
+}
+
+/// `FPackedHierarchyNode` (NaniteResources.h:48) — one BVH node covering up to
+/// `NANITE_MAX_BVH_NODE_FANOUT` (4) children.
+///
+/// **Structure of arrays, not an array of structures.** All four `LODBounds`
+/// come first, then all four `Misc0`, and so on. Reading it as four interleaved
+/// 52-byte child records gives the same 208 bytes and the wrong values
+/// everywhere — which a byte-identical round trip cannot detect, and which is
+/// what this type existed as before it was checked against the header.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PackedHierarchyNode {
+    pub lod_bounds: [Vector4f; 4],
+    pub box_bounds_center: [Vector3f; 4],
+    pub min_lod_error_max_parent_lod_error: [u32; 4],
+    pub box_bounds_extent: [Vector3f; 4],
+    pub child_start_reference: [u32; 4],
+    pub resource_page_index_num_pages_group_part_size: [u32; 4],
+}
+
+impl PackedHierarchyNode {
+    pub const SIZE: usize = 208;
+    /// `NANITE_MAX_BVH_NODE_FANOUT`.
+    pub const FANOUT: usize = 4;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        for v in &mut self.lod_bounds {
+            v.serialize(ar)?;
+        }
+        for i in 0..Self::FANOUT {
+            self.box_bounds_center[i].serialize(ar)?;
+            ar.u32(&mut self.min_lod_error_max_parent_lod_error[i])?;
+        }
+        for i in 0..Self::FANOUT {
+            self.box_bounds_extent[i].serialize(ar)?;
+            ar.u32(&mut self.child_start_reference[i])?;
+        }
+        for v in &mut self.resource_page_index_num_pages_group_part_size {
+            ar.u32(v)?;
+        }
+        Ok(())
+    }
+}
+
+/// `TLumenCardOBB<float>` (MeshCardRepresentation.h:26).
+///
+/// The wire order is **AxisX, AxisY, AxisZ, Origin, Extent** — `Origin` is
+/// declared first and serialized fourth.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct LumenCardObb {
+    pub axis_x: Vector3f,
+    pub axis_y: Vector3f,
+    pub axis_z: Vector3f,
+    pub origin: Vector3f,
+    pub extent: Vector3f,
+}
+
+impl LumenCardObb {
+    pub const SIZE: usize = 60;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        self.axis_x.serialize(ar)?;
+        self.axis_y.serialize(ar)?;
+        self.axis_z.serialize(ar)?;
+        self.origin.serialize(ar)?;
+        self.extent.serialize(ar)
+    }
+}
+
+/// `FLumenCardBuildData` (MeshCardBuild.h:17).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct LumenCardBuildData {
+    pub obb: LumenCardObb,
+    pub axis_aligned_direction_index: u8,
+}
+
+impl LumenCardBuildData {
+    pub const SIZE: usize = 61;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        self.obb.serialize(ar)?;
+        ar.u8(&mut self.axis_aligned_direction_index)
+    }
+}
+
 ue_structs!(
+    PageStreamingState,
+    PackedHierarchyNode,
+    LumenCardObb,
+    LumenCardBuildData,
     Guid,
     ShaHash,
     HashedName,
