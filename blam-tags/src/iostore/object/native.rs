@@ -42,6 +42,11 @@ pub enum NativeStruct {
     Vec2f([f32; 2]),
     /// `FTwoVectors` — two `FVector`s.
     TwoVec3d([f64; 6]),
+    /// A struct whose `WithSerializer` serializer writes nothing outside the
+    /// transaction buffer, so it occupies zero bytes on disk:
+    /// `FKeyHandleMap`, `FKeyHandleLookupTable`. Not an absence of information —
+    /// the property is *present*, and its content is reconstructed at load.
+    EmptySerializer,
     /// `FMatrix` — 4 × 4 doubles.
     Mat4d(Box<[f64; 16]>),
     /// `FMatrix44f`.
@@ -173,6 +178,7 @@ impl NativeStruct {
             bail!("{name} is {want} bytes but {} were given", b.len());
         }
         Ok(match name {
+            "KeyHandleMap" | "KeyHandleLookupTable" => NativeStruct::EmptySerializer,
             "Vector" | "Rotator" => NativeStruct::Vec3d(f64s::<3>(b)),
             "Vector4" | "Quat" | "Sphere" | "Plane" => NativeStruct::Vec4d(f64s::<4>(b)),
             "Vector2D" => NativeStruct::Vec2d(f64s::<2>(b)),
@@ -253,6 +259,7 @@ impl NativeStruct {
     pub fn encode(&self, name: &str) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         match self {
+            NativeStruct::EmptySerializer => {}
             NativeStruct::Vec3d(v) => v.iter().for_each(|x| out.extend(x.to_le_bytes())),
             NativeStruct::Vec4d(v) => v.iter().for_each(|x| out.extend(x.to_le_bytes())),
             NativeStruct::Vec2d(v) => v.iter().for_each(|x| out.extend(x.to_le_bytes())),

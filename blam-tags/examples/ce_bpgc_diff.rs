@@ -52,8 +52,27 @@ fn main() {
                 {
                     Ok(p) => p,
                     Err(err) => {
-                        println!("{} :: {class}\n  READ FAILED: {err:#}\n", h.package_name());
-                        continue;
+                        println!(
+                            "{} :: {}\n  class {class}\n  READ FAILED: {err:#}",
+                            h.package_name(),
+                            h.name_map.get(ex.object_name)
+                        );
+                        if let Ok(flat) = flattened_schema(&class, usmap) {
+                            if let Ok((hdr, used)) = parse_header(body) {
+                                println!("  header {used}B present={:?}", hdr.present);
+                                for (i, nz) in &hdr.present {
+                                    match flat.get(*i) {
+                                        Some((p, slot, owner)) => println!(
+                                            "    slot {i} nonzero={nz}  {}[{slot}] {:?}  <- {owner}",
+                                            p.name, p.ty
+                                        ),
+                                        None => println!("    slot {i} nonzero={nz}  <BEYOND SCHEMA>"),
+                                    }
+                                }
+                            }
+                        }
+                        println!("  in  {}\n", hex(body));
+                        return;
                     }
                 };
                 let out = match write_export_in(&class, &parts, usmap, Some(&resolver)) {

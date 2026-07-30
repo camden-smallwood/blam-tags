@@ -47,6 +47,8 @@ use super::value::{PropValue, SoftObjectPath};
 /// now has one — see its entry.
 pub const NATIVE_STRUCT_NAMES: &[&str] = &[
     "Box",
+    "KeyHandleLookupTable",
+    "KeyHandleMap",
     "Color",
     "DateTime",
     "DeprecateSlateVector2D",
@@ -100,6 +102,19 @@ pub const NATIVE_STRUCT_NAMES: &[&str] = &[
 
 pub fn native_struct_size(name: &str) -> Option<usize> {
     Some(match name {
+        // `FKeyHandleMap::Serialize` and `FKeyHandleLookupTable::Serialize`
+        // (KeyHandle.cpp:139, :257) do their work **only** when
+        // `Ar.IsTransacting()`, and both return `true` — so the struct claims to
+        // have serialized itself and writes nothing at all outside the undo
+        // buffer. Both declare `WithSerializer = true`
+        // (KeyHandle.h:115, :204), so `FStructProperty::SerializeItem` takes that
+        // path and never falls back to the tagged/unversioned one.
+        //
+        // A present property that occupies no bytes: without this the reader
+        // treats the *next* property's bytes as this one's unversioned header,
+        // which is what produced "KeyHandleMap: present schema index 0 beyond 0
+        // props" on 53 animation Blueprints.
+        "KeyHandleMap" | "KeyHandleLookupTable" => 0,
         "Vector" | "Rotator" => 24,               // 3 × f64
         "Vector4" | "Quat" => 32,                 // 4 × f64
         "Vector2D" | "LinearColor" | "Guid" => 16,

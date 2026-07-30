@@ -449,13 +449,24 @@ pub fn flattened_schema<'u>(
 /// [`flattened_schema`] applies, so filtering on it silently drops 130
 /// `Blam*TagDataAsset` exports that decode perfectly well.
 pub fn has_schema(class: &str, usmap: &Usmap) -> bool {
-    // Equivalent to `flattened_schema(..).is_ok()` — that fails only when the
-    // chain has no head — but without building the flattened Vec, which this
-    // is called for on every one of the corpus's 1.15M exports.
-    usmap.get(class).is_some()
-        || (class.starts_with("Blam")
-            && class.ends_with("TagDataAsset")
-            && usmap.get("BlamTagDataAssetBase").is_some())
+    // Must agree with `flattened_schema`, which fails when the head is missing
+    // *or* when any super names a struct this `.usmap` does not have — a
+    // truncated chain is not a schema. Walking the links is still far cheaper
+    // than building the flattened Vec, which matters: this runs on every one of
+    // the corpus's 1.24M exports.
+    let head = usmap.get(class).or_else(|| {
+        (class.starts_with("Blam") && class.ends_with("TagDataAsset"))
+            .then(|| usmap.get("BlamTagDataAssetBase"))
+            .flatten()
+    });
+    let Some(mut cur) = head else { return false };
+    while let Some(name) = cur.super_name.as_deref() {
+        match usmap.get(name) {
+            Some(sup) => cur = sup,
+            None => return false,
+        }
+    }
+    true
 }
 
 /// Whether this property is written as a mask bit rather than as bytes.

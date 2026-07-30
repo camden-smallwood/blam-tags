@@ -210,8 +210,15 @@ impl Usmap {
                     out.push((p, i, owner));
                 }
             }
-            match cur.super_name.as_deref().and_then(|s| self.get(s)) {
-                Some(sup) => cur = sup,
+            // A named-but-absent super is NOT the end of the chain. Treating
+            // the two alike silently truncates the schema, and a truncated
+            // schema is worse than none: the header's indices then land on the
+            // wrong properties, or past the end. Campaign Evolved has 13 such
+            // exports — Blueprint classes deriving from the unreflected
+            // `XGTGPerformanceOverlayTool` natives — and each read as
+            // "present schema index 28 beyond 4 props".
+            match cur.super_name.as_deref() {
+                Some(name) => cur = self.get(name)?,
                 None => break,
             }
         }

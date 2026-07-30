@@ -117,9 +117,22 @@ pub(super) fn read_ffield_tail(r: &mut Reader, type_name: &str) -> Result<Proper
             let name = r.resolver.and_then(|p| p.struct_name(idx)).unwrap_or_default();
             PropertyType::Struct(name)
         }
+        // `FByteProperty::SerializeItem` (PropertyByte.cpp) writes the value as
+        // an **`FName`** whenever the property has an enum, and as a raw byte
+        // only when `Enum == nullptr`. Discarding the enum reference here made
+        // every `TEnumAsByte<E>` inside a container read one byte where the file
+        // has an eight-byte name, which desynchronises the rest of the stream —
+        // the next thing read as a property header is whatever the name's second
+        // half happened to be. That is what produced "present schema index 5
+        // beyond 2 props" on a two-property struct: the schema was right and the
+        // cursor was not.
         "ByteProperty" => {
-            r.i32()?; // Enum object ref
-            PropertyType::Byte { enum_name: None }
+            let idx = r.i32()?;
+            let enum_name = (idx != 0)
+                .then(|| r.resolver.and_then(|p| p.struct_name(idx)))
+                .flatten()
+                .or_else(|| (idx != 0).then(|| String::new()));
+            PropertyType::Byte { enum_name }
         }
         // `FEnumProperty::Serialize` writes `Enum` **before** the underlying
         // property (`EnumProperty.cpp`). Reading them the other way round makes
@@ -169,11 +182,20 @@ pub(super) fn read_ffield_tail(r: &mut Reader, type_name: &str) -> Result<Proper
             r.name()?; // PropertyClass FName
             PropertyType::FieldPath
         }
-        "DelegateProperty"
-        | "MulticastInlineDelegateProperty"
-        | "MulticastSparseDelegateProperty" => {
+        // The three delegate classes do NOT share a wire format, and collapsing
+        // them was worth 45 unreadable widget exports. `FScriptDelegate` is one
+        // `(object, FName)` pair; a multicast delegate is a *count* followed by
+        // that many pairs (`FMulticastScriptDelegate::Serialize`). Reading a
+        // bound-to-nothing multicast as a single pair over-reads its whole
+        // payload — and the `.usmap` has kept them apart all along, so this was
+        // the recovered path disagreeing with the declared one.
+        "DelegateProperty" => {
             r.i32()?; // SignatureFunction
             PropertyType::Delegate
+        }
+        "MulticastInlineDelegateProperty" | "MulticastSparseDelegateProperty" => {
+            r.i32()?; // SignatureFunction
+            PropertyType::MulticastDelegate
         }
         other => bail!("unhandled FProperty class '{other}' in UserDefinedStruct layout"),
     })
