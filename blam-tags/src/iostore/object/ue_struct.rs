@@ -934,7 +934,93 @@ impl MorphTargetDelta {
     }
 }
 
+/// `FTransform` — a rotation, a translation and a scale.
+///
+/// Stored at double precision whatever the file used. A cook writes either the
+/// `double` variant (80 bytes) or the `float` one (40), and which is not
+/// recorded anywhere — [`super::tail_models::ReferenceSkeleton`] has to discover
+/// it. Widening a `float` to `double` and narrowing it back is exact, so one
+/// type serves both and the discovered width decides what is written.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Transform {
+    pub rotation: [f64; 4],
+    pub translation: [f64; 3],
+    pub scale_3d: [f64; 3],
+}
+
+impl Transform {
+    pub const SIZE_DOUBLE: usize = 80;
+    pub const SIZE_FLOAT: usize = 40;
+
+    pub fn serialize<A: Ar>(&mut self, ar: &mut A, width: usize) -> Result<()> {
+        fn one<A: Ar>(ar: &mut A, v: &mut f64, double: bool) -> Result<()> {
+            if double {
+                ar.f64(v)
+            } else {
+                let mut f = *v as f32;
+                ar.f32(&mut f)?;
+                *v = f as f64;
+                Ok(())
+            }
+        }
+        let double = width == Self::SIZE_DOUBLE;
+        for v in self.rotation.iter_mut().chain(&mut self.translation).chain(&mut self.scale_3d) {
+            one(ar, v, double)?;
+        }
+        Ok(())
+    }
+}
+
+/// `FPrecomputedVisibilityCell` — a cell's origin and where its data sits.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PrecomputedVisibilityCell {
+    pub min: Vector3d,
+    pub chunk_index: u16,
+    pub data_offset: u16,
+}
+
+impl PrecomputedVisibilityCell {
+    pub const SIZE: usize = 28;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        self.min.serialize(ar)?;
+        ar.u16(&mut self.chunk_index)?;
+        ar.u16(&mut self.data_offset)
+    }
+}
+
+/// One `FGeometryCollectionMeshElement` — a draw range within a collection's
+/// mesh resources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GeometryCollectionMeshElement {
+    pub transform_index: i16,
+    pub material_index: u8,
+    pub flags: u8,
+    pub triangle_start: u32,
+    pub triangle_count: u32,
+    pub vertex_start: u32,
+    pub vertex_end: u32,
+}
+
+impl GeometryCollectionMeshElement {
+    pub const SIZE: usize = 20;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        let mut lo = self.transform_index as u16;
+        ar.u16(&mut lo)?;
+        self.transform_index = lo as i16;
+        ar.u8(&mut self.material_index)?;
+        ar.u8(&mut self.flags)?;
+        ar.u32(&mut self.triangle_start)?;
+        ar.u32(&mut self.triangle_count)?;
+        ar.u32(&mut self.vertex_start)?;
+        ar.u32(&mut self.vertex_end)
+    }
+}
+
 ue_structs!(
+    PrecomputedVisibilityCell,
+    GeometryCollectionMeshElement,
     Plane4f,
     BspSurf,
     ModelVertex,

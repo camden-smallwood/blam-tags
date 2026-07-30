@@ -60,7 +60,7 @@ use super::block::{flattened_schema, read_struct, write_block};
 use super::common::read_bulk_array;
 use super::limits::MAX_NATIVE_COUNT;
 use super::ue_struct::{
-    bounded_count, BspSurf, HashedName, MeshUvChannelInfo, ModelVertex, MorphTargetDelta, ClothBufferIndexMapping, DuplicatedVertexIndex, EntryToValueKey,
+    bounded_count, GeometryCollectionMeshElement, PrecomputedVisibilityCell, Transform, Vector4f, BspSurf, HashedName, MeshUvChannelInfo, ModelVertex, MorphTargetDelta, ClothBufferIndexMapping, DuplicatedVertexIndex, EntryToValueKey,
     GrassWeightOffset, MemoryImageTypeDependency, PlatformTypeLayoutParameters,
     UcsModifiedProperty, VTablePatch, Box3d, Box3f, LightmassPrimitiveSettings, MeshToMeshVertData, PerPlatformFloat,
     SparseDistanceFieldMip, StaticMeshBuffersSize, LumenCardBuildData, PackedHierarchyNode, PageStreamingState, read_vec, write_run, write_vec, BoxSphereBounds, ClothingSectionData, FuncMapEntry,
@@ -2980,7 +2980,7 @@ pub struct GeometryCollectionMesh {
     pub pre_skinned_bounds: BoxSphereBounds,
     /// `Sections`, `SectionsNoInternal`, `SubSections` — 20-byte
     /// `FGeometryCollectionMeshElement` each.
-    pub sections: [FixedArray; 3],
+    pub sections: [Vec<GeometryCollectionMeshElement>; 3],
 }
 
 /// `UGeometryCollection`'s tail: the managed array collection, then the cooked
@@ -3033,11 +3033,14 @@ impl GeometryCollectionTail {
                 let description_num_triangles = r.i32()?;
                 let pre_skinned_bounds =
                     { let mut b = BoxSphereBounds::default(); b.serialize(r)?; b };
-                let sections = [
-                    FixedArray::read(r, "Sections", 20)?,
-                    FixedArray::read(r, "SectionsNoInternal", 20)?,
-                    FixedArray::read(r, "SubSections", 20)?,
-                ];
+                let mut sections: [Vec<GeometryCollectionMeshElement>; 3] =
+                    [Vec::new(), Vec::new(), Vec::new()];
+                for (slot, what) in
+                    sections.iter_mut().zip(["Sections", "SectionsNoInternal", "SubSections"])
+                {
+                    let n = bounded_count(r.i32()?, what, r.o - 4)?;
+                    *slot = read_vec(r, what, n)?;
+                }
                 mesh = Some(GeometryCollectionMesh {
                     index_buffer,
                     position_stride,
@@ -3112,7 +3115,7 @@ impl GeometryCollectionTail {
             ar.i32(&mut m.description_num_triangles.to_owned())?;
             m.pre_skinned_bounds.clone().serialize(ar)?;
             for s in &m.sections {
-                s.write(ar)?;
+                write_vec(ar, s)?;
             }
         }
         if let Some(n) = &self.nanite {
@@ -3624,8 +3627,7 @@ impl ModelTail {
 #[derive(Debug, Clone, PartialEq)]
 pub struct VisibilityBucket {
     pub cell_data_size: i32,
-    /// `FCompressedVisibilityChunk` cells: an `FVector` min and two `uint16`.
-    pub cells: FixedArray,
+    pub cells: Vec<PrecomputedVisibilityCell>,
     pub chunks: Vec<VisibilityChunk>,
 }
 
@@ -3657,7 +3659,7 @@ pub struct LevelTail {
     pub volume_distance_field_scale: f32,
     pub volume_distance_field_box: Box3d,
     pub volume_size: [u8; 12],
-    pub volume_distance_field_data: FixedArray,
+    pub volume_distance_field_data: Vec<u32>,
 }
 
 impl LevelTail {
@@ -3684,7 +3686,8 @@ impl LevelTail {
         let mut visibility_buckets = Vec::with_capacity(n.min(64));
         for _ in 0..n {
             let cell_data_size = r.i32()?;
-            let cells = FixedArray::read(r, "visibility cells", 28)?;
+            let n = bounded_count(r.i32()?, "visibility cells", r.o - 4)?;
+            let cells: Vec<PrecomputedVisibilityCell> = read_vec(r, "visibility cells", n)?;
             let m = {
                 let m = r.i32()?;
                 super::limits::bounded(m, MAX_NATIVE_COUNT, "visibility chunks", r.o - 4)?
@@ -3721,7 +3724,7 @@ impl LevelTail {
             volume_distance_field_scale: r.f32()?,
             volume_distance_field_box: { let mut b = Box3d::default(); b.serialize(r)?; b },
             volume_size: r.take(12)?.try_into().expect("12 bytes"),
-            volume_distance_field_data: FixedArray::read(r, "distance field data", 4)?,
+            volume_distance_field_data: read_u32_array(r, "distance field data")?,
         })
     }
 
@@ -3745,7 +3748,7 @@ impl LevelTail {
         ar.i32(&mut (self.visibility_buckets.len() as i32))?;
         for b in &self.visibility_buckets {
             ar.i32(&mut b.cell_data_size.to_owned())?;
-            b.cells.write(ar)?;
+            write_vec(ar, &b.cells)?;
             ar.i32(&mut (b.chunks.len() as i32))?;
             for c in &b.chunks {
                 ar.u32(&mut c.compressed.to_owned())?;
@@ -3758,7 +3761,7 @@ impl LevelTail {
         ar.f32(&mut self.volume_distance_field_scale.to_owned())?;
         self.volume_distance_field_box.clone().serialize(ar)?;
         ar.raw(&mut self.volume_size.to_vec(), 12)?;
-        self.volume_distance_field_data.write(ar)
+        write_u32_array(ar, &self.volume_distance_field_data)
     }
 }
 
@@ -3812,7 +3815,7 @@ pub struct AnimSequenceTail {
     /// `bSerializeCompressedData`. When clear the tail ends here.
     pub serialize_compressed_data: bool,
     pub compressed_raw_data_size: i32,
-    pub track_to_skeleton_map: FixedArray,
+    pub track_to_skeleton_map: Vec<i32>,
     /// `FAnimCompressedCurveIndexedName` serializes **only** its `CurveName`;
     /// the `CurveIndex` the struct declares is written for memory counting only,
     /// so an element is 8 bytes on the wire, not 12.
@@ -3826,7 +3829,7 @@ pub struct AnimSequenceTail {
     pub compressed_byte_stream: Option<Vec<u8>>,
     pub bone_codec: FStr,
     pub curve_codec: FStr,
-    pub compressed_curve_byte_stream: FixedArray,
+    pub compressed_curve_byte_stream: Vec<u8>,
     /// `CompressedNumberOfKeys` from the `ICompressedAnimData` base.
     pub compressed_number_of_keys: i32,
     pub codec_data: BoneCodecData,
@@ -3843,21 +3846,21 @@ impl AnimSequenceTail {
                 strip_flags,
                 serialize_compressed_data,
                 compressed_raw_data_size: 0,
-                track_to_skeleton_map: FixedArray { element_size: 4, data: Vec::new() },
+                track_to_skeleton_map: Vec::new(),
                 indexed_curve_names: Vec::new(),
                 compressed_byte_stream_len: 0,
                 use_bulk: false,
                 compressed_byte_stream: None,
                 bone_codec: FStr::default(),
                 curve_codec: FStr::default(),
-                compressed_curve_byte_stream: FixedArray { element_size: 1, data: Vec::new() },
+                compressed_curve_byte_stream: Vec::new(),
                 compressed_number_of_keys: 0,
                 codec_data: BoneCodecData::Acl { compression_failed: 0 },
                 trailing_flag: 0,
             });
         }
         let compressed_raw_data_size = r.i32()?;
-        let track_to_skeleton_map = FixedArray::read(r, "CompressedTrackToSkeletonMapTable", 4)?;
+        let track_to_skeleton_map = read_i32_array(r, "CompressedTrackToSkeletonMapTable")?;
         let indexed_curve_names = read_name_array(r, "IndexedCurveNames")?;
         let compressed_byte_stream_len = r.i32()?;
         let n = super::limits::bounded(
@@ -3871,7 +3874,7 @@ impl AnimSequenceTail {
             (!use_bulk).then(|| r.take(n).map(<[u8]>::to_vec)).transpose()?;
         let bone_codec = r.fstring()?;
         let curve_codec = r.fstring()?;
-        let compressed_curve_byte_stream = FixedArray::read(r, "CompressedCurveByteStream", 1)?;
+        let compressed_curve_byte_stream = read_byte_array(r, "CompressedCurveByteStream")?;
         let compressed_number_of_keys = r.i32()?;
         let codec_name = bone_codec.as_str();
         let codec_data = if codec_name.starts_with("AnimBoneCompressionCodec_ACL") {
@@ -3910,7 +3913,7 @@ impl AnimSequenceTail {
             return Ok(());
         }
         ar.i32(&mut self.compressed_raw_data_size.to_owned())?;
-        self.track_to_skeleton_map.write(ar)?;
+        write_i32_array(ar, &self.track_to_skeleton_map)?;
         write_name_array(ar, &self.indexed_curve_names)?;
         ar.i32(&mut self.compressed_byte_stream_len.to_owned())?;
         ar.u32(&mut u32::from(self.use_bulk))?;
@@ -3931,7 +3934,7 @@ impl AnimSequenceTail {
         }
         ar.fstring(&mut self.bone_codec.clone())?;
         ar.fstring(&mut self.curve_codec.clone())?;
-        self.compressed_curve_byte_stream.write(ar)?;
+        write_byte_array(ar, &self.compressed_curve_byte_stream)?;
         ar.i32(&mut self.compressed_number_of_keys.to_owned())?;
         match &self.codec_data {
             BoneCodecData::Acl { compression_failed } => {
@@ -4121,7 +4124,7 @@ pub struct SkelRenderSection {
     pub correspond_cloth_asset_index: [u8; 2],
     pub clothing_section_data: ClothingSectionData,
     /// The duplicated-vertex buffers, stripped from cooks that do not need them.
-    pub dup_verts: Option<(FixedArray, FixedArray)>,
+    pub dup_verts: Option<(Vec<u32>, Vec<DuplicatedVertexIndex>)>,
     pub disabled: u32,
 }
 
@@ -4162,11 +4165,10 @@ impl SkelRenderSection {
             c
         };
         let dup_verts = (class_strip & 1 == 0)
-            .then(|| -> Result<(FixedArray, FixedArray)> {
-                Ok((
-                    FixedArray::read(r, "DupVertData", 4)?,
-                    FixedArray::read(r, "DupVertIndexData", 8)?,
-                ))
+            .then(|| -> Result<(Vec<u32>, Vec<DuplicatedVertexIndex>)> {
+                let a = read_u32_array(r, "DupVertData")?;
+                let n = bounded_count(r.i32()?, "DupVertIndexData", r.o - 4)?;
+                Ok((a, read_vec(r, "DupVertIndexData", n)?))
             })
             .transpose()?;
         Ok(SkelRenderSection {
@@ -4213,8 +4215,8 @@ impl SkelRenderSection {
         self.clothing_section_data.clone().serialize(ar)?;
         match (&self.dup_verts, self.class_strip & 1 == 0) {
             (Some((a, b)), true) => {
-                a.write(ar)?;
-                b.write(ar)?;
+                write_u32_array(ar, a)?;
+                write_vec(ar, b)?;
             }
             (None, false) => {}
             _ => bail!("duplicated vertex data disagrees with the strip flags"),
@@ -4227,10 +4229,10 @@ impl SkelRenderSection {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SkinWeightProfile {
     pub name: FName,
-    pub bone_ids: FixedArray,
-    pub bone_weights: FixedArray,
+    pub bone_ids: Vec<u8>,
+    pub bone_weights: Vec<u8>,
     pub num_weights_per_vertex: u8,
-    pub vertex_index_to_influence_offset: FixedArray,
+    pub vertex_index_to_influence_offset: Vec<EntryToValueKey>,
 }
 
 /// One named per-vertex attribute buffer.
@@ -4246,11 +4248,11 @@ pub struct VertexAttributeBuffer {
 /// Compressed morph-target render data, present only when the cook wrote it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MorphTargetData {
-    pub morph_data: FixedArray,
-    pub minimum_value_per_morph: FixedArray,
-    pub maximum_value_per_morph: FixedArray,
-    pub batch_start_offset_per_morph: FixedArray,
-    pub batches_per_morph: FixedArray,
+    pub morph_data: Vec<u32>,
+    pub minimum_value_per_morph: Vec<Vector4f>,
+    pub maximum_value_per_morph: Vec<Vector4f>,
+    pub batch_start_offset_per_morph: Vec<u32>,
+    pub batches_per_morph: Vec<u32>,
     /// `NumTotalBatches`, `PositionPrecision`, `TangentZPrecision`.
     pub precision: [u8; 12],
 }
@@ -4286,14 +4288,14 @@ pub struct SkelStreamedData {
     /// Present only when the mesh declares vertex colours; the inner option is
     /// the buffer, which serializes only when it has vertices.
     pub colors: Option<((StripDataFlags, i32, u32), Option<BulkArray>)>,
-    pub cloth: Option<(StripDataFlags, BulkArray, FixedArray)>,
+    pub cloth: Option<(StripDataFlags, BulkArray, Vec<ClothBufferIndexMapping>)>,
     pub skin_weight_profiles: Vec<SkinWeightProfile>,
     /// `FRayTracingGeometry::RawData`.
-    pub source_ray_tracing_geometry: FixedArray,
+    pub source_ray_tracing_geometry: Vec<u8>,
     pub morph: Option<MorphTargetData>,
     pub vertex_attributes: Vec<VertexAttributeBuffer>,
     pub half_edge_strip: StripDataFlags,
-    pub half_edge: Option<(FixedArray, FixedArray)>,
+    pub half_edge: Option<(Vec<i32>, Vec<i32>)>,
 }
 
 impl SkelStreamedData {
@@ -4338,7 +4340,10 @@ impl SkelStreamedData {
                 Ok((
                     strip,
                     BulkArray::read(r, "cloth vertices")?,
-                    FixedArray::read(r, "ClothIndexMapping", 12)?,
+                    {
+                        let n = bounded_count(r.i32()?, "ClothIndexMapping", r.o - 4)?;
+                        read_vec(r, "ClothIndexMapping", n)?
+                    },
                 ))
             })
             .transpose()?;
@@ -4350,29 +4355,25 @@ impl SkelStreamedData {
         for _ in 0..n {
             skin_weight_profiles.push(SkinWeightProfile {
                 name: r.fname()?,
-                bone_ids: FixedArray::read(r, "profile BoneIDs", 1)?,
-                bone_weights: FixedArray::read(r, "profile BoneWeights", 1)?,
+                bone_ids: read_byte_array(r, "profile BoneIDs")?,
+                bone_weights: read_byte_array(r, "profile BoneWeights")?,
                 num_weights_per_vertex: r.u8()?,
-                vertex_index_to_influence_offset: FixedArray::read(
-                    r,
-                    "profile VertexIndexToInfluenceOffset",
-                    8,
-                )?,
+                vertex_index_to_influence_offset: {
+                    let n =
+                        bounded_count(r.i32()?, "profile VertexIndexToInfluenceOffset", r.o - 4)?;
+                    read_vec(r, "profile VertexIndexToInfluenceOffset", n)?
+                },
             });
         }
-        let source_ray_tracing_geometry = FixedArray::read(r, "SourceRayTracingGeometry", 1)?;
+        let source_ray_tracing_geometry = read_byte_array(r, "SourceRayTracingGeometry")?;
         let morph = (r.u32()? != 0)
             .then(|| -> Result<MorphTargetData> {
                 Ok(MorphTargetData {
-                    morph_data: FixedArray::read(r, "MorphData", 4)?,
-                    minimum_value_per_morph: FixedArray::read(r, "MinimumValuePerMorph", 16)?,
-                    maximum_value_per_morph: FixedArray::read(r, "MaximumValuePerMorph", 16)?,
-                    batch_start_offset_per_morph: FixedArray::read(
-                        r,
-                        "BatchStartOffsetPerMorph",
-                        4,
-                    )?,
-                    batches_per_morph: FixedArray::read(r, "BatchesPerMorph", 4)?,
+                    morph_data: read_u32_array(r, "MorphData")?,
+                    minimum_value_per_morph: { let n = bounded_count(r.i32()?, "MinimumValuePerMorph", r.o - 4)?; read_vec(r, "MinimumValuePerMorph", n)? },
+                    maximum_value_per_morph: { let n = bounded_count(r.i32()?, "MaximumValuePerMorph", r.o - 4)?; read_vec(r, "MaximumValuePerMorph", n)? },
+                    batch_start_offset_per_morph: read_u32_array(r, "BatchStartOffsetPerMorph")?,
+                    batches_per_morph: read_u32_array(r, "BatchesPerMorph")?,
                     precision: r.take(12)?.try_into().expect("12 bytes"),
                 })
             })
@@ -4393,10 +4394,10 @@ impl SkelStreamedData {
         }
         let half_edge_strip = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
         let half_edge = (half_edge_strip.class & 1 == 0)
-            .then(|| -> Result<(FixedArray, FixedArray)> {
+            .then(|| -> Result<(Vec<i32>, Vec<i32>)> {
                 Ok((
-                    FixedArray::read(r, "VertexToEdgeData", 4)?,
-                    FixedArray::read(r, "EdgeToTwinEdgeData", 4)?,
+                    read_i32_array(r, "VertexToEdgeData")?,
+                    read_i32_array(r, "EdgeToTwinEdgeData")?,
                 ))
             })
             .transpose()?;
@@ -4479,7 +4480,7 @@ impl SkelStreamedData {
             (Some((strip, verts, mapping)), true) => {
                 strip.clone().serialize(ar)?;
                 verts.write(ar)?;
-                mapping.write(ar)?;
+                write_vec(ar, mapping)?;
             }
             (None, false) => {}
             _ => bail!("cloth presence disagrees with the render sections"),
@@ -4487,20 +4488,20 @@ impl SkelStreamedData {
         ar.i32(&mut (self.skin_weight_profiles.len() as i32))?;
         for p in &self.skin_weight_profiles {
             ar.fname(&mut p.name.clone())?;
-            p.bone_ids.write(ar)?;
-            p.bone_weights.write(ar)?;
+            write_byte_array(ar, &p.bone_ids)?;
+            write_byte_array(ar, &p.bone_weights)?;
             ar.u8(&mut p.num_weights_per_vertex.to_owned())?;
-            p.vertex_index_to_influence_offset.write(ar)?;
+            write_vec(ar, &p.vertex_index_to_influence_offset)?;
         }
-        self.source_ray_tracing_geometry.write(ar)?;
+        write_byte_array(ar, &self.source_ray_tracing_geometry)?;
         match &self.morph {
             Some(m) => {
                 ar.u32(&mut 1)?;
-                m.morph_data.write(ar)?;
-                m.minimum_value_per_morph.write(ar)?;
-                m.maximum_value_per_morph.write(ar)?;
-                m.batch_start_offset_per_morph.write(ar)?;
-                m.batches_per_morph.write(ar)?;
+                write_u32_array(ar, &m.morph_data)?;
+                write_vec(ar, &m.minimum_value_per_morph)?;
+                write_vec(ar, &m.maximum_value_per_morph)?;
+                write_u32_array(ar, &m.batch_start_offset_per_morph)?;
+                write_u32_array(ar, &m.batches_per_morph)?;
                 ar.raw(&mut m.precision.to_vec(), 12)?;
             }
             None => ar.u32(&mut 0)?,
@@ -4516,8 +4517,8 @@ impl SkelStreamedData {
         self.half_edge_strip.clone().serialize(ar)?;
         match (&self.half_edge, self.half_edge_strip.class & 1 == 0) {
             (Some((a, b)), true) => {
-                a.write(ar)?;
-                b.write(ar)?;
+                write_i32_array(ar, a)?;
+                write_i32_array(ar, b)?;
             }
             (None, false) => {}
             _ => bail!("half-edge data disagrees with the strip flags"),
@@ -4532,7 +4533,7 @@ pub struct SkelAvailabilityInfo {
     /// Everything from `DataTypeSize` through the skin-weight lookup count — a
     /// flat run of scalars whose order differs from the streamed form.
     pub header: [u8; 65],
-    pub cloth: Option<(FixedArray, i32, u32)>,
+    pub cloth: Option<(Vec<ClothBufferIndexMapping>, i32, u32)>,
     pub skin_weight_profile_names: Vec<FName>,
 }
 
@@ -4541,7 +4542,8 @@ impl SkelAvailabilityInfo {
         let header: [u8; 65] = r.take(65)?.try_into().expect("65 bytes");
         let cloth = has_cloth
             .then(|| -> Result<_> {
-                Ok((FixedArray::read(r, "ClothIndexMapping", 12)?, r.i32()?, r.u32()?))
+                let n = bounded_count(r.i32()?, "ClothIndexMapping", r.o - 4)?;
+                Ok((read_vec(r, "ClothIndexMapping", n)?, r.i32()?, r.u32()?))
             })
             .transpose()?;
         Ok(SkelAvailabilityInfo {
@@ -4555,7 +4557,7 @@ impl SkelAvailabilityInfo {
         ar.raw(&mut self.header.to_vec(), 65)?;
         match (&self.cloth, has_cloth) {
             (Some((m, stride, n)), true) => {
-                m.write(ar)?;
+                write_vec(ar, m)?;
                 ar.i32(&mut stride.to_owned())?;
                 ar.u32(&mut n.to_owned())?;
             }
@@ -5411,7 +5413,8 @@ pub fn roundtrip_tail(
                 for _ in 0..n {
                     let name = r.fname()?;
                     let type_id = r.i32()?;
-                    let entries = FixedArray::read(&mut r, "EntryToValueKeyMap", 12)?;
+                    let n = bounded_count(r.i32()?, "EntryToValueKeyMap", r.o - 4)?;
+                    let entries: Vec<EntryToValueKey> = read_vec(&mut r, "EntryToValueKeyMap", n)?;
                     let parent = r.i32()?;
                     let name2 = r.fname()?;
                     let attribute_id = r.i32()?;
@@ -5463,7 +5466,7 @@ pub fn roundtrip_tail(
                 for (name, type_id, entries, parent, name2, attribute_id, count, values) in &attrs {
                     w.fname(&mut name.clone())?;
                     w.i32(&mut type_id.to_owned())?;
-                    entries.write(&mut w)?;
+                    write_vec(&mut w, entries)?;
                     w.i32(&mut parent.to_owned())?;
                     w.fname(&mut name2.clone())?;
                     w.i32(&mut attribute_id.to_owned())?;
@@ -6117,6 +6120,19 @@ fn write_i32_array(ar: &mut impl Ar, v: &[i32]) -> Result<()> {
         ar.i32(&mut x.to_owned())?;
     }
     Ok(())
+}
+
+/// Read a `TArray<uint8>` written with a bare count — a genuine byte array in
+/// the engine too, not a run this model declined to interpret.
+fn read_byte_array(r: &mut Reader, what: &str) -> Result<Vec<u8>> {
+    let n = bounded_count(r.i32()?, what, r.o - 4)?;
+    Ok(r.take(n)?.to_vec())
+}
+
+fn write_byte_array(ar: &mut impl Ar, v: &[u8]) -> Result<()> {
+    ar.i32(&mut (v.len() as i32))?;
+    let n = v.len();
+    ar.raw(&mut v.to_vec(), n)
 }
 
 /// Read a `TArray<FName>` written with a bare count.
