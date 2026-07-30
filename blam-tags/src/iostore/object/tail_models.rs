@@ -25,6 +25,33 @@
 //! `StaticMesh` (Nanite), `SkeletalMesh`, `AnimSequence` (ACL) and
 //! `GeometryCollection`.
 //!
+//! # Every remaining `Vec<u8>`, and why
+//!
+//! No field here is an anonymous byte run any more: every scalar, name, object
+//! reference, index and engine struct is a type. What is still `Vec<u8>` is
+//! only what Unreal itself types that way — a `TArray<uint8>` or the output of a
+//! codec that owns its own interior. The full list, so the claim can be checked
+//! rather than trusted:
+//!
+//! | field | what it is |
+//! |---|---|
+//! | `BulkArray::data` | `BulkSerialize`d vertex/index buffers — a memory dump whose element type lives in the mesh's build settings, not the stream |
+//! | `TextureMip::payload` | block-compressed pixels |
+//! | `TextureCpuCopy::raw_data` | `FImage::RawData`, a `TArray64<uint8>` |
+//! | `VirtualTextureDataChunk::payload`, `InlineBulkPayload::payload`, `CookedFormat::payload` | bulk payloads: virtual-texture tiles, vector fields, Chaos cooked physics |
+//! | `NaniteResources::root_data` | Nanite's compressed cluster pages |
+//! | `DistanceFieldVolume::always_loaded_mip` | `TArray<uint8>` brick data |
+//! | `StructTail::field_chain` | the `FField` chain — structured, but with no writer in this crate |
+//! | `StructTail::script` | Kismet bytecode, a `TArray<uint8>` |
+//! | `ChaosPtr::payload` | Chaos's recursive implicit-object or BVH encoding |
+//! | `ShaderMap::frozen_image`, `InlineShaderMaps::data` | a frozen memory image and compiled shader bytecode |
+//! | `NiagaraShaderResource::base_compile_hash` | `TArray<uint8>` |
+//! | `LandscapeComponentTail::height_weight_data` | packed height/weight samples, `TArray<uint8>` |
+//! | `VisibilityChunk::data` | compressed visibility, `TArray<uint8>` |
+//! | `AnimSequenceTail::compressed_byte_stream`, `compressed_curve_byte_stream` | ACL clips, `TArray<uint8>` |
+//! | `DnaAssetTail::behavior`, `geometry` | RigLogic DNA streams |
+//! | `SkinWeightProfile::bone_ids`, `bone_weights`, `SkelStreamedData::source_ray_tracing_geometry` | `TArray<uint8>` |
+//!
 //! # Payloads another serializer owns
 //!
 //! Several of these tails end in a blob a *different* serializer produced: a
@@ -1575,8 +1602,8 @@ pub struct NaniteResources {
     pub hierarchy_nodes: Vec<PackedHierarchyNode>,
     pub hierarchy_root_offsets: Vec<u32>,
     pub page_dependencies: Vec<u32>,
-    /// Two bytes per entry.
-    pub imposter_atlas: Vec<u8>,
+    /// `TArray<uint16>`.
+    pub imposter_atlas: Vec<u16>,
     /// The trailing statistics, in the order `FResources::Serialize` writes them
     /// (NaniteResources.cpp:286).
     pub num_root_pages: u32,
@@ -1624,7 +1651,7 @@ impl NaniteResources {
             let n = r.i32()?;
             super::limits::bounded(n, MAX_NATIVE_COUNT, "ImposterAtlas", r.o - 4)?
         };
-        let imposter_atlas = r.take(n * 2)?.to_vec();
+        let imposter_atlas = (0..n).map(|_| r.u16()).collect::<Result<Vec<_>>>()?;
         Ok(NaniteResources {
             strip_flags,
             resource_flags,
@@ -1657,12 +1684,7 @@ impl NaniteResources {
         write_vec(ar, &self.hierarchy_nodes)?;
         write_u32_array(ar, &self.hierarchy_root_offsets)?;
         write_u32_array(ar, &self.page_dependencies)?;
-        if self.imposter_atlas.len() % 2 != 0 {
-            bail!("imposter atlas has an odd byte count");
-        }
-        ar.i32(&mut ((self.imposter_atlas.len() / 2) as i32))?;
-        let n = self.imposter_atlas.len();
-        ar.raw(&mut self.imposter_atlas.clone(), n)?;
+        write_u16_array(ar, &self.imposter_atlas)?;
         ar.u32(&mut self.num_root_pages.to_owned())?;
         ar.i32(&mut self.position_precision.to_owned())?;
         ar.i32(&mut self.normal_precision.to_owned())?;
@@ -2243,7 +2265,7 @@ impl ModelComponentTail {
 pub struct RetargetSource {
     pub key: FName,
     pub pose_name: FName,
-    pub reference_pose: Vec<u8>,
+    pub reference_pose: Vec<Transform>,
 }
 
 /// `USkeleton::Serialize`.
@@ -2273,11 +2295,13 @@ impl SkeletonTail {
                 let m = r.i32()?;
                 super::limits::bounded(m, MAX_NATIVE_COUNT, "FReferencePose", r.o - 4)?
             };
-            retarget_sources.push(RetargetSource {
-                key,
-                pose_name,
-                reference_pose: r.take(m * tsize)?.to_vec(),
-            });
+            let mut reference_pose = Vec::with_capacity(m.min(4096));
+            for _ in 0..m {
+                let mut t = Transform::default();
+                t.serialize(r, tsize)?;
+                reference_pose.push(t);
+            }
+            retarget_sources.push(RetargetSource { key, pose_name, reference_pose });
         }
         let guid = { let mut g = Guid::default(); g.serialize(r)?; g };
         let smart_names = r.i32()?;
@@ -2299,12 +2323,10 @@ impl SkeletonTail {
         for s in &self.retarget_sources {
             ar.fname(&mut s.key.clone())?;
             ar.fname(&mut s.pose_name.clone())?;
-            if tsize == 0 || s.reference_pose.len() % tsize != 0 {
-                bail!("retarget pose is {} bytes for {tsize}-byte transforms", s.reference_pose.len());
+            ar.i32(&mut (s.reference_pose.len() as i32))?;
+            for t in &s.reference_pose {
+                t.clone().serialize(ar, tsize)?;
             }
-            ar.i32(&mut ((s.reference_pose.len() / tsize) as i32))?;
-            let n = s.reference_pose.len();
-            ar.raw(&mut s.reference_pose.clone(), n)?;
         }
         self.guid.clone().serialize(ar)?;
         ar.i32(&mut 0)?; // the deprecated SmartNames container, always empty
@@ -4206,7 +4228,7 @@ pub struct ReferenceSkeleton {
     /// width leaves the following bone-count where it belongs. Keeping the
     /// answer is what lets the writer reproduce the pose without probing again.
     pub transform_size: usize,
-    pub bone_pose: Vec<u8>,
+    pub bone_pose: Vec<Transform>,
     pub name_to_index: Vec<NameToIndex>,
 }
 
@@ -4232,10 +4254,16 @@ impl ReferenceSkeleton {
                 })
                 .context("could not size FTransform in FReferenceSkeleton")?
         };
+        let mut bone_pose = Vec::with_capacity(npose.min(4096));
+        for _ in 0..npose {
+            let mut t = Transform::default();
+            t.serialize(r, transform_size)?;
+            bone_pose.push(t);
+        }
         Ok(ReferenceSkeleton {
             bone_info,
             transform_size,
-            bone_pose: r.take(npose * transform_size)?.to_vec(),
+            bone_pose,
             name_to_index: {
                 let n = bounded_count(r.i32()?, "RawRefBoneNameToIndexMap", r.o - 4)?;
                 read_vec(r, "RawRefBoneNameToIndexMap", n)?
@@ -4245,16 +4273,10 @@ impl ReferenceSkeleton {
 
     fn write(&self, ar: &mut impl Ar) -> Result<()> {
         write_vec(ar, &self.bone_info)?;
-        if self.transform_size == 0 || self.bone_pose.len() % self.transform_size != 0 {
-            bail!(
-                "bone pose is {} bytes for {}-byte transforms",
-                self.bone_pose.len(),
-                self.transform_size
-            );
+        ar.i32(&mut (self.bone_pose.len() as i32))?;
+        for t in &self.bone_pose {
+            t.clone().serialize(ar, self.transform_size)?;
         }
-        ar.i32(&mut ((self.bone_pose.len() / self.transform_size) as i32))?;
-        let n = self.bone_pose.len();
-        ar.raw(&mut self.bone_pose.clone(), n)?;
         write_vec(ar, &self.name_to_index)
     }
 }
