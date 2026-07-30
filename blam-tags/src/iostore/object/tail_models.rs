@@ -5231,6 +5231,27 @@ pub fn roundtrip_tail(
             modeled.write(&mut w)?;
             Ok(w.into_bytes())
         })()),
+        // `URigVM` and `URigHierarchy` override `Serialize` and deliberately do
+        // *not* call up, so their export is entirely their own format with no
+        // property block ahead of it. Both have a reader and neither has a
+        // writer, so the run stays whole — but it is now *checked*: the reader
+        // must land exactly on the end.
+        "RigVM" => Some((|| {
+            let mut r = reader(tail, names, ctx);
+            super::tails::read_rigvm(&mut r, ctx.usmap)?;
+            if r.o != tail.len() {
+                bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+            }
+            Ok(tail.to_vec())
+        })()),
+        "RigHierarchy" => Some((|| {
+            let mut r = reader(tail, names, ctx);
+            super::tails::read_rig_hierarchy(&mut r)?;
+            if r.o != tail.len() {
+                bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+            }
+            Ok(tail.to_vec())
+        })()),
         "BodySetup" => Some((|| {
             let mut r = reader(tail, names, ctx);
             let modeled = BodySetupTail::read(&mut r, ctx)?;
@@ -5910,7 +5931,28 @@ pub fn roundtrip_tail(
                 Ok(w.into_bytes())
             })()),
             // `USkeletalBodySetup` adds nothing over `UBodySetup`.
-            "BodySetup" => Some((|| {
+            // `URigVM` and `URigHierarchy` override `Serialize` and deliberately do
+        // *not* call up, so their export is entirely their own format with no
+        // property block ahead of it. Both have a reader and neither has a
+        // writer, so the run stays whole — but it is now *checked*: the reader
+        // must land exactly on the end.
+        "RigVM" => Some((|| {
+            let mut r = reader(tail, names, ctx);
+            super::tails::read_rigvm(&mut r, ctx.usmap)?;
+            if r.o != tail.len() {
+                bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+            }
+            Ok(tail.to_vec())
+        })()),
+        "RigHierarchy" => Some((|| {
+            let mut r = reader(tail, names, ctx);
+            super::tails::read_rig_hierarchy(&mut r)?;
+            if r.o != tail.len() {
+                bail!("model consumed {} of {} tail bytes", r.o, tail.len());
+            }
+            Ok(tail.to_vec())
+        })()),
+        "BodySetup" => Some((|| {
                 let mut r = reader(tail, names, ctx);
                 let modeled = BodySetupTail::read(&mut r, ctx)?;
                 if r.o != tail.len() {

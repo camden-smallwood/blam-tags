@@ -245,7 +245,11 @@ fn main() {
                 }
                 let s = stats.entry(short.to_string()).or_default();
                 s.0 += 1;
-                let Some(block) = parts.block.as_ref() else { continue };
+                // `URigVM` and `URigHierarchy` write no property block at all —
+                // skipping them here is what made two exports look unmodeled
+                // when nothing had ever asked.
+                let empty = Default::default();
+                let block = parts.block.as_ref().unwrap_or(&empty);
                 let layouts = RefCell::new(HashMap::new());
                 let resolver = PkgResolver {
                     world: &world,
@@ -302,10 +306,12 @@ fn main() {
     // they are reported as their own bucket.
     let mut unmodeled = 0u64;
     let mut unmodeled_classes = 0u64;
+    let mut unmodeled_names: Vec<String> = Vec::new();
     for (class, (seen, exact, failed, bytes)) in &stats {
         if *exact == 0 && *failed == 0 {
             unmodeled += seen;
             unmodeled_classes += 1;
+            unmodeled_names.push(format!("{class} ({seen})"));
             continue;
         }
         println!("{class:<44} {seen:>10} {exact:>10} {failed:>8} {bytes:>13}");
@@ -315,8 +321,13 @@ fn main() {
         by += bytes;
     }
     println!(
-        "\n{e} of {t} modeled tails exact ({:.4}%), {f} failed, {by} bytes now regenerated rather than retained\nno model yet: {unmodeled} tails across {unmodeled_classes} classes",
-        100.0 * e as f64 / t.max(1) as f64
+        "\n{e} of {t} modeled tails exact ({:.4}%), {f} failed, {by} bytes now regenerated rather than retained\nno model yet: {unmodeled} tails across {unmodeled_classes} classes{names}",
+        100.0 * e as f64 / t.max(1) as f64,
+        names = if unmodeled_names.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", unmodeled_names.join(", "))
+        },
     );
     for s in &samples {
         println!("\n{s}");

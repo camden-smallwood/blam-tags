@@ -443,8 +443,19 @@ pub fn can_serialize_as_zero(ty: &PropertyType) -> bool {
         | PropertyType::LazyObject
         | PropertyType::Interface => true,
         PropertyType::Enum { inner, .. } => can_serialize_as_zero(inner),
-        // Atomic-and-small, which is what having a fixed native size means here.
-        PropertyType::Struct(name) => native_struct_size(name).is_some(),
+        // The engine's test is `STRUCT_Atomic` and under sixteen words, and the
+        // `.usmap` records neither — so this cannot be derived, only permitted.
+        // Having a fixed native size is *sufficient* but not necessary:
+        // `FBox2f` is atomic and small yet serializes as an ordinary property
+        // block when it is non-zero, so it is absent from `native_struct_size`
+        // and was refused here. The cooker masks it, the reader materialises an
+        // empty block for it, and the writer then could not put it back.
+        //
+        // Answering `true` is safe because the caller ANDs this with the bit the
+        // file itself carries (see `write_block`): a struct is only ever masked
+        // where the cooker masked it. Answering `false` was not safe — it turned
+        // nine data tables into a refusal.
+        PropertyType::Struct(_) => true,
         // An optional inherits its inner type's flags.
         PropertyType::Optional(inner) => can_serialize_as_zero(inner),
         _ => false,
@@ -466,6 +477,12 @@ pub fn can_serialize_as_zero(ty: &PropertyType) -> bool {
 pub fn should_save_as_zero(ty: &PropertyType, v: &PropValue, usmap: &Usmap) -> bool {
     if !can_serialize_as_zero(ty) {
         return false;
+    }
+    // A masked struct is read as an *empty* block — `zero_value` builds one, and
+    // no bytes were consumed. Serializing it to test for zeroes would need the
+    // nested schema and would fail; emptiness is the test.
+    if let (PropertyType::Struct(_), PropValue::Struct(b)) = (ty, v) {
+        return b.entries.is_empty();
     }
     let mut w = Writer::new();
     if write_value(&mut w, ty, v, false, usmap).is_err() {
