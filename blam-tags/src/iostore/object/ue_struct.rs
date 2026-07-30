@@ -41,8 +41,9 @@ impl Guid {
     }
 }
 
-/// `FSHAHash` — twenty bytes with no interior. A hash is one value, not a
-/// struct, so this is a named byte array rather than a decomposition.
+/// `FSHAHash` (SecureHash.h) — twenty bytes with no interior. A hash is one
+/// value, not a struct, so this is a named byte array rather than a
+/// decomposition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShaHash(pub [u8; 20]);
 
@@ -63,7 +64,8 @@ impl ShaHash {
     }
 }
 
-/// `FHashedName` — a `uint64` hash standing in for a name that was not kept.
+/// `FHashedName` (MemoryImage.h:856) — a `uint64` hash standing in for a name
+/// that was not kept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HashedName(pub u64);
 
@@ -75,8 +77,8 @@ impl HashedName {
     }
 }
 
-/// `FStripDataFlags` — the global and class-specific strip masks, always written
-/// as a pair.
+/// `FStripDataFlags` (EngineUtils.h:864) — `GlobalStripFlags` then
+/// `ClassStripFlags`, both `uint8`, always written as a pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StripDataFlags {
     pub global: u8,
@@ -86,11 +88,13 @@ pub struct StripDataFlags {
 impl StripDataFlags {
     pub const SIZE: usize = 2;
 
-    /// `EStrippedData::Editor` — set by every client cook, and *not* a reason to
-    /// suppress render data.
-    pub const EDITOR: u8 = 1;
+    /// `EStrippedData::EditorOnly` — set by every client cook, and *not* a reason
+    /// to suppress render data. (Named `Editor` before 5.4.)
+    pub const EDITOR_ONLY: u8 = 1;
     /// `EStrippedData::AudioVisual`.
     pub const AUDIO_VISUAL: u8 = 2;
+    /// `EStrippedData::NeededForCooking`.
+    pub const NEEDED_FOR_COOKING: u8 = 4;
 
     pub fn audio_visual_stripped(&self) -> bool {
         self.global & Self::AUDIO_VISUAL != 0
@@ -102,7 +106,8 @@ impl StripDataFlags {
     }
 }
 
-/// `FVector` at large-world-coordinate precision.
+/// `FVector` (NoExportTypes.h:582) — three `FLargeWorldCoordinatesReal`, i.e.
+/// doubles in UE5.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Vector3d {
     pub x: f64,
@@ -120,7 +125,7 @@ impl Vector3d {
     }
 }
 
-/// `FVector3f`.
+/// `FVector3f` (NoExportTypes.h:548).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Vector3f {
     pub x: f32,
@@ -138,7 +143,7 @@ impl Vector3f {
     }
 }
 
-/// `FVector4f`.
+/// `FVector4f` (NoExportTypes.h:600).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Vector4f {
     pub x: f32,
@@ -158,7 +163,7 @@ impl Vector4f {
     }
 }
 
-/// `FBoxSphereBounds` at LWC precision.
+/// `FBoxSphereBounds` (NoExportTypes.h:1645) — origin, box extent, sphere radius.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct BoxSphereBounds {
     pub origin: Vector3d,
@@ -176,7 +181,8 @@ impl BoxSphereBounds {
     }
 }
 
-/// `FBox` at LWC precision — 49 bytes, the `IsValid` byte deliberately unpadded.
+/// `FBox` (NoExportTypes.h:1536) — min, max, `IsValid`. 49 bytes: the native
+/// serializer writes `IsValid` as one unpadded byte, not a four-byte `bool`.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Box3d {
     pub min: Vector3d,
@@ -194,7 +200,7 @@ impl Box3d {
     }
 }
 
-/// `FBox3f` — the float variant, 25 bytes rather than 49.
+/// `FBox3f` (NoExportTypes.h:1501) — the float variant, 25 bytes rather than 49.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Box3f {
     pub min: Vector3f,
@@ -212,8 +218,9 @@ impl Box3f {
     }
 }
 
-/// `FPerPlatformFloat` in a cooked stream: the `bCooked` flag `FArchive` writes
-/// as four bytes, then the default. The override map is editor-only.
+/// `FPerPlatformFloat` (PerPlatformProperties.h:300) in a cooked stream: the
+/// `bCooked` flag `FArchive` writes as four bytes, then `Default`. The
+/// `PerPlatform` override map is editor-only and absent from a cook.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct PerPlatformFloat {
     pub cooked: u32,
@@ -229,7 +236,9 @@ impl PerPlatformFloat {
     }
 }
 
-/// `FMeshUVChannelInfo` — two four-byte bools and the per-channel densities.
+/// `FMeshUVChannelInfo` (MeshUVChannelInfo.h:6) — `bInitialized` and
+/// `bOverrideDensities`, each four bytes through `FArchive`, then
+/// `LocalUVDensities[4]`.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct MeshUvChannelInfo {
     pub initialized: u32,
@@ -273,7 +282,9 @@ impl StaticMaterial {
     }
 }
 
-/// `FMeshBoneInfo` — a bone's name and its parent.
+/// `FMeshBoneInfo` (ReferenceSkeleton.h:14). `operator<<` writes `Name` then
+/// `ParentIndex` and nothing else in a cook (ReferenceSkeleton.cpp:57); the
+/// export name is editor-only.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MeshBoneInfo {
     pub name: FName,
@@ -289,7 +300,9 @@ impl MeshBoneInfo {
     }
 }
 
-/// One entry of a `TMap<FName, int32>` as a plain archive writes it.
+/// One entry of `FReferenceSkeleton::RawRefBoneNameToIndexMap`
+/// (ReferenceSkeleton.h) — a `TMap<FName, int32>`, which a plain archive writes
+/// as a count and then the pairs.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NameToIndex {
     pub name: FName,
@@ -305,7 +318,8 @@ impl NameToIndex {
     }
 }
 
-/// One entry of `UClass::FuncMap` — a function's name and the object that is it.
+/// One entry of `UClass::FuncMap` (Class.h) — a `TMap<FName,
+/// TObjectPtr<UFunction>>`, written as a count and then the pairs.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FuncMapEntry {
     pub name: FName,
@@ -321,7 +335,8 @@ impl FuncMapEntry {
     }
 }
 
-/// `FImplementedInterface`.
+/// `FImplementedInterface` (Class.h:2834) — the interface class, the pointer
+/// offset, and whether Blueprint implements it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ImplementedInterface {
     pub class: i32,
@@ -533,7 +548,7 @@ impl LumenCardBuildData {
     }
 }
 
-/// `FInt32Vector`.
+/// `FIntVector` (NoExportTypes.h:1268) — three `int32`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Int32Vector {
     pub x: i32,
@@ -551,7 +566,7 @@ impl Int32Vector {
     }
 }
 
-/// `FVector2D` at large-world-coordinate precision.
+/// `FVector2D` (NoExportTypes.h:691) — two `FLargeWorldCoordinatesReal`.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Vector2d {
     pub x: f64,
@@ -567,7 +582,7 @@ impl Vector2d {
     }
 }
 
-/// `FVector2f`.
+/// `FVector2f` (NoExportTypes.h:662).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Vector2f {
     pub x: f32,
@@ -665,53 +680,49 @@ impl MeshToMeshVertData {
     }
 }
 
-/// `FLightmassPrimitiveSettings`.
+/// `FLightmassPrimitiveSettings`, in the order `operator<<` writes it
+/// (Polygon.cpp:23).
 ///
-/// Typed from the UHT declaration — four `uint8 b:1` bitfields then five floats,
-/// each bool four bytes through `FArchive`, which is the measured 36. The
-/// *order* is the declaration's; the `operator<<` body is in none of the
-/// obvious translation units, so unlike the rest of this module it is the one
-/// layout whose field order is inferred rather than read.
+/// **The wire order is not the declaration order.** The declaration is four
+/// bitfield bools then five floats; the serializer writes
+/// `FullyOccludedSamplesFraction` *third*, between `bShadowIndirectOnly` and
+/// `bUseEmissiveForStaticLighting`. Both orders total 36 bytes, so a round-trip
+/// gate cannot tell them apart — this reader had the wrong one until the
+/// serializer was read.
+///
+/// Each `bool` is four bytes through `FArchive`.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct LightmassPrimitiveSettings {
     pub use_two_sided_lighting: u32,
     pub shadow_indirect_only: u32,
+    pub fully_occluded_samples_fraction: f32,
     pub use_emissive_for_static_lighting: u32,
     pub use_vertex_normal_for_hemisphere_gather: u32,
     pub emissive_light_falloff_exponent: f32,
     pub emissive_light_explicit_influence_radius: f32,
     pub emissive_boost: f32,
     pub diffuse_boost: f32,
-    pub fully_occluded_samples_fraction: f32,
 }
 
 impl LightmassPrimitiveSettings {
     pub const SIZE: usize = 36;
 
     pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
-        for b in [
-            &mut self.use_two_sided_lighting,
-            &mut self.shadow_indirect_only,
-            &mut self.use_emissive_for_static_lighting,
-            &mut self.use_vertex_normal_for_hemisphere_gather,
-        ] {
-            ar.u32(b)?;
-        }
-        for f in [
-            &mut self.emissive_light_falloff_exponent,
-            &mut self.emissive_light_explicit_influence_radius,
-            &mut self.emissive_boost,
-            &mut self.diffuse_boost,
-            &mut self.fully_occluded_samples_fraction,
-        ] {
-            ar.f32(f)?;
-        }
-        Ok(())
+        ar.u32(&mut self.use_two_sided_lighting)?;
+        ar.u32(&mut self.shadow_indirect_only)?;
+        ar.f32(&mut self.fully_occluded_samples_fraction)?;
+        ar.u32(&mut self.use_emissive_for_static_lighting)?;
+        ar.u32(&mut self.use_vertex_normal_for_hemisphere_gather)?;
+        ar.f32(&mut self.emissive_light_falloff_exponent)?;
+        ar.f32(&mut self.emissive_light_explicit_influence_radius)?;
+        ar.f32(&mut self.emissive_boost)?;
+        ar.f32(&mut self.diffuse_boost)
     }
 }
 
-/// One entry of `UActorComponent::UCSModifiedProperties` — which object, which
-/// property, and the construction-script instance that set it.
+/// `FSimpleMemberReference` (EdGraphPin.h:34), the element type of
+/// `UActorComponent::UCSModifiedProperties`: the object that owns the member,
+/// its name, and its GUID.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UcsModifiedProperty {
     pub object: i32,
@@ -747,9 +758,9 @@ impl ClothBufferIndexMapping {
     }
 }
 
-/// One `FMemoryImageVTablePatch`-adjacent type dependency in a shader map's
-/// pointer table: the type's name, the size its layout had when the image was
-/// frozen, and the hash of that layout.
+/// One frozen-memory-image type dependency (MemoryImage.cpp:1349): the type's
+/// `Name`, the `LayoutSize` its layout had when the image was frozen, and the
+/// `LayoutHash` of that layout.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MemoryImageTypeDependency {
     pub name: FName,
@@ -767,8 +778,8 @@ impl MemoryImageTypeDependency {
     }
 }
 
-/// `FPlatformTypeLayoutParameters` — the alignment and flags a frozen memory
-/// image was built with.
+/// `FPlatformTypeLayoutParameters` (MemoryLayout.h:810) — `MaxFieldAlignment`
+/// then `Flags`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PlatformTypeLayoutParameters {
     pub max_field_alignment: u32,
@@ -784,8 +795,8 @@ impl PlatformTypeLayoutParameters {
     }
 }
 
-/// One vtable patch: where in the frozen image a pointer lives and what offset
-/// to write there.
+/// One vtable patch in a `FPointerTableBase` (MemoryImage.cpp) — the vtable
+/// offset and the offset in the frozen image to write it at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VTablePatch {
     pub vtable_offset: u32,
@@ -801,8 +812,12 @@ impl VTablePatch {
     }
 }
 
-/// One `TMap<FGuid, int32>`-style grass weight offset: the object it belongs to
-/// and where its weights start.
+/// One entry of `ULandscapeComponent::WeightmapLayerAllocations`-adjacent grass
+/// weight data — the grass type and where its weights start.
+///
+/// **Not located in the engine source.** The two `int32`s are what the stream
+/// carries and what the walker measured; the field names are this reader's
+/// reading of them, not the engine's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GrassWeightOffset {
     pub grass_type: i32,
@@ -818,11 +833,11 @@ impl GrassWeightOffset {
     }
 }
 
-/// One entry of a duplicated-vertex index buffer: where a vertex's duplicates
-/// start and how many there are.
+/// `FIndexLengthPair` (SkeletalMeshDuplicatedVerticesBuffer.h:11) — `Length`
+/// **then** `Index`, in that order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DuplicatedVertexIndex {
-    pub num_duplicates: u32,
+    pub length: u32,
     pub index: u32,
 }
 
@@ -830,12 +845,14 @@ impl DuplicatedVertexIndex {
     pub const SIZE: usize = 8;
 
     pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
-        ar.u32(&mut self.num_duplicates)?;
+        ar.u32(&mut self.length)?;
         ar.u32(&mut self.index)
     }
 }
 
-/// One `FPCGMetadataAttributeBase` entry-to-value mapping.
+/// One entry of `FPCGMetadataAttributeBase::EntryToValueKeyMap`
+/// (PCGMetadataAttribute.h) — a `TMap<PCGMetadataEntryKey, PCGMetadataValueKey>`,
+/// i.e. an `int64` keyed to an `int32`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EntryToValueKey {
     pub entry_key: i64,
@@ -853,7 +870,8 @@ impl EntryToValueKey {
     }
 }
 
-/// `FPlane4f` — a normal and a distance, all floats.
+/// `FPlane4f` (NoExportTypes.h) — **derives `FVector3f`**, so the layout is
+/// X, Y, Z from the base and then W.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Plane4f {
     pub x: f32,
@@ -932,7 +950,8 @@ impl ModelVertex {
     }
 }
 
-/// `FMorphTargetDelta` — one vertex's morph offset.
+/// `FMorphTargetDelta` (MorphTarget.h:23) — a position and tangent offset and
+/// the vertex they apply to.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct MorphTargetDelta {
     pub position_delta: Vector3f,
@@ -950,7 +969,8 @@ impl MorphTargetDelta {
     }
 }
 
-/// `FTransform` — a rotation, a translation and a scale.
+/// `FTransform` (NoExportTypes.h:2093) — `Rotation` (`FQuat`), `Translation`
+/// and `Scale3D` (`FVector`), in that order.
 ///
 /// Stored at double precision whatever the file used. A cook writes either the
 /// `double` variant (80 bytes) or the `float` one (40), and which is not
@@ -987,7 +1007,8 @@ impl Transform {
     }
 }
 
-/// `FPrecomputedVisibilityCell` — a cell's origin and where its data sits.
+/// `FPrecomputedVisibilityCell` (Level.h:170) — `Min`, `ChunkIndex`,
+/// `DataOffset`.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct PrecomputedVisibilityCell {
     pub min: Vector3d,
@@ -1005,13 +1026,13 @@ impl PrecomputedVisibilityCell {
     }
 }
 
-/// One `FGeometryCollectionMeshElement` — a draw range within a collection's
-/// mesh resources.
+/// `FGeometryCollectionMeshElement` (GeometryCollectionRenderData.h:73), in the
+/// order `operator<<` writes it (:84).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GeometryCollectionMeshElement {
     pub transform_index: i16,
     pub material_index: u8,
-    pub flags: u8,
+    pub is_internal: u8,
     pub triangle_start: u32,
     pub triangle_count: u32,
     pub vertex_start: u32,
@@ -1026,7 +1047,7 @@ impl GeometryCollectionMeshElement {
         ar.u16(&mut lo)?;
         self.transform_index = lo as i16;
         ar.u8(&mut self.material_index)?;
-        ar.u8(&mut self.flags)?;
+        ar.u8(&mut self.is_internal)?;
         ar.u32(&mut self.triangle_start)?;
         ar.u32(&mut self.triangle_count)?;
         ar.u32(&mut self.vertex_start)?;
@@ -1034,7 +1055,7 @@ impl GeometryCollectionMeshElement {
     }
 }
 
-/// `FLinearColor`.
+/// `FLinearColor` (NoExportTypes.h:1480) — R, G, B, A as floats.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct LinearColor {
     pub r: f32,
@@ -1054,7 +1075,8 @@ impl LinearColor {
     }
 }
 
-/// `FGeometryCollectionSection` — a draw range in a collection's index buffer.
+/// `FGeometryCollectionSection` (GeometryCollectionSection.h:12), in the order
+/// `operator<<` writes it (:27).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GeometryCollectionSection {
     pub material_id: i32,
@@ -1162,4 +1184,55 @@ pub fn bounded_count(n: i32, what: &str, at: usize) -> Result<usize> {
         bail!("implausible {what} count {n} @ {at}");
     }
     Ok(n as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every engine struct in this module must say where its layout came from.
+    ///
+    /// A byte-identical round trip cannot see a wrong field order inside the
+    /// right total width, so the corpus gates are structurally blind to the one
+    /// mistake these types can make. Reading the engine's `operator<<` is the
+    /// only check there is, and this asserts the reading was actually done —
+    /// three layouts here were wrong until it was (`FPackedHierarchyNode`'s
+    /// structure-of-arrays, `FMeshToMeshVertData`'s width, and
+    /// `FLightmassPrimitiveSettings`' interleaved float).
+    ///
+    /// A type whose declaration genuinely could not be found must say *that*,
+    /// in those words, rather than quietly looking cited.
+    #[test]
+    fn every_type_cites_its_engine_declaration() {
+        let src = include_str!("ue_struct.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let mut missing = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            let Some(name) = l.strip_prefix("pub struct ") else { continue };
+            let name = name.split(|c: char| !c.is_alphanumeric() && c != '_').next().unwrap_or("");
+            // Walk back over the attributes and doc comment.
+            let mut doc = String::new();
+            let mut j = i;
+            while j > 0 {
+                j -= 1;
+                let t = lines[j].trim_start();
+                if t.starts_with("#[") || t.starts_with("//") {
+                    doc.insert_str(0, lines[j]);
+                    doc.insert(0, '\n');
+                } else {
+                    break;
+                }
+            }
+            let cited = doc.contains(".h:")
+                || doc.contains(".cpp:")
+                || doc.contains(".h)")
+                || doc.contains(".cpp)")
+                || doc.contains("Not located in the engine source");
+            if !cited {
+                missing.push(name.to_string());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these types do not cite an engine declaration: {missing:?}"
+        );
+    }
 }
