@@ -36,6 +36,7 @@ pub mod compat;
 pub mod container;
 pub mod object;
 pub mod package;
+pub mod world;
 
 // Back-compatible aliases for the pre-layering paths. Every one of these is the
 // same module under its old name, so existing `iostore::zen::…` imports keep
