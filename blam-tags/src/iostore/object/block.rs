@@ -423,7 +423,7 @@ pub(super) fn read_struct(r: &mut Reader, class: &str, usmap: &Usmap, depth: usi
 
 /// The flattened property schema the unversioned fragment stream indexes by,
 /// each slot paired with its index within a static array.
-pub(super) fn flattened_schema<'u>(
+pub fn flattened_schema<'u>(
     class: &str,
     usmap: &'u Usmap,
 ) -> Result<Vec<(&'u UsmapProperty, u8, &'u str)>> {

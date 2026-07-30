@@ -34,7 +34,7 @@ pub use super::export::{
     write_export, write_export_in, Export, ExportBlock, Trailer, UnreflectedBlock,
     NO_PROPERTY_BLOCK,
 };
-pub use super::block::{has_schema, is_masked, parse_header, parse_header_walked, Header};
+pub use super::block::{flattened_schema, has_schema, is_masked, parse_header, parse_header_walked, Header};
 pub use super::property::{can_serialize_as_zero, should_save_as_zero};
 pub use super::tails::CLASSES_WITH_OWN_TAIL;
 pub use super::tail_models::{

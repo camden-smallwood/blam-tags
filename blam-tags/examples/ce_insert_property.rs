@@ -18,55 +18,75 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 
-use blam_tags::iostore::container_header::EIoContainerHeaderVersion;
-use blam_tags::iostore::object::unversioned::{read_export, set_property, write_export, PropValue};
+use blam_tags::iostore::object::unversioned::{
+    flattened_schema, read_export_in, set_property, write_export_in, ExportContext, PropValue,
+};
 use blam_tags::iostore::package::builder::{read_payloads, write_package};
-use blam_tags::iostore::script_objects::ScriptObjects;
-use blam_tags::iostore::ue_types::EIoStoreTocVersion;
 use blam_tags::iostore::usmap::{PropertyType, Usmap};
+use blam_tags::iostore::world::{World, CE_HEADER_VERSION as HV, CE_TOC_VERSION as CV};
 use blam_tags::iostore::zen::FZenPackageHeader;
-use blam_tags::iostore::IoStoreArchive;
 
 const PAKS: &str = "/Users/camden/Halo/halo-campaign-evolved_pc/Meteorite/Content/Paks";
-const CV: EIoStoreTocVersion = EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash;
-const HV: EIoContainerHeaderVersion = EIoContainerHeaderVersion::SoftPackageReferences;
 
 /// A distinctive value that fits every integer width, including a `uint8` enum.
 const PROBE: i64 = 3;
+/// Non-zero, exactly representable, and not a plausible class default.
+const PROBE_F: f64 = 0.5;
+
+/// A value to insert for a scalar property, or `None` for a type this gate
+/// cannot synthesise one for.
+///
+/// Restricting this to `Int`/`Int64` left 45,292 packages — 43.6% — with
+/// nothing to edit and recorded as "no candidate", which reads as a property of
+/// the corpus and was a property of the gate. Widening it to the other scalar
+/// widths, floats and bools is what actually exercises those packages, and
+/// `Bool` in particular is the one that reaches the zero-mask path.
+///
+/// `Name`, `Str` and `Text` are deliberately out: inserting one means interning
+/// a name or a string into the package, which is a different edit with a
+/// different failure mode, and mixing it in here would blur what a failure
+/// means.
+fn probe_value(ty: &PropertyType) -> Option<PropValue> {
+    match ty {
+        PropertyType::Int
+        | PropertyType::Int64
+        | PropertyType::Int16
+        | PropertyType::Int8
+        | PropertyType::UInt16
+        | PropertyType::UInt32
+        | PropertyType::UInt64
+        | PropertyType::Byte { enum_name: None } => Some(PropValue::Int(PROBE)),
+        PropertyType::Float | PropertyType::Double => Some(PropValue::Float(PROBE_F)),
+        PropertyType::Bool => Some(PropValue::Bool(true)),
+        _ => None,
+    }
+}
 
 fn main() {
     let usmap_path = std::env::args().nth(1).unwrap_or_else(|| {
         "/Users/camden/Downloads/5.5.4-1097863+++Meteorite+Rel-i343-Meteorite-2606-CU2-Meteorite.usmap".into()
     });
-    let mut usmap = match std::fs::read(&usmap_path) {
+    let mut usmap = match std::fs::read(usmap_path) {
         Ok(b) => Usmap::parse(&b).expect("parse usmap"),
         Err(_) => Usmap::meteorite().expect("bundled usmap"),
     };
     blam_tags::iostore::usmap::register_editor_plugin_classes(&mut usmap);
 
-    let mut by_hash: HashMap<u64, String> = HashMap::new();
-    let so = ScriptObjects::load(format!("{PAKS}/global.utoc")).expect("script objects");
-    for e in so.entries() {
-        if let Some(p) = so.resolve(e.global_index.raw_index()) {
-            by_hash.insert(e.global_index.raw_index(), p.to_string());
-        }
-    }
-
-    let mut utocs: Vec<_> = std::fs::read_dir(PAKS)
-        .expect("read Paks")
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("utoc")))
-        .filter(|p| !p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("global.utoc")))
-        .collect();
-    utocs.sort();
+    let world = World::open(PAKS, usmap).expect("mount Paks");
+    let usmap = world.usmap();
 
     let (mut inserted, mut verified, mut no_candidate) = (0usize, 0usize, 0usize);
     let mut grew = 0usize;
+    // Why a package yielded no edit. Previously all of this was one bucket
+    // called "no absent int prop", which is how two defects hid inside it: the
+    // gate read without a resolver, so every export needing one was recorded as
+    // having no free slot, and it used `Usmap::flattened_slots` directly, which
+    // misses the fallback `flattened_schema` applies.
+    let mut why: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut failures: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut samples: Vec<String> = Vec::new();
 
-    for u in &utocs {
-        let Ok(a) = IoStoreArchive::open(u) else { continue };
+    for a in world.archives() {
         for e in a.entries() {
             let lo = e.path.to_ascii_lowercase();
             if !lo.ends_with(".uasset") && !lo.ends_with(".umap") {
@@ -81,42 +101,66 @@ fn main() {
             let original = payloads.clone();
             let mut payloads = payloads;
             let names = h.name_map.copy_raw_names();
+            // The edit path needs the same context the read path does: a data
+            // table's row layout and a property bag's member types live in
+            // other packages, and without them those exports simply fail to
+            // read and get counted as uneditable.
+            let bulk: Vec<(i64, i64)> =
+                h.bulk_data.iter().map(|x| (x.serial_offset, x.serial_size)).collect();
+            let resolver = world.resolver(&h, &b, &names);
+            let ctx = ExportContext { bulk_data: &bulk, resolver: Some(&resolver) };
 
             // An integer property the class declares but this export omits.
-            let mut done: Option<(usize, String, String)> = None;
+            let mut done: Option<(usize, String, String, PropValue)> = None;
             for i in 0..h.export_map.len() {
                 let ex = &h.export_map[i];
-                let Some(class) = by_hash.get(&ex.class_index.raw_index()) else { continue };
+                let Some(class) = world.class_path(ex.class_index.raw_index()) else {
+                    *why.entry("class not in script objects").or_default() += 1;
+                    continue;
+                };
                 let short = class.rsplit('.').next().unwrap_or(class).to_string();
-                let Some(flat) = usmap.flattened_slots(&short) else { continue };
-                let Ok(mut parts) = read_export(&payloads[i], &names, &usmap, &short, ex.object_flags)
-                else {
+                let Ok(flat) = flattened_schema(&short, usmap) else {
+                    *why.entry("no schema for the class").or_default() += 1;
                     continue;
                 };
-                let Some(block) = parts.properties_mut() else { continue };
-                let Some(prop) = flat
+                let Ok(mut parts) =
+                    read_export_in(&payloads[i], &names, usmap, &short, ex.object_flags, &ctx)
+                else {
+                    *why.entry("export did not read").or_default() += 1;
+                    continue;
+                };
+                let Some(block) = parts.properties_mut() else {
+                    *why.entry("no property block").or_default() += 1;
+                    continue;
+                };
+                let Some((prop, want)) = flat
                     .iter()
-                    .find(|(p, slot)| {
-                        *slot == 0
-                            && matches!(p.ty, PropertyType::Int | PropertyType::Int64)
-                            && block.get(&p.name).is_none()
+                    .filter(|(_, slot, _)| *slot == 0)
+                    .find_map(|(p, _, _)| {
+                        (block.get(&p.name).is_none())
+                            .then(|| probe_value(&p.ty).map(|v| (p.name.clone(), v)))
+                            .flatten()
                     })
-                    .map(|(p, _)| p.name.clone())
                 else {
+                    *why.entry("no absent scalar property").or_default() += 1;
                     continue;
                 };
-                if set_property(block, &short, &prop, PropValue::Int(PROBE), &usmap).is_err() {
+                if set_property(block, &short, &prop, want.clone(), usmap).is_err() {
+                    *why.entry("set_property refused").or_default() += 1;
                     continue;
                 }
-                let Ok(bytes) = write_export(&short, &parts, &usmap) else { continue };
+                let Ok(bytes) = write_export_in(&short, &parts, usmap, Some(&resolver)) else {
+                    *why.entry("export did not write").or_default() += 1;
+                    continue;
+                };
                 if bytes.len() > payloads[i].len() {
                     grew += 1;
                 }
                 payloads[i] = bytes;
-                done = Some((i, short, prop));
+                done = Some((i, short, prop, want));
                 break;
             }
-            let Some((idx, class, prop)) = done else {
+            let Some((idx, class, prop, want)) = done else {
                 no_candidate += 1;
                 continue;
             };
@@ -144,12 +188,17 @@ fn main() {
                 continue;
             };
             let names2 = h2.name_map.copy_raw_names();
-            let Ok(parts2) = read_export(
+            let bulk2: Vec<(i64, i64)> =
+                h2.bulk_data.iter().map(|x| (x.serial_offset, x.serial_size)).collect();
+            let resolver2 = world.resolver(&h2, &rebuilt, &names2);
+            let ctx2 = ExportContext { bulk_data: &bulk2, resolver: Some(&resolver2) };
+            let Ok(parts2) = read_export_in(
                 &payloads2[idx],
                 &names2,
-                &usmap,
+                usmap,
                 &class,
                 h2.export_map[idx].object_flags,
+                &ctx2,
             ) else {
                 *failures.entry("reread-export").or_default() += 1;
                 if samples.len() < 8 {
@@ -158,11 +207,11 @@ fn main() {
                 continue;
             };
             let block2 = parts2.properties().expect("block");
-            if !matches!(block2.get(&prop), Some(PropValue::Int(v)) if *v == PROBE) {
+            if !block2.get(&prop).is_some_and(|v| v.semantic_eq(&want)) {
                 *failures.entry("value-missing").or_default() += 1;
                 if samples.len() < 8 {
                     samples.push(format!(
-                        "{} :: {class}.{prop}: expected Int({PROBE}), got {:?}",
+                        "{} :: {class}.{prop}: expected {want:?}, got {:?}",
                         h.package_name(),
                         block2.get(&prop)
                     ));
@@ -173,12 +222,13 @@ fn main() {
             // The properties that were already there must be untouched, and so
             // must every other export.
             let mut ok = true;
-            let parts0 = read_export(
+            let parts0 = read_export_in(
                 &original[idx],
                 &names,
-                &usmap,
+                usmap,
                 &class,
                 h.export_map[idx].object_flags,
+                &ctx,
             )
             .expect("original decodes");
             // Compare by *schema slot*, not by name. A static array's slots
@@ -224,7 +274,10 @@ fn main() {
     println!("properties inserted  {inserted}");
     println!("fully verified       {verified} ({:.4}%)", 100.0 * verified as f64 / inserted.max(1) as f64);
     println!("  export grew        {grew}");
-    println!("no absent int prop   {no_candidate}");
+    println!("no edit made         {no_candidate}");
+    for (reason, n) in &why {
+        println!("    {n:>8}  {reason}");
+    }
     if !failures.is_empty() {
         println!("\nfailures:");
         let mut v: Vec<_> = failures.iter().collect();

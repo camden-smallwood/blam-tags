@@ -23,7 +23,7 @@ use std::io::Cursor;
 
 use blam_tags::iostore::object::unversioned::{
     ExportBlock,
-    read_export_in, read_userdefined_struct_layout, roundtrip_tail, ExportContext, PackageResolver,
+    read_export_in, roundtrip_tail, ExportContext,
     PropValue, PropertyBlock, TailContext,
 };
 use blam_tags::iostore::package::builder::read_payloads;
