@@ -25,7 +25,7 @@
 
 pub use super::archive::{ExportContext, PackageResolver};
 pub use super::edit::{
-    intern_name, remove_property, set_name_property, set_property, set_property_slot,
+    intern_name, remove_property, set_name_property, set_object_property, set_property, set_property_slot,
     set_string_property,
 };
 pub use super::export::{

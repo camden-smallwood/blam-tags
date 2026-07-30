@@ -15,7 +15,12 @@ use std::sync::Arc;
 use super::block::flattened_schema;
 use super::usmap::Usmap;
 use super::value::{BlockLayout, FName, PropValue, PropertyBlock, PropertyEntry, SchemaSlot};
+use crate::iostore::package::imports::{
+    import_package_index, import_slot_of, read_import_slots, write_import_slots, ImportSlot,
+    ImportTarget,
+};
 use crate::iostore::package::name_map::FNameMap;
+use crate::iostore::package::zen::FZenPackageHeader;
 
 /// Resolve `text` against a package's name map, appending it if absent, and
 /// return the [`FName`] a property can hold.
@@ -312,4 +317,93 @@ mod tests {
             n.number
         )), "Rocket_4");
     }
+}
+
+/// Repoint an object property at a different package, adjusting the package's
+/// import structures to match.
+///
+/// This is what "rebind this tag to a different Blueprint" is: `AssetReference`
+/// on a Campaign Evolved tag wrapper holds an `FPackageIndex` into the import
+/// map, and the map does not name a package — three parallel arrays behind it
+/// do. Setting the property alone would leave it pointing at whatever the old
+/// slot still says.
+///
+/// `block` must be the package's **only** export's block, or at least every
+/// block that can reference an import, because deciding whether a slot may be
+/// rewritten in place means knowing whether anything else points at it. For a CE
+/// tag wrapper that is exactly satisfied: all 12,291 have precisely one export.
+///
+/// A slot referenced only by this property is retargeted in place, keeping the
+/// import map's length and slot order — which is what lets every other
+/// `FPackageIndex` in the payload stay valid. A slot something *else* also
+/// points at gets a new slot appended instead, because rewriting it would
+/// silently repoint the other reference too.
+pub fn set_object_property(
+    header: &mut FZenPackageHeader,
+    block: &mut PropertyBlock,
+    property: &str,
+    target: ImportTarget,
+) -> Result<()> {
+    let Some(entry) = block.entries.iter().position(|e| &*e.name == property) else {
+        bail!("the block has no property named {property}");
+    };
+    let current = match block.entries[entry].value.unwrapped() {
+        PropValue::Object(index) => *index,
+        other => bail!("{property} is not an object reference (it is {other:?})"),
+    };
+
+    let mut slots = read_import_slots(header)?;
+    let slot = match import_slot_of(current) {
+        // Already an import, and nothing else uses it: retarget in place, so
+        // the import map keeps its length and every other index stays valid.
+        Some(slot)
+            if slot < slots.len()
+                && matches!(slots[slot], ImportSlot::Package(_))
+                && count_object_references(block, current) == 1 =>
+        {
+            slots[slot] = ImportSlot::Package(target);
+            slot
+        }
+        // Null, an export, out of range, or a slot shared with another
+        // reference — take a fresh slot rather than disturb anything.
+        _ => {
+            slots.push(ImportSlot::Package(target));
+            slots.len() - 1
+        }
+    };
+
+    write_import_slots(header, &slots)?;
+    block.entries[entry].value = PropValue::Object(import_package_index(slot));
+    Ok(())
+}
+
+/// How many object references in `block`, at any depth, name `package_index`.
+///
+/// Nested on purpose: `CookedAssetsReferencedByTag` is an array of references,
+/// so a top-level-only count would report zero for exactly the properties most
+/// likely to share a slot.
+fn count_object_references(block: &PropertyBlock, package_index: i32) -> usize {
+    fn count_value(value: &PropValue, package_index: i32) -> usize {
+        match value.unwrapped() {
+            PropValue::Object(i) => usize::from(*i == package_index),
+            PropValue::Array(items) | PropValue::Set(items) => {
+                items.iter().map(|v| count_value(v, package_index)).sum()
+            }
+            PropValue::Map(pairs) => pairs
+                .iter()
+                .map(|(k, v)| count_value(k, package_index) + count_value(v, package_index))
+                .sum(),
+            PropValue::Struct(inner) => count_object_references(inner, package_index),
+            PropValue::Delegate { object, .. } => usize::from(*object == package_index),
+            PropValue::MulticastDelegate(list) => {
+                list.iter().filter(|(o, _)| *o == package_index).count()
+            }
+            _ => 0,
+        }
+    }
+    block
+        .entries
+        .iter()
+        .map(|e| count_value(&e.value, package_index))
+        .sum()
 }

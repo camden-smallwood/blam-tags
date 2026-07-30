@@ -44,7 +44,7 @@ pub mod world;
 pub use asset::{nanite, skeletal_mesh, static_mesh, wwise_event};
 pub use container::{header as container_header, oodle, pak, writer};
 pub use object::{unversioned, usmap};
-pub use package::{name_map, script_objects, ser, ue_types, zen};
+pub use package::{imports, name_map, script_objects, ser, ue_types, zen};
 
 use std::collections::HashMap;
 use std::error::Error;

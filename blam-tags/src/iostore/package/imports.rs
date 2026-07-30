@@ -1,0 +1,533 @@
+//! A package's imports as *targets* rather than as indices.
+//!
+//! A Zen package names an imported object with an `FPackageObjectIndex` of kind
+//! `PackageImport`, which carries two indices: one into `imported_packages`
+//! (parallel to `imported_package_names`) and one into
+//! `imported_public_export_hashes`. Neither says what the import *is* — the
+//! answer is spread across three arrays, and every one of them is order- and
+//! index-sensitive.
+//!
+//! That shape is fine to read and hostile to edit. Repointing a reference at a
+//! different package means changing an id, a name, a hash, and possibly the
+//! position of all three, because `imported_packages` is sorted by id. Doing it
+//! by hand on the arrays is how an editor silently produces a package whose
+//! import indices no longer mean what its payload thinks they mean.
+//!
+//! So: read the import map into resolved [`ImportSlot`]s, change the one you
+//! want, and write the slots back. [`write_import_slots`] rederives all three
+//! arrays from the slot list.
+//!
+//! **Slot order is preserved, and that is the point.** An export payload holds
+//! `FPackageIndex` values that are positions in the import map, so keeping
+//! those positions fixed means an edit never has to rewrite the payload — only
+//! the arrays behind the slots move. (Synthesizing a package *from scratch* is
+//! the harder problem, because there the slot order is the cooker's linker
+//! order and is not reproducible; that is a different job from editing one.)
+
+use anyhow::{bail, Result};
+
+use super::ue_types::{
+    lower_utf16_cityhash, FPackageId, FPackageImportReference, FPackageObjectIndex,
+    FPackageObjectIndexType,
+};
+use super::zen::FZenPackageHeader;
+
+/// An imported object, named rather than indexed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportTarget {
+    /// The full package path, e.g. `/Game/Characters/Elite/BP_Elite`.
+    pub package: String,
+    /// The imported object's public export hash — see [`public_export_hash`].
+    pub object_hash: u64,
+}
+
+/// One entry of a package's import map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportSlot {
+    /// A native object from a `/Script/...` module, identified by a hash of its
+    /// object path. Carried through unchanged: nothing about it depends on the
+    /// package's own arrays.
+    Script(FPackageObjectIndex),
+    /// An object in another package.
+    Package(ImportTarget),
+    /// The null slot. Cooked tag packages carry one per imported package.
+    Null,
+}
+
+/// The hash a public export is addressed by: CityHash64 of the lowercased
+/// UTF-16LE object name.
+///
+/// The same function produces an `FPackageId` from a package name — the two are
+/// different namespaces computed identically, which is why they are easy to
+/// swap by accident.
+pub fn public_export_hash(object_name: &str) -> u64 {
+    lower_utf16_cityhash(object_name)
+}
+
+/// Resolve a package's import map into named targets.
+pub fn read_import_slots(header: &FZenPackageHeader) -> Result<Vec<ImportSlot>> {
+    header
+        .import_map
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| match entry.kind() {
+            FPackageObjectIndexType::Null => Ok(ImportSlot::Null),
+            FPackageObjectIndexType::ScriptImport => Ok(ImportSlot::Script(*entry)),
+            FPackageObjectIndexType::Export => {
+                bail!("import map slot {i} is an Export index, which cannot be resolved")
+            }
+            FPackageObjectIndexType::PackageImport => {
+                let reference = entry
+                    .package_import()
+                    .ok_or_else(|| anyhow::anyhow!("import map slot {i} is not a package import"))?;
+                let package = header
+                    .imported_package_names
+                    .get(reference.imported_package_index as usize)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "import map slot {i} names package {} of {}",
+                            reference.imported_package_index,
+                            header.imported_package_names.len()
+                        )
+                    })?
+                    .clone();
+                let object_hash = *header
+                    .imported_public_export_hashes
+                    .get(reference.imported_public_export_hash_index as usize)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "import map slot {i} names hash {} of {}",
+                            reference.imported_public_export_hash_index,
+                            header.imported_public_export_hashes.len()
+                        )
+                    })?;
+                Ok(ImportSlot::Package(ImportTarget { package, object_hash }))
+            }
+        })
+        .collect()
+}
+
+/// Rebuild `import_map`, `imported_packages`, `imported_package_names` and
+/// `imported_public_export_hashes` from `slots`.
+///
+/// The rules are the cook's own, and were measured over every shipped tag
+/// package: `imported_packages` ascends by `FPackageId`, each
+/// `imported_package_names[i]` is the name hashing to `imported_packages[i]`,
+/// and `imported_public_export_hashes` holds one entry per unique
+/// `(package index, hash)` pair in import-map first-use order.
+///
+/// Deduping the hashes by hash alone is wrong — two packages can export objects
+/// whose names collide, and merging them costs eight bytes and points one
+/// package's import at another's export.
+pub fn write_import_slots(header: &mut FZenPackageHeader, slots: &[ImportSlot]) -> Result<()> {
+    // Packages first: the id ordering decides every `imported_package_index`,
+    // so it has to be settled before any slot can be numbered.
+    let mut packages: Vec<(FPackageId, String)> = Vec::new();
+    for slot in slots {
+        if let ImportSlot::Package(target) = slot {
+            let id = FPackageId::from_name(&target.package);
+            if !packages.iter().any(|(existing, _)| *existing == id) {
+                packages.push((id, target.package.clone()));
+            }
+        }
+    }
+    packages.sort_by_key(|(id, _)| *id);
+
+    let index_of = |package: &str| -> Result<u32> {
+        let id = FPackageId::from_name(package);
+        packages
+            .iter()
+            .position(|(existing, _)| *existing == id)
+            .map(|i| i as u32)
+            .ok_or_else(|| anyhow::anyhow!("package {package} was not collected"))
+    };
+
+    let mut hashes: Vec<u64> = Vec::new();
+    let mut pairs: Vec<(u32, u64)> = Vec::new();
+    let mut import_map = Vec::with_capacity(slots.len());
+    for slot in slots {
+        import_map.push(match slot {
+            ImportSlot::Null => FPackageObjectIndex::create_null(),
+            ImportSlot::Script(index) => *index,
+            ImportSlot::Package(target) => {
+                let package_index = index_of(&target.package)?;
+                let key = (package_index, target.object_hash);
+                let hash_index = match pairs.iter().position(|existing| *existing == key) {
+                    Some(i) => i as u32,
+                    None => {
+                        pairs.push(key);
+                        hashes.push(target.object_hash);
+                        (hashes.len() - 1) as u32
+                    }
+                };
+                FPackageObjectIndex::create_package_import(FPackageImportReference {
+                    imported_package_index: package_index,
+                    imported_public_export_hash_index: hash_index,
+                })
+            }
+        });
+    }
+
+    header.import_map = import_map;
+    header.imported_packages = packages.iter().map(|(id, _)| *id).collect();
+    header.imported_package_names = packages.into_iter().map(|(_, name)| name).collect();
+    header.imported_public_export_hashes = hashes;
+    Ok(())
+}
+
+/// The `FPackageIndex` an export property uses to name import slot `slot`.
+///
+/// Imports are negative and one-based, so slot 0 is `-1`. Getting this wrong
+/// reads as an off-by-one that still resolves — to the neighbouring import.
+pub fn import_package_index(slot: usize) -> i32 {
+    -(slot as i32) - 1
+}
+
+/// The import slot an export property's `FPackageIndex` names, or `None` when
+/// it names an export or nothing.
+pub fn import_slot_of(package_index: i32) -> Option<usize> {
+    (package_index < 0).then(|| (-package_index - 1) as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn import_indices_are_negative_and_one_based() {
+        assert_eq!(import_package_index(0), -1);
+        assert_eq!(import_slot_of(-1), Some(0));
+        assert_eq!(import_slot_of(-4), Some(3));
+        assert_eq!(import_slot_of(0), None);
+        assert_eq!(import_slot_of(3), None);
+    }
+
+    /// The hash is over the *object* name, and a package path is a different
+    /// namespace that happens to hash the same way. Pinned to values read out
+    /// of shipped tags so a change to the hash is caught here.
+    #[test]
+    fn the_public_export_hash_is_cityhash_of_the_lowercased_name() {
+        assert_eq!(public_export_hash("jackal-model"), 0x9595babddd1ed22f);
+        assert_eq!(public_export_hash("plasma_pistol-weapon"), 0x368e3d0b13dcbb23);
+        // Case-insensitive, which is what makes the two spellings of
+        // `sq_grunt_major_pp_2` one identity.
+        assert_eq!(public_export_hash("JACKAL-MODEL"), public_export_hash("jackal-model"));
+    }
+}
+
+#[cfg(test)]
+mod corpus {
+    use super::*;
+    use crate::iostore::container_header::EIoContainerHeaderVersion;
+    use crate::iostore::ue_types::EIoStoreTocVersion;
+    use crate::iostore::IoStoreArchive;
+    use std::io::Cursor;
+    use std::path::PathBuf;
+
+    const CV: EIoStoreTocVersion = EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash;
+    const HV: EIoContainerHeaderVersion = EIoContainerHeaderVersion::SoftPackageReferences;
+
+    /// Reading the import map into targets and writing it straight back must
+    /// reproduce all four arrays, byte for byte, on every shipped tag package.
+    ///
+    /// This is the control the edit path rests on. `write_import_slots`
+    /// rederives ordering and deduplication from rules rather than copying what
+    /// was there, so an edit that changes one target rebuilds *everything* — and
+    /// if the rules were even slightly wrong, the damage would land on packages
+    /// the user never edited a reference in. Proving the no-op case reproduces
+    /// the cook exactly is what separates "rebuilt" from "rearranged".
+    ///
+    ///   CE_PAKS=/path/to/Meteorite/Content/Paks \
+    ///     cargo test --features iostore imports::corpus -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires a Campaign Evolved install; set CE_PAKS"]
+    fn rederiving_the_import_arrays_reproduces_every_shipped_tag() {
+        let Ok(root) = std::env::var("CE_PAKS") else {
+            panic!("set CE_PAKS to the game's Content/Paks");
+        };
+        let mut utocs: Vec<PathBuf> = std::fs::read_dir(&root)
+            .expect("read paks dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("utoc")))
+            .filter(|p| !p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("global.utoc")))
+            .collect();
+        utocs.sort();
+
+        let (mut total, mut with_imports, mut identical) = (0usize, 0usize, 0usize);
+        let mut mismatches: Vec<String> = Vec::new();
+
+        for utoc in &utocs {
+            let Ok(archive) = IoStoreArchive::open(utoc) else { continue };
+            for entry in archive.entries() {
+                let lower = entry.path.to_ascii_lowercase().replace('\\', "/");
+                if !lower.ends_with(".uasset") || !lower.contains("/content/tags/") {
+                    continue;
+                }
+                let Ok(bytes) = archive.read(&entry.path) else { continue };
+                let Ok(header) =
+                    FZenPackageHeader::deserialize(&mut Cursor::new(&bytes[..]), None, CV, HV, None)
+                else {
+                    continue;
+                };
+                total += 1;
+                if !header.imported_packages.is_empty() {
+                    with_imports += 1;
+                }
+
+                let slots = read_import_slots(&header).expect("resolve import slots");
+                let mut rebuilt = header.clone();
+                write_import_slots(&mut rebuilt, &slots).expect("rewrite import slots");
+
+                if rebuilt.import_map == header.import_map
+                    && rebuilt.imported_packages == header.imported_packages
+                    && rebuilt.imported_package_names == header.imported_package_names
+                    && rebuilt.imported_public_export_hashes == header.imported_public_export_hashes
+                {
+                    identical += 1;
+                } else if mismatches.len() < 10 {
+                    mismatches.push(format!(
+                        "{}\n  map {} -> {}\n  pkgs {:?} -> {:?}\n  hashes {:?} -> {:?}",
+                        entry.path,
+                        header.import_map.len(),
+                        rebuilt.import_map.len(),
+                        header.imported_package_names,
+                        rebuilt.imported_package_names,
+                        header.imported_public_export_hashes,
+                        rebuilt.imported_public_export_hashes,
+                    ));
+                }
+            }
+        }
+
+        println!("tag packages          {total}");
+        println!("with package imports  {with_imports}");
+        println!("arrays reproduced     {identical}");
+        for m in &mismatches {
+            println!("MISMATCH {m}");
+        }
+        assert!(total > 0, "no tag packages found");
+        assert_eq!(identical, total, "some packages did not rebuild identically");
+    }
+}
+
+#[cfg(test)]
+mod edit_corpus {
+    use super::*;
+    use crate::iostore::container_header::EIoContainerHeaderVersion;
+    use crate::iostore::object::edit::set_object_property;
+    use crate::iostore::object::export::{read_export, write_export, Export};
+    use crate::iostore::object::value::PropValue;
+    use crate::iostore::package::builder::{read_payloads, write_package};
+    use crate::iostore::ue_types::EIoStoreTocVersion;
+    use crate::iostore::usmap::Usmap;
+    use crate::iostore::IoStoreArchive;
+    use std::io::Cursor;
+    use std::path::PathBuf;
+
+    const CV: EIoStoreTocVersion = EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash;
+    const HV: EIoContainerHeaderVersion = EIoContainerHeaderVersion::SoftPackageReferences;
+
+    fn class_for(group: &str) -> String {
+        let mut pascal = String::new();
+        for word in group.split('_').filter(|w| !w.is_empty()) {
+            let mut chars = word.chars();
+            if let Some(first) = chars.next() {
+                pascal.extend(first.to_uppercase());
+                pascal.push_str(&chars.as_str().to_ascii_lowercase());
+            }
+        }
+        format!("Blam{pascal}TagDataAsset")
+    }
+
+    /// Repoint `AssetReference` on every shipped tag that has one, rebuild the
+    /// package, and read it back from the rebuilt bytes.
+    ///
+    /// Two things are checked, and the second is the one that catches real
+    /// damage: the new target must come back, **and every other property must
+    /// be untouched**. An edit that lands while corrupting its neighbours
+    /// passes any check that only looks at what it meant to change, and
+    /// rebuilding import arrays is exactly where that goes wrong.
+    ///
+    /// The no-op control runs first: repointing at the value already there must
+    /// reproduce the original package **byte for byte**. Without it, "the edit
+    /// read back" would be equally true of a rebuild that quietly rewrote half
+    /// the header.
+    ///
+    ///   CE_PAKS=/path/to/Meteorite/Content/Paks \
+    ///     cargo test --features iostore imports::edit_corpus -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires a Campaign Evolved install; set CE_PAKS"]
+    fn repointing_an_asset_reference_survives_a_rebuild() {
+        let root = std::env::var("CE_PAKS").expect("set CE_PAKS to the game's Content/Paks");
+        let mut utocs: Vec<PathBuf> = std::fs::read_dir(&root)
+            .expect("read paks dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("utoc")))
+            .filter(|p| !p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("global.utoc")))
+            .collect();
+        utocs.sort();
+        let usmap = Usmap::meteorite().expect("bundled usmap");
+        const NEW_TARGET: &str = "/Game/_Prototypes/Blueprints/BP_EmptyActor";
+
+        let (mut with_ref, mut noop_identical, mut edited, mut verified, mut neighbours_ok) =
+            (0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut failures: Vec<String> = Vec::new();
+
+        for utoc in &utocs {
+            let Ok(archive) = IoStoreArchive::open(utoc) else { continue };
+            for entry in archive.entries() {
+                let lower = entry.path.to_ascii_lowercase().replace('\\', "/");
+                if !lower.ends_with(".uasset") || !lower.contains("/content/tags/") {
+                    continue;
+                }
+                let stem = lower.trim_end_matches(".uasset");
+                let Some((_, group)) = stem.rsplit('/').next().and_then(|f| f.rsplit_once('-'))
+                else {
+                    continue;
+                };
+                let class = class_for(group);
+                if usmap.get(&class).is_none() {
+                    continue;
+                }
+                let Ok(bytes) = archive.read(&entry.path) else { continue };
+                let Ok(header) =
+                    FZenPackageHeader::deserialize(&mut Cursor::new(&bytes[..]), None, CV, HV, None)
+                else {
+                    continue;
+                };
+                let Ok(payloads) = read_payloads(&header, &bytes) else { continue };
+                let (Some(payload), Some(export_entry)) =
+                    (payloads.first(), header.export_map.first())
+                else {
+                    continue;
+                };
+                let names = header.name_map.copy_raw_names();
+                let Ok(export) =
+                    read_export(payload, &names, &usmap, &class, export_entry.object_flags)
+                else {
+                    continue;
+                };
+                let Some(block) = export.properties() else { continue };
+                let Some(PropValue::Object(current)) =
+                    block.get("AssetReference").map(PropValue::unwrapped)
+                else {
+                    continue;
+                };
+                let Some(slot) = import_slot_of(*current) else { continue };
+                let slots = read_import_slots(&header).expect("slots");
+                let ImportSlot::Package(original) = slots[slot].clone() else { continue };
+                with_ref += 1;
+
+                // Control: repoint at what is already there.
+                let rebuilt_noop = rebuild(&header, &payloads, &export, &class, &usmap, original);
+                if rebuilt_noop.as_deref() == Some(&bytes[..]) {
+                    noop_identical += 1;
+                } else if failures.len() < 8 {
+                    failures.push(format!("{}: no-op rebuild differed", entry.path));
+                }
+
+                // The real edit: point it somewhere else entirely.
+                let target = ImportTarget {
+                    package: NEW_TARGET.to_owned(),
+                    object_hash: public_export_hash("BP_EmptyActor_C"),
+                };
+                let Some(new_bytes) =
+                    rebuild(&header, &payloads, &export, &class, &usmap, target.clone())
+                else {
+                    if failures.len() < 8 {
+                        failures.push(format!("{}: edited rebuild failed", entry.path));
+                    }
+                    continue;
+                };
+                edited += 1;
+
+                // Read it back from the rebuilt bytes, not from what we wrote.
+                let Ok(back_header) = FZenPackageHeader::deserialize(
+                    &mut Cursor::new(&new_bytes[..]),
+                    None,
+                    CV,
+                    HV,
+                    None,
+                ) else {
+                    failures.push(format!("{}: rebuilt package did not parse", entry.path));
+                    continue;
+                };
+                let back_payloads = read_payloads(&back_header, &new_bytes).expect("payloads");
+                let back_names = back_header.name_map.copy_raw_names();
+                let back = read_export(
+                    &back_payloads[0],
+                    &back_names,
+                    &usmap,
+                    &class,
+                    back_header.export_map[0].object_flags,
+                )
+                .expect("re-read export");
+                let back_block = back.properties().expect("block");
+
+                let resolved = match back_block.get("AssetReference").map(PropValue::unwrapped) {
+                    Some(PropValue::Object(i)) => import_slot_of(*i)
+                        .and_then(|s| read_import_slots(&back_header).ok()?.get(s).cloned())
+                        .and_then(|s| match s {
+                            ImportSlot::Package(t) => Some(t.package),
+                            _ => None,
+                        }),
+                    _ => None,
+                };
+                if resolved.as_deref() == Some(NEW_TARGET) {
+                    verified += 1;
+                } else if failures.len() < 8 {
+                    failures.push(format!("{}: read back {resolved:?}", entry.path));
+                }
+
+                // Neighbours: every other property must be value-identical, and
+                // every other import must still name the same package.
+                let others_same = block
+                    .entries
+                    .iter()
+                    .zip(&back_block.entries)
+                    .all(|(a, b)| {
+                        a.name == b.name
+                            && (&*a.name == "AssetReference" || a.value.semantic_eq(&b.value))
+                    })
+                    && block.entries.len() == back_block.entries.len();
+                if others_same {
+                    neighbours_ok += 1;
+                } else if failures.len() < 8 {
+                    failures.push(format!("{}: neighbouring properties changed", entry.path));
+                }
+            }
+        }
+
+        println!("tags with AssetReference  {with_ref}");
+        println!("no-op rebuild identical   {noop_identical}");
+        println!("edited + rebuilt          {edited}");
+        println!("new target read back      {verified}");
+        println!("neighbours unchanged      {neighbours_ok}");
+        for f in &failures {
+            println!("FAIL {f}");
+        }
+        assert!(with_ref > 0, "no tag carried an AssetReference");
+        assert_eq!(noop_identical, with_ref, "a no-op rebuild was not byte-identical");
+        assert_eq!(verified, with_ref, "an edit did not read back");
+        assert_eq!(neighbours_ok, with_ref, "an edit disturbed its neighbours");
+    }
+
+    /// Apply one `AssetReference` change and put the package back together.
+    fn rebuild(
+        header: &FZenPackageHeader,
+        payloads: &[Vec<u8>],
+        export: &Export,
+        class: &str,
+        usmap: &Usmap,
+        target: ImportTarget,
+    ) -> Option<Vec<u8>> {
+        let mut header = header.clone();
+        let mut export = export.clone();
+        let block = export.properties_mut()?;
+        set_object_property(&mut header, block, "AssetReference", target).ok()?;
+        let payload = write_export(class, &export, usmap).ok()?;
+        let mut payloads = payloads.to_vec();
+        payloads[0] = payload;
+        write_package(&header, &payloads, HV).ok().map(|(bytes, _)| bytes)
+    }
+}

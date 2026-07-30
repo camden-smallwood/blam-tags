@@ -6,6 +6,7 @@
 //! inside it; that is [`super::object`]'s business.
 
 pub mod builder;
+pub mod imports;
 pub mod name_map;
 pub mod script_objects;
 pub mod ser;
