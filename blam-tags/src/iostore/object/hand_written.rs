@@ -118,47 +118,164 @@ fn property_bag_type(
     let named = || {
         resolver.and_then(|p| p.struct_name(d.value_type_object)).unwrap_or_default()
     };
+    use PropertyBagPropertyType as T;
     let mut ty = match d.value_type {
-        1 => PropertyType::Bool,
-        2 => PropertyType::Byte { enum_name: Option::None },
-        3 => PropertyType::Int,
-        4 => PropertyType::Int64,
-        5 => PropertyType::Float,
-        6 => PropertyType::Double,
-        7 => PropertyType::Name,
-        8 => PropertyType::Str,
-        9 => PropertyType::Text,
-        10 => PropertyType::Enum {
+        T::Bool => PropertyType::Bool,
+        T::Byte => PropertyType::Byte { enum_name: Option::None },
+        T::Int32 => PropertyType::Int,
+        T::Int64 => PropertyType::Int64,
+        T::Float => PropertyType::Float,
+        T::Double => PropertyType::Double,
+        T::Name => PropertyType::Name,
+        T::String => PropertyType::Str,
+        T::Text => PropertyType::Text,
+        T::Enum => PropertyType::Enum {
             inner: Box::new(PropertyType::Byte { enum_name: Option::None }),
             enum_name: named(),
         },
-        11 => PropertyType::Struct(named()),
-        12 | 14 => PropertyType::Object,
-        13 | 15 => PropertyType::SoftObject,
-        16 => PropertyType::UInt32,
-        17 => PropertyType::UInt64,
-        // `None`, and anything a later engine adds.
-        other => PropertyType::Unknown(other),
+        T::Struct => PropertyType::Struct(named()),
+        T::Object | T::Class => PropertyType::Object,
+        T::SoftObject | T::SoftClass => PropertyType::SoftObject,
+        T::UInt32 => PropertyType::UInt32,
+        T::UInt64 => PropertyType::UInt64,
+        T::None => PropertyType::Unknown(0),
+        T::Unknown(v) => PropertyType::Unknown(v),
     };
+    // Outermost container first, so wrap from the inside out.
     for c in d.container_types.iter().rev() {
         ty = match c {
-            1 => PropertyType::Array(Box::new(ty)),
-            2 => PropertyType::Set(Box::new(ty)),
+            PropertyBagContainerType::Array => PropertyType::Array(Box::new(ty)),
+            PropertyBagContainerType::Set => PropertyType::Set(Box::new(ty)),
             _ => ty,
         };
     }
     ty
 }
 
-/// `FPropertyBagPropertyDesc`.
+/// `EPropertyBagPropertyType` (PropertyBag.h:13).
+///
+/// A property bag's member types are an enum in the engine, so they are an enum
+/// here. `Unknown` keeps a value a later engine adds readable instead of turning
+/// the whole bag into an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropertyBagPropertyType {
+    None,
+    Bool,
+    Byte,
+    Int32,
+    Int64,
+    Float,
+    Double,
+    Name,
+    String,
+    Text,
+    Enum,
+    Struct,
+    Object,
+    SoftObject,
+    Class,
+    SoftClass,
+    UInt32,
+    UInt64,
+    Unknown(u8),
+}
+
+impl PropertyBagPropertyType {
+    pub fn from_u8(v: u8) -> Self {
+        use PropertyBagPropertyType::*;
+        match v {
+            0 => None,
+            1 => Bool,
+            2 => Byte,
+            3 => Int32,
+            4 => Int64,
+            5 => Float,
+            6 => Double,
+            7 => Name,
+            8 => String,
+            9 => Text,
+            10 => Enum,
+            11 => Struct,
+            12 => Object,
+            13 => SoftObject,
+            14 => Class,
+            15 => SoftClass,
+            16 => UInt32,
+            17 => UInt64,
+            other => Unknown(other),
+        }
+    }
+
+    pub fn to_u8(self) -> u8 {
+        use PropertyBagPropertyType::*;
+        match self {
+            None => 0,
+            Bool => 1,
+            Byte => 2,
+            Int32 => 3,
+            Int64 => 4,
+            Float => 5,
+            Double => 6,
+            Name => 7,
+            String => 8,
+            Text => 9,
+            Enum => 10,
+            Struct => 11,
+            Object => 12,
+            SoftObject => 13,
+            Class => 14,
+            SoftClass => 15,
+            UInt32 => 16,
+            UInt64 => 17,
+            Unknown(v) => v,
+        }
+    }
+}
+
+/// `EPropertyBagContainerType` (PropertyBag.h:39).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropertyBagContainerType {
+    None,
+    Array,
+    Set,
+    Unknown(u8),
+}
+
+impl PropertyBagContainerType {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::None,
+            1 => Self::Array,
+            2 => Self::Set,
+            other => Self::Unknown(other),
+        }
+    }
+
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Array => 1,
+            Self::Set => 2,
+            Self::Unknown(v) => v,
+        }
+    }
+}
+
+/// `FPropertyBagPropertyDesc` (PropertyBag.h:219), in declaration order:
+/// `ValueTypeObject`, `ID`, `Name`, `ValueType`, `ContainerTypes`. The metadata
+/// array and `MetaClass` that follow are editor-only and absent from a cook —
+/// the reader asserts the metadata count is zero rather than assuming it.
+///
+/// `ValueTypeObject` is an **object reference**: for a `Struct` or `Enum` member
+/// it *is* the type, which is why decoding a bag needs the package.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PropertyBagDesc {
     pub value_type_object: i32,
-    pub id: [u8; 16],
+    pub id: super::ue_struct::Guid,
     pub name: FName,
-    pub value_type: u8,
-    /// The nested container types, one byte each.
-    pub container_types: Vec<u8>,
+    pub value_type: PropertyBagPropertyType,
+    /// The nested container types, outermost first.
+    pub container_types: Vec<PropertyBagContainerType>,
 }
 
 /// `FMaterialLayersFunctionsTree` — a node array, a payload array, then the
@@ -1199,11 +1316,16 @@ impl HandWritten {
                     let mut descs = Vec::with_capacity(n.min(super::limits::PREALLOC_CAP));
                     for _ in 0..n {
                         let value_type_object = r.i32()?;
-                        let id: [u8; 16] = r.take(16)?.try_into().expect("16 bytes");
+                        let mut id = super::ue_struct::Guid::default();
+                        id.serialize(r)?;
                         let name = r.fname()?;
-                        let value_type = r.u8()?;
+                        let value_type = PropertyBagPropertyType::from_u8(r.u8()?);
                         let containers = r.u8()? as usize;
-                        let container_types = r.take(containers)?.to_vec();
+                        let container_types = r
+                            .take(containers)?
+                            .iter()
+                            .map(|b| PropertyBagContainerType::from_u8(*b))
+                            .collect();
                         if r.u32()? != 0 {
                             anyhow::bail!(
                                 "property-bag descriptor carries editor-only metadata"
@@ -1471,12 +1593,14 @@ impl HandWritten {
                         ar.i32(&mut (descs.len() as i32))?;
                         for d in descs {
                             ar.i32(&mut d.value_type_object.to_owned())?;
-                            ar.raw(&mut d.id.to_vec(), 16)?;
+                            d.id.clone().serialize(ar)?;
                             ar.fname(&mut d.name.clone())?;
-                            ar.u8(&mut d.value_type.to_owned())?;
+                            ar.u8(&mut d.value_type.to_u8())?;
                             ar.u8(&mut (d.container_types.len() as u8))?;
-                            let n = d.container_types.len();
-                            ar.raw(&mut d.container_types.clone(), n)?;
+                            let mut cts: Vec<u8> =
+                                d.container_types.iter().map(|c| c.to_u8()).collect();
+                            let n = cts.len();
+                            ar.raw(&mut cts, n)?;
                             ar.u32(&mut 0)?;
                         }
                         ar.i32(&mut b.serial_size.to_owned())?;

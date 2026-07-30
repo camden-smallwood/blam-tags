@@ -812,15 +812,20 @@ impl VTablePatch {
     }
 }
 
-/// One entry of `ULandscapeComponent::WeightmapLayerAllocations`-adjacent grass
-/// weight data — the grass type and where its weights start.
+/// One entry of `FLandscapeComponentGrassData::WeightOffsets`
+/// (LandscapeComponent.h:227) — a `TMap<TObjectPtr<ULandscapeGrassType>, int32>`.
 ///
-/// **Not located in the engine source.** The two `int32`s are what the stream
-/// carries and what the walker measured; the field names are this reader's
-/// reading of them, not the engine's.
+/// The cooked path of `operator<<` (LandscapeGrass.cpp:1661) writes
+/// `NumElements`, then this map, then `HeightWeightData`; everything above it in
+/// that function is `WITH_EDITORONLY_DATA`.
+///
+/// The key is an **object reference**, not an opaque id — a mod repointing a
+/// grass type has to be able to see it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GrassWeightOffset {
+    /// `ULandscapeGrassType`, as an `FPackageIndex`.
     pub grass_type: i32,
+    /// Where this type's weights start in `HeightWeightData`.
     pub offset: i32,
 }
 
