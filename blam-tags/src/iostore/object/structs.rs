@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use super::archive::Reader;
 use super::common::native_count;
-use super::limits::{MAX_DEPTH, PREALLOC_CAP};
+use super::limits::PREALLOC_CAP;
 use super::usmap::Usmap;
 use super::value::{PropValue, SoftObjectPath};
 
@@ -177,42 +177,6 @@ pub fn native_struct_size(name: &str) -> Option<usize> {
     })
 }
 
-/// Structs serialized by a hand-written `Serialize` whose length is
-/// data-dependent, so [`native_struct_size`] cannot describe them. They carry no
-/// reflected members at all, which is exactly how they present in the `.usmap`:
-/// a struct with zero properties. Returns `None` for anything not modeled here,
-/// so the caller falls back to the schema-driven walk.
-/// `operator<<(FArchive&, FShaderValueTypeHandle&)`. Split out because a
-/// `Struct` value type holds a list of members whose own types are handles, so
-/// the reader has to recurse.
-pub(super) fn read_shader_value_type(r: &mut Reader, depth: usize) -> Result<()> {
-    if depth > MAX_DEPTH {
-        bail!("shader value type nested past 32 levels");
-    }
-    const STRUCT: u8 = 4;
-    let ty = r.u8()?;
-    r.u32()?; // bIsDynamicArray
-    if ty == STRUCT {
-        r.name()?; // Name
-        let n = native_count(r, "shader value type struct elements")?;
-        for _ in 0..n {
-            r.name()?; // FStructElement::Name
-            read_shader_value_type(r, depth + 1)?;
-        }
-    } else {
-        // EShaderFundamentalDimensionType: Scalar 0, Vector 1, Matrix 2.
-        match r.u8()? {
-            1 => {
-                r.u8()?; // VectorElemCount
-            }
-            2 => {
-                r.take(2)?; // MatrixRowCount, MatrixColumnCount
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
 
 /// The two hand-written structs that decode to a *value* rather than to a
 /// struct, so they never needed a typed model of their own.
@@ -260,77 +224,8 @@ pub(super) fn read_native_variable_struct(
     }))
 }
 
-/// A `TMovieSceneEvaluationTree<T>`: a root node, then two entry containers —
-/// the child nodes and the payload items. Each container is an array of 12-byte
-/// `FEntry` records (start/size/capacity) followed by an array of its elements.
-///
-/// A node is a `TRange<FFrameNumber>` (10 bytes, per the `FMovieSceneFrameRange`
-/// measurement) plus a parent handle and two entry handles: 26 bytes. Only
-/// `item_size` varies between the concrete trees.
-pub(super) fn read_evaluation_tree(r: &mut Reader, item_size: usize) -> Result<PropValue> {
-    const NODE: usize = 26;
-    let mut s = BTreeMap::new();
-    s.insert("RootNode".to_string(), PropValue::Raw(r.take(NODE)?.to_vec()));
-    let entries = native_count(r, "child node entries")?;
-    r.take(entries * 12)?;
-    let nodes = native_count(r, "child nodes")?;
-    r.take(nodes * NODE)?;
-    let data_entries = native_count(r, "data entries")?;
-    r.take(data_entries * 12)?;
-    let items = native_count(r, "data items")?;
-    r.take(items * item_size)?;
-    s.insert("NumChildNodes".to_string(), PropValue::Int(nodes as i64));
-    s.insert("NumItems".to_string(), PropValue::Int(items as i64));
-    Ok(PropValue::Struct(s.into()))
-}
 
-/// `FNiagaraDataInterfaceGeneratedFunction`: definition `FName`, instance
-/// `FString`, `(FName, FName)` specifiers, the variadic input/output references,
-/// and a `uint16` usage mask.
-pub(super) fn read_niagara_generated_function(r: &mut Reader) -> Result<PropValue> {
-    let mut s = BTreeMap::new();
-    s.insert("DefinitionName".to_string(), PropValue::Name(r.fname()?));
-    s.insert("InstanceName".to_string(), PropValue::Str(r.fstring()?));
-    let n = native_count(r, "Specifiers")?;
-    let mut spec = Vec::with_capacity(n.min(PREALLOC_CAP));
-    for _ in 0..n {
-        let k = PropValue::Name(r.fname()?);
-        let v = PropValue::Name(r.fname()?);
-        spec.push(PropValue::Array(vec![k, v]));
-    }
-    s.insert("Specifiers".to_string(), PropValue::Array(spec));
-    // Each variadic entry is an `FNiagaraVariableCommonReference`: an `FName`
-    // and an `FPackageIndex`.
-    for field in ["VariadicInputs", "VariadicOutputs"] {
-        let n = native_count(r, field)?;
-        let mut v = Vec::with_capacity(n.min(PREALLOC_CAP));
-        for _ in 0..n {
-            let mut e = BTreeMap::new();
-            e.insert("Name".to_string(), PropValue::Name(r.fname()?));
-            e.insert("UnderlyingType".to_string(), PropValue::Object(r.i32()?));
-            v.push(PropValue::Struct(e.into()));
-        }
-        s.insert(field.to_string(), PropValue::Array(v));
-    }
-    // No trailing `MiscUsageBitMask`: that field is gated on a later Niagara
-    // custom version than this build. Measured on `NS_collision`, where the
-    // second generated function's `FName` begins immediately after the variadic
-    // output count — two bytes earlier than the bitmask would allow.
-    Ok(PropValue::Struct(s.into()))
-}
 
-/// A natively-serialized `TArray<int32>`: count then that many `int32`s.
-pub(super) fn read_native_i32_array(r: &mut Reader) -> Result<PropValue> {
-    let n = r.i32()?;
-    if !(0..=100_000_000).contains(&n) {
-        bail!("implausible native array count {n} @ {}", r.o - 4);
-    }
-    let mut v = Vec::with_capacity((n as usize).min(PREALLOC_CAP));
-    for _ in 0..n {
-        v.push(PropValue::Int(r.i32()? as i64));
-    }
-    Ok(PropValue::Array(v))
-}
 
 /// `FWeightedRandomSampler`: `TArray<float> Prob`, `TArray<int32> Alias`,
 /// `float TotalWeight`.

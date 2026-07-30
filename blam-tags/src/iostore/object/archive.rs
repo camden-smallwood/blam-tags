@@ -83,11 +83,6 @@ impl<'a> Reader<'a> {
     pub(super) fn with_ctx(b: &'a [u8], names: &'a [String], ctx: &ExportContext<'a>) -> Self {
         Reader { resolver: ctx.resolver, ..Reader::new(b, names) }
     }
-    /// The bytes consumed since `start`. Used to keep an unmodeled value's
-    /// exact bytes rather than dropping them (see `PropValue::Raw`).
-    pub(super) fn since(&self, start: usize) -> Vec<u8> {
-        self.b[start.min(self.o)..self.o].to_vec()
-    }
     pub(super) fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         let s = self
             .b

@@ -64,7 +64,7 @@ use super::ue_struct::{
     LinearColor, Vector2d, Vector2f, Vector3f, PrecomputedVisibilityCell, Transform, Vector4f, BspSurf, HashedName, MeshUvChannelInfo, ModelVertex, MorphTargetDelta, ClothBufferIndexMapping, DuplicatedVertexIndex, EntryToValueKey,
     GrassWeightOffset, MemoryImageTypeDependency, PlatformTypeLayoutParameters,
     UcsModifiedProperty, VTablePatch, Box3d, Box3f, LightmassPrimitiveSettings, MeshToMeshVertData, PerPlatformFloat,
-    SparseDistanceFieldMip, StaticMeshBuffersSize, LumenCardBuildData, PackedHierarchyNode, PageStreamingState, read_vec, write_run, write_vec, BoxSphereBounds, ClothingSectionData, FuncMapEntry,
+    SparseDistanceFieldMip, StaticMeshBuffersSize, LumenCardBuildData, PackedHierarchyNode, PageStreamingState, read_vec, write_vec, BoxSphereBounds, ClothingSectionData, FuncMapEntry,
     Guid, ImplementedInterface, MeshBoneInfo, NameToIndex, ShaHash, StaticMaterial,
     StaticMeshSection, StripDataFlags,
 };
@@ -2880,7 +2880,6 @@ pub struct ManagedArrayCollection {
 impl ManagedArrayCollection {
     fn read(r: &mut Reader) -> Result<Self> {
         use super::tails::{
-            managed_array_elem, managed_array_is_bulk, managed_array_nested_elem,
             read_bvh_particles, read_chaos_implicit_object, MANAGED_ARRAY_TYPES,
         };
         let version = r.i32()?;

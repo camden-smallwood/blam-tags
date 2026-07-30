@@ -4,7 +4,7 @@
 use anyhow::{bail, Context, Result};
 
 use super::archive::{tail_why, ExportContext, Reader};
-use super::block::{emit_block, read_struct};
+use super::block::read_struct;
 use super::tails::{read_class_native_tail, read_rig_hierarchy, read_rigvm};
 use super::usmap::Usmap;
 use super::value::PropertyBlock;
