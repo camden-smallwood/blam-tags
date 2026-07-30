@@ -1588,10 +1588,16 @@ pub struct NaniteResources {
     pub page_dependencies: Vec<u32>,
     /// Two bytes per entry.
     pub imposter_atlas: Vec<u8>,
-    /// `NumRootPages`, `PositionPrecision`, `NormalPrecision`,
-    /// `NumInputTriangles`, then `NumInputVertices`, the two `uint16` counts and
-    /// `NumClusters`.
-    pub stats: [u8; 28],
+    /// The trailing statistics, in the order `FResources::Serialize` writes them
+    /// (NaniteResources.cpp:286).
+    pub num_root_pages: u32,
+    pub position_precision: i32,
+    pub normal_precision: i32,
+    pub num_input_triangles: u32,
+    pub num_input_vertices: u32,
+    pub num_input_meshes: u16,
+    pub num_input_tex_coords: u16,
+    pub num_clusters: u32,
 }
 
 impl NaniteResources {
@@ -1640,7 +1646,14 @@ impl NaniteResources {
             hierarchy_root_offsets,
             page_dependencies,
             imposter_atlas,
-            stats: r.take(28)?.try_into().expect("28 bytes"),
+            num_root_pages: r.u32()?,
+            position_precision: r.i32()?,
+            normal_precision: r.i32()?,
+            num_input_triangles: r.u32()?,
+            num_input_vertices: r.u32()?,
+            num_input_meshes: r.u16()?,
+            num_input_tex_coords: r.u16()?,
+            num_clusters: r.u32()?,
         })
     }
 
@@ -1661,7 +1674,14 @@ impl NaniteResources {
         ar.i32(&mut ((self.imposter_atlas.len() / 2) as i32))?;
         let n = self.imposter_atlas.len();
         ar.raw(&mut self.imposter_atlas.clone(), n)?;
-        ar.raw(&mut self.stats.to_vec(), 28)
+        ar.u32(&mut self.num_root_pages.to_owned())?;
+        ar.i32(&mut self.position_precision.to_owned())?;
+        ar.i32(&mut self.normal_precision.to_owned())?;
+        ar.u32(&mut self.num_input_triangles.to_owned())?;
+        ar.u32(&mut self.num_input_vertices.to_owned())?;
+        ar.u16(&mut self.num_input_meshes.to_owned())?;
+        ar.u16(&mut self.num_input_tex_coords.to_owned())?;
+        ar.u32(&mut self.num_clusters.to_owned())
     }
 }
 
@@ -2962,7 +2982,10 @@ pub struct GeometryCollectionMesh {
     pub position_num_vertices: i32,
     pub positions: BulkArray,
     pub vertex_strip: StripDataFlags,
-    pub vertex_header: [u8; 16],
+    pub num_tex_coords: i32,
+    pub vertex_num_vertices: i32,
+    pub use_full_precision_uvs: u32,
+    pub use_high_precision_tangent_basis: u32,
     pub tangents_and_uvs: Option<(BulkArray, BulkArray)>,
     pub color_strip: StripDataFlags,
     pub color_stride: i32,
@@ -3005,7 +3028,10 @@ impl GeometryCollectionTail {
                 let position_num_vertices = r.i32()?;
                 let positions = BulkArray::read(r, "collection positions")?;
                 let vertex_strip = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
-                let vertex_header: [u8; 16] = r.take(16)?.try_into().expect("16 bytes");
+                let num_tex_coords = r.i32()?;
+        let vertex_num_vertices = r.i32()?;
+        let use_full_precision_uvs = r.u32()?;
+        let use_high_precision_tangent_basis = r.u32()?;
                 let tangents_and_uvs = (vertex_strip.global & 2 == 0)
                     .then(|| -> Result<(BulkArray, BulkArray)> {
                         Ok((
@@ -3037,7 +3063,10 @@ impl GeometryCollectionTail {
                     position_num_vertices,
                     positions,
                     vertex_strip,
-                    vertex_header,
+                    num_tex_coords,
+                    vertex_num_vertices,
+                    use_full_precision_uvs,
+                    use_high_precision_tangent_basis,
                     tangents_and_uvs,
                     color_strip,
                     color_stride,
@@ -3076,7 +3105,10 @@ impl GeometryCollectionTail {
             ar.i32(&mut m.position_num_vertices.to_owned())?;
             m.positions.write(ar)?;
             m.vertex_strip.clone().serialize(ar)?;
-            ar.raw(&mut m.vertex_header.to_vec(), 16)?;
+            ar.i32(&mut m.num_tex_coords.to_owned())?;
+            ar.i32(&mut m.vertex_num_vertices.to_owned())?;
+            ar.u32(&mut m.use_full_precision_uvs.to_owned())?;
+            ar.u32(&mut m.use_high_precision_tangent_basis.to_owned())?;
             match (&m.tangents_and_uvs, m.vertex_strip.global & 2 == 0) {
                 (Some((t, u)), true) => {
                     t.write(ar)?;
@@ -4071,11 +4103,18 @@ impl ReferenceSkeleton {
 pub struct SkelRenderSection {
     pub global_strip: u8,
     pub class_strip: u8,
-    /// `MaterialIndex` (`uint16`) through `BaseVertexIndex` — a flat run of
-    /// scalars, 27 bytes: the `uint8`
-    /// `RecomputeTangentsVertexMaskChannel` sits in the middle of it and is
-    /// unpadded.
-    pub header: [u8; 27],
+    /// In the order `operator<<` writes them (SkeletalMeshLODRenderData.cpp:169).
+    /// `RecomputeTangentsVertexMaskChannel` is an `ESkinVertexColorChannel`, a
+    /// single unpadded byte between `bRecomputeTangent` and `bCastShadow` —
+    /// which is *not* where it is declared.
+    pub material_index: u16,
+    pub base_index: u32,
+    pub num_triangles: u32,
+    pub recompute_tangent: u32,
+    pub recompute_tangents_vertex_mask_channel: u8,
+    pub cast_shadow: u32,
+    pub visible_in_ray_tracing: u32,
+    pub base_vertex_index: u32,
     pub cloth_mapping_lods: Vec<Vec<MeshToMeshVertData>>,
     pub bone_map: FixedArray,
     pub num_vertices: u32,
@@ -4097,7 +4136,14 @@ impl SkelRenderSection {
     fn read(r: &mut Reader) -> Result<Self> {
         let global_strip = r.u8()?;
         let class_strip = r.u8()?;
-        let header: [u8; 27] = r.take(27)?.try_into().expect("27 bytes");
+        let material_index = r.u16()?;
+        let base_index = r.u32()?;
+        let num_triangles = r.u32()?;
+        let recompute_tangent = r.u32()?;
+        let recompute_tangents_vertex_mask_channel = r.u8()?;
+        let cast_shadow = r.u32()?;
+        let visible_in_ray_tracing = r.u32()?;
+        let base_vertex_index = r.u32()?;
         let n = {
             let n = r.i32()?;
             super::limits::bounded(n, MAX_NATIVE_COUNT, "ClothMappingDataLODs", r.o - 4)?
@@ -4127,7 +4173,14 @@ impl SkelRenderSection {
         Ok(SkelRenderSection {
             global_strip,
             class_strip,
-            header,
+            material_index,
+            base_index,
+            num_triangles,
+            recompute_tangent,
+            recompute_tangents_vertex_mask_channel,
+            cast_shadow,
+            visible_in_ray_tracing,
+            base_vertex_index,
             cloth_mapping_lods,
             bone_map,
             num_vertices,
@@ -4142,7 +4195,14 @@ impl SkelRenderSection {
     fn write(&self, ar: &mut impl Ar) -> Result<()> {
         ar.u8(&mut self.global_strip.to_owned())?;
         ar.u8(&mut self.class_strip.to_owned())?;
-        ar.raw(&mut self.header.to_vec(), 27)?;
+        ar.u16(&mut self.material_index.to_owned())?;
+        ar.u32(&mut self.base_index.to_owned())?;
+        ar.u32(&mut self.num_triangles.to_owned())?;
+        ar.u32(&mut self.recompute_tangent.to_owned())?;
+        ar.u8(&mut self.recompute_tangents_vertex_mask_channel.to_owned())?;
+        ar.u32(&mut self.cast_shadow.to_owned())?;
+        ar.u32(&mut self.visible_in_ray_tracing.to_owned())?;
+        ar.u32(&mut self.base_vertex_index.to_owned())?;
         ar.i32(&mut (self.cloth_mapping_lods.len() as i32))?;
         for a in &self.cloth_mapping_lods {
             write_vec(ar, a)?;
@@ -4207,13 +4267,19 @@ pub struct SkelStreamedData {
     pub position_num_vertices: i32,
     pub positions: BulkArray,
     pub vertex_strip: StripDataFlags,
-    /// `NumTexCoords`, `NumVertices`, and the two precision flags.
-    pub vertex_header: [u8; 16],
+    pub num_tex_coords: i32,
+    pub vertex_num_vertices: i32,
+    pub use_full_precision_uvs: u32,
+    pub use_high_precision_tangent_basis: u32,
     pub tangents: BulkArray,
     pub uvs: BulkArray,
     pub skin_strip: StripDataFlags,
-    /// `bVariableBonesPerVertex` through `bUse16BitBoneWeight`.
-    pub skin_header: [u8; 24],
+    pub variable_bones_per_vertex: u32,
+    pub max_bone_influences: u32,
+    pub num_bone_weights: u32,
+    pub skin_num_vertices: u32,
+    pub use_16_bit_bone_index: u32,
+    pub use_16_bit_bone_weight: u32,
     pub skin_weights: BulkArray,
     pub lookup_strip: StripDataFlags,
     pub lookup_num_vertices: u32,
@@ -4240,11 +4306,19 @@ impl SkelStreamedData {
         let position_num_vertices = r.i32()?;
         let positions = BulkArray::read(r, "positions")?;
         let vertex_strip = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
-        let vertex_header: [u8; 16] = r.take(16)?.try_into().expect("16 bytes");
+        let num_tex_coords = r.i32()?;
+        let vertex_num_vertices = r.i32()?;
+        let use_full_precision_uvs = r.u32()?;
+        let use_high_precision_tangent_basis = r.u32()?;
         let tangents = BulkArray::read(r, "tangents")?;
         let uvs = BulkArray::read(r, "UVs")?;
         let skin_strip = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
-        let skin_header: [u8; 24] = r.take(24)?.try_into().expect("24 bytes");
+        let variable_bones_per_vertex = r.u32()?;
+        let max_bone_influences = r.u32()?;
+        let num_bone_weights = r.u32()?;
+        let skin_num_vertices = r.u32()?;
+        let use_16_bit_bone_index = r.u32()?;
+        let use_16_bit_bone_weight = r.u32()?;
         let skin_weights = BulkArray::read(r, "skin weights")?;
         let lookup_strip = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
         let lookup_num_vertices = r.u32()?;
@@ -4335,11 +4409,19 @@ impl SkelStreamedData {
             position_num_vertices,
             positions,
             vertex_strip,
-            vertex_header,
+            num_tex_coords,
+            vertex_num_vertices,
+            use_full_precision_uvs,
+            use_high_precision_tangent_basis,
             tangents,
             uvs,
             skin_strip,
-            skin_header,
+            variable_bones_per_vertex,
+            max_bone_influences,
+            num_bone_weights,
+            skin_num_vertices,
+            use_16_bit_bone_index,
+            use_16_bit_bone_weight,
             skin_weights,
             lookup_strip,
             lookup_num_vertices,
@@ -4363,11 +4445,19 @@ impl SkelStreamedData {
         ar.i32(&mut self.position_num_vertices.to_owned())?;
         self.positions.write(ar)?;
         self.vertex_strip.clone().serialize(ar)?;
-        ar.raw(&mut self.vertex_header.to_vec(), 16)?;
+        ar.i32(&mut self.num_tex_coords.to_owned())?;
+        ar.i32(&mut self.vertex_num_vertices.to_owned())?;
+        ar.u32(&mut self.use_full_precision_uvs.to_owned())?;
+        ar.u32(&mut self.use_high_precision_tangent_basis.to_owned())?;
         self.tangents.write(ar)?;
         self.uvs.write(ar)?;
         self.skin_strip.clone().serialize(ar)?;
-        ar.raw(&mut self.skin_header.to_vec(), 24)?;
+        ar.u32(&mut self.variable_bones_per_vertex.to_owned())?;
+        ar.u32(&mut self.max_bone_influences.to_owned())?;
+        ar.u32(&mut self.num_bone_weights.to_owned())?;
+        ar.u32(&mut self.skin_num_vertices.to_owned())?;
+        ar.u32(&mut self.use_16_bit_bone_index.to_owned())?;
+        ar.u32(&mut self.use_16_bit_bone_weight.to_owned())?;
         self.skin_weights.write(ar)?;
         self.lookup_strip.clone().serialize(ar)?;
         ar.u32(&mut self.lookup_num_vertices.to_owned())?;
