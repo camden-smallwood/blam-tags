@@ -25,3 +25,13 @@ pub mod text;
 pub mod unversioned;
 pub mod usmap;
 pub mod value;
+
+/// A reader over a standalone span, for tools that already hold a tail.
+pub fn archive_reader<'a>(bytes: &'a [u8], names: &'a [String]) -> archive::Reader<'a> {
+    archive::Reader::new(bytes, names)
+}
+
+/// The `EManagedArrayType` name for a type id, or `"?"`.
+pub fn managed_array_type_name(id: i32) -> &'static str {
+    tails::MANAGED_ARRAY_TYPES.get(id.max(0) as usize).copied().unwrap_or("?")
+}

@@ -60,7 +60,7 @@ pub(super) trait Ar {
 // out rather than added speculatively.
 
 /// Little-endian byte-cursor over an export's serial data.
-pub(super) struct Reader<'a> {
+pub struct Reader<'a> {
     pub(super) b: &'a [u8],
     pub(super) o: usize,
     pub(super) names: &'a [String],

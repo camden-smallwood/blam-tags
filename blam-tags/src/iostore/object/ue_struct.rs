@@ -551,6 +551,22 @@ impl Int32Vector {
     }
 }
 
+/// `FVector2D` at large-world-coordinate precision.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Vector2d {
+    pub x: f64,
+    pub y: f64,
+}
+
+impl Vector2d {
+    pub const SIZE: usize = 16;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        ar.f64(&mut self.x)?;
+        ar.f64(&mut self.y)
+    }
+}
+
 /// `FVector2f`.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Vector2f {
@@ -1018,7 +1034,52 @@ impl GeometryCollectionMeshElement {
     }
 }
 
+/// `FLinearColor`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct LinearColor {
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+}
+
+impl LinearColor {
+    pub const SIZE: usize = 16;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        ar.f32(&mut self.r)?;
+        ar.f32(&mut self.g)?;
+        ar.f32(&mut self.b)?;
+        ar.f32(&mut self.a)
+    }
+}
+
+/// `FGeometryCollectionSection` — a draw range in a collection's index buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GeometryCollectionSection {
+    pub material_id: i32,
+    pub first_index: i32,
+    pub num_triangles: i32,
+    pub min_vertex_index: i32,
+    pub max_vertex_index: i32,
+}
+
+impl GeometryCollectionSection {
+    pub const SIZE: usize = 20;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        ar.i32(&mut self.material_id)?;
+        ar.i32(&mut self.first_index)?;
+        ar.i32(&mut self.num_triangles)?;
+        ar.i32(&mut self.min_vertex_index)?;
+        ar.i32(&mut self.max_vertex_index)
+    }
+}
+
 ue_structs!(
+    LinearColor,
+    GeometryCollectionSection,
+    Vector2d,
     PrecomputedVisibilityCell,
     GeometryCollectionMeshElement,
     Plane4f,
