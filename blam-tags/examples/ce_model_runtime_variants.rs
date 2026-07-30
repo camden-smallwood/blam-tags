@@ -10,17 +10,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 
+use blam_tags::iostore::IoStoreArchive;
 use blam_tags::iostore::container_header::EIoContainerHeaderVersion;
 use blam_tags::iostore::ue_types::EIoStoreTocVersion;
-use blam_tags::iostore::unversioned::{read_export_struct, PropValue};
+use blam_tags::iostore::unversioned::{PropValue, read_export_struct};
 use blam_tags::iostore::usmap::Usmap;
 use blam_tags::iostore::zen::FZenPackageHeader;
-use blam_tags::iostore::IoStoreArchive;
 use blam_tags::{Model, TagFile};
 
 const PAKS: &str = "/Users/camden/Halo/halo-campaign-evolved_pc/Meteorite/Content/Paks";
-const USMAP: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/assets/meteorite-5.5.4.usmap");
+const USMAP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/meteorite-5.5.4.usmap");
 const CV: EIoStoreTocVersion = EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash;
 const HV: EIoContainerHeaderVersion = EIoContainerHeaderVersion::SoftPackageReferences;
 
@@ -30,8 +29,14 @@ fn main() {
     let mut utocs: Vec<_> = std::fs::read_dir(PAKS)
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("utoc")))
-        .filter(|p| !p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("global.utoc")))
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("utoc"))
+        })
+        .filter(|p| {
+            !p.file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("global.utoc"))
+        })
         .collect();
     utocs.sort();
 
@@ -45,7 +50,9 @@ fn main() {
     let mut samples: Vec<String> = Vec::new();
 
     for u in &utocs {
-        let Ok(a) = IoStoreArchive::open(u) else { continue };
+        let Ok(a) = IoStoreArchive::open(u) else {
+            continue;
+        };
         for e in a.entries() {
             let lower = e.path.to_ascii_lowercase().replace('\\', "/");
             if !lower.ends_with("-model.uasset") || !lower.contains("/content/tags/") {
@@ -56,17 +63,26 @@ fn main() {
             else {
                 continue;
             };
-            let Some(ex) = h.export_map.first() else { continue };
+            let Some(ex) = h.export_map.first() else {
+                continue;
+            };
             let names = h.name_map.copy_raw_names();
             let off = h.summary.header_size as usize + ex.cooked_serial_offset as usize;
             let end = (off + ex.cooked_serial_size as usize).min(ua.len());
-            let Ok(props) = read_export_struct(&ua[off..end], &names, &usmap, "BlamModelTagDataAsset")
+            let Ok(props) =
+                read_export_struct(&ua[off..end], &names, &usmap, "BlamModelTagDataAsset")
             else {
                 continue;
             };
-            let Ok(blob) = a.read(&e.path.replace(".uasset", ".ubulk")) else { continue };
-            let Ok(tag) = TagFile::read_from_bytes(&blob) else { continue };
-            let Ok(model) = Model::from_tag(&tag) else { continue };
+            let Ok(blob) = a.read(&e.path.replace(".uasset", ".ubulk")) else {
+                continue;
+            };
+            let Ok(tag) = TagFile::read_from_bytes(&blob) else {
+                continue;
+            };
+            let Ok(model) = Model::from_tag(&tag) else {
+                continue;
+            };
             n += 1;
             let pkg = h.package_name();
 
@@ -76,7 +92,10 @@ fn main() {
             if let Some(PropValue::Array(rt)) = props.get("RegionTable") {
                 has_regiontable += 1;
                 if regiontable_samples.len() < 5 {
-                    regiontable_samples.push(format!("{pkg}: {:?}", rt.iter().take(8).collect::<Vec<_>>()));
+                    regiontable_samples.push(format!(
+                        "{pkg}: {:?}",
+                        rt.iter().take(8).collect::<Vec<_>>()
+                    ));
                 }
             }
             match props.get("ModelRegionStringTable") {
@@ -85,7 +104,10 @@ fn main() {
                         .import_map
                         .get((-*i - 1) as usize)
                         .and_then(|im| im.package_import())
-                        .and_then(|r| h.imported_package_names.get(r.imported_package_index as usize))
+                        .and_then(|r| {
+                            h.imported_package_names
+                                .get(r.imported_package_index as usize)
+                        })
                         .cloned()
                         .unwrap_or_default();
                     rst_targets.entry(t).or_default().push(pkg.clone());
@@ -124,7 +146,15 @@ fn main() {
                 .map(|v| {
                     let mut perms = BTreeMap::new();
                     for r in &v.regions {
-                        let p = r.permutation_names.first().cloned().unwrap_or_default();
+                        // Two cases the reader would otherwise conflate. A
+                        // region with *zero* permutations is omitted from the
+                        // map; a region whose first permutation has an empty
+                        // name is kept and written as "None". Treating both as
+                        // "None" costs one tag, and skipping both costs 23.
+                        if r.permutation_names.is_empty() {
+                            continue;
+                        }
+                        let p = r.permutation_names[0].clone();
                         perms.insert(
                             r.name.clone(),
                             if p.is_empty() { "None".to_string() } else { p },
@@ -166,14 +196,20 @@ fn main() {
     for s in &regiontable_samples {
         println!("      {s}");
     }
-    println!("\n  ModelRegionStringTable: {} distinct targets, {} tags with none",
-        rst_targets.len(), no_rst.len());
+    println!(
+        "\n  ModelRegionStringTable: {} distinct targets, {} tags with none",
+        rst_targets.len(),
+        no_rst.len()
+    );
     let mut ts: Vec<_> = rst_targets.iter().collect();
     ts.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
     for (t, tags) in ts.iter().take(12) {
         println!("      {:>4}  {t}\n            e.g. {}", tags.len(), tags[0]);
     }
-    println!("      (tags with NO string table, e.g.) {:?}", no_rst.iter().take(5).collect::<Vec<_>>());
+    println!(
+        "      (tags with NO string table, e.g.) {:?}",
+        no_rst.iter().take(5).collect::<Vec<_>>()
+    );
 
     println!("\n-- mismatch samples --");
     for s in &samples {
