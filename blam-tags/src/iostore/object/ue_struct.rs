@@ -694,7 +694,158 @@ impl LightmassPrimitiveSettings {
     }
 }
 
+/// One entry of `UActorComponent::UCSModifiedProperties` — which object, which
+/// property, and the construction-script instance that set it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UcsModifiedProperty {
+    pub object: i32,
+    pub property_name: FName,
+    pub guid: Guid,
+}
+
+impl UcsModifiedProperty {
+    pub const SIZE: usize = 28;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        ar.i32(&mut self.object)?;
+        ar.fname(&mut self.property_name)?;
+        self.guid.serialize(ar)
+    }
+}
+
+/// `FClothBufferIndexMapping` (SkeletalMeshTypes.h:91).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ClothBufferIndexMapping {
+    pub base_vertex_index: u32,
+    pub mapping_offset: u32,
+    pub lod_bias_stride: u32,
+}
+
+impl ClothBufferIndexMapping {
+    pub const SIZE: usize = 12;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        ar.u32(&mut self.base_vertex_index)?;
+        ar.u32(&mut self.mapping_offset)?;
+        ar.u32(&mut self.lod_bias_stride)
+    }
+}
+
+/// One `FMemoryImageVTablePatch`-adjacent type dependency in a shader map's
+/// pointer table: the type's name, the size its layout had when the image was
+/// frozen, and the hash of that layout.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MemoryImageTypeDependency {
+    pub name: FName,
+    pub layout_size: u32,
+    pub layout_hash: ShaHash,
+}
+
+impl MemoryImageTypeDependency {
+    pub const SIZE: usize = 32;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        ar.fname(&mut self.name)?;
+        ar.u32(&mut self.layout_size)?;
+        self.layout_hash.serialize(ar)
+    }
+}
+
+/// `FPlatformTypeLayoutParameters` — the alignment and flags a frozen memory
+/// image was built with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PlatformTypeLayoutParameters {
+    pub max_field_alignment: u32,
+    pub flags: u32,
+}
+
+impl PlatformTypeLayoutParameters {
+    pub const SIZE: usize = 8;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        ar.u32(&mut self.max_field_alignment)?;
+        ar.u32(&mut self.flags)
+    }
+}
+
+/// One vtable patch: where in the frozen image a pointer lives and what offset
+/// to write there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VTablePatch {
+    pub vtable_offset: u32,
+    pub offset: u32,
+}
+
+impl VTablePatch {
+    pub const SIZE: usize = 8;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        ar.u32(&mut self.vtable_offset)?;
+        ar.u32(&mut self.offset)
+    }
+}
+
+/// One `TMap<FGuid, int32>`-style grass weight offset: the object it belongs to
+/// and where its weights start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GrassWeightOffset {
+    pub grass_type: i32,
+    pub offset: i32,
+}
+
+impl GrassWeightOffset {
+    pub const SIZE: usize = 8;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        ar.i32(&mut self.grass_type)?;
+        ar.i32(&mut self.offset)
+    }
+}
+
+/// One entry of a duplicated-vertex index buffer: where a vertex's duplicates
+/// start and how many there are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DuplicatedVertexIndex {
+    pub num_duplicates: u32,
+    pub index: u32,
+}
+
+impl DuplicatedVertexIndex {
+    pub const SIZE: usize = 8;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        ar.u32(&mut self.num_duplicates)?;
+        ar.u32(&mut self.index)
+    }
+}
+
+/// One `FPCGMetadataAttributeBase` entry-to-value mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EntryToValueKey {
+    pub entry_key: i64,
+    pub value_key: i32,
+}
+
+impl EntryToValueKey {
+    pub const SIZE: usize = 12;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        let mut lo = self.entry_key as u64;
+        ar.u64(&mut lo)?;
+        self.entry_key = lo as i64;
+        ar.i32(&mut self.value_key)
+    }
+}
+
 ue_structs!(
+    UcsModifiedProperty,
+    ClothBufferIndexMapping,
+    MemoryImageTypeDependency,
+    PlatformTypeLayoutParameters,
+    VTablePatch,
+    GrassWeightOffset,
+    DuplicatedVertexIndex,
+    EntryToValueKey,
     Int32Vector,
     Vector2f,
     SparseDistanceFieldMip,

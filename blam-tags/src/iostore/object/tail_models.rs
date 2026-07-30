@@ -60,7 +60,9 @@ use super::block::{flattened_schema, read_struct, write_block};
 use super::common::read_bulk_array;
 use super::limits::MAX_NATIVE_COUNT;
 use super::ue_struct::{
-    bounded_count, Box3d, Box3f, LightmassPrimitiveSettings, MeshToMeshVertData, PerPlatformFloat,
+    bounded_count, ClothBufferIndexMapping, DuplicatedVertexIndex, EntryToValueKey,
+    GrassWeightOffset, MemoryImageTypeDependency, PlatformTypeLayoutParameters,
+    UcsModifiedProperty, VTablePatch, Box3d, Box3f, LightmassPrimitiveSettings, MeshToMeshVertData, PerPlatformFloat,
     SparseDistanceFieldMip, StaticMeshBuffersSize, LumenCardBuildData, PackedHierarchyNode, PageStreamingState, read_vec, write_run, write_vec, BoxSphereBounds, ClothingSectionData, FuncMapEntry,
     Guid, ImplementedInterface, MeshBoneInfo, NameToIndex, ShaHash, StaticMaterial,
     StaticMeshSection, StripDataFlags,
@@ -249,7 +251,7 @@ fn write_lod_info(ar: &mut impl Ar, lod: &StaticMeshComponentLodInfo) -> Result<
 /// an `FPackageIndex`, an `FName` and an `FGuid` — 28 bytes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActorComponentTail {
-    pub ucs_modified_properties: Vec<u8>,
+    pub ucs_modified_properties: Vec<UcsModifiedProperty>,
 }
 
 /// `USceneComponent`'s tail: baked bounds, written only when the component asked
@@ -292,11 +294,9 @@ pub struct SceneComponentChainTail {
 
 impl SceneComponentChainTail {
     pub fn read(r: &mut Reader, block: &PropertyBlock) -> Result<Self> {
-        let n = {
-            let n = r.i32()?;
-            super::limits::bounded(n, MAX_NATIVE_COUNT, "UCSModifiedProperties", r.o - 4)?
-        };
-        let ucs_modified_properties = r.take(n * 28)?.to_vec();
+        let n = bounded_count(r.i32()?, "UCSModifiedProperties", r.o - 4)?;
+        let ucs_modified_properties: Vec<UcsModifiedProperty> =
+            read_vec(r, "UCSModifiedProperties", n)?;
         let bounds = if scene_component_writes_bounds(block) {
             Some(if r.u32()? != 0 {
                 Some(r.take(56)?.try_into().expect("56 bytes"))
@@ -313,13 +313,7 @@ impl SceneComponentChainTail {
     }
 
     pub fn write(&self, ar: &mut impl Ar, block: &PropertyBlock) -> Result<()> {
-        let ucs = &self.actor_component.ucs_modified_properties;
-        if ucs.len() % 28 != 0 {
-            bail!("UCS modified properties is {} bytes, not a multiple of 28", ucs.len());
-        }
-        ar.i32(&mut ((ucs.len() / 28) as i32))?;
-        let n = ucs.len();
-        ar.raw(&mut ucs.clone(), n)?;
+        write_vec(ar, &self.actor_component.ucs_modified_properties)?;
         // The property block decides whether these bytes exist, so a model that
         // disagrees with it would change the tail's length.
         match (&self.scene_component.bounds, scene_component_writes_bounds(block)) {
@@ -348,13 +342,7 @@ impl StaticMeshComponentChainTail {
     }
 
     pub fn write(&self, ar: &mut impl Ar, block: &PropertyBlock) -> Result<()> {
-        let ucs = &self.actor_component.ucs_modified_properties;
-        if ucs.len() % 28 != 0 {
-            bail!("UCS modified properties is {} bytes, not a multiple of 28", ucs.len());
-        }
-        ar.i32(&mut ((ucs.len() / 28) as i32))?;
-        let n = ucs.len();
-        ar.raw(&mut ucs.clone(), n)?;
+        write_vec(ar, &self.actor_component.ucs_modified_properties)?;
 
         // The property block decides whether these bytes exist at all, so a
         // model that disagrees with it would change the tail's length.
@@ -2028,7 +2016,7 @@ pub struct MorphLodModel {
     /// The count when stripped, or the 28-byte deltas when not.
     pub vertices: Result2<i32, FixedArray>,
     pub num_base_mesh_verts: i32,
-    pub section_indices: FixedArray,
+    pub section_indices: Vec<i32>,
     pub generated_by_engine: u32,
     /// Empty in a cook, but written.
     pub source_filename: FStr,
@@ -2071,7 +2059,7 @@ impl MorphTargetTail {
                 stripped,
                 vertices,
                 num_base_mesh_verts: r.i32()?,
-                section_indices: FixedArray::read(r, "SectionIndices", 4)?,
+                section_indices: read_i32_array(r, "SectionIndices")?,
                 generated_by_engine: r.u32()?,
                 source_filename: r.fstring()?,
             });
@@ -2096,7 +2084,7 @@ impl MorphTargetTail {
                 _ => bail!("morph vertex form disagrees with the stripped flag"),
             }
             ar.i32(&mut l.num_base_mesh_verts.to_owned())?;
-            l.section_indices.write(ar)?;
+            write_i32_array(ar, &l.section_indices)?;
             ar.u32(&mut l.generated_by_engine.to_owned())?;
             ar.fstring(&mut l.source_filename.clone())?;
         }
@@ -2196,7 +2184,7 @@ pub struct ModelElement {
     pub map_build_data_id: Guid,
     pub component: i32,
     pub material: i32,
-    pub nodes: FixedArray,
+    pub nodes: Vec<u16>,
 }
 
 /// `UModelComponent::Serialize`.
@@ -2205,7 +2193,7 @@ pub struct ModelComponentTail {
     pub model: i32,
     pub elements: Vec<ModelElement>,
     pub component_index: u32,
-    pub nodes: FixedArray,
+    pub nodes: Vec<u16>,
 }
 
 impl ModelComponentTail {
@@ -2221,14 +2209,14 @@ impl ModelComponentTail {
                 map_build_data_id: { let mut g = Guid::default(); g.serialize(r)?; g },
                 component: r.i32()?,
                 material: r.i32()?,
-                nodes: FixedArray::read(r, "element nodes", 2)?,
+                nodes: read_u16_array(r, "element nodes")?,
             });
         }
         Ok(ModelComponentTail {
             model,
             elements,
             component_index: r.u32()?,
-            nodes: FixedArray::read(r, "component nodes", 2)?,
+            nodes: read_u16_array(r, "component nodes")?,
         })
     }
 
@@ -2239,10 +2227,10 @@ impl ModelComponentTail {
             e.map_build_data_id.clone().serialize(ar)?;
             ar.i32(&mut e.component.to_owned())?;
             ar.i32(&mut e.material.to_owned())?;
-            e.nodes.write(ar)?;
+            write_u16_array(ar, &e.nodes)?;
         }
         ar.u32(&mut self.component_index.to_owned())?;
-        self.nodes.write(ar)
+        write_u16_array(ar, &self.nodes)
     }
 }
 
@@ -2331,7 +2319,7 @@ impl SkeletonTail {
 pub struct StructTail {
     pub super_struct: i32,
     /// `ChildArray` — an `FPackageIndex` per entry.
-    pub children: FixedArray,
+    pub children: Vec<i32>,
     /// The `FField` chain, exactly as `read_field_chain` consumed it.
     pub field_chain: Vec<u8>,
     /// Written ahead of the script and *not* equal to its length — the engine
@@ -2343,7 +2331,7 @@ pub struct StructTail {
 impl StructTail {
     fn read(r: &mut Reader) -> Result<Self> {
         let super_struct = r.i32()?;
-        let children = FixedArray::read(r, "ChildArray", 4)?;
+        let children = read_i32_array(r, "ChildArray")?;
         let at = r.o;
         r.struct_fields = Some(super::reflect::read_field_chain(r)?);
         let field_chain = r.b[at..r.o].to_vec();
@@ -2363,7 +2351,7 @@ impl StructTail {
 
     fn write(&self, ar: &mut impl Ar) -> Result<()> {
         ar.i32(&mut self.super_struct.to_owned())?;
-        self.children.write(ar)?;
+        write_i32_array(ar, &self.children)?;
         let n = self.field_chain.len();
         ar.raw(&mut self.field_chain.clone(), n)?;
         ar.i32(&mut self.bytecode_size.to_owned())?;
@@ -2534,7 +2522,7 @@ pub enum TailPiece {
 /// A decoded [`TailPiece`].
 #[derive(Debug, Clone)]
 pub enum TailValue {
-    UcsProperties(Vec<u8>),
+    UcsProperties(Vec<UcsModifiedProperty>),
     SceneBounds(Option<Option<[u8; 56]>>),
     OptStr(Option<FStr>),
     Bytes(Vec<u8>),
@@ -2599,11 +2587,8 @@ fn read_pieces(
     for p in pieces {
         out.push(match *p {
             TailPiece::UcsProperties => {
-                let n = {
-                    let n = r.i32()?;
-                    super::limits::bounded(n, MAX_NATIVE_COUNT, "UCSModifiedProperties", r.o - 4)?
-                };
-                TailValue::UcsProperties(r.take(n * 28)?.to_vec())
+                let n = bounded_count(r.i32()?, "UCSModifiedProperties", r.o - 4)?;
+                TailValue::UcsProperties(read_vec(r, "UCSModifiedProperties", n)?)
             }
             TailPiece::SceneBounds => TailValue::SceneBounds(
                 if scene_component_writes_bounds(block) {
@@ -2667,14 +2652,7 @@ fn write_pieces(
     }
     for (v, p) in values.iter().zip(pieces) {
         match (v, *p) {
-            (TailValue::UcsProperties(u), TailPiece::UcsProperties) => {
-                if u.len() % 28 != 0 {
-                    bail!("UCS modified properties is {} bytes, not a multiple of 28", u.len());
-                }
-                ar.i32(&mut ((u.len() / 28) as i32))?;
-                let n = u.len();
-                ar.raw(&mut u.clone(), n)?;
-            }
+            (TailValue::UcsProperties(u), TailPiece::UcsProperties) => write_vec(ar, u)?,
             (TailValue::SceneBounds(b), TailPiece::SceneBounds) => {
                 match (b, scene_component_writes_bounds(block)) {
                     (Some(b), true) => match b {
@@ -3146,14 +3124,14 @@ impl GeometryCollectionTail {
 pub struct VTablePatchTable {
     pub type_name_hash: [u8; 8],
     /// `VTableOffset` and `Offset` per patch.
-    pub patches: FixedArray,
+    pub patches: Vec<VTablePatch>,
 }
 
 /// One name patch table — script names and memory-image names share the shape.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NamePatchTable {
-    pub name: [u8; 8],
-    pub offsets: FixedArray,
+    pub name: FName,
+    pub offsets: Vec<u32>,
 }
 
 /// Where a shader map's bytecode lives.
@@ -3183,7 +3161,7 @@ pub struct ShaderMap {
     pub layout_params: [u8; 8],
     pub frozen_image: Vec<u8>,
     /// An `FName`, a layout size and an `FSHAHash` per dependency.
-    pub type_dependencies: FixedArray,
+    pub type_dependencies: Vec<MemoryImageTypeDependency>,
     /// `FHashedName` per entry. The two *counts* are written adjacently and only
     /// then the combined run of hashes, so these cannot be read as two
     /// independent count-then-payload arrays — doing so put a vertex-factory
@@ -3207,7 +3185,9 @@ impl ShaderMap {
             super::limits::bounded(n, MAX_NATIVE_COUNT, "frozen memory image", r.o - 4)?
         };
         let frozen_image = r.take(n)?.to_vec();
-        let type_dependencies = FixedArray::read(r, "memory image type dependencies", 32)?;
+        let n = bounded_count(r.i32()?, "memory image type dependencies", r.o - 4)?;
+        let type_dependencies: Vec<MemoryImageTypeDependency> =
+            read_vec(r, "memory image type dependencies", n)?;
         let n_types = {
             let n = r.i32()?;
             super::limits::bounded(n, MAX_NATIVE_COUNT, "shader types", r.o - 4)?
@@ -3243,15 +3223,18 @@ impl ShaderMap {
         for _ in 0..n_vtable {
             vtable_patches.push(VTablePatchTable {
                 type_name_hash: r.take(8)?.try_into().expect("8 bytes"),
-                patches: FixedArray::read(r, "vtable patches", 8)?,
+                patches: { let n = bounded_count(r.i32()?, "vtable patches", r.o - 4)?; read_vec(r, "vtable patches", n)? },
             });
         }
         let mut name_table = |r: &mut Reader, n: usize| -> Result<Vec<NamePatchTable>> {
             let mut out = Vec::with_capacity(n.min(64));
             for _ in 0..n {
                 out.push(NamePatchTable {
-                    name: r.take(8)?.try_into().expect("8 bytes"),
-                    offsets: FixedArray::read(r, "name patches", 4)?,
+                    name: r.fname()?,
+                    offsets: {
+                        let n = bounded_count(r.i32()?, "name patches", r.o - 4)?;
+                        (0..n).map(|_| r.u32()).collect::<Result<_>>()?
+                    },
                 });
             }
             Ok(out)
@@ -3301,7 +3284,7 @@ impl ShaderMap {
         ar.i32(&mut (self.frozen_image.len() as i32))?;
         let n = self.frozen_image.len();
         ar.raw(&mut self.frozen_image.clone(), n)?;
-        self.type_dependencies.write(ar)?;
+        write_vec(ar, &self.type_dependencies)?;
         ar.i32(&mut (self.shader_types.len() as i32))?;
         ar.i32(&mut (self.vertex_factory_types.len() as i32))?;
         for h in self.shader_types.iter().chain(&self.vertex_factory_types) {
@@ -3318,11 +3301,11 @@ impl ShaderMap {
         ar.i32(&mut (self.image_name_patches.len() as i32))?;
         for t in &self.vtable_patches {
             ar.raw(&mut t.type_name_hash.to_vec(), 8)?;
-            t.patches.write(ar)?;
+            write_vec(ar, &t.patches)?;
         }
         for t in self.script_name_patches.iter().chain(&self.image_name_patches) {
-            ar.raw(&mut t.name.to_vec(), 8)?;
-            t.offsets.write(ar)?;
+            ar.fname(&mut t.name.clone())?;
+            write_u32_array(ar, &t.offsets)?;
         }
         match &self.code {
             ShaderCode::Shared { hash } => {
@@ -3429,7 +3412,7 @@ impl NiagaraScriptTail {
 pub struct LandscapeComponentTail {
     pub num_elements: i32,
     /// An `FPackageIndex` and an `int32` per entry.
-    pub grass_weight_offsets: FixedArray,
+    pub grass_weight_offsets: Vec<GrassWeightOffset>,
     pub height_weight_data: Vec<u8>,
     pub cooked: u32,
 }
@@ -3641,14 +3624,14 @@ pub struct VisibilityChunk {
 /// references, and the precomputed visibility and distance-field data.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LevelTail {
-    pub actors: FixedArray,
+    pub actors: Vec<i32>,
     /// Protocol, host, map and portal.
     pub url_strings: [FStr; 4],
     pub url_options: Vec<FStr>,
     pub port: i32,
     pub url_valid: u32,
     pub model: i32,
-    pub model_components: FixedArray,
+    pub model_components: Vec<i32>,
     pub level_script_actor: i32,
     pub nav_list_start: i32,
     pub nav_list_end: i32,
@@ -3663,7 +3646,7 @@ pub struct LevelTail {
 
 impl LevelTail {
     pub fn read(r: &mut Reader) -> Result<Self> {
-        let actors = FixedArray::read(r, "Actors", 4)?;
+        let actors = read_i32_array(r, "Actors")?;
         let url_strings = [r.fstring()?, r.fstring()?, r.fstring()?, r.fstring()?];
         let n = {
             let n = r.i32()?;
@@ -3673,7 +3656,7 @@ impl LevelTail {
         let port = r.i32()?;
         let url_valid = r.u32()?;
         let model = r.i32()?;
-        let model_components = FixedArray::read(r, "ModelComponents", 4)?;
+        let model_components = read_i32_array(r, "ModelComponents")?;
         let level_script_actor = r.i32()?;
         let nav_list_start = r.i32()?;
         let nav_list_end = r.i32()?;
@@ -3727,7 +3710,7 @@ impl LevelTail {
     }
 
     pub fn write(&self, ar: &mut impl Ar) -> Result<()> {
-        self.actors.write(ar)?;
+        write_i32_array(ar, &self.actors)?;
         for s in &self.url_strings {
             ar.fstring(&mut s.clone())?;
         }
@@ -3738,7 +3721,7 @@ impl LevelTail {
         ar.i32(&mut self.port.to_owned())?;
         ar.u32(&mut self.url_valid.to_owned())?;
         ar.i32(&mut self.model.to_owned())?;
-        self.model_components.write(ar)?;
+        write_i32_array(ar, &self.model_components)?;
         ar.i32(&mut self.level_script_actor.to_owned())?;
         ar.i32(&mut self.nav_list_start.to_owned())?;
         ar.i32(&mut self.nav_list_end.to_owned())?;
@@ -3817,7 +3800,7 @@ pub struct AnimSequenceTail {
     /// `FAnimCompressedCurveIndexedName` serializes **only** its `CurveName`;
     /// the `CurveIndex` the struct declares is written for memory counting only,
     /// so an element is 8 bytes on the wire, not 12.
-    pub indexed_curve_names: FixedArray,
+    pub indexed_curve_names: Vec<FName>,
     /// The declared length of the compressed stream. Kept because a bulk-backed
     /// stream writes the length with no payload behind it, so it cannot be
     /// derived from what follows.
@@ -3845,7 +3828,7 @@ impl AnimSequenceTail {
                 serialize_compressed_data,
                 compressed_raw_data_size: 0,
                 track_to_skeleton_map: FixedArray { element_size: 4, data: Vec::new() },
-                indexed_curve_names: FixedArray { element_size: 8, data: Vec::new() },
+                indexed_curve_names: Vec::new(),
                 compressed_byte_stream_len: 0,
                 use_bulk: false,
                 compressed_byte_stream: None,
@@ -3859,7 +3842,7 @@ impl AnimSequenceTail {
         }
         let compressed_raw_data_size = r.i32()?;
         let track_to_skeleton_map = FixedArray::read(r, "CompressedTrackToSkeletonMapTable", 4)?;
-        let indexed_curve_names = FixedArray::read(r, "IndexedCurveNames", 8)?;
+        let indexed_curve_names = read_name_array(r, "IndexedCurveNames")?;
         let compressed_byte_stream_len = r.i32()?;
         let n = super::limits::bounded(
             compressed_byte_stream_len,
@@ -3912,7 +3895,7 @@ impl AnimSequenceTail {
         }
         ar.i32(&mut self.compressed_raw_data_size.to_owned())?;
         self.track_to_skeleton_map.write(ar)?;
-        self.indexed_curve_names.write(ar)?;
+        write_name_array(ar, &self.indexed_curve_names)?;
         ar.i32(&mut self.compressed_byte_stream_len.to_owned())?;
         ar.u32(&mut u32::from(self.use_bulk))?;
         match (&self.compressed_byte_stream, self.use_bulk) {
@@ -4116,7 +4099,7 @@ pub struct SkelRenderSection {
     pub visible_in_ray_tracing: u32,
     pub base_vertex_index: u32,
     pub cloth_mapping_lods: Vec<Vec<MeshToMeshVertData>>,
-    pub bone_map: FixedArray,
+    pub bone_map: Vec<u16>,
     pub num_vertices: u32,
     pub max_bone_influences: i32,
     pub correspond_cloth_asset_index: [u8; 2],
@@ -4153,7 +4136,7 @@ impl SkelRenderSection {
             let m = bounded_count(r.i32()?, "cloth mapping data", r.o - 4)?;
             cloth_mapping_lods.push(read_vec(r, "cloth mapping data", m)?);
         }
-        let bone_map = FixedArray::read(r, "BoneMap", 2)?;
+        let bone_map = read_u16_array(r, "BoneMap")?;
         let num_vertices = r.u32()?;
         let max_bone_influences = r.i32()?;
         let correspond_cloth_asset_index = r.take(2)?.try_into().expect("2 bytes");
@@ -4207,7 +4190,7 @@ impl SkelRenderSection {
         for a in &self.cloth_mapping_lods {
             write_vec(ar, a)?;
         }
-        self.bone_map.write(ar)?;
+        write_u16_array(ar, &self.bone_map)?;
         ar.u32(&mut self.num_vertices.to_owned())?;
         ar.i32(&mut self.max_bone_influences.to_owned())?;
         ar.raw(&mut self.correspond_cloth_asset_index.to_vec(), 2)?;
@@ -4534,7 +4517,7 @@ pub struct SkelAvailabilityInfo {
     /// flat run of scalars whose order differs from the streamed form.
     pub header: [u8; 65],
     pub cloth: Option<(FixedArray, i32, u32)>,
-    pub skin_weight_profile_names: FixedArray,
+    pub skin_weight_profile_names: Vec<FName>,
 }
 
 impl SkelAvailabilityInfo {
@@ -4548,7 +4531,7 @@ impl SkelAvailabilityInfo {
         Ok(SkelAvailabilityInfo {
             header,
             cloth,
-            skin_weight_profile_names: FixedArray::read(r, "SkinWeightProfileNames", 8)?,
+            skin_weight_profile_names: read_name_array(r, "SkinWeightProfileNames")?,
         })
     }
 
@@ -4563,7 +4546,7 @@ impl SkelAvailabilityInfo {
             (None, false) => {}
             _ => bail!("cloth mapping disagrees with the render sections"),
         }
-        self.skin_weight_profile_names.write(ar)
+        write_name_array(ar, &self.skin_weight_profile_names)
     }
 }
 
@@ -4574,7 +4557,7 @@ pub struct SkeletalMeshLod {
     pub class_strip: u8,
     pub is_lod_cooked_out: bool,
     pub is_inlined: bool,
-    pub required_bones: FixedArray,
+    pub required_bones: Vec<u16>,
     /// Absent for a server cook or a LOD below the minimum — the LOD ends at
     /// `RequiredBones`.
     pub render: Option<SkeletalMeshLodRender>,
@@ -4583,7 +4566,7 @@ pub struct SkeletalMeshLod {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SkeletalMeshLodRender {
     pub sections: Vec<SkelRenderSection>,
-    pub active_bone_indices: FixedArray,
+    pub active_bone_indices: Vec<u16>,
     pub buffers_size: u32,
     pub buffers: SkeletalMeshLodBuffers,
 }
@@ -4602,7 +4585,7 @@ impl SkeletalMeshLod {
         let class_strip = r.u8()?;
         let is_lod_cooked_out = r.u32()? != 0;
         let is_inlined = r.u32()? != 0;
-        let required_bones = FixedArray::read(r, "RequiredBones", 2)?;
+        let required_bones = read_u16_array(r, "RequiredBones")?;
         // `EStrippedData::AudioVisual` is bit 1 — bit 0 is `EditorOnly`, which
         // every client cook sets and which must NOT suppress the buffers.
         if global_strip & 2 != 0 || is_lod_cooked_out {
@@ -4624,7 +4607,7 @@ impl SkeletalMeshLod {
             sections.push(SkelRenderSection::read(r)?);
         }
         let has_cloth = sections.iter().any(SkelRenderSection::has_cloth);
-        let active_bone_indices = FixedArray::read(r, "ActiveBoneIndices", 2)?;
+        let active_bone_indices = read_u16_array(r, "ActiveBoneIndices")?;
         let buffers_size = r.u32()?;
         let buffers = if is_inlined {
             SkeletalMeshLodBuffers::Inline(Box::new(SkelStreamedData::read(
@@ -4663,7 +4646,7 @@ impl SkeletalMeshLod {
         ar.u8(&mut self.class_strip.to_owned())?;
         ar.u32(&mut u32::from(self.is_lod_cooked_out))?;
         ar.u32(&mut u32::from(self.is_inlined))?;
-        self.required_bones.write(ar)?;
+        write_u16_array(ar, &self.required_bones)?;
         let expected = self.global_strip & 2 == 0 && !self.is_lod_cooked_out;
         let rd = match (&self.render, expected) {
             (Some(rd), true) => rd,
@@ -4675,7 +4658,7 @@ impl SkeletalMeshLod {
             s.write(ar)?;
         }
         let has_cloth = rd.sections.iter().any(SkelRenderSection::has_cloth);
-        rd.active_bone_indices.write(ar)?;
+        write_u16_array(ar, &rd.active_bone_indices)?;
         ar.u32(&mut rd.buffers_size.to_owned())?;
         match (&rd.buffers, self.is_inlined) {
             (SkeletalMeshLodBuffers::Inline(d), true) => d.write(ar, has_vertex_colors, has_cloth),
@@ -4702,7 +4685,7 @@ pub struct SkeletalMeshTail {
     pub cooked: u32,
     /// The render data, written only when cooked.
     pub render: Option<SkeletalMeshRenderData>,
-    pub dummy_objs: FixedArray,
+    pub dummy_objs: Vec<i32>,
     /// `BodySetup`, written only when the mesh enables per-poly collision — a
     /// condition that lives in the property block.
     pub body_setup: Option<i32>,
@@ -4767,7 +4750,7 @@ impl SkeletalMeshTail {
                 })
             })
             .transpose()?;
-        let dummy_objs = FixedArray::read(r, "legacy DummyObjs", 4)?;
+        let dummy_objs = read_i32_array(r, "legacy DummyObjs")?;
         let body_setup = flag("bEnablePerPolyCollision").then(|| r.i32()).transpose()?;
         Ok(SkeletalMeshTail {
             strip_flags,
@@ -4813,7 +4796,7 @@ impl SkeletalMeshTail {
             (None, false) => {}
             _ => bail!("render data presence disagrees with the cooked flag"),
         }
-        self.dummy_objs.write(ar)?;
+        write_i32_array(ar, &self.dummy_objs)?;
         match (self.body_setup, flag("bEnablePerPolyCollision")) {
             (Some(v), true) => ar.i32(&mut v.to_owned())?,
             (None, false) => {}
@@ -5345,7 +5328,9 @@ pub fn roundtrip_tail(
                 let mut r = reader(tail, names, ctx);
                 let base = SceneComponentChainTail::read(&mut r, block)?;
                 let num_elements = r.i32()?;
-                let grass_weight_offsets = FixedArray::read(&mut r, "grass weight offsets", 8)?;
+                let n = bounded_count(r.i32()?, "grass weight offsets", r.o - 4)?;
+                let grass_weight_offsets: Vec<GrassWeightOffset> =
+                    read_vec(&mut r, "grass weight offsets", n)?;
                 let n = {
                     let n = r.i32()?;
                     super::limits::bounded(n, MAX_NATIVE_COUNT, "HeightWeightData", r.o - 4)?
@@ -5362,7 +5347,7 @@ pub fn roundtrip_tail(
                 let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 base.write(&mut w, block)?;
                 w.i32(&mut own.num_elements.to_owned())?;
-                own.grass_weight_offsets.write(&mut w)?;
+                write_vec(&mut w, &own.grass_weight_offsets)?;
                 w.i32(&mut (own.height_weight_data.len() as i32))?;
                 let n = own.height_weight_data.len();
                 w.raw(&mut own.height_weight_data.clone(), n)?;
@@ -6083,6 +6068,50 @@ pub fn roundtrip_tail(
             }),
         },
     }
+}
+
+/// Read a `TArray<u16>` written with a bare count — bone indices and node
+/// indices, which UE types as `uint16` rather than as an opaque pair of bytes.
+fn read_u16_array(r: &mut Reader, what: &str) -> Result<Vec<u16>> {
+    let n = bounded_count(r.i32()?, what, r.o - 4)?;
+    (0..n).map(|_| r.u16()).collect()
+}
+
+fn write_u16_array(ar: &mut impl Ar, v: &[u16]) -> Result<()> {
+    ar.i32(&mut (v.len() as i32))?;
+    for x in v {
+        ar.u16(&mut x.to_owned())?;
+    }
+    Ok(())
+}
+
+/// Read a `TArray<i32>` written with a bare count. Used for object-reference
+/// arrays too — an `FPackageIndex` is an `int32`.
+fn read_i32_array(r: &mut Reader, what: &str) -> Result<Vec<i32>> {
+    let n = bounded_count(r.i32()?, what, r.o - 4)?;
+    (0..n).map(|_| r.i32()).collect()
+}
+
+fn write_i32_array(ar: &mut impl Ar, v: &[i32]) -> Result<()> {
+    ar.i32(&mut (v.len() as i32))?;
+    for x in v {
+        ar.i32(&mut x.to_owned())?;
+    }
+    Ok(())
+}
+
+/// Read a `TArray<FName>` written with a bare count.
+fn read_name_array(r: &mut Reader, what: &str) -> Result<Vec<FName>> {
+    let n = bounded_count(r.i32()?, what, r.o - 4)?;
+    (0..n).map(|_| r.fname()).collect()
+}
+
+fn write_name_array(ar: &mut impl Ar, v: &[FName]) -> Result<()> {
+    ar.i32(&mut (v.len() as i32))?;
+    for x in v {
+        ar.fname(&mut x.clone())?;
+    }
+    Ok(())
 }
 
 /// A reader over a tail that carries the package context.
