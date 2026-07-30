@@ -99,8 +99,11 @@ impl PartialEq<&str> for FName {
 /// text-bearing class — an `FText` with an empty namespace is the common case.
 /// [`FStr::empty_has_terminator`] is which.
 ///
-/// Known limit: a declared length longer than the text plus its terminator
-/// still drops the excess. No string in the shipped corpus has any.
+/// A declared length longer than the text plus its terminator keeps the excess
+/// in [`FStr::trailing`]. UE stops at the first NUL and discards the rest, so
+/// the *text* is unaffected — but the bytes are real, a writer that dropped them
+/// would shorten the field, and nothing in the shipped corpus exercises it, so
+/// the gate would never say.
 #[derive(Debug, Clone, PartialEq, Eq, Default, PartialOrd, Ord, Hash)]
 pub struct FStr {
     text: String,
@@ -109,6 +112,9 @@ pub struct FStr {
     /// Only meaningful when the text is empty: the file wrote a terminator
     /// rather than a bare zero length.
     pub empty_has_terminator: bool,
+    /// Bytes after the terminator, when the declared length ran past it.
+    /// Code units, so two bytes each for a wide string.
+    pub trailing: Vec<u8>,
 }
 
 impl FStr {
@@ -117,12 +123,12 @@ impl FStr {
         // A non-empty string always has a terminator; the flag only decides the
         // empty case, so defaulting it this way keeps an authored string in the
         // canonical form.
-        FStr { empty_has_terminator: !text.is_empty(), text, wide }
+        FStr { empty_has_terminator: !text.is_empty(), text, wide, trailing: Vec::new() }
     }
 
     /// As [`FStr::new`], recording how an empty string was encoded.
     pub fn with_terminator(text: impl Into<String>, wide: bool, empty_has_terminator: bool) -> Self {
-        FStr { text: text.into(), wide, empty_has_terminator }
+        FStr { text: text.into(), wide, empty_has_terminator, trailing: Vec::new() }
     }
     pub fn as_str(&self) -> &str {
         &self.text
@@ -338,6 +344,11 @@ pub enum PropValue {
     /// An `FSoftObjectPath`: `(PackageName, AssetName, SubPath)`.
     SoftObject(SoftObjectPath),
     Array(Vec<PropValue>),
+    /// A `TSet`. Distinct from [`PropValue::Array`] because the *value* has to
+    /// say which container it came from: they serialize alike but a consumer
+    /// deciding whether duplicates are meaningful, or an editor offering "add
+    /// element", needs to know without re-reading the schema.
+    Set(Vec<PropValue>),
     /// A `TMap`, preserving insertion order.
     Map(Vec<(PropValue, PropValue)>),
     /// A `TSet`/`TMap` whose delta-serialization prefix was **not** empty.
@@ -445,7 +456,7 @@ impl PropValue {
             (SoftObject(a), SoftObject(b)) => {
                 a.package == b.package && a.asset == b.asset && a.sub_path == b.sub_path
             }
-            (Array(a), Array(b)) => {
+            (Array(a), Array(b)) | (Set(a), Set(b)) => {
                 a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.semantic_eq(y))
             }
             (Map(a), Map(b)) => {
@@ -496,9 +507,25 @@ impl PropValue {
             _ => None,
         }
     }
+    /// A `TArray`'s elements. A `TSet` is *not* an array — ask [`Self::as_set`].
     pub fn as_array(&self) -> Option<&[PropValue]> {
         match self.unwrapped() {
             PropValue::Array(a) => Some(a),
+            _ => None,
+        }
+    }
+    /// A `TSet`'s elements.
+    pub fn as_set(&self) -> Option<&[PropValue]> {
+        match self.unwrapped() {
+            PropValue::Set(a) => Some(a),
+            _ => None,
+        }
+    }
+    /// The elements of either a `TArray` or a `TSet`, for callers that only
+    /// care that it is a sequence.
+    pub fn as_sequence(&self) -> Option<&[PropValue]> {
+        match self.unwrapped() {
+            PropValue::Array(a) | PropValue::Set(a) => Some(a),
             _ => None,
         }
     }

@@ -84,6 +84,10 @@ fn jprop(v: &PropValue, resolve: &dyn Fn(i32) -> Option<(String, u64)>) -> Strin
             "{{\"k\":\"arr\",\"v\":[{}]}}",
             a.iter().map(|x| jprop(x, resolve)).collect::<Vec<_>>().join(",")
         ),
+        PropValue::Set(a) => format!(
+            "{{\"k\":\"set\",\"v\":[{}]}}",
+            a.iter().map(|x| jprop(x, resolve)).collect::<Vec<_>>().join(",")
+        ),
         PropValue::Map(m) => format!(
             "{{\"k\":\"map\",\"v\":[{}]}}",
             m.iter()

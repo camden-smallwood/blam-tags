@@ -157,20 +157,29 @@ impl<'a> Reader<'a> {
             let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
             // A positive length means a terminator was written, which is what
             // distinguishes an empty string here from one stored as length 0.
-            Ok(FStr::with_terminator(
+            let mut s = FStr::with_terminator(
                 String::from_utf8_lossy(&bytes[..end]).into_owned(),
                 false,
                 true,
-            ))
+            );
+            // Anything past the terminator. UE stops reading at the NUL, so this
+            // never changes the text — but the bytes are in the field and a
+            // writer that dropped them would shorten it.
+            s.trailing = bytes.get(end + 1..).unwrap_or(&[]).to_vec();
+            Ok(s)
         } else {
             let chars = (-n) as usize;
             let bytes = self.take(chars * 2)?;
-            let u16s: Vec<u16> = bytes
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .take_while(|&c| c != 0)
-                .collect();
-            Ok(FStr::with_terminator(String::from_utf16_lossy(&u16s), true, true))
+            let units: Vec<u16> =
+                bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            let end = units.iter().position(|&c| c == 0).unwrap_or(units.len());
+            let mut s = FStr::with_terminator(
+                String::from_utf16_lossy(&units[..end]),
+                true,
+                true,
+            );
+            s.trailing = bytes.get((end + 1) * 2..).unwrap_or(&[]).to_vec();
+            Ok(s)
         }
     }
 }
@@ -325,19 +334,29 @@ impl Ar for Writer<'_> {
         // and changed 825 exports across every text-bearing class — caught by
         // `ce_semantic_roundtrip` reporting them as value-stable but no longer
         // byte-identical.
-        if v.is_empty() && !v.empty_has_terminator {
+        // `trailing` is whatever ran past the terminator in the file. It counts
+        // towards the declared length, so it has to be in the length as well as
+        // in the payload.
+        if v.is_empty() && !v.empty_has_terminator && v.trailing.is_empty() {
             self.b.extend_from_slice(&0i32.to_le_bytes());
         } else if !v.is_wide() {
-            self.b.extend_from_slice(&(v.len() as i32 + 1).to_le_bytes());
+            let extra = v.trailing.len() as i32;
+            self.b.extend_from_slice(&(v.len() as i32 + 1 + extra).to_le_bytes());
             self.b.extend_from_slice(v.as_bytes());
             self.b.push(0);
+            self.b.extend_from_slice(&v.trailing);
         } else {
             let chars: Vec<u16> = v.encode_utf16().collect();
-            self.b.extend_from_slice(&(-(chars.len() as i32 + 1)).to_le_bytes());
+            if v.trailing.len() % 2 != 0 {
+                bail!("a wide string's trailing bytes are not whole code units");
+            }
+            let extra = (v.trailing.len() / 2) as i32;
+            self.b.extend_from_slice(&(-(chars.len() as i32 + 1 + extra)).to_le_bytes());
             for c in chars {
                 self.b.extend_from_slice(&c.to_le_bytes());
             }
             self.b.extend_from_slice(&0u16.to_le_bytes());
+            self.b.extend_from_slice(&v.trailing);
         }
         Ok(())
     }

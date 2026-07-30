@@ -34,7 +34,7 @@ struct Stat{
 fn kindof(v:&PropValue)->&'static str{ match v{
     PropValue::Bool(_)=>"bool",PropValue::Int(_)=>"int",PropValue::Float(_)=>"float",
     PropValue::Name(_)=>"name",PropValue::Str(_)=>"str",PropValue::Object(_)=>"obj",
-    PropValue::SoftObject(_)=>"soft",PropValue::Array(_)=>"arr",PropValue::Map(_)=>"map",
+    PropValue::SoftObject(_)=>"soft",PropValue::Array(_)=>"arr",PropValue::Set(_)=>"set",PropValue::Map(_)=>"map",
     PropValue::Struct(_)=>"struct",PropValue::Native(_)=>"native",PropValue::Delegate{..}=>"delegate",PropValue::MulticastDelegate(_)=>"multicast",PropValue::FieldPath{..}=>"fieldpath",PropValue::Unset=>"unset",PropValue::Raw(_)=>"raw",PropValue::WithRemovals{inner,..}=>kindof(inner),PropValue::HandWritten(_)=>"handwritten"} }
 fn refs(v:&PropValue, key:&str, hard:&mut BTreeMap<String,usize>, soft:&mut BTreeMap<String,usize>){
     match v{

@@ -100,7 +100,7 @@ pub(super) fn read_value(
             for _ in 0..n {
                 v.push(read_value(r, inner, usmap, depth, true)?);
             }
-            with_removals(removals, PropValue::Array(v))
+            with_removals(removals, PropValue::Set(v))
         }
         // `FMapProperty::SerializeItem`'s load path (PropertyMap.cpp:624):
         // `NumKeysToRemove`, then that many **keys**, then `NumEntries` and the
@@ -304,6 +304,10 @@ pub(super) fn write_value(
         (PropertyType::Set(inner), v) => {
             let (removals, items) = split_removals(v);
             let items = match items {
+                PropValue::Set(a) => a.as_slice(),
+                // A `TArray` value in a `TSet` slot is accepted: the two
+                // serialize alike, and refusing would break anything that built
+                // a set before `PropValue::Set` existed.
                 PropValue::Array(a) => a.as_slice(),
                 other => bail!("expected set elements, have {other:?}"),
             };
@@ -653,7 +657,7 @@ mod tests {
         let mut r = Reader::new(&bytes, &[]);
         let back = read_value(&mut r, &ty, &usmap, 0, false).expect("read");
         assert!(
-            matches!(back, PropValue::Array(ref a) if a.len() == 1),
+            matches!(back, PropValue::Set(ref a) if a.len() == 1),
             "an empty prefix should not produce a wrapper: {back:?}"
         );
     }

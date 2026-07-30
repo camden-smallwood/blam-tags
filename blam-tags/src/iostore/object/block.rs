@@ -683,7 +683,7 @@ mod tests {
         let props = read_export_struct(&export, &[], &usmap, "SetAlignmentProbe")
             .expect("decode probe struct");
 
-        assert!(matches!(props.get("Tags"), Some(PropValue::Array(v)) if v.is_empty()));
+        assert!(matches!(props.get("Tags"), Some(PropValue::Set(v)) if v.is_empty()));
         assert!(
             matches!(props.get("Value"), Some(PropValue::Int(0x1122_3344))),
             "int after a set was read from the wrong offset: {:?}",
@@ -903,7 +903,10 @@ mod tests {
             .expect("decode probe struct");
 
         match props.get("Tags") {
-            Some(PropValue::Array(v)) => {
+            // A `TSet` is `PropValue::Set`, not `Array` — the two serialize
+            // alike, and this test asserted the older representation that could
+            // not tell them apart.
+            Some(PropValue::Set(v)) => {
                 let ints: Vec<i64> = v
                     .iter()
                     .map(|e| match e {
