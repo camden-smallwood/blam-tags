@@ -7,7 +7,7 @@
 //! is exactly why every byte-oriented gate was blind to the fact that nothing
 //! had *understood* them: 41.9 MB of the corpus.
 //!
-//! The sizes were already known ([`native_struct_size`](super::structs::native_struct_size));
+//! The sizes were already known ([`native_struct_size`]);
 //! what was missing is the field layout behind each one. Note that size does not
 //! determine layout — `FVector2D` (2 × f64), `FLinearColor` (4 × f32) and
 //! `FGuid` (4 × u32) are all sixteen bytes and all different.
@@ -161,9 +161,10 @@ impl NativeStruct {
         }
     }
 
-    /// Bytes that are still *untyped* inside this value — zero for every
-    /// modeled variant, and the span length for [`NativeStruct::Opaque`]. What
-    /// `ce_decode_coverage` counts.
+    /// Bytes that are still *untyped* inside this value. Always zero now that
+    /// every arm is modeled — the `Opaque { bytes }` arm this counted was
+    /// removed as unreachable (see the module docs). Kept because it is what
+    /// the decode-coverage sweep reports.
     pub fn untyped_bytes(&self) -> usize {
         match self {
             _ => 0,

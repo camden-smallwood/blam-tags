@@ -3,7 +3,7 @@
 //! Before this module, `inspect` / `find` / `deps` each hand-rolled
 //! an `as_struct → as_block → as_array → leaf` recursion that
 //! differed only in what they emitted per node. The duplication was
-//! tolerable at three callers; [`export`], [`check`], and `data-diff`
+//! tolerable at three callers; `export`, `check`, and `data-diff`
 //! are about to make it painful.
 //!
 //! [`walk`] drives the recursion, tracking the current `/`-separated
@@ -78,7 +78,7 @@ pub trait FieldVisitor {
         VisitControl::Descend
     }
 
-    /// Entering an array field. Same shape as [`enter_block`]. Default: `Descend`.
+    /// Entering an array field. Same shape as `enter_block`. Default: `Descend`.
     fn enter_array(
         &mut self,
         _path: &str,

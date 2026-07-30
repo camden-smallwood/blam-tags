@@ -13,9 +13,9 @@
 //!
 //! Engine references used to anchor the decode:
 //! - `extract_rigid_vertex_data_compressed @ 0x82ce1868` (validates
-//!   decl[36] mapping order/sizes).
-//! - `extract_rigid_vertex_data @ 0x82ce0cd0` (decl[2]).
-//! - `extract_world_vertex_data @ 0x82ce1a48` (decl[1]).
+//!   `decl[36]` mapping order/sizes).
+//! - `extract_rigid_vertex_data @ 0x82ce0cd0` (`decl[2]`).
+//! - `extract_world_vertex_data @ 0x82ce1a48` (`decl[1]`).
 //! - `uncompress_UDec4_to_real_vector4d_normalized @ 0x82c736f8`.
 //! - `XMLoadDHenN3` (D3DDECLTYPE_DHEN3N decoder) `@ 0x82c739e8` with
 //!   scales `[1/511, 1/1023, 1/1023]` — DHEN3N is **signed 10/11/11**.

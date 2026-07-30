@@ -15,7 +15,7 @@
 //! infrastructure lives in [`crate::context`] (session state),
 //! [`crate::format`] (value rendering), [`crate::parse`] (string →
 //! `TagFieldData`), [`crate::walk`] (tree traversal), and
-//! [`crate::paths`] (filesystem path helpers).
+//! [`blam_tags::paths`] (filesystem path helpers).
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

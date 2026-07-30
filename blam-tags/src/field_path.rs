@@ -20,7 +20,7 @@
 //!   pins the exact field even when siblings share a name/type.
 //! - `[index]` — block / array element index.
 //!
-//! Parsing is tolerant (see [`crate::path::parse_segment`]): field-name markup
+//! Parsing is tolerant (see `crate::path::parse_segment`): field-name markup
 //! that reuses a grammar character (`ambient color:[0,255]`, `max sounds [1,16]`)
 //! is cleaned into the name rather than mis-read as a `type:`/`[index]` token.
 
@@ -97,14 +97,14 @@ impl TagFieldPath {
         });
     }
 
-    /// Append a bare-name segment (no ordinal). Prefer [`push_field`] for
+    /// Append a bare-name segment (no ordinal). Prefer `push_field` for
     /// resolvable paths; this is for hand-built or legacy names.
     pub fn push_name(&mut self, name: impl AsRef<str>) {
         self.segments
             .push(TagFieldPathSegment::new(clean_field_name(name.as_ref()).into_owned()));
     }
 
-    /// Builder form of [`push_field`].
+    /// Builder form of `push_field`.
     pub fn with_field(mut self, field: &TagField<'_>) -> Self {
         self.push_field(field);
         self

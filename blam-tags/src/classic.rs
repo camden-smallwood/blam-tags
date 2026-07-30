@@ -9,7 +9,7 @@
 //!
 //! This module owns the classic *encoding*; it borrows the synthesized
 //! layout only for structure + field types + nesting. The decoded form
-//! is the same [`TagBlockData`]/[`TagStructData`] model the MCC reader
+//! is the same `TagBlockData`/`TagStructData` model the MCC reader
 //! produces, so the entire downstream API + extractors work unchanged.
 //!
 //! ## On-disk shape (verified against real MCC CE/H2 bytes + HABT)
@@ -446,7 +446,7 @@ fn classic_struct_size(layout: &TagLayout, struct_index: u32, engine: ClassicEng
 /// Decode then re-encode a classic tag body, returning the re-encoded
 /// bytes. The byte-exact roundtrip gate: `classic_roundtrip(body, ..) ==
 /// body` for a well-formed tag. Keeps the internal
-/// [`TagBlockData`] model crate-private.
+/// `TagBlockData` model crate-private.
 pub fn classic_roundtrip(
     body: &[u8],
     layout: &TagLayout,

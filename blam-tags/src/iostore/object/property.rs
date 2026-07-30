@@ -1,7 +1,7 @@
 //! One property value, by its schema type.
 //!
 //! `in_container` distinguishes the two ways UE reaches a value, which matters
-//! for enums and only for enums — see [`read_value`].
+//! for enums and only for enums — see `read_value`.
 
 use anyhow::{bail, Context, Result};
 
@@ -498,7 +498,7 @@ pub fn should_save_as_zero(ty: &PropertyType, v: &PropValue, usmap: &Usmap) -> b
 
 /// Emit one property value's bytes, given the schema type it is declared as.
 ///
-/// The byte-slice counterpart to [`read_value`], and the write half of this
+/// The byte-slice counterpart to `read_value`, and the write half of this
 /// layer's public surface alongside
 /// [`emit_header`](super::block::emit_header). Errors — rather than guessing —
 /// for the shapes that still need the `PropertyBlock` model: a nested reflected

@@ -7,7 +7,7 @@
 //!   convention. Six faces arranged with `+Y` on top, `-Y` on
 //!   bottom, and the middle row as `+X +Z -X -Z` (DirectX storage
 //!   order [+X, -X, +Y, -Y, +Z, -Z] mapped to display positions
-//!   top=2, middle=[0,4,1,5], bottom=3). Empty cells filled with
+//!   top=2, middle=`[0,4,1,5]`, bottom=3). Empty cells filled with
 //!   Bungie's magic blue (R=0, G=0, B=255, A=255), the color-plate
 //!   "ignore this region" marker.
 //!

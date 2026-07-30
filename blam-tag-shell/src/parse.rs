@@ -1,7 +1,7 @@
 //! Parse CLI-flavored strings into [`TagFieldData`] values.
 //!
 //! All textual parsing of tag-field values lives here — the library
-//! offers only typed mutation via [`TagFieldMut::set`]. The shell
+//! offers only typed mutation via [`blam_tags::TagFieldMut::set`]. The shell
 //! reads what the user typed, parses it into the right `TagFieldData`
 //! variant for the field's schema type, and hands it to `set`.
 //!

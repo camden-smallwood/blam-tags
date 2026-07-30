@@ -44,14 +44,6 @@ impl CurveSegmentType {
             Self::Spline | Self::Spline2 => 4,
         }
     }
-    /// On-disk compact part size (header 8 + body).
-    pub(crate) fn compact_part_size(self) -> usize {
-        match self {
-            Self::Linear => 16,
-            Self::Spline => 24,
-            Self::Spline2 => 36,
-        }
-    }
 }
 
 /// Corner (`FunctionEditorSegmentCornerType`): whether a join is a hard corner

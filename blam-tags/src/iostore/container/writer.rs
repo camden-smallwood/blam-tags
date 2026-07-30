@@ -11,7 +11,7 @@
 //! `.ucas` + a `.pak` stub. The stock UE loader (`FPakPlatformFile`) discovers
 //! containers by scanning `Paks/*.pak` and derives the `.utoc`/`.ucas` from that
 //! path, so the (empty) `.pak` is required for the container to be mounted at
-//! all — see [`empty_pak_stub`].
+//! all — see `empty_pak_stub`.
 //!
 //! All chunks are stored uncompressed (compression method 0), so no Oodle
 //! *encoder* is needed. Layout matches [`crate::iostore::IoStoreArchive`] exactly and is

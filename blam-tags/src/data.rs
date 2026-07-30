@@ -1,6 +1,6 @@
 //! Tag data tree: the per-tag instance values shaped by a layout.
 //!
-//! Byte ownership is **per block**. Each [`TagBlockData`] owns a single
+//! Byte ownership is **per block**. Each `TagBlockData` owns a single
 //! `raw_data` buffer holding all of its elements' bytes laid out
 //! contiguously. Nested structs, inline arrays, and exploded
 //! pageable-resource payloads are *offset regions* inside their

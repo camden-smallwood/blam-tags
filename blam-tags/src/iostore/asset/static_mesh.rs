@@ -47,9 +47,6 @@ impl<'a> R<'a> {
         self.p += n;
         Ok(s)
     }
-    fn u8(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
-    }
     fn i32(&mut self) -> Result<i32> {
         Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }

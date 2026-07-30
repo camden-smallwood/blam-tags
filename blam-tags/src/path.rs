@@ -26,11 +26,11 @@
 //! (struct/block/array/resource); a same-named non-container leaf (e.g.
 //! the H2 particle "Mapping" custom placeholder) is skipped on descent.
 //!
-//! Lookups return a [`TagFieldCursor`] / [`TagFieldCursorMut`] bundling the
+//! Lookups return a `TagFieldCursor` / `TagFieldCursorMut` bundling the
 //! enclosing block's `raw_data` slice, the containing
-//! [`crate::data::TagStructData`], and the final field's index. Read
-//! primitives via [`TagFieldCursor::parse`]; write via
-//! [`TagFieldCursorMut::set`].
+//! `crate::data::TagStructData`, and the final field's index. Read
+//! primitives via `TagFieldCursor::parse`; write via
+//! `TagFieldCursorMut::set`.
 
 use crate::data::{TagBlockData, TagResourceChunk, TagStructData, TagSubChunkContent};
 use crate::fields::TagFieldType;

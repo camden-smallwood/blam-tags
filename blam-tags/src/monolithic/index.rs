@@ -84,7 +84,7 @@ pub struct TagFileEntry {
     pub creator_filetime_lo: u32,
     pub creator_filetime_hi: u32,
     /// Packed `(partition_handle: u32, datum_handle: u32)` lookup
-    /// key for the `blok` data array. Use [`WideDatumHandle::from_u64`]
+    /// key for the `blok` data array. Use `WideDatumHandle::from_u64`
     /// in `heap.rs` to unpack.
     pub wide_block_index: u64,
     /// Stable per-tag id within this cache. Distinct from the entry's

@@ -30,8 +30,11 @@ use crate::file::TagFile;
 use crate::game::Game;
 use crate::geometry::{read_compression_bounds, strip_to_list, CompressionBounds};
 use crate::math::{
-    Matrix4, RealOrientation, RealPlane3d, RealPoint2d, RealPoint3d, RealQuaternion, RealVector3d,
+    RealOrientation, RealPlane3d, RealPoint2d, RealPoint3d, RealQuaternion, RealVector3d,
 };
+// Only the UE-mesh fusion paths below use a 4x4, and they are all `iostore`.
+#[cfg(feature = "iostore")]
+use crate::math::Matrix4;
 use crate::typed_enums::{Enum, Flags};
 
 //================================================================================
@@ -879,7 +882,7 @@ impl RenderModel {
 
     /// Synthesize the cross-game [`RenderModel`] super-type (+ its
     /// [`RenderMesh`]es) from Halo: Campaign Evolved's UE5 render geometry —
-    /// the CampaignEvolved analog of [`Self::from_gbxmodel_tag`]. Geometry
+    /// the CampaignEvolved analog of `Self::from_gbxmodel_tag`. Geometry
     /// (positions/UVs/normals/skin) comes from one or more UE
     /// [`SkeletalMesh`](crate::iostore::skeletal_mesh::SkeletalMesh)es (a
     /// character's body/head/armor pieces); the node skeleton, markers, and

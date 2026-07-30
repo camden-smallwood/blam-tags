@@ -682,8 +682,8 @@ impl RenderMethod {
     /// the existing data.
     ///
     /// Anchors:
-    /// - [`reference_tag_to_bake_render_method_2026_05_23`] — full call graph
-    /// - [`reference_tool_exe_bake_vs_tagtool_2026_05_23`] — per-type semantics
+    /// - `reference_tag_to_bake_render_method_2026_05_23` — full call graph
+    /// - `reference_tool_exe_bake_vs_tagtool_2026_05_23` — per-type semantics
     pub fn bake(
         &mut self,
         rmdf: &RenderMethodDefinition,
@@ -694,10 +694,10 @@ impl RenderMethod {
         self.bake_with_ctx(rmdf, rmt2, load_rmop, &DefaultEvalContext { eval_time })
     }
 
-    /// Like [`bake`] but threads a caller-supplied
+    /// Like [`Self::bake`] but threads a caller-supplied
     /// [`RenderMethodEvalContext`] so animated_parameter functions with
     /// named inputs (e.g., `"battery_empty"`) get resolved by the caller's
-    /// game state. Most users should use [`bake`] which defaults to
+    /// game state. Most users should use [`Self::bake`] which defaults to
     /// time-only evaluation.
     pub fn bake_with_ctx(
         &mut self,

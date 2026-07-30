@@ -12,7 +12,7 @@
 //! bug).
 //!
 //! The fix: resolve by NAME. The field decoder already resolves the
-//! embedded option/bit names ([`TagFieldData::CharEnum`] etc. carry
+//! embedded option/bit names ([`crate::fields::TagFieldData::CharEnum`] etc. carry
 //! `name` / `names`). We map those names onto a canonical Rust enum `T`
 //! whose variants + discriminants come from the authoritative
 //! `definitions/halo3_mcc/*.json` (`enums_flags`). The stored value is
@@ -217,8 +217,13 @@ impl<T: FromPrimitive + ToPrimitive + Copy, U: TagInt> Enum<T, U> {
             _t: PhantomData,
         }
     }
-    /// The raw storage value (the canonical discriminant). `pub(crate)` —
-    /// callers operate on the typed variant, not the integer.
+
+    /// The raw storage value (the canonical discriminant).
+    ///
+    /// `#[cfg(test)]` on purpose: callers operate on the typed variant and
+    /// never on the integer, so this has no production use — but that the
+    /// wrapper *keeps* the raw discriminant is behaviour worth asserting.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn raw(self) -> U {
         self.raw
@@ -279,7 +284,7 @@ impl<T: SchemaEnum, U: TagInt> fmt::Display for Enum<T, U> {
 }
 
 /// `Default` for explicit fallback construction only — NOT a decode
-/// path (decode always goes through [`Enum::resolve`], which panics on
+/// path (decode always goes through `Enum::resolve`, which panics on
 /// an unresolved value). Requires `T: Default` (mark a `#[default]`
 /// variant). Lets walker structs keep `#[derive(Default)]`.
 impl<T: SchemaEnum + Default, U: TagInt> Default for Enum<T, U> {
@@ -393,8 +398,13 @@ impl<T: FromPrimitive + ToPrimitive + Copy, U: TagInt> Flags<T, U> {
         self.bits == U::ZERO
     }
 
-    /// Canonical bit pattern (bits at `T` discriminants). `pub(crate)` —
-    /// internal/serialization use only; callers use the typed flag API.
+    /// Canonical bit pattern (bits at `T` discriminants, *not* the embedded
+    /// wire positions).
+    ///
+    /// `#[cfg(test)]` on purpose: no production caller needs the raw word, but
+    /// that the re-pack is canonical rather than a replay of the tag's own bit
+    /// order is the load-bearing invariant of this type.
+    #[cfg(test)]
     pub(crate) fn canonical_bits(&self) -> u64 {
         self.bits.to_u64()
     }

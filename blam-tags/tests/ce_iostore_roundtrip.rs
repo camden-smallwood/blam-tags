@@ -203,9 +203,8 @@ fn the_tag_wrapper_fixture_has_leading_empty_fragments() {
     for_each_export(&pkg, &usmap, &classes, |_, class, payload, flags, names| {
         let Ok(parts) = read_export(payload, names, &usmap, class, flags) else { return };
         if let Some(block) = parts.properties() {
-            if let BlockLayout::Unversioned { leading_empty, .. } = block.layout {
-                max_leading = max_leading.max(leading_empty);
-            }
+            let BlockLayout::Unversioned { leading_empty, .. } = block.layout;
+            max_leading = max_leading.max(leading_empty);
         }
     });
     assert!(

@@ -154,7 +154,7 @@ fn interleave(per_channel: Vec<Vec<i16>>, sample_rate: u32) -> Result<DecodedPcm
 /// Decode a raw Xbox IMA-ADPCM stream (H2 "xbox adpcm", WAV format `0x0069`) to
 /// interleaved PCM.
 ///
-/// 1–2 channels are a single Xbox IMA stream ([`decode_xbox_pair`]). **>2
+/// 1–2 channels are a single Xbox IMA stream (`decode_xbox_pair`). **>2
 /// channels** are stored as independent **mono** Xbox-ADPCM streams interleaved
 /// one 16-bit **word (2 bytes) at a time**, round-robin per channel — reverse-
 /// engineered from H2 `tool.exe` (`import_sounds.cpp`: the multichannel encoder

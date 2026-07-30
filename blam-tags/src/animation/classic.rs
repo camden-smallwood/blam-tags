@@ -17,7 +17,7 @@
 //! When the per-animation `compressed data` flag is set, `frame data` holds
 //! a keyframe-compressed block at `offset to compressed data` instead (6-byte
 //! quaternions, real_point3d translations, f32 scales, each with a per-node
-//! keyframe table). See [`decode_compressed`].
+//! keyframe table). See `decode_compressed`.
 //!
 //! This module reuses the shared [`AnimationClip`] currency: it fills
 //! `static_tracks` / `animated_tracks` packed in node order and `node_flags`

@@ -46,7 +46,7 @@ impl<'a> TagDefinitions<'a> {
 //================================================================================
 
 /// A struct definition wrapper — bundles a [`TagLayout`] with a
-/// specific [`TagStructLayout`] index.
+/// specific [`crate::layout::TagStructLayout`] index.
 #[derive(Clone, Copy)]
 pub struct TagStructDefinition<'a> {
     layout: &'a TagLayout,

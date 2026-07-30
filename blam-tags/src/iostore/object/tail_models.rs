@@ -3260,7 +3260,7 @@ impl ManagedArrayCollection {
             };
             // Bulk kinds are self-describing: the stream writes an element
             // size and a count, and the size is kept because it is data.
-            let mut bulk = |r: &mut Reader, expect: usize| -> Result<(i32, usize)> {
+            let bulk = |r: &mut Reader, expect: usize| -> Result<(i32, usize)> {
                 let element_size = r.i32()?;
                 let n = r.i32()?;
                 if element_size < 0 || n < 0 {
@@ -3786,7 +3786,7 @@ impl ShaderMap {
             let n = r.i32()?;
             super::limits::bounded(n, MAX_NATIVE_COUNT, "vertex factory types", r.o - 4)?
         };
-        let mut hashed = |r: &mut Reader, n: usize| -> Result<Vec<HashedName>> {
+        let hashed = |r: &mut Reader, n: usize| -> Result<Vec<HashedName>> {
             (0..n)
                 .map(|_| {
                     let mut h = HashedName::default();
@@ -3829,7 +3829,7 @@ impl ShaderMap {
                 },
             });
         }
-        let mut name_table = |r: &mut Reader, n: usize| -> Result<Vec<NamePatchTable>> {
+        let name_table = |r: &mut Reader, n: usize| -> Result<Vec<NamePatchTable>> {
             let mut out = Vec::with_capacity(n.min(64));
             for _ in 0..n {
                 out.push(NamePatchTable {
@@ -4157,7 +4157,7 @@ impl ActorTail {
 /// the measured corpus stop agreeing, and the corpus wins.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnknownSchemaTail {
-    /// The literal fragment run. Not the interpreted [`Header`], because
+    /// The literal fragment run. Not the interpreted `Header`, because
     /// i343's writer splits fragments in a way `FUnversionedHeaderBuilder`
     /// would not and the canonical re-derivation loses it.
     pub fragments: Vec<super::block::HeaderFragment>,

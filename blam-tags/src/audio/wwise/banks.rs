@@ -72,7 +72,7 @@ impl WwiseBanks {
 
     /// Like [`Self::open_pc`] but opens the given dialogue-language subfolder's
     /// packages (plus the shared top-level SFX packages). `language = None` uses
-    /// [`PREFERRED_LANGUAGE`].
+    /// `PREFERRED_LANGUAGE`.
     pub fn open_pc_language(tags_root: &Path, language: Option<&str>) -> Result<Self, String> {
         let base = tags_root
             .parent()

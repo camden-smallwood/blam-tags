@@ -641,7 +641,7 @@ pub struct DecodedVertex {
 }
 
 /// A decoded cluster: triangles + vertices (ref vertices are `None` until
-/// [`resolve_page_references`] runs).
+/// `resolve_page_references` runs).
 pub struct DecodedCluster {
     pub tri_indices: Vec<[u32; 3]>,
     pub vertices: Vec<Option<DecodedVertex>>,
@@ -700,7 +700,12 @@ impl Cluster {
 
         let base_vertex = (num_prev_new - 1) as u32;
         let read_base = page.disk_header_offset + cdh.index_data_offset as usize;
-        let (mut x, mut y, mut z) = (0u32, 0u32, 0u32);
+        // Every path through the branch below assigns each exactly once, so
+        // there is no initial value to pick and none to leave stale.
+        let x: u32;
+        // `y`/`z` are taken by `&mut` further down, so they stay `mut`.
+        let mut y: u32;
+        let mut z: u32;
         let mut index_data =
             read_unaligned_dword(data, read_base, ((num_prev_ref + !is_start) * 5) as i64 as u64);
 
@@ -790,7 +795,7 @@ impl Cluster {
 
     /// Decode this cluster's geometry (5.4+/5.5 path): triangle indices, the
     /// ref/non-ref vertex classification, and all non-ref vertices. Ref
-    /// vertices are left `None` for [`resolve_page_references`].
+    /// vertices are left `None` for `resolve_page_references`.
     pub fn decode(&self, data: &[u8], page: &Page, cluster_index: u32) -> DecodedCluster {
         let cdh = page.cluster_disk_headers[cluster_index as usize];
 
@@ -1062,7 +1067,7 @@ impl Page {
 }
 
 /// A page decoded to geometry, plus the per-cluster ref pointers (same-page
-/// refs already resolved; cross-page refs pending [`resolve_cross_page`]).
+/// refs already resolved; cross-page refs pending `resolve_cross_page`).
 pub struct DecodedPage {
     pub clusters: Vec<DecodedCluster>,
     pub refs: Vec<Vec<VertexRef>>,

@@ -37,7 +37,7 @@ const FOOTER_BANG: u32 = 0x21402324;
 const FOOTER_DFT: u32 = 0x64406674;
 
 /// A 32-bit datum handle (`salt: u16 high`, `index: u16 low`).
-/// Looking up a slot in a [`DataArray`] reads `index` and validates
+/// Looking up a slot in a `DataArray` reads `index` and validates
 /// the slot's stored salt matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DatumHandle(pub u32);
@@ -62,8 +62,8 @@ impl DatumHandle {
 
 /// 64-bit handle: `(partition_handle, datum_handle)` packed
 /// big-endian. The high 32 bits identify a partition slot in a
-/// [`WideDataArray`]; the low 32 bits identify a datum within that
-/// partition's nested [`DataArray`].
+/// `WideDataArray`; the low 32 bits identify a datum within that
+/// partition's nested `DataArray`.
 #[derive(Debug, Clone, Copy)]
 pub struct WideDatumHandle {
     pub partition: DatumHandle,
@@ -146,7 +146,7 @@ impl WideDataArrayHeader {
 
 /// Leaf datum in the `blok` chunk's nested array: 16 bytes,
 /// stored alongside per-element `datum_index` (4 bytes before) and
-/// footer (4 bytes after) inside a [`DataArray`].
+/// footer (4 bytes after) inside a `DataArray`.
 #[derive(Debug, Clone, Copy)]
 pub struct TagFileBlock {
     /// Slot identifier + an opaque u16. The high u16 (`identifier`)
@@ -184,7 +184,7 @@ impl TagFileBlock {
 
 /// Leaf datum in a partition's `LruvCache.blocks` array: 24 bytes,
 /// stored alongside `datum_index + footer` (8 bytes overhead) inside
-/// a [`DataArray`]. Total per-element stride is 32 bytes.
+/// a `DataArray`. Total per-element stride is 32 bytes.
 #[derive(Debug, Clone, Copy)]
 pub struct LruvBlock {
     /// Identifier (high u16) + flags (u8) + padding (u8). The
@@ -449,7 +449,7 @@ impl PartitionHeapState {
 
 /// Resolved `(file_index, byte_offset, byte_size)` triple — the
 /// output of [`PartitionHeap::resolve_entry`] and the input to the
-/// blob-file readers in [`crate::monolithic::cache`].
+/// blob-file readers in `crate::monolithic::cache`.
 #[derive(Debug, Clone, Copy)]
 pub struct PartitionBlock {
     /// Index into `tags_N` or `cache_N` (which family depends on

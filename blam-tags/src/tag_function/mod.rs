@@ -1321,7 +1321,7 @@ impl TagFunction {
     /// re-appends the editor trailer. For transition/periodic/exponent the
     /// editor mirrors the compact, so the trailer is regenerated from the
     /// compacts to stay consistent; the multi_part editor trailer is
-    /// maintained by [`TagFunctionEditor`] and preserved verbatim here.
+    /// maintained by [`crate::tag_function::editor::TagFunctionEditor`] and preserved verbatim here.
     pub fn to_bytes(&self) -> Vec<u8> {
         if !self.dirty && !self.raw.is_empty() {
             return self.raw.clone();
@@ -1413,7 +1413,7 @@ impl TagFunction {
     /// NOTE: this is the low-level type switch; it invalidates the editor-data
     /// trailer (cleared here). Faithful, Foundation-compatible conversion —
     /// including a valid identity `MultiSpline` and consistent ranged-second
-    /// handling — is done by [`TagFunctionEditor::set_master_type`].
+    /// handling — is done by [`crate::tag_function::editor::TagFunctionEditor::set_master_type`].
     pub fn set_function_type(&mut self, target: FunctionType) {
         if self.function_type() == target {
             return;

@@ -33,7 +33,7 @@
 //! raw name like `ambient color:[0,255]` or `max sounds [1,16]` reached the path
 //! layer verbatim, its `:`/`[`/`#` would collide with the path grammar's own
 //! `type:`, `[index]`, and `#ordinal` tokens. Cleaning both the stored name and
-//! the lookup query (see [`crate::data::field_name_matches`]) makes lookups
+//! the lookup query (see `crate::data::field_name_matches`) makes lookups
 //! markup-insensitive regardless of how a given tag happened to store its names.
 
 use std::borrow::Cow;
@@ -155,7 +155,7 @@ fn units_slot<'a>(head: &'a str, range: Option<&str>) -> Option<&'a str> {
 
 /// The bare addressable name for `raw` — markup stripped. Borrows when possible.
 ///
-/// This is the hot path used by [`crate::data::field_name_matches`] and the
+/// This is the hot path used by `crate::data::field_name_matches` and the
 /// path layer; keep it allocation-free for the common (no-`/`) case.
 pub fn clean_field_name(raw: &str) -> Cow<'_, str> {
     clean_name_cow(raw)

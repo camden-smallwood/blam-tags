@@ -79,7 +79,7 @@ impl MonolithicChunk {
 }
 
 /// Convenience for code that wants to read just the header without
-/// constructing a [`MonolithicChunk`]. Mirrors [`crate::io::read_chunk_header`]
+/// constructing a [`MonolithicChunk`]. Mirrors `crate::io::read_chunk_header`
 /// hard-coded to BE.
 pub fn read_be_chunk_header<R: Read>(
     reader: &mut std::io::BufReader<R>,

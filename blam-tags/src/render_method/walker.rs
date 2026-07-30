@@ -69,7 +69,7 @@ pub enum ParameterSource {
 pub enum ResolvedValue {
     Bitmap(BitmapBinding),
     /// `Color` and `ArgbColor` parameters both land here. The 4 slots
-    /// are A, R, G, B in `[0, 1]`; bit-pack via [`ArgbColor`] if you
+    /// are A, R, G, B in `[0, 1]`; bit-pack via [`crate::math::ArgbColor`] if you
     /// need the original `u32`.
     Color([f32; 4]),
     Real(f32),
@@ -82,7 +82,7 @@ pub enum ResolvedValue {
 ///
 /// `address_mode` is the unified axis mode — for materials that author
 /// per-axis overrides (`bitmap_address_mode_x` / `_y` on the rmsh
-/// parameter), see [`address_mode_x`] / [`address_mode_y`].
+/// parameter), see `address_mode_x` / `address_mode_y`.
 #[derive(Debug, Clone)]
 pub struct BitmapBinding {
     /// Tag-relative path to the `.bitmap` (e.g.,
@@ -97,7 +97,7 @@ pub struct BitmapBinding {
     /// Unified address mode — when the rmsh parameter is present, this
     /// is its `bitmap_address_mode` field; otherwise the rmop's
     /// `default_address_mode`. Per-axis overrides (`bitmap_address_mode_x` /
-    /// `_y`) are surfaced separately as [`address_mode_x`] / [`address_mode_y`].
+    /// `_y`) are surfaced separately as `address_mode_x` / `address_mode_y`.
     pub address_mode: BitmapAddressMode,
     /// Per-axis U/X address mode. Falls back to `address_mode` when the
     /// rmsh parameter doesn't author a per-axis override.
@@ -177,7 +177,7 @@ impl ResolvedRenderMethod {
     /// Time-aware resolve — evaluates animated functions at
     /// `(input, range) = (time_seconds, time_seconds)`. Color
     /// gradients still return a stub-white from
-    /// [`TagFunction::evaluate_color`] until that path is implemented.
+    /// [`crate::tag_function::TagFunction::evaluate_color`] until that path is implemented.
     pub fn resolve_with_time(
         rm: &RenderMethod,
         rmdf: &RenderMethodDefinition,

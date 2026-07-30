@@ -1,6 +1,6 @@
 //! Read-only reader for UE5 **IoStore** containers (`.utoc` index + `.ucas`
 //! data), used to mount Halo: Campaign Evolved's packaged tags as a virtual
-//! filesystem.
+//! filesystem. Gated behind the `iostore` feature.
 //!
 //! Campaign Evolved is a UE5 remake of Halo 1 on a modified Reach engine. Its
 //! Reach tags are cooked into UE5 packages: each tag is a

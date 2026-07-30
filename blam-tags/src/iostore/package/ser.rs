@@ -67,7 +67,7 @@ pub trait WriteExt: Write {
     {
         value.ser(self)
     }
-    /// Serialize &[T] without length prefix
+    /// Serialize `&[T]` without length prefix
     fn ser_no_length<T: Writeable, S: AsRef<[T]>>(&mut self, value: &S) -> Result<()>
     where
         Self: Sized,

@@ -224,7 +224,7 @@ impl<'a> TagStruct<'a> {
     }
 
     /// User-addressable field names in declaration order. Mirrors
-    /// [`TagStructData::field_names`] — used by the CLI's "did you
+    /// `TagStructData::field_names` — used by the CLI's "did you
     /// mean?" path.
     pub fn field_names(&self) -> impl Iterator<Item = &'a str> + 'a {
         self.struct_data.field_names(self.layout)
@@ -263,7 +263,7 @@ impl<'a> TagStruct<'a> {
 
     /// Resolve a `/`-separated field path. Accepts optional
     /// `Type:name` filter and `[N]` block/array index per segment —
-    /// same grammar as [`crate::path::lookup`].
+    /// same grammar as `crate::path::lookup`.
     pub fn field_path(&self, path: &str) -> Option<TagField<'a>> {
         let cursor = crate::path::lookup_from_struct(
             self.layout, self.struct_data, self.struct_raw, path,
@@ -509,7 +509,7 @@ impl<'a> TagStruct<'a> {
 
     /// Read a `real_quaternion` field as `[i, j, k, w]`. Returns the
     /// Read a `real_quaternion` field. Returns
-    /// [`RealQuaternion::IDENTITY`] when the field is *missing* (not
+    /// [`crate::math::RealQuaternion::IDENTITY`] when the field is *missing* (not
     /// present in this struct). **Panics** if the field is present
     /// but has a non-quaternion type — that's a code-vs-schema
     /// mismatch, not a runtime data issue, and silent defaults would
@@ -522,7 +522,7 @@ impl<'a> TagStruct<'a> {
         }
     }
 
-    /// Read a `real_point_3d` field. Returns [`RealPoint3d::ZERO`]
+    /// Read a `real_point_3d` field. Returns [`crate::math::RealPoint3d::ZERO`]
     /// when the field is missing. **Panics** if the field is present
     /// but has a different math type — for `real_vector_3d` use
     /// [`Self::read_vec3`].
@@ -534,7 +534,7 @@ impl<'a> TagStruct<'a> {
         }
     }
 
-    /// Read a `real_vector_3d` field. Returns [`RealVector3d::ZERO`]
+    /// Read a `real_vector_3d` field. Returns [`crate::math::RealVector3d::ZERO`]
     /// when the field is missing. **Panics** on type mismatch — see
     /// [`Self::read_point3d`].
     pub fn read_vec3(&self, name: &str) -> crate::math::RealVector3d {
@@ -545,7 +545,7 @@ impl<'a> TagStruct<'a> {
         }
     }
 
-    /// Read a `real_point_2d` field. Returns [`RealPoint2d::ZERO`]
+    /// Read a `real_point_2d` field. Returns [`crate::math::RealPoint2d::ZERO`]
     /// when the field is missing. **Panics** on type mismatch.
     pub fn read_point2d(&self, name: &str) -> crate::math::RealPoint2d {
         match self.field(name).and_then(|f| f.value()) {
@@ -1208,7 +1208,7 @@ impl<'a> TagResource<'a> {
 
     /// The raw `tgdt` payload bytes for an Exploded resource. The
     /// leading `struct_size` bytes are the header struct's raw bytes
-    /// (also reachable via [`as_struct`]); any trailing bytes are
+    /// (also reachable via `as_struct`); any trailing bytes are
     /// opaque per-group data.
     pub fn exploded_payload(&self) -> Option<&'a [u8]> {
         match self.chunk {
@@ -1227,7 +1227,7 @@ impl<'a> TagResource<'a> {
     }
 
     /// For resources that were originally a `tgxc` xsync state and
-    /// have since been hydrated by [`crate::MonolithicCache::read_tag`]
+    /// have since been hydrated by [`crate::monolithic::MonolithicCache::read_tag`]
     /// into the [`TagResourceKind::Exploded`] shape, the parsed xsync
     /// state — control_data, fixups, root address, interop GUIDs.
     /// `None` for MCC-native `tgrc` resources and for any other

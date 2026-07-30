@@ -5,8 +5,9 @@
 //! de-duplicated in FMOD's `VorbisCodecSetups[]` table, which we extracted
 //! into a bundled blob (see `tools/extract_vorbis_books.py`). Each packet is
 //! a stock libVorbis 1.3.2 setup header, so once we look it up by CRC32 and
-//! synthesize the (trivial) identification + comment headers, a standard
-//! Vorbis decoder (`lewton`) decodes the audio packets directly.
+//! synthesize the (trivial) identification header, a standard
+//! Vorbis decoder (`lewton`) decodes the audio packets directly. No comment
+//! header is built: `read_audio_packet` needs only identification + setup.
 //!
 //! On disk each subsound's data is a flat sequence of audio packets, each
 //! prefixed by a little-endian `u16` length (FMOD's "V1" framing — no Ogg
@@ -70,16 +71,6 @@ fn ident_packet(channels: u8, sample_rate: u32) -> Vec<u8> {
     v
 }
 
-/// Synthesize a minimal Vorbis comment header packet (no vendor, no tags).
-fn comment_packet() -> Vec<u8> {
-    let mut v = Vec::with_capacity(16);
-    v.push(0x03);
-    v.extend_from_slice(b"vorbis");
-    v.extend_from_slice(&0u32.to_le_bytes()); // vendor length
-    v.extend_from_slice(&0u32.to_le_bytes()); // user comment list length
-    v.push(0x01); // framing bit
-    v
-}
 
 /// Decoded PCM: interleaved 16-bit samples plus stream parameters.
 pub struct DecodedPcm {
@@ -125,7 +116,6 @@ pub fn decode_subsound(
 
     let ident: IdentHeader =
         read_header_ident(&ident_packet(channels, sample_rate)).map_err(|e| format!("ident: {e:?}"))?;
-    // Comment header is parsed for completeness/validation but unused.
     let setup: SetupHeader = read_header_setup(setup_bytes, channels, (8, 11))
         .map_err(|e| format!("setup 0x{setup_hash:08x}: {e:?}"))?;
 
@@ -196,7 +186,7 @@ fn interleave_into(out: &mut Vec<i16>, chans: &[Vec<i16>], channels: usize) {
 /// - 5ch : FL, C, FR, BL, BR
 /// - 6ch : FL, C, FR, BL, BR, LFE
 ///
-/// Returns a 2-channel (stereo) interleaved Vec<i16>.  If `channels` is
+/// Returns a 2-channel (stereo) interleaved `Vec<i16>`.  If `channels` is
 /// already ≤2 the input slice is returned as-is via `to_vec()`.
 pub fn downmix_to_stereo(samples: &[i16], channels: usize) -> Vec<i16> {
     if channels <= 2 {

@@ -18,11 +18,11 @@ use super::value::{FName, FStr};
 
 /// A bidirectional byte archive.
 ///
-/// Implemented by [`Reader`] (loading) and [`Writer`] (saving). Every method
-/// takes the value by `&mut` so one body serves both directions; branch on
-/// [`Ar::is_loading`] only where the *shape* genuinely differs, such as sizing a
-/// container from a count that is read on load and derived on save.
-pub(super) trait Ar {
+/// Implemented by [`Reader`] (loading) and `Writer` (saving). Every method
+/// takes the value by `&mut` so one body serves both directions. There is
+/// deliberately no `is_loading`: nothing yet needs to branch on direction, and
+/// the note below records what would justify adding one.
+pub trait Ar {
     fn u8(&mut self, v: &mut u8) -> Result<()>;
     fn u16(&mut self, v: &mut u16) -> Result<()>;
     fn i32(&mut self, v: &mut i32) -> Result<()>;

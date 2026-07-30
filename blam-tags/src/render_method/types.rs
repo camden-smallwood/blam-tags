@@ -713,8 +713,8 @@ pub struct RenderMethodPostprocessPass {
 /// layout differs slightly — MCC stores 12 `s_tag_block_index` slots,
 /// vs Ares 12 + four `u8` extern sizes + pad).
 ///
-/// One slot per [`ParameterUsage`]-equivalent dimension; the runtime
-/// dispatches to a different submit function per slot.
+/// One slot per parameter-usage dimension; the runtime dispatches to a
+/// different submit function per slot.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RenderMethodTemplatePass {
     pub bitmaps:                       TagBlockIndex,

@@ -446,7 +446,7 @@ pub fn flattened_schema<'u>(
 ///
 /// [`Header`] is the *interpreted* form — which schema indices carry a value —
 /// and is what almost everything wants. It is deliberately lossy about how the
-/// fragment run was split, because [`HeaderBuilder`] re-derives a canonical
+/// fragment run was split, because `HeaderBuilder` re-derives a canonical
 /// split and that reproduces every header Epic's cooker wrote.
 ///
 /// It does not reproduce every header *i343's* tools wrote. They emit a
@@ -1075,7 +1075,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize)> {
 }
 
 /// As [`parse_header`], also returning the flattened schema length the header
-/// walks over — see [`read_header_walked`]. `(header, bytes_used, schema_len)`.
+/// walks over — see `read_header_walked`. `(header, bytes_used, schema_len)`.
 pub fn parse_header_walked(bytes: &[u8]) -> Result<(Header, usize, usize)> {
     let mut r = Reader::new(bytes, &[]);
     let (h, walked) = read_header_walked(&mut r)?;

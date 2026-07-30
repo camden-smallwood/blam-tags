@@ -1,6 +1,6 @@
 //! `model_animation_graph` (jmad) animation extraction.
 //!
-//! [`Animation::new(&tag)`] walks the user-facing `definitions/animations`
+//! `Animation::new(&tag)` walks the user-facing `definitions/animations`
 //! block (or `resources/animations` for older inline-layout tags) and
 //! pairs each entry with its `tag resource groups[r]/tag_resource/
 //! group_members[m]` runtime payload. Each [`AnimationGroup`] carries
@@ -141,11 +141,11 @@ pub enum SizeLayout {
     H3,
     /// Reach onward. 17 fields, all i32. Field names kept the same,
     /// but several now carry codec/flag sizes rather than what the
-    /// names suggest. See [`Self::reach_static_codec_size`] etc.
+    /// names suggest — see the Reach arms of the size accessors below.
     Reach,
     /// Halo 2 (`jmad`). The on-disk `data sizes` are stored either as
     /// a 7-field unnamed struct (pool-block v1/v2) or as separate inline
-    /// fields (pool-block v0); [`read_h2_data_sizes`] normalizes both to
+    /// fields (pool-block v0); `read_h2_data_sizes` normalizes both to
     /// the positional order `[static_codec, animated_codec, static_flags,
     /// animated_flags, movement, pill]`. That order matches Reach's, so
     /// the codec decoder addresses Halo 2 with the same positional logic

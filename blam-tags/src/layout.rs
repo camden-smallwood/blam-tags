@@ -86,7 +86,7 @@ pub struct TagFieldLayout {
 #[derive(Debug)]
 pub struct TagBlockLayout {
     /// Position in [`TagLayout::block_layouts`]. Tracked so
-    /// [`crate::data::TagBlockData`] can remember which block it came from.
+    /// `crate::data::TagBlockData` can remember which block it came from.
     pub index: u32,
     /// Offset into [`TagLayout::string_data`] of the block name.
     pub name_offset: u32,
@@ -106,7 +106,7 @@ pub struct TagResourceLayout {
     pub unknown: u32,
     /// Index into [`TagLayout::struct_layouts`] of the struct that
     /// wraps the resource payload when it's in
-    /// [`crate::data::TagResourceChunk::Exploded`] form.
+    /// `crate::data::TagResourceChunk::Exploded` form.
     pub struct_index: u32,
 }
 
@@ -127,7 +127,7 @@ pub struct TagInteropLayout {
 #[derive(Debug)]
 pub struct TagStructLayout {
     /// Position in [`TagLayout::struct_layouts`]. Tracked so
-    /// [`crate::data::TagStructData`] can remember which struct it came from.
+    /// `crate::data::TagStructData` can remember which struct it came from.
     pub index: u32,
     /// Stable identifier for the struct type across layout versions.
     pub guid: [u8;16],

@@ -7,7 +7,7 @@
 //! **Byte order:** integers can be either little-endian (PC / MCC, the
 //! common case) or big-endian (Xbox 360 / legacy builds). The
 //! [`Endian`] enum + dispatching readers ([`read_u16`], [`read_u32`],
-//! [`read_u64`], [`read_i32`]) pick the right byte order at runtime; the
+//! [`read_u64`]) pick the right byte order at runtime; the
 //! `_le` and `_be` variants are the internal implementations and only
 //! get called directly from the dispatchers + endian detection.
 //!

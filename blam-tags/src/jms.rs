@@ -46,7 +46,10 @@ use crate::geometry::{
     read_compression_bounds, strip_to_list, strip_to_list_u32, walk_surface_ring,
     CompressionBounds, EdgeRow, SCALE,
 };
-use crate::math::{Matrix4, RealPoint3d, RealQuaternion, RealVector3d};
+use crate::math::{RealPoint3d, RealQuaternion, RealVector3d};
+// Only the UE-mesh fusion paths below use a 4x4, and they are all `iostore`.
+#[cfg(feature = "iostore")]
+use crate::math::Matrix4;
 
 /// JMS export errors. Most failures during a corpus sweep land in
 /// `MissingField` (schema-shape variation) or `Io` (write-out).
@@ -161,7 +164,7 @@ pub struct UeStaticPart<'a> {
     pub name: String,
     pub material_names: Vec<String>,
     /// The component's transform relative to `bone_name` (from
-    /// `RuntimeStaticMesh.Transform`); [`MeshTransform::default`] = identity.
+    /// `RuntimeStaticMesh.Transform`); `MeshTransform::default` = identity.
     pub rel_transform: crate::iostore::unversioned::MeshTransform,
     /// When `Some(anchor)`, the piece is a MetaHuman hat/helmet authored
     /// **world-aligned** at a head socket, in the local frame of the MetaHuman

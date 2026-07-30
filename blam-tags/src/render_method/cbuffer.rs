@@ -386,10 +386,6 @@ fn name_is_multiplier(name: &str) -> bool {
         || name.starts_with("environment_map_specular_contribution")
 }
 
-fn eval_value(f: &TagFunction) -> f32 {
-    f.evaluate(0.0, 0.0)
-}
-
 /// Time-aware scalar eval — feeds the function input from
 /// `(time_period, eval_time)`. If `time_period > 0`, input is the
 /// normalized phase `(t mod period) / period` (cyclic). Otherwise the

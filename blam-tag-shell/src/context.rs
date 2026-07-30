@@ -220,12 +220,6 @@ impl CliContext {
         self.read_tag_file(&path)
     }
 
-    /// True when this context resolves tag references through a
-    /// monolithic cache rather than the filesystem.
-    pub fn is_cache_mode(&self) -> bool {
-        self.cache.is_some()
-    }
-
     /// Immutable borrow of the loaded tag. Context is the command
     /// name for the error message when nothing is loaded.
     pub fn loaded(&self, cmd: &str) -> Result<&LoadedTag> {
@@ -271,7 +265,7 @@ impl LoadedTag {
 
     /// Save and report where it went. Convenience for mutating
     /// commands — returns `(target_path, was_redirected)` so callers
-    /// can print a "saved to <path>" line only when output differs
+    /// can print a `"saved to <path>"` line only when output differs
     /// from the source.
     pub fn commit(&mut self, dest: Option<&Path>) -> Result<Commit> {
         let source = self.path.clone();

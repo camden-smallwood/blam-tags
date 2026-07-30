@@ -29,7 +29,7 @@
 //! producing a broken layout.
 //!
 //! Inheritance: when a schema declares `parent_tag`, ancestor
-//! registries are merged into the child via [`merge_parent_schemas`]
+//! registries are merged into the child via `merge_parent_schemas`
 //! before the build, so cross-parent references (e.g. biped's
 //! `biped_group` referencing `mapping_function` from object) resolve
 //! transparently.

@@ -208,7 +208,7 @@ impl MonolithicCache {
     /// After parsing, performs a **resource-hydration** pass: every
     /// pageable-resource field whose payload is an inline `tgxc`
     /// xsync state is rewritten to a regular
-    /// [`TagResourceChunk::Exploded`] with the primary data slurped
+    /// `TagResourceChunk::Exploded` with the primary data slurped
     /// from this tag's `cache_N` partition block. Consumers (bitmap,
     /// render-geometry, etc.) then read the resource bytes via the
     /// same API surface they use for MCC's inline-`Exploded` form.

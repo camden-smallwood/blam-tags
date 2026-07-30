@@ -46,7 +46,7 @@ pub fn intern_name(name_map: &mut FNameMap, text: &str) -> FName {
 /// need that.
 ///
 /// Entries are kept in ascending schema order, which
-/// [`write_block`](super::block::write_block) requires — `FUnversionedHeaderBuilder`
+/// `write_block` requires — `FUnversionedHeaderBuilder`
 /// walks the schema forwards and cannot express going back.
 pub fn set_property(
     block: &mut PropertyBlock,
@@ -81,13 +81,12 @@ pub fn set_property_slot(
 
     // The block records the schema it was read against; a property beyond it
     // would produce a header the loader walks off the end of.
-    if let BlockLayout::Unversioned { schema_len, .. } = block.layout {
-        if schema_index >= schema_len {
-            bail!(
-                "{property} is schema index {schema_index} but the block was read against a \
-                 {schema_len}-property schema"
-            );
-        }
+    let BlockLayout::Unversioned { schema_len, .. } = block.layout;
+    if schema_index >= schema_len {
+        bail!(
+            "{property} is schema index {schema_index} but the block was read against a \
+             {schema_len}-property schema"
+        );
     }
 
     match block.entries.iter_mut().find(|e| e.slot.is_some_and(|s| s.index == schema_index)) {

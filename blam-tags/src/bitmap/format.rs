@@ -4,7 +4,7 @@
 //! `bitmap_formats` enum (49 entries across halo3_mcc, halo3odst_mcc,
 //! haloreach_mcc, halo4_mcc / halo4_xbox360 schemas). Indices on disk
 //! differ between games, but the schema enum option *names* are
-//! stable and that's what [`Self::from_schema_name`] keys on.
+//! stable and that's what [`crate::bitmap::BitmapFormat::from_schema_name`] keys on.
 //!
 //! [`BitmapCurve`] is the canonical 6-value `e_bitmap_curve` enum
 //! verified against H3 source `bitmap_curve.h`. Maps to the schema's
@@ -137,7 +137,7 @@ pub enum BitmapFormat {
     /// 24-bit depth (Reach+). Render-only; not observed in shipped tags.
     Depth24,
     /// Classic Halo CE / Halo 2 palettized 8-bit. Each pixel is an
-    /// index into a fixed 256-entry palette ([`super::p8::P8_PALETTE`]).
+    /// index into a fixed 256-entry palette (`super::p8::P8_PALETTE`).
     /// Used for height / vector (bump) maps. Decodes to A8R8G8B8 via
     /// the palette — no native DDS pixelformat.
     P8,

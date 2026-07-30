@@ -1292,7 +1292,7 @@ pub(super) fn read_rig_hierarchy(r: &mut Reader) -> Result<()> {
 /// Returns `false` when the rest of this export is not modeled, so the caller
 /// stops and reports the remainder as an unmodeled tail instead of guessing.
 /// Every class whose own `Serialize` appends something, i.e. every class the
-/// dispatcher in [`read_class_native_tail`] has an arm for.
+/// dispatcher in `read_class_native_tail` has an arm for.
 ///
 /// Exposed so a tool can ask "does this class contribute a tail of its own, or
 /// is its tail entirely inherited?" — which is what says whether a subclass

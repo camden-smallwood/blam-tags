@@ -97,7 +97,7 @@ pub struct AssVertex {
     pub uvs: Vec<RealPoint3d>,
 }
 
-/// ASS triangle: material slot + 3 vertex indices into [`AssObject::vertices`].
+/// ASS triangle: material slot + 3 vertex indices into `AssObject::vertices`.
 #[derive(Debug, Clone)]
 pub struct AssTriangle {
     pub material: i32,

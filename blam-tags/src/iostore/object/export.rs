@@ -336,7 +336,11 @@ pub fn read_export_in(
     names: &[String],
     usmap: &Usmap,
     class: &str,
-    object_flags: u32,
+    // Unread for the same reason as in [`read_uobject_trailer`]: the trailer has
+    // no `RF_ClassDefaultObject` branch, so a CDO is read like anything else.
+    // Kept in the signature because callers have the flags and the distinction
+    // is worth being explicit about having checked.
+    _object_flags: u32,
     ctx: &ExportContext<'_>,
 ) -> Result<Export> {
     if NO_PROPERTY_BLOCK.contains(&class) {

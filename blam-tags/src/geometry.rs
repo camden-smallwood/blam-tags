@@ -23,7 +23,7 @@
 //! [`crate::math::RealQuaternion`], [`crate::math::RealPlane3d`]).
 //! Use those.
 //!
-//! World-units → JMS/ASS centimeter scale factor [`SCALE`] also
+//! World-units → JMS/ASS centimeter scale factor `SCALE` also
 //! lives here so both format modules use the same value.
 
 use crate::api::TagStruct;

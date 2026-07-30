@@ -1,7 +1,7 @@
 //! Structs whose `Serialize` lives in engine code rather than in a schema, as
 //! typed values.
 //!
-//! These are the 23 shapes [`super::structs::read_native_variable_struct`]
+//! These are the 23 shapes `super::structs::read_native_variable_struct`
 //! decodes by hand. Until now each produced a `PropertyBlock` of loose fields
 //! carrying a `BlockLayout::Native` span, and the span — not the fields — was
 //! what got written. That makes the fields a *view* and the bytes the truth,

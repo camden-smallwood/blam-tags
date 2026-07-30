@@ -25,7 +25,7 @@
 //! byte offset into that blob. Entries there are bit-packed
 //! (`FPakFile::DecodePakEntry`); each file's payload is additionally preceded
 //! on disk by a re-serialized `FPakEntry` header, which is what
-//! [`entry_header_len`] accounts for.
+//! `entry_header_len` accounts for.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
