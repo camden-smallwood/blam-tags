@@ -1202,12 +1202,37 @@ mod tests {
     /// in those words, rather than quietly looking cited.
     #[test]
     fn every_type_cites_its_engine_declaration() {
-        let src = include_str!("ue_struct.rs");
+        check_citations(include_str!("ue_struct.rs"), &[]);
+    }
+
+    /// The same rule for the tail models, which mirror engine *serializers*
+    /// rather than engine structs.
+    ///
+    /// The exemptions are this crate's own plumbing — a context object, a
+    /// two-way choice, and the piece/value pair that lets a flat tail be
+    /// declared as data. None of them corresponds to anything in the engine, so
+    /// demanding a citation would only invite a fake one.
+    #[test]
+    fn every_tail_model_cites_its_engine_serializer() {
+        check_citations(
+            include_str!("tail_models.rs"),
+            &["TailContext", "Result2", "TailPiece", "TailValue"],
+        );
+    }
+
+    fn check_citations(src: &str, exempt: &[&str]) {
         let lines: Vec<&str> = src.lines().collect();
         let mut missing = Vec::new();
         for (i, l) in lines.iter().enumerate() {
-            let Some(name) = l.strip_prefix("pub struct ") else { continue };
+            let Some(name) =
+                l.strip_prefix("pub struct ").or_else(|| l.strip_prefix("pub enum "))
+            else {
+                continue;
+            };
             let name = name.split(|c: char| !c.is_alphanumeric() && c != '_').next().unwrap_or("");
+            if exempt.contains(&name) {
+                continue;
+            }
             // Walk back over the attributes and doc comment.
             let mut doc = String::new();
             let mut j = i;
@@ -1225,6 +1250,7 @@ mod tests {
                 || doc.contains(".cpp:")
                 || doc.contains(".h)")
                 || doc.contains(".cpp)")
+                || doc.contains(".inl)")
                 || doc.contains("Not located in the engine source");
             if !cited {
                 missing.push(name.to_string());

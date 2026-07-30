@@ -101,6 +101,7 @@ use super::value::{FName, FStr, PropValue, PropertyBlock};
 /// A `TArray` written with `BulkSerialize`: element size, count, then
 /// `count × size` blittable bytes.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `TArray::BulkSerialize` (Array.h).
 pub struct BulkArray {
     pub element_size: i32,
     pub data: Vec<u8>,
@@ -144,6 +145,7 @@ impl BulkArray {
 
 /// An `FColorVertexBuffer` inside a component's per-LOD override colours.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FColorVertexBuffer` (ColorVertexBuffer.h).
 pub struct ColorVertexBuffer {
     pub global_strip: u8,
     pub class_strip: u8,
@@ -156,6 +158,7 @@ pub struct ColorVertexBuffer {
 
 /// One entry of `UStaticMeshComponent::LODData`.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FStaticMeshComponentLODInfo` (StaticMeshComponent.h).
 pub struct StaticMeshComponentLodInfo {
     pub global_strip: u8,
     pub class_strip: u8,
@@ -171,6 +174,7 @@ pub struct StaticMeshComponentLodInfo {
 
 /// The `UStaticMeshComponent` tail: 126,158 exports, median 16 bytes.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `UStaticMeshComponent::Serialize` (StaticMeshComponent.cpp).
 pub struct StaticMeshComponentTail {
     pub lod_data: Vec<StaticMeshComponentLodInfo>,
     /// `MeshPaintTextureCooked`, behind its own four-byte present flag.
@@ -278,6 +282,7 @@ fn write_lod_info(ar: &mut impl Ar, lod: &StaticMeshComponentLodInfo) -> Result<
 /// `UActorComponent`'s tail: the sparse UCS-modified-property list, each entry
 /// an `FPackageIndex`, an `FName` and an `FGuid` — 28 bytes.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `UActorComponent::Serialize` (ActorComponent.cpp).
 pub struct ActorComponentTail {
     pub ucs_modified_properties: Vec<UcsModifiedProperty>,
 }
@@ -289,12 +294,14 @@ pub struct ActorComponentTail {
 /// the four-byte present flag. That distinction is the whole difficulty: the
 /// bytes that exist depend on a value in the property block.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `USceneComponent::Serialize` (SceneComponent.cpp).
 pub struct SceneComponentTail {
     pub bounds: Option<Option<[u8; 56]>>,
 }
 
 /// The whole tail of a `UStaticMeshComponent` export, chain and all.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `UStaticMeshComponent::Serialize` (StaticMeshComponent.cpp).
 pub struct StaticMeshComponentChainTail {
     pub actor_component: ActorComponentTail,
     pub scene_component: SceneComponentTail,
@@ -315,6 +322,7 @@ fn scene_component_writes_bounds(block: &PropertyBlock) -> bool {
 /// `USpotLightComponent` to `UHaloAudioPlacementComponent`, whose whole tail is
 /// these two layers.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `USceneComponent::Serialize` (SceneComponent.cpp).
 pub struct SceneComponentChainTail {
     pub actor_component: ActorComponentTail,
     pub scene_component: SceneComponentTail,
@@ -398,6 +406,7 @@ impl StaticMeshComponentChainTail {
 /// cooked component with no instances writes a size the model has to reproduce,
 /// and deriving it from `items` would be guessing at a width nothing observed.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `TArray::BulkSerialize` (Array.h).
 pub struct TypedBulkArray<T> {
     pub element_size: i32,
     pub items: Vec<T>,
@@ -476,6 +485,7 @@ fn write_matrix(m: &InstanceTransform) -> Vec<u8> {
 /// are 128-byte `FMatrix`es (3,425,245 of them) and the custom data is
 /// 4-byte floats (4,588,932). See `ce_ismc_probe`.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `UInstancedStaticMeshComponent::Serialize` (InstancedStaticMesh.cpp).
 pub struct InstancedStaticMeshComponentTail {
     pub cooked: bool,
     /// The authoring instance buffers, written when the component did not skip
@@ -488,6 +498,7 @@ pub struct InstancedStaticMeshComponentTail {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `UInstancedStaticMeshComponent::Serialize` (InstancedStaticMesh.cpp).
 pub struct InstanceBuffers {
     pub transforms: TypedBulkArray<InstanceTransform>,
     pub custom_data: TypedBulkArray<f32>,
@@ -607,6 +618,7 @@ impl ClusterNode {
 /// built from the ISMC layer alone came up exactly 8 bytes — one empty bulk
 /// array — short on every foliage export.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `UHierarchicalInstancedStaticMeshComponent::Serialize` (HierarchicalInstancedStaticMeshComponent.cpp).
 pub struct HierarchicalInstancedStaticMeshComponentTail {
     pub cluster_tree: TypedBulkArray<ClusterNode>,
 }
@@ -617,6 +629,7 @@ pub struct HierarchicalInstancedStaticMeshComponentTail {
 /// present only for the classes that descend through
 /// `UHierarchicalInstancedStaticMeshComponent`.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `UInstancedStaticMeshComponent::Serialize` (InstancedStaticMesh.cpp).
 pub struct InstancedStaticMeshComponentChainTail {
     pub actor_component: ActorComponentTail,
     pub scene_component: SceneComponentTail,
@@ -741,6 +754,7 @@ pub struct TextureMip {
 /// recomputed on write — retaining it would let the model disagree with its own
 /// contents.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `SerializePlatformData` (TextureDerivedData.cpp:2834).
 pub struct TexturePlatformData {
     pub format_name: FName,
     /// The cook can emit a derived-data *reference* instead of the data. Not
@@ -776,6 +790,7 @@ impl TexturePlatformData {
 /// `UTexture2D` alone writes a `bSerializeMipData` flag between the cooked flag
 /// and the list; the other classes call the shared serializer directly.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `UTexture::SerializeCookedPlatformData` (TextureDerivedData.cpp:3335).
 pub struct TextureCookedData {
     pub strip_flags: StripDataFlags,
     pub cooked: bool,
@@ -1042,6 +1057,7 @@ pub struct VirtualTextureTileOffsetData {
 
 /// One streamed chunk of a virtual texture's built data.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FVirtualTextureDataChunk` (VirtualTextureBuiltData.h:37).
 pub struct VirtualTextureDataChunk {
     pub bulk_data_hash: ShaHash,
     pub size_in_bytes: u32,
@@ -1234,6 +1250,7 @@ impl VirtualTextureBuiltData {
 
 /// An `FWeightedRandomSampler`: two float arrays and a total weight.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FWeightedRandomSampler` (WeightedRandomSampler.h).
 pub struct WeightedRandomSampler {
     pub prob: Vec<f32>,
     pub alias: Vec<i32>,
@@ -1271,6 +1288,7 @@ impl WeightedRandomSampler {
 /// An `FRawStaticIndexBuffer`: a 32-bit flag, the indices as a bulk array, and
 /// the "should expand to 32 bit" flag.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FRawStaticIndexBuffer` (StaticMeshResources.h).
 pub struct RawStaticIndexBuffer {
     pub is_32_bit: u32,
     pub indices: BulkArray,
@@ -1299,6 +1317,7 @@ impl RawStaticIndexBuffer {
 /// vertex *formats* need modeling here: the stride and the flags that decide it
 /// are all present as values, and the packed vertices behind them are leaf data.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FStaticMeshLODResources::SerializeBuffers` (StaticMeshResources.h).
 pub struct StaticMeshBuffers {
     pub global_strip: u8,
     pub class_strip: u8,
@@ -1329,6 +1348,7 @@ pub struct StaticMeshBuffers {
 
 /// The samplers that follow the buffers: one per section, then one for the LOD.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FStaticMeshSectionAreaWeightedTriangleSampler` (StaticMeshResources.h:255).
 pub struct StaticMeshSamplers {
     pub per_section: Vec<WeightedRandomSampler>,
     pub area_weighted: WeightedRandomSampler,
@@ -1453,6 +1473,7 @@ fn write_optional_index_buffer(
 
 /// One `FStaticMeshLODResources`.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FStaticMeshLODResources::Serialize` (StaticMeshResources.h).
 pub struct StaticMeshLod {
     pub global_strip: u8,
     pub class_strip: u8,
@@ -1467,6 +1488,7 @@ pub struct StaticMeshLod {
 
 /// The part of a LOD that only exists when it kept its render data.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FStaticMeshLODResources::Serialize` (StaticMeshResources.h).
 pub struct StaticMeshLodRender {
     pub has_ray_tracing_geometry: u32,
     /// Inline buffers, or the bulk-data handle and metadata of stripped ones.
@@ -1475,6 +1497,7 @@ pub struct StaticMeshLodRender {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FStaticMeshLODResources::Serialize` (StaticMeshResources.h).
 pub enum StaticMeshLodBuffers {
     Inline { buffers: Box<StaticMeshBuffers>, samplers: StaticMeshSamplers },
     /// Streamed: a bulk-data index, the depth-only triangle count and packed
@@ -1592,6 +1615,7 @@ impl StaticMeshLod {
 /// that *addresses* them is modeled: the page streaming states, the BVH
 /// hierarchy, the dependencies and the mesh statistics.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `Nanite::FResources::Serialize` (NaniteResources.cpp:257).
 pub struct NaniteResources {
     pub strip_flags: StripDataFlags,
     pub resource_flags: u32,
@@ -1698,6 +1722,7 @@ impl NaniteResources {
 
 /// One LOD's ray-tracing proxy entry.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FStaticMeshRayTracingProxy` (StaticMeshResources.h).
 pub struct RayTracingProxyLod {
     /// `bOwnsBuffers`, and the 40-byte sections it owns when set.
     pub sections: Option<Vec<[u8; 40]>>,
@@ -1709,6 +1734,7 @@ pub struct RayTracingProxyLod {
 
 /// `FStaticMeshRayTracingProxy`, written only when `bHasRayTracingProxy`.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FStaticMeshRayTracingProxy` (StaticMeshResources.h).
 pub struct RayTracingProxy {
     pub strip_flags: StripDataFlags,
     pub using_rendering_lods: u32,
@@ -1717,6 +1743,7 @@ pub struct RayTracingProxy {
 
 /// One LOD's Lumen card representation.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FCardRepresentationData` (MeshCardRepresentation.h).
 pub struct CardRepresentation {
     pub bounds: Box3d,
     pub mostly_two_sided: u32,
@@ -1725,6 +1752,7 @@ pub struct CardRepresentation {
 
 /// One LOD's distance-field volume (`FDistanceFieldVolumeData5`).
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FDistanceFieldVolumeData` (DistanceFieldAtlas.h).
 pub struct DistanceFieldVolume {
     /// An `FBox3f` — the float variant, 25 bytes, not the 49-byte `FBox`.
     pub local_space_mesh_bounds: Box3f,
@@ -1738,6 +1766,7 @@ pub struct DistanceFieldVolume {
 /// The whole tail of a `UStaticMesh` export: 15,231 exports and 1,310 MiB, the
 /// largest tail population in the corpus.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `UStaticMesh::Serialize` (StaticMesh.cpp).
 pub struct StaticMeshTail {
     pub strip_flags: StripDataFlags,
     pub cooked: u32,
@@ -2033,6 +2062,7 @@ impl StaticMeshTail {
 
 /// One LOD of a `UMorphTarget`.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FMorphTargetLODModel` (MorphTarget.h).
 pub struct MorphLodModel {
     /// `true` when the vertex array was stripped and only its count is written.
     pub stripped: bool,
@@ -2054,6 +2084,7 @@ pub enum Result2<A, B> {
 
 /// `UMorphTarget::Serialize`.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `UMorphTarget::Serialize` (MorphTarget.cpp).
 pub struct MorphTargetTail {
     pub strip_flags: u16,
     /// Absent when audio-visual data was stripped — the tail ends at the flags.
@@ -2120,6 +2151,7 @@ impl MorphTargetTail {
 
 /// One streamed audio chunk of a `USoundWave`.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FStreamedAudioChunk` (SoundWave.h).
 pub struct AudioChunk {
     pub flags: u32,
     pub bulk: InlineBulkPayload,
@@ -2131,6 +2163,7 @@ pub struct AudioChunk {
 
 /// `USoundWave::Serialize` in a cooked, streaming build.
 #[derive(Debug, Clone)]
+/// Mirrors `USoundWave::Serialize` (SoundWave.cpp).
 pub struct SoundWaveTail {
     pub flags: u32,
     pub cue_points: Vec<PropertyBlock>,
@@ -2206,6 +2239,7 @@ impl SoundWaveTail {
 
 /// One element of a `UModelComponent`.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FModelElement` (ModelComponent.h).
 pub struct ModelElement {
     pub map_build_data_id: Guid,
     pub component: i32,
@@ -2215,6 +2249,7 @@ pub struct ModelElement {
 
 /// `UModelComponent::Serialize`.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `UModelComponent::Serialize` (ModelComponent.cpp).
 pub struct ModelComponentTail {
     pub model: i32,
     pub elements: Vec<ModelElement>,
@@ -2262,6 +2297,7 @@ impl ModelComponentTail {
 
 /// One `FReferencePose` of a `USkeleton`'s retarget sources.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FReferencePose` (Skeleton.h).
 pub struct RetargetSource {
     pub key: FName,
     pub pose_name: FName,
@@ -2270,6 +2306,7 @@ pub struct RetargetSource {
 
 /// `USkeleton::Serialize`.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `USkeleton::Serialize` (Skeleton.cpp).
 pub struct SkeletonTail {
     pub reference_skeleton: ReferenceSkeleton,
     pub retarget_sources: Vec<RetargetSource>,
@@ -2342,6 +2379,7 @@ impl SkeletonTail {
 /// no writer in this crate, so they stay spans. What the model owns is the
 /// framing: the super-struct reference, the child list, and the two sizes.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `UStruct::Serialize` (Class.cpp).
 pub struct StructTail {
     pub super_struct: i32,
     /// `ChildArray` — an `FPackageIndex` per entry.
@@ -2389,6 +2427,7 @@ impl StructTail {
 
 /// `UFunction::Serialize`.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `UFunction::Serialize` (Class.cpp).
 pub struct FunctionTail {
     pub function_flags: u32,
     /// `RepOffset`, written only for `FUNC_Net`.
@@ -2424,6 +2463,7 @@ impl FunctionTail {
 
 /// `UClass::Serialize`.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `UClass::Serialize` (Class.cpp).
 pub struct ClassTail {
     pub func_map: Vec<FuncMapEntry>,
     pub class_flags: u32,
@@ -2478,6 +2518,7 @@ impl ClassTail {
 /// Only read when more than four bytes remain, which is the engine's own guard
 /// against reading a short tail's last word as a count.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `UBlueprintGeneratedClass::Serialize` (BlueprintGeneratedClass.cpp).
 pub struct BlueprintGeneratedClassTail {
     pub editor_tags: Option<Vec<(FName, FStr)>>,
 }
@@ -2802,6 +2843,7 @@ fn write_pieces(
 /// records whether the payload was there rather than re-deriving it, which is
 /// what lets a single pointer be written without replaying the whole graph.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FChaosArchive` shared-pointer tagging (ChaosArchive.h).
 pub struct ChaosPtr {
     pub present: bool,
     pub tag: Option<i32>,
@@ -2856,6 +2898,7 @@ impl ChaosPtr {
 /// there — `TryBulkSerializeManagedArray` writes it — and deriving it from the
 /// Rust type would silently paper over a disagreement.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `EManagedArrayType` (ManagedArrayTypeValues.inl).
 pub enum ManagedArrayValues {
     Vector { element_size: i32, items: Vec<Vector3f> },
     IntVector { element_size: i32, items: Vec<Int32Vector> },
@@ -2878,6 +2921,7 @@ pub enum ManagedArrayValues {
 
 /// One attribute of an `FManagedArrayCollection`.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FManagedArrayCollection::Serialize` (ManagedArrayCollection.cpp).
 pub struct ManagedArrayAttribute {
     pub name: FName,
     pub group: FName,
@@ -2892,6 +2936,7 @@ pub struct ManagedArrayAttribute {
 /// `FManagedArrayCollection` — the attribute store a geometry collection is
 /// built out of.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FManagedArrayCollection::Serialize` (ManagedArrayCollection.cpp).
 pub struct ManagedArrayCollection {
     pub version: i32,
     /// An `FName` key and its `FGroupInfo` — a version and a size.
@@ -3130,6 +3175,7 @@ impl ManagedArrayCollection {
 
 /// `FGeometryCollectionMeshResources` plus its description.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FGeometryCollectionMeshResources::Serialize` (GeometryCollectionRenderData.h).
 pub struct GeometryCollectionMesh {
     /// The index buffer comes **first** here, unlike `FStaticMeshLODResources`,
     /// and each buffer writes its own strip flags because they are serialized
@@ -3163,6 +3209,7 @@ pub struct GeometryCollectionMesh {
 /// `UGeometryCollection`'s tail: the managed array collection, then the cooked
 /// render data.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `UGeometryCollection::Serialize` (GeometryCollection.cpp).
 pub struct GeometryCollectionTail {
     pub is_cooked_or_cooking: u32,
     pub collection: ManagedArrayCollection,
@@ -3304,6 +3351,7 @@ impl GeometryCollectionTail {
 
 /// One vtable patch table inside a shader map's pointer table.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FPointerTableBase` vtable patches (MemoryImage.cpp).
 pub struct VTablePatchTable {
     pub type_name_hash: HashedName,
     /// `VTableOffset` and `Offset` per patch.
@@ -3312,6 +3360,7 @@ pub struct VTablePatchTable {
 
 /// One name patch table — script names and memory-image names share the shape.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FPointerTableBase` name patches (MemoryImage.cpp).
 pub struct NamePatchTable {
     pub name: FName,
     pub offsets: Vec<u32>,
@@ -3319,6 +3368,7 @@ pub struct NamePatchTable {
 
 /// Where a shader map's bytecode lives.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FShaderMapResourceCode::Serialize` (Shader.cpp).
 pub enum ShaderCode {
     /// In a shared shader library; only the hash is in the package.
     Shared { hash: [u8; 20] },
@@ -3339,6 +3389,7 @@ pub enum ShaderCode {
 /// The frozen memory image and the compiled bytecode stay byte strings; the
 /// tables that address and relocate them are values.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FMemoryImageResult::LoadFromArchive` (MemoryImage.cpp).
 pub struct ShaderMap {
     pub layout_params: PlatformTypeLayoutParameters,
     pub frozen_image: Vec<u8>,
@@ -3527,6 +3578,7 @@ impl ShaderMap {
 
 /// One of a `UNiagaraScript`'s compiled shader resources.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FNiagaraShaderScript::SerializeShaderMap` (NiagaraShared.cpp).
 pub struct NiagaraShaderResource {
     pub cooked: bool,
     pub num_permutations: i32,
@@ -3541,6 +3593,7 @@ pub struct NiagaraShaderResource {
 /// A script with no shader maps ends at the property block, so the tail is empty
 /// — which is not the same as a script whose resource count is zero.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `UNiagaraScript::Serialize` (NiagaraScript.cpp).
 pub struct NiagaraScriptTail {
     pub resources: Vec<NiagaraShaderResource>,
 }
@@ -3602,6 +3655,7 @@ impl NiagaraScriptTail {
 /// `ULandscapeComponent`'s tail: the grass weight offsets and the packed
 /// height/weight data.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `ULandscapeComponent::Serialize` (LandscapeComponent.cpp).
 pub struct LandscapeComponentTail {
     pub num_elements: i32,
     /// An `FPackageIndex` and an `int32` per entry.
@@ -3613,6 +3667,7 @@ pub struct LandscapeComponentTail {
 /// `ULandscapeHeightfieldCollisionComponent`'s tail: the cooked Chaos
 /// heightfield, behind its own present flag.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `ULandscapeHeightfieldCollisionComponent::Serialize` (LandscapeCollision.cpp).
 pub struct LandscapeCollisionTail {
     pub cooked_collision_data: Option<BulkArray>,
 }
@@ -3623,6 +3678,7 @@ pub struct LandscapeCollisionTail {
 /// shape — an index, and the bytes when the map points at this very offset — is
 /// the one every inline bulk payload has.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FByteBulkData::Serialize` (BulkData.cpp).
 pub struct InlineBulkPayload {
     pub bulk_index: i32,
     pub payload: Option<Vec<u8>>,
@@ -3655,6 +3711,7 @@ impl InlineBulkPayload {
 /// Modeled on its own because several actor classes add nothing of their own —
 /// `AStaticMeshActor` alone is 69,832 exports whose whole tail is this.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `AActor::Serialize` (Actor.cpp:844).
 pub struct ActorTail {
     pub name: Option<FStr>,
     /// `FActorInstanceGuid`.
@@ -3688,6 +3745,7 @@ impl ActorTail {
 /// `UAkAudioEvent`'s tail: the localized cooked event data, then its durations
 /// and attenuation radius.
 #[derive(Debug, Clone)]
+/// Mirrors `UAkAudioEvent::Serialize` (AkAudioEvent.cpp).
 pub struct AkAudioEventTail {
     pub cooked_data: PropertyBlock,
     pub maximum_duration: f32,
@@ -3725,6 +3783,7 @@ impl AkAudioEventTail {
 /// models because every one of them has an empty vertex buffer, and blew up on
 /// the two that do not.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `UModel::Serialize` (Model.cpp).
 pub struct ModelTail {
     pub global_strip: u8,
     pub class_strip: u8,
@@ -3816,6 +3875,7 @@ impl ModelTail {
 
 /// One bucket of a level's precomputed visibility.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FPrecomputedVisibilityBucket` (Level.h).
 pub struct VisibilityBucket {
     pub cell_data_size: i32,
     pub cells: Vec<PrecomputedVisibilityCell>,
@@ -3823,6 +3883,7 @@ pub struct VisibilityBucket {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FCompressedVisibilityChunk` (Level.h).
 pub struct VisibilityChunk {
     pub compressed: u32,
     pub uncompressed_size: i32,
@@ -3832,6 +3893,7 @@ pub struct VisibilityChunk {
 /// `ULevel`'s tail: the actor list, the level's `FURL`, the model and component
 /// references, and the precomputed visibility and distance-field data.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `ULevel::Serialize` (Level.cpp).
 pub struct LevelTail {
     pub actors: Vec<i32>,
     /// Protocol, host, map and portal.
@@ -3981,6 +4043,7 @@ impl LevelTail {
 
 /// The bone-compression codec's own trailing data, which differs by codec.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FACLCompressedAnimDataBase` / `FUECompressedAnimData` (AnimEncoding.h).
 pub enum BoneCodecData {
     /// `FACLCompressedAnimDataBase::SerializeCompressedData` — the base key
     /// count then `bCompressionFailed`. The compressed clip itself lives in
@@ -3999,6 +4062,7 @@ pub enum BoneCodecData {
 /// 2,039,646,153 tracks — which is what happened, on all 14,130 exports, before
 /// this type existed.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `UAnimSequence::Serialize` (AnimSequence.cpp).
 pub struct AnimSequenceChainTail {
     pub animation_asset_guid: Guid,
     pub sequence: AnimSequenceTail,
@@ -4024,6 +4088,7 @@ impl AnimSequenceChainTail {
 /// string here — it is ACL's own container, and decoding it is work item H.
 /// Everything that describes and addresses it is a value.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FCompressedAnimSequence::SerializeCompressedData` (AnimSequence.cpp).
 pub struct AnimSequenceTail {
     pub strip_flags: StripDataFlags,
     /// `bSerializeCompressedData`. When clear the tail ends here.
@@ -4174,6 +4239,7 @@ impl AnimSequenceTail {
 /// stream can be written without a size and the reader has to find where the
 /// second one begins.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `UDNAAsset::Serialize` (DNAAsset.cpp).
 pub struct DnaAssetTail {
     pub behavior: Vec<u8>,
     pub geometry: Vec<u8>,
@@ -4220,6 +4286,7 @@ impl DnaAssetTail {
 
 /// `FReferenceSkeleton` — the rig the renderer skins against.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FReferenceSkeleton` (ReferenceSkeleton.h).
 pub struct ReferenceSkeleton {
     pub bone_info: Vec<MeshBoneInfo>,
     /// How wide an `FTransform` is in this cook, 80 or 40 bytes.
@@ -4283,6 +4350,7 @@ impl ReferenceSkeleton {
 
 /// One `FSkelMeshRenderSection`.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FSkelMeshRenderSection` `operator<<` (SkeletalMeshLODRenderData.cpp:149).
 pub struct SkelRenderSection {
     pub global_strip: u8,
     pub class_strip: u8,
@@ -4408,6 +4476,7 @@ impl SkelRenderSection {
 
 /// One skin-weight profile's override data.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FSkinWeightProfilesData` (SkinWeightProfile.h).
 pub struct SkinWeightProfile {
     pub name: FName,
     pub bone_ids: Vec<u8>,
@@ -4418,6 +4487,7 @@ pub struct SkinWeightProfile {
 
 /// One named per-vertex attribute buffer.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FSkeletalMeshAttributeVertexBuffer` (SkeletalMeshAttributeVertexBuffer.h).
 pub struct VertexAttributeBuffer {
     pub name: FName,
     pub component_count: i32,
@@ -4428,6 +4498,7 @@ pub struct VertexAttributeBuffer {
 
 /// Compressed morph-target render data, present only when the cook wrote it.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FMorphTargetVertexInfoBuffers` (MorphTargetVertexInfoBuffers.h).
 pub struct MorphTargetData {
     pub morph_data: Vec<u32>,
     pub minimum_value_per_morph: Vec<Vector4f>,
@@ -4442,6 +4513,7 @@ pub struct MorphTargetData {
 /// `FSkeletalMeshLODRenderData::SerializeStreamedData` — everything a LOD keeps
 /// inline.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FSkeletalMeshLODRenderData::SerializeStreamedData` (SkeletalMeshLODRenderData.cpp).
 pub struct SkelStreamedData {
     pub strip_flags: StripDataFlags,
     pub index_data_type_size: u8,
@@ -4715,6 +4787,7 @@ impl SkelStreamedData {
 
 /// The metadata a streamed-out LOD leaves behind in the export.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FSkeletalMeshLODRenderData::SerializeAvailabilityInfo` (SkeletalMeshLODRenderData.cpp).
 pub struct SkelAvailabilityInfo {
     /// The metadata a streamed-out LOD leaves behind, in the order
     /// `SerializeAvailabilityInfo` writes it. Note the static-mesh vertex-buffer
@@ -4822,6 +4895,7 @@ impl SkelAvailabilityInfo {
 
 /// One `FSkeletalMeshLODRenderData`.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FSkeletalMeshLODRenderData::Serialize` (SkeletalMeshLODRenderData.cpp).
 pub struct SkeletalMeshLod {
     pub global_strip: u8,
     pub class_strip: u8,
@@ -4834,6 +4908,7 @@ pub struct SkeletalMeshLod {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FSkeletalMeshLODRenderData::Serialize` (SkeletalMeshLODRenderData.cpp).
 pub struct SkeletalMeshLodRender {
     pub sections: Vec<SkelRenderSection>,
     pub active_bone_indices: Vec<u16>,
@@ -4842,6 +4917,7 @@ pub struct SkeletalMeshLodRender {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FSkeletalMeshLODRenderData::Serialize` (SkeletalMeshLODRenderData.cpp).
 pub enum SkeletalMeshLodBuffers {
     Inline(Box<SkelStreamedData>),
     /// Streamed to `.ubulk`. A zero-size payload means the LOD was discarded
@@ -4946,6 +5022,7 @@ impl SkeletalMeshLod {
 
 /// The whole tail of a `USkeletalMesh` export: 415 exports, 470 MiB.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `USkeletalMesh::Serialize` (SkeletalMesh.cpp).
 pub struct SkeletalMeshTail {
     pub strip_flags: StripDataFlags,
     /// `ImportedBounds`, an `FBoxSphereBounds` at LWC precision.
@@ -4962,6 +5039,7 @@ pub struct SkeletalMeshTail {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FSkeletalMaterial` (SkeletalMaterial.h).
 pub struct SkeletalMeshMaterial {
     pub material_interface: i32,
     pub slot_name: FName,
@@ -4971,6 +5049,7 @@ pub struct SkeletalMeshMaterial {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FSkeletalMeshRenderData::Serialize` (SkeletalMeshRenderData.cpp).
 pub struct SkeletalMeshRenderData {
     pub lods: Vec<SkeletalMeshLod>,
     pub nanite: NaniteResources,
@@ -5088,6 +5167,7 @@ impl SkeletalMeshTail {
 /// something the tail model can do on the way past. What the model does supply
 /// is the addressing: which format, which bulk-data index.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FFormatContainer` (BodySetup.h).
 pub struct CookedFormat {
     pub format: FName,
     pub bulk_index: i32,
@@ -5100,6 +5180,7 @@ pub struct CookedFormat {
 /// 17,754 exports and 1,051 MiB, the second-largest tail population in the
 /// corpus.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `UBodySetup::Serialize` (BodySetup.cpp:826).
 pub struct BodySetupTail {
     pub guid: Guid,
     pub cooked: bool,
@@ -5162,6 +5243,7 @@ impl BodySetupTail {
 /// One `FMaterialResourceLocOnDisk`: where a resource starts and which
 /// feature/quality level it was compiled for.
 #[derive(Debug, Clone, Copy, PartialEq)]
+/// Mirrors `FMaterialResourceLocOnDisk` (MaterialShared.h).
 pub struct MaterialResourceLoc {
     pub offset: u32,
     pub feature_level: u8,
@@ -5177,6 +5259,7 @@ pub struct MaterialResourceLoc {
 /// What *is* modeled is everything that addresses it — the name table and the
 /// per-resource locations, which is what a tool needs to find a resource.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `FMaterialResourceProxyReader` (MaterialShared.cpp).
 pub struct InlineShaderMaps {
     /// The resource count that leads the block. Zero or negative ends it
     /// immediately, and nothing below is written at all.
@@ -5280,6 +5363,7 @@ fn write_flagged_struct(
 /// block*, not in the tail.
 // No `PartialEq`: a `PropertyBlock` is compared with `semantic_eq`, not `==`.
 #[derive(Debug, Clone)]
+/// Mirrors `UMaterialInterface::Serialize` (MaterialInterface.cpp:184) and `SerializeInlineShaderMaps` (Material.cpp:780).
 pub struct MaterialChainTail {
     pub cached_expression_data: Option<PropertyBlock>,
     /// Present for a `UMaterialInstance`, absent for a `UMaterial`.
@@ -5363,6 +5447,7 @@ impl MaterialChainTail {
 /// The whole tail of a cooked texture export: `UTexture`'s strip flags, then the
 /// concrete class's cooked platform data.
 #[derive(Debug, Clone, PartialEq)]
+/// Mirrors `UTexture::Serialize` (Texture.cpp).
 pub struct TextureChainTail {
     /// `UTexture::Serialize` writes only its strip flags in a cooked stream.
     pub texture_strip_flags: StripDataFlags,
