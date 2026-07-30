@@ -1076,6 +1076,39 @@ The write path also gained a `PackageResolver`. The reader always had one — a
 `UUserDefinedStruct` used as a property type has no `.usmap` schema — and
 regenerating a nested block's header needs the same layout the reader used.
 
+**B2. Strongly typed like the engine, not merely round-tripping. — DONE.**
+`ce_decode_coverage` reports **5,865,478,137 of 5,865,478,137 export bytes behind
+a typed model (100.0000%)**. No field in `tail_models` is an anonymous byte run:
+every scalar, name, object reference, index and engine struct is a type, in a new
+`ue_struct` module, and the module header tables every remaining `Vec<u8>` with
+what it is so the claim is checkable.
+
+The distinction that made this worth doing: **byte-identical round-trip cannot
+see a wrong field order inside the right width.** Verifying the layouts against
+UE 5.5.4 rather than inferring them from byte counts found three defects the
+gates were structurally blind to:
+
+  * `FPackedHierarchyNode` is a *structure of arrays* (NaniteResources.h:48).
+    Reading it as four interleaved 52-byte child records gives the same 208
+    bytes and the wrong value in every field.
+  * `FMeshToMeshVertData` is **64** bytes, not the 80 the walker used
+    (SkeletalMeshLODRenderData.cpp:193). Every cloth mapping in the corpus is
+    empty, so nothing ever exercised it.
+  * `can_serialize_as_zero` tested structs by "has a fixed native size", which is
+    sufficient but not necessary — `FBox2f` is atomic and maskable yet
+    serializes as a property block.
+
+Also latent, and only reachable under *mutation*: `FName`s and `FPackageIndex`es
+were buried inside byte runs — `FStaticMaterial`, `FBspSurf`, `FMeshBoneInfo`,
+`UCSModifiedProperties`, `ULevel::Actors`, `UStruct::ChildArray`. A raw copy
+round-trips exactly as long as nothing edits the name map or retargets a
+reference, which is precisely what a writer is for.
+
+Wire order is not declaration order, and the types say so where they differ:
+`FStaticMeshSection` (`bForceOpaque` third, declared fifth), `TLumenCardOBB`
+(`Origin` fourth, declared first), `FSkelMeshRenderSection` (the vertex-mask
+channel between `bRecomputeTangent` and `bCastShadow`).
+
 **C. Close the 3 declining arms (90 KB). — DONE.** One was a real bug and two
 were the census measuring itself. `NiagaraScript` declined at the end of its
 export with 0 bytes left, because it read a shader-map resource count off the
