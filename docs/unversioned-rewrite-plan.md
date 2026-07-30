@@ -1042,26 +1042,39 @@ span count — the three Niagara variable types are 1.86M of the 1.92M spans, th
 and fifteen with under a thousand spans each. `BlockLayout::Native` is deleted
 when the last one lands.
 
-**B. Tail arms → typed models (64 arms + 42 helpers, 4.77 GiB).** *Started.
-333,264 tails, 1.48 GiB, 100% exact — the instanced-static-mesh family (546 MB),
-the whole texture family (628 MB, virtual textures and CPU copies included), and
-the whole material family (385 MB). What remains at the top of `ce_tail_census`
-is `StaticMesh` (Nanite, 1,310 MiB), `BodySetup` (Chaos, 1,051), `SkeletalMesh`
-(470), `AnimSequence` (ACL, 172) and `GeometryCollection` (144) — four of those
-five are work item H.*
+**B. Tail arms → typed models (64 arms + 42 helpers, 4.77 GiB). — DONE.**
+**821,846 of 821,846 tails, 5,119,304,057 of 5,119,304,057 bytes, all
+byte-exact.** Nothing is retained as an opaque span any more.
 
-*Also: `walk_export`'s `stopped` only ever meant "an arm declined", never "the
-walk reached the end". `ce_tail_stop_census` now measures bytes consumed, which
-found five classes silently leaving 19,132 bytes unread. Both measures are now
-100%.*
-Sequence by bytes so the regeneration gate moves early, but the batches are
-arms, not classes:
+The work was not 226 classes. `ce_tail_chains` groups the corpus by the deepest
+ancestors that actually append something, and most classes append nothing: 49
+actor subclasses and 42 scene-component subclasses were covered by two models
+already written, so `roundtrip_tail` dispatches on the inheritance chain rather
+than the name. A further 16 families are declared as data — a `&[TailPiece]`
+sequence in `COMPOSED_TAILS` — rather than as bespoke types.
 
-| Batch | What | Cumulative bytes |
-|---|---|---|
-| B1 | the arms behind the 9 heaviest classes | 90.45% |
-| B2 | the arms behind the next 13 | 99.09% |
-| B3 | everything remaining | 100% |
+Payloads a *different* serializer owns stay byte strings, and that is a
+deliberate boundary rather than retention: Nanite pages, Chaos physics data,
+compiled shader maps, block-compressed mips, ACL clips, Kismet bytecode, `FField`
+chains, DNA and Recast tiles. They are leaf data, not an encoding of some richer
+value this layer could recover and re-emit. What the models own is the framing
+and the addressing — every count, flag, dimension, format name and bulk index
+around them. Decoding the payloads themselves is work item H.
+
+Two defects in the *codec* fell out of finishing it, both found by the gate:
+
+  * `can_serialize_as_zero` tested structs by "has a fixed native size", which is
+    sufficient but not necessary. `FBox2f` is atomic and small — so the cooker
+    masks it — yet serializes as an ordinary property block, so the writer could
+    not put a masked one back.
+  * `is_native_bool` answered "not native" for declarations the UHT dump has
+    never seen, which is every field of a Blueprint-defined struct. Unknown now
+    falls back to replaying the file's bit; `bool_is_known` existed to tell the
+    cases apart and nothing consulted it.
+
+The write path also gained a `PackageResolver`. The reader always had one — a
+`UUserDefinedStruct` used as a property type has no `.usmap` schema — and
+regenerating a nested block's header needs the same layout the reader used.
 
 **C. Close the 3 declining arms (90 KB). — DONE.** One was a real bug and two
 were the census measuring itself. `NiagaraScript` declined at the end of its
