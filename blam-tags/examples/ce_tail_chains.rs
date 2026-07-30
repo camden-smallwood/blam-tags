@@ -109,6 +109,7 @@ fn main() {
                     origin: payloads[i].len() - parts.tail.len(),
                     usmap: &usmap,
                     resolver: None,
+                    object_flags: ex.object_flags,
                 };
                 if roundtrip_tail(short, &parts.tail, &names, block, ctx).is_some() {
                     continue;

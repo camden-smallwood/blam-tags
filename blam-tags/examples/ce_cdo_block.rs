@@ -64,8 +64,8 @@ fn main() {
                 h.bulk_data.iter().map(|x| (x.serial_offset, x.serial_size)).collect();
             let ctx = ExportContext { bulk_data: &bulk, resolver: Some(&resolver) };
             for ex in &h.export_map {
-                if ex.object_flags & 0x10 == 0 {
-                    continue; // CDOs only
+                if std::env::var("ALL_EXPORTS").is_err() && ex.object_flags & 0x10 == 0 {
+                    continue; // CDOs only unless asked
                 }
                 let Some(class) = world.class_key(&h, ex.class_index) else { continue };
                 let off = h.summary.header_size as usize + ex.cooked_serial_offset as usize;
@@ -79,7 +79,9 @@ fn main() {
                     continue;
                 };
                 let Ok(flat) = flattened_schema(&class, usmap) else { continue };
-                println!("{} :: {}", h.package_name(), h.name_map.get(ex.object_name));
+                println!("{} :: {} flags={:#x} template={}",
+                    h.package_name(), h.name_map.get(ex.object_name), ex.object_flags,
+                    ex.object_flags & 0x30 != 0);
                 println!("  class {class}  ({} flattened slots)", flat.len());
                 println!("  export {} bytes, block+trailer {} , leftover {}",
                     body.len(), body.len() - parts.tail.len(), parts.tail.len());
@@ -156,8 +158,11 @@ fn main() {
                         }
                     }
                 }
-                return;
+                if std::env::var("ALL_EXPORTS").is_err() {
+                    return;
+                }
             }
+            return;
         }
     }
 }

@@ -79,6 +79,7 @@ fn main() {
                     origin: payloads[i].len() - parts.tail.len(),
                     usmap: &usmap,
                     resolver: None,
+                    object_flags: ex.object_flags,
                 };
                 let _ = block;
                 let _ = ctx;

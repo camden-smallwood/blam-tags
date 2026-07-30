@@ -704,6 +704,20 @@ pub struct TailContext<'a> {
     /// Both directions need it — regenerating a nested block's header needs the
     /// nested schema just as much as reading it did.
     pub resolver: Option<&'a dyn super::archive::PackageResolver>,
+    /// The export's `object_flags`. Some tails are conditional on them:
+    /// `FLevelInstanceActorGuid::operator<<` (LevelInstanceActorGuid.cpp) writes
+    /// its GUID only `if (!Actor->IsTemplate())`, so an archetype's tail is
+    /// sixteen bytes shorter than an instance's.
+    pub object_flags: u32,
+}
+
+impl TailContext<'_> {
+    /// `UObject::IsTemplate()` — `RF_ClassDefaultObject | RF_ArchetypeObject`.
+    pub fn is_template(&self) -> bool {
+        const RF_CLASS_DEFAULT_OBJECT: u32 = 0x10;
+        const RF_ARCHETYPE_OBJECT: u32 = 0x20;
+        self.object_flags & (RF_CLASS_DEFAULT_OBJECT | RF_ARCHETYPE_OBJECT) != 0
+    }
 }
 
 /// A texture's CPU-side copy (`FSharedImage`, an `FImage`; ImageCore.h:412).
@@ -2567,6 +2581,9 @@ pub enum TailPiece {
     SceneBounds,
     /// A four-byte present flag and, when set, an `FString`.
     OptStr,
+    /// An `FGuid` that is written only when the export is not a template —
+    /// `FLevelInstanceActorGuid::operator<<` gates on `!Actor->IsTemplate()`.
+    GuidUnlessTemplate,
     /// A fixed run of bytes whose interior another serializer owns.
     Bytes(usize),
     /// An `FGuid`.
@@ -2602,6 +2619,8 @@ pub enum TailValue {
     OptStr(Option<FStr>),
     Bytes(Vec<u8>),
     Guid(Guid),
+    /// A piece the export's flags say is not written at all.
+    Absent,
     I32(i32),
     U32(u32),
     U16(u16),
@@ -2630,7 +2649,15 @@ pub const COMPOSED_TAILS: &[(&str, &[TailPiece])] = &[
         "SkyAtmosphereComponent+SceneComponent+ActorComponent",
         &[TailPiece::UcsProperties, TailPiece::SceneBounds, TailPiece::Guid],
     ),
-    ("LevelInstance+Actor", &[TailPiece::OptStr, TailPiece::Guid, TailPiece::Guid, TailPiece::Guid]),
+    // `AActor`'s three pieces, then `ALevelInstance::Serialize`'s
+    // `LevelInstanceActorGuid` — which `operator<<` writes only for a
+    // non-template (LevelInstanceActorGuid.cpp). The corpus has exactly one
+    // archetype of a `APackedLevelActor` subclass, and reading its GUID anyway
+    // ran four bytes off the end.
+    (
+        "LevelInstance+Actor",
+        &[TailPiece::OptStr, TailPiece::Guid, TailPiece::Guid, TailPiece::GuidUnlessTemplate],
+    ),
     // `UWorld`: the persistent level, then two object arrays.
     ("World", &[TailPiece::I32, TailPiece::ObjectArray, TailPiece::ObjectArray]),
     ("NiagaraDataInterfaceTexture", &[TailPiece::U32]),
@@ -2689,6 +2716,15 @@ fn read_pieces(
                 g.serialize(r)?;
                 g
             }),
+            TailPiece::GuidUnlessTemplate => {
+                if ctx.is_template() {
+                    TailValue::Absent
+                } else {
+                    let mut g = Guid::default();
+                    g.serialize(r)?;
+                    TailValue::Guid(g)
+                }
+            }
             TailPiece::I32 => TailValue::I32(r.i32()?),
             TailPiece::U32 => TailValue::U32(r.u32()?),
             TailPiece::U16 => TailValue::U16(r.u16()?),
@@ -2757,6 +2793,10 @@ fn write_pieces(
     for (v, p) in values.iter().zip(pieces) {
         match (v, *p) {
             (TailValue::UcsProperties(u), TailPiece::UcsProperties) => write_vec(ar, u)?,
+            (TailValue::Guid(g), TailPiece::GuidUnlessTemplate) if !ctx.is_template() => {
+                g.clone().serialize(ar)?
+            }
+            (TailValue::Absent, TailPiece::GuidUnlessTemplate) if ctx.is_template() => {}
             (TailValue::SceneBounds(b), TailPiece::SceneBounds) => {
                 match (b, scene_component_writes_bounds(block)) {
                     (Some(b), true) => match b {

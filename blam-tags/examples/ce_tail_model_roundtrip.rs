@@ -94,6 +94,7 @@ fn main() {
                     origin: payloads[i].len() - parts.tail.len(),
                     usmap: usmap,
                     resolver: Some(&resolver),
+                    object_flags: ex.object_flags,
                 };
                 match roundtrip_tail(short, &parts.tail, &names, block, ctx) {
                     Some(Ok(out)) if out == parts.tail => {
