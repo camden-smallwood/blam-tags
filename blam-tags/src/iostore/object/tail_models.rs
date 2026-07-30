@@ -44,6 +44,10 @@
 //! isolation reads the wrong 8 bytes and reports success, which is exactly what
 //! the first version of this module did before the gate caught it.
 //!
+//! No model here derives `Eq`. Nearly all of them reach a float sooner or later
+//! — bounds, weights, barycentric coordinates — so equality is `PartialEq` and
+//! byte-level comparison is the gate's job, not the type's.
+//!
 //! Worse for a writer: some of it is conditional on *property values*.
 //! `USceneComponent` writes its baked bounds only when `bComputeBoundsOnceForGame`
 //! is set, so the tail cannot be written without the property block — the two
@@ -56,7 +60,8 @@ use super::block::{flattened_schema, read_struct, write_block};
 use super::common::read_bulk_array;
 use super::limits::MAX_NATIVE_COUNT;
 use super::ue_struct::{
-    bounded_count, LumenCardBuildData, PackedHierarchyNode, PageStreamingState, read_vec, write_run, write_vec, BoxSphereBounds, ClothingSectionData, FuncMapEntry,
+    bounded_count, Box3d, Box3f, LightmassPrimitiveSettings, MeshToMeshVertData, PerPlatformFloat,
+    SparseDistanceFieldMip, StaticMeshBuffersSize, LumenCardBuildData, PackedHierarchyNode, PageStreamingState, read_vec, write_run, write_vec, BoxSphereBounds, ClothingSectionData, FuncMapEntry,
     Guid, ImplementedInterface, MeshBoneInfo, NameToIndex, ShaHash, StaticMaterial,
     StaticMeshSection, StripDataFlags,
 };
@@ -65,7 +70,7 @@ use super::value::{FName, FStr, PropValue, PropertyBlock};
 
 /// A `TArray` written with `BulkSerialize`: element size, count, then
 /// `count × size` blittable bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BulkArray {
     pub element_size: i32,
     pub data: Vec<u8>,
@@ -108,7 +113,7 @@ impl BulkArray {
 }
 
 /// An `FColorVertexBuffer` inside a component's per-LOD override colours.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColorVertexBuffer {
     pub global_strip: u8,
     pub class_strip: u8,
@@ -120,7 +125,7 @@ pub struct ColorVertexBuffer {
 }
 
 /// One entry of `UStaticMeshComponent::LODData`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StaticMeshComponentLodInfo {
     pub global_strip: u8,
     pub class_strip: u8,
@@ -135,7 +140,7 @@ pub struct StaticMeshComponentLodInfo {
 }
 
 /// The `UStaticMeshComponent` tail: 126,158 exports, median 16 bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StaticMeshComponentTail {
     pub lod_data: Vec<StaticMeshComponentLodInfo>,
     /// `MeshPaintTextureCooked`, behind its own four-byte present flag.
@@ -242,7 +247,7 @@ fn write_lod_info(ar: &mut impl Ar, lod: &StaticMeshComponentLodInfo) -> Result<
 
 /// `UActorComponent`'s tail: the sparse UCS-modified-property list, each entry
 /// an `FPackageIndex`, an `FName` and an `FGuid` — 28 bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ActorComponentTail {
     pub ucs_modified_properties: Vec<u8>,
 }
@@ -253,13 +258,13 @@ pub struct ActorComponentTail {
 /// `None` means the property flag was clear, so *nothing* is written — not even
 /// the four-byte present flag. That distinction is the whole difficulty: the
 /// bytes that exist depend on a value in the property block.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SceneComponentTail {
     pub bounds: Option<Option<[u8; 56]>>,
 }
 
 /// The whole tail of a `UStaticMeshComponent` export, chain and all.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StaticMeshComponentChainTail {
     pub actor_component: ActorComponentTail,
     pub scene_component: SceneComponentTail,
@@ -279,7 +284,7 @@ fn scene_component_writes_bounds(block: &PropertyBlock) -> bool {
 /// That is most of them: 42 classes and 151,249 exports in this corpus, from
 /// `USpotLightComponent` to `UHaloAudioPlacementComponent`, whose whole tail is
 /// these two layers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SceneComponentChainTail {
     pub actor_component: ActorComponentTail,
     pub scene_component: SceneComponentTail,
@@ -676,7 +681,7 @@ pub struct TailContext<'a> {
 ///
 /// `RawData` is a `TArray64<uint8>`, so its count is 64-bit — the one place in
 /// the texture tail that is not a 32-bit count.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TextureCpuCopy {
     pub size_x: i32,
     pub size_y: i32,
@@ -687,7 +692,7 @@ pub struct TextureCpuCopy {
 }
 
 /// `FOptTexturePlatformData` (Texture.h:801, 5.5.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OptTexturePlatformData {
     pub ext_data: u32,
     pub num_mips_in_tail: u32,
@@ -703,7 +708,7 @@ pub struct OptTexturePlatformData {
 /// The bytes are block-compressed and stay that way. They *are* the stored
 /// representation — decoding them to RGBA is a lossy interpretation that belongs
 /// in an API on top, not in the codec, and re-encoding could not reproduce them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TextureMip {
     pub bulk_index: i32,
     pub payload: Option<Vec<u8>>,
@@ -1007,7 +1012,7 @@ fn write_u32_array(ar: &mut impl Ar, v: &[u32]) -> Result<()> {
 }
 
 /// `FVirtualTextureTileOffsetData` (VirtualTextureBuiltData.h:89, 5.5.4).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VirtualTextureTileOffsetData {
     pub width: u32,
     pub height: u32,
@@ -1020,7 +1025,7 @@ pub struct VirtualTextureTileOffsetData {
 }
 
 /// One streamed chunk of a virtual texture's built data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VirtualTextureDataChunk {
     pub bulk_data_hash: [u8; 20],
     pub size_in_bytes: u32,
@@ -1249,7 +1254,7 @@ impl WeightedRandomSampler {
 
 /// An `FRawStaticIndexBuffer`: a 32-bit flag, the indices as a bulk array, and
 /// the "should expand to 32 bit" flag.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RawStaticIndexBuffer {
     pub is_32_bit: u32,
     pub indices: BulkArray,
@@ -1277,7 +1282,7 @@ impl RawStaticIndexBuffer {
 /// Every payload is a bulk array carrying its own element size, so none of the
 /// vertex *formats* need modeling here: the stride and the flags that decide it
 /// are all present as values, and the packed vertices behind them are leaf data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StaticMeshBuffers {
     pub global_strip: u8,
     pub class_strip: u8,
@@ -1450,8 +1455,7 @@ pub struct StaticMeshLodRender {
     pub has_ray_tracing_geometry: u32,
     /// Inline buffers, or the bulk-data handle and metadata of stripped ones.
     pub buffers: StaticMeshLodBuffers,
-    /// `FStaticMeshBuffersSize`: three `uint32` totals.
-    pub buffers_size: [u8; 12],
+    pub buffers_size: StaticMeshBuffersSize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1496,7 +1500,11 @@ impl StaticMeshLod {
             Some(StaticMeshLodRender {
                 has_ray_tracing_geometry,
                 buffers,
-                buffers_size: r.take(12)?.try_into().expect("12 bytes"),
+                buffers_size: {
+                    let mut b = StaticMeshBuffersSize::default();
+                    b.serialize(r)?;
+                    b
+                },
             })
         } else {
             None
@@ -1552,7 +1560,7 @@ impl StaticMeshLod {
                     }
                     _ => bail!("buffer form disagrees with the inlined flag"),
                 }
-                ar.raw(&mut rd.buffers_size.to_vec(), 12)?;
+                rd.buffers_size.clone().serialize(ar)?;
             }
             (None, false) => {}
             _ => bail!("LOD render data presence disagrees with its flags"),
@@ -1567,7 +1575,6 @@ impl StaticMeshLod {
 /// encoding — leaf data here, and their decoder is a separate module. Everything
 /// that *addresses* them is modeled: the page streaming states, the BVH
 /// hierarchy, the dependencies and the mesh statistics.
-// No `Eq`: the hierarchy nodes carry float bounds.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NaniteResources {
     pub strip_flags: StripDataFlags,
@@ -1659,7 +1666,7 @@ impl NaniteResources {
 }
 
 /// One LOD's ray-tracing proxy entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RayTracingProxyLod {
     /// `bOwnsBuffers`, and the 40-byte sections it owns when set.
     pub sections: Option<Vec<[u8; 40]>>,
@@ -1670,7 +1677,7 @@ pub struct RayTracingProxyLod {
 }
 
 /// `FStaticMeshRayTracingProxy`, written only when `bHasRayTracingProxy`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RayTracingProxy {
     pub strip_flags: StripDataFlags,
     pub using_rendering_lods: u32,
@@ -1678,24 +1685,20 @@ pub struct RayTracingProxy {
 }
 
 /// One LOD's Lumen card representation.
-// No `Eq`: a Lumen card's OBB is floats.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CardRepresentation {
-    /// `Bounds` as an `FBox` — three doubles each way plus `IsValid`.
-    pub bounds: [u8; 49],
+    pub bounds: Box3d,
     pub mostly_two_sided: u32,
     pub cards: Vec<LumenCardBuildData>,
 }
 
 /// One LOD's distance-field volume (`FDistanceFieldVolumeData5`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DistanceFieldVolume {
-    /// `LocalSpaceMeshBounds` is an `FBox3f` — six floats and `IsValid`, 25
-    /// bytes, not the 49-byte double-width `FBox`.
-    pub local_space_mesh_bounds: [u8; 25],
+    /// An `FBox3f` — the float variant, 25 bytes, not the 49-byte `FBox`.
+    pub local_space_mesh_bounds: Box3f,
     pub mostly_two_sided: u32,
-    /// Three `FSparseDistanceFieldMip` of 56 bytes.
-    pub mips: [u8; 168],
+    pub mips: [SparseDistanceFieldMip; 3],
     pub always_loaded_mip: Vec<u8>,
     /// `StreamableMips`: a bulk-data handle.
     pub streamable_mips_index: i32,
@@ -1703,7 +1706,6 @@ pub struct DistanceFieldVolume {
 
 /// The whole tail of a `UStaticMesh` export: 15,231 exports and 1,310 MiB, the
 /// largest tail population in the corpus.
-// No `Eq`: LODs carry `f32` deviations and sampler weights.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StaticMeshTail {
     pub strip_flags: StripDataFlags,
@@ -1725,8 +1727,8 @@ pub struct StaticMeshTail {
     /// `Bounds`: an `FBoxSphereBounds`.
     pub bounds: BoxSphereBounds,
     pub lods_share_static_lighting: u32,
-    /// `ScreenSize[MAX_STATIC_LODS_UE4]`, each an `FPerPlatformFloat`.
-    pub screen_sizes: [u8; 64],
+    /// `ScreenSize[MAX_STATIC_LODS_UE4]`.
+    pub screen_sizes: [PerPlatformFloat; 8],
     pub render_data_strip: StripDataFlags,
     pub has_speed_tree_wind: u32,
     pub materials: Vec<StaticMaterial>,
@@ -1808,7 +1810,7 @@ impl StaticMeshTail {
                         if r.u32()? == 0 {
                             return Ok(None);
                         }
-                        let bounds: [u8; 49] = r.take(49)?.try_into().expect("49 bytes");
+                        let bounds = { let mut b = Box3d::default(); b.serialize(r)?; b };
                         let mostly_two_sided = r.u32()?;
                         let n = {
                             let n = r.i32()?;
@@ -1829,9 +1831,13 @@ impl StaticMeshTail {
                         if r.u32()? == 0 {
                             return Ok(None);
                         }
-                        let local_space_mesh_bounds = r.take(25)?.try_into().expect("25 bytes");
+                        let local_space_mesh_bounds =
+                            { let mut b = Box3f::default(); b.serialize(r)?; b };
                         let mostly_two_sided = r.u32()?;
-                        let mips = r.take(168)?.try_into().expect("168 bytes");
+                        let mut mips = [SparseDistanceFieldMip::default(); 3];
+                        for m in &mut mips {
+                            m.serialize(r)?;
+                        }
                         let n = {
                             let n = r.i32()?;
                             super::limits::bounded(n, MAX_NATIVE_COUNT, "AlwaysLoadedMip", r.o - 4)?
@@ -1850,7 +1856,10 @@ impl StaticMeshTail {
 
         let bounds = { let mut b = BoxSphereBounds::default(); b.serialize(r)?; b };
         let lods_share_static_lighting = r.u32()?;
-        let screen_sizes = r.take(64)?.try_into().expect("64 bytes");
+        let mut screen_sizes = [PerPlatformFloat::default(); 8];
+        for v in &mut screen_sizes {
+            v.serialize(r)?;
+        }
         let render_data_strip = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
         let has_speed_tree_wind = r.u32()?;
         let n = bounded_count(r.i32()?, "StaticMaterials", r.o - 4)?;
@@ -1936,7 +1945,7 @@ impl StaticMeshTail {
                     match c {
                         Some(c) => {
                             ar.u32(&mut 1)?;
-                            ar.raw(&mut c.bounds.to_vec(), 49)?;
+                            c.bounds.clone().serialize(ar)?;
                             ar.u32(&mut c.mostly_two_sided.to_owned())?;
                             write_vec(ar, &c.cards)?;
                         }
@@ -1961,9 +1970,11 @@ impl StaticMeshTail {
                     match d {
                         Some(d) => {
                             ar.u32(&mut 1)?;
-                            ar.raw(&mut d.local_space_mesh_bounds.to_vec(), 25)?;
+                            d.local_space_mesh_bounds.clone().serialize(ar)?;
                             ar.u32(&mut d.mostly_two_sided.to_owned())?;
-                            ar.raw(&mut d.mips.to_vec(), 168)?;
+                            for m in &d.mips {
+                                m.clone().serialize(ar)?;
+                            }
                             ar.i32(&mut (d.always_loaded_mip.len() as i32))?;
                             let n = d.always_loaded_mip.len();
                             ar.raw(&mut d.always_loaded_mip.clone(), n)?;
@@ -1979,7 +1990,9 @@ impl StaticMeshTail {
 
         self.bounds.clone().serialize(ar)?;
         ar.u32(&mut self.lods_share_static_lighting.to_owned())?;
-        ar.raw(&mut self.screen_sizes.to_vec(), 64)?;
+        for v in &self.screen_sizes {
+            v.clone().serialize(ar)?;
+        }
         self.render_data_strip.clone().serialize(ar)?;
         ar.u32(&mut self.has_speed_tree_wind.to_owned())?;
         write_vec(ar, &self.materials)?;
@@ -1988,7 +2001,7 @@ impl StaticMeshTail {
 }
 
 /// One LOD of a `UMorphTarget`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MorphLodModel {
     /// `true` when the vertex array was stripped and only its count is written.
     pub stripped: bool,
@@ -2002,14 +2015,14 @@ pub struct MorphLodModel {
 }
 
 /// A two-way choice that is not an error — named to avoid reading as `Result`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Result2<A, B> {
     A(A),
     B(B),
 }
 
 /// `UMorphTarget::Serialize`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MorphTargetTail {
     pub strip_flags: u16,
     /// Absent when audio-visual data was stripped — the tail ends at the flags.
@@ -2072,7 +2085,7 @@ impl MorphTargetTail {
 }
 
 /// One streamed audio chunk of a `USoundWave`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AudioChunk {
     pub flags: u32,
     pub bulk: InlineBulkPayload,
@@ -2158,7 +2171,7 @@ impl SoundWaveTail {
 }
 
 /// One element of a `UModelComponent`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelElement {
     pub map_build_data_id: Guid,
     pub component: i32,
@@ -2167,7 +2180,7 @@ pub struct ModelElement {
 }
 
 /// `UModelComponent::Serialize`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelComponentTail {
     pub model: i32,
     pub elements: Vec<ModelElement>,
@@ -2214,7 +2227,7 @@ impl ModelComponentTail {
 }
 
 /// One `FReferencePose` of a `USkeleton`'s retarget sources.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RetargetSource {
     pub key: FName,
     pub pose_name: FName,
@@ -2222,7 +2235,7 @@ pub struct RetargetSource {
 }
 
 /// `USkeleton::Serialize`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SkeletonTail {
     pub reference_skeleton: ReferenceSkeleton,
     pub retarget_sources: Vec<RetargetSource>,
@@ -2294,7 +2307,7 @@ impl SkeletonTail {
 /// The `FField` chain and the Kismet bytecode are both their own sub-formats with
 /// no writer in this crate, so they stay spans. What the model owns is the
 /// framing: the super-struct reference, the child list, and the two sizes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StructTail {
     pub super_struct: i32,
     /// `ChildArray` — an `FPackageIndex` per entry.
@@ -2341,7 +2354,7 @@ impl StructTail {
 }
 
 /// `UFunction::Serialize`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FunctionTail {
     pub function_flags: u32,
     /// `RepOffset`, written only for `FUNC_Net`.
@@ -2376,7 +2389,7 @@ impl FunctionTail {
 }
 
 /// `UClass::Serialize`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ClassTail {
     pub func_map: Vec<FuncMapEntry>,
     pub class_flags: u32,
@@ -2430,7 +2443,7 @@ impl ClassTail {
 ///
 /// Only read when more than four bytes remain, which is the engine's own guard
 /// against reading a short tail's last word as a count.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BlueprintGeneratedClassTail {
     pub editor_tags: Option<Vec<(FName, FStr)>>,
 }
@@ -2470,7 +2483,7 @@ impl BlueprintGeneratedClassTail {
 /// bespoke struct for each would be forty near-identical types, so the shape is
 /// declared as data in [`COMPOSED_TAILS`] and decoded generically. Nothing is
 /// retained — each piece becomes a value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TailPiece {
     /// `UActorComponent`'s UCS-modified-property list — 28 bytes per entry.
     UcsProperties,
@@ -2715,7 +2728,7 @@ fn write_pieces(
 /// follows, and a repeat is a back-reference with nothing behind it. So the model
 /// records whether the payload was there rather than re-deriving it, which is
 /// what lets a single pointer be written without replaying the whole graph.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChaosPtr {
     pub present: bool,
     pub tag: Option<i32>,
@@ -2758,7 +2771,7 @@ impl ChaosPtr {
 }
 
 /// One attribute's values inside an `FManagedArrayCollection`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ManagedArrayValues {
     /// Written with `BulkSerialize`, so it carries its own element size.
     Bulk { element_size: i32, data: Vec<u8> },
@@ -2771,7 +2784,7 @@ pub enum ManagedArrayValues {
 }
 
 /// One attribute of an `FManagedArrayCollection`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ManagedArrayAttribute {
     pub name: FName,
     pub group: FName,
@@ -2785,7 +2798,7 @@ pub struct ManagedArrayAttribute {
 
 /// `FManagedArrayCollection` — the attribute store a geometry collection is
 /// built out of.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ManagedArrayCollection {
     pub version: i32,
     /// An `FName` key and its `FGroupInfo` — a version and a size.
@@ -2938,7 +2951,6 @@ impl ManagedArrayCollection {
 }
 
 /// `FGeometryCollectionMeshResources` plus its description.
-// No `Eq`: the pre-skinned bounds are doubles.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GeometryCollectionMesh {
     /// The index buffer comes **first** here, unlike `FStaticMeshLODResources`,
@@ -2969,7 +2981,6 @@ pub struct GeometryCollectionMesh {
 
 /// `UGeometryCollection`'s tail: the managed array collection, then the cooked
 /// render data.
-// No `Eq`: the mesh's bounds are doubles.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GeometryCollectionTail {
     pub is_cooked_or_cooking: u32,
@@ -3099,7 +3110,7 @@ impl GeometryCollectionTail {
 }
 
 /// One vtable patch table inside a shader map's pointer table.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VTablePatchTable {
     pub type_name_hash: [u8; 8],
     /// `VTableOffset` and `Offset` per patch.
@@ -3107,14 +3118,14 @@ pub struct VTablePatchTable {
 }
 
 /// One name patch table — script names and memory-image names share the shape.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NamePatchTable {
     pub name: [u8; 8],
     pub offsets: FixedArray,
 }
 
 /// Where a shader map's bytecode lives.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ShaderCode {
     /// In a shared shader library; only the hash is in the package.
     Shared { hash: [u8; 20] },
@@ -3134,7 +3145,7 @@ pub enum ShaderCode {
 ///
 /// The frozen memory image and the compiled bytecode stay byte strings; the
 /// tables that address and relocate them are values.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ShaderMap {
     /// `FPlatformTypeLayoutParameters`: max field alignment and flags.
     pub layout_params: [u8; 8],
@@ -3307,7 +3318,7 @@ impl ShaderMap {
 }
 
 /// One of a `UNiagaraScript`'s compiled shader resources.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NiagaraShaderResource {
     pub cooked: bool,
     pub num_permutations: i32,
@@ -3321,7 +3332,7 @@ pub struct NiagaraShaderResource {
 ///
 /// A script with no shader maps ends at the property block, so the tail is empty
 /// — which is not the same as a script whose resource count is zero.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NiagaraScriptTail {
     pub resources: Vec<NiagaraShaderResource>,
 }
@@ -3382,7 +3393,7 @@ impl NiagaraScriptTail {
 
 /// `ULandscapeComponent`'s tail: the grass weight offsets and the packed
 /// height/weight data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LandscapeComponentTail {
     pub num_elements: i32,
     /// An `FPackageIndex` and an `int32` per entry.
@@ -3393,7 +3404,7 @@ pub struct LandscapeComponentTail {
 
 /// `ULandscapeHeightfieldCollisionComponent`'s tail: the cooked Chaos
 /// heightfield, behind its own present flag.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LandscapeCollisionTail {
     pub cooked_collision_data: Option<BulkArray>,
 }
@@ -3403,7 +3414,7 @@ pub struct LandscapeCollisionTail {
 /// `UVectorFieldStatic`'s volume source is the only user in this corpus, but the
 /// shape — an index, and the bytes when the map points at this very offset — is
 /// the one every inline bulk payload has.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct InlineBulkPayload {
     pub bulk_index: i32,
     pub payload: Option<Vec<u8>>,
@@ -3435,7 +3446,7 @@ impl InlineBulkPayload {
 ///
 /// Modeled on its own because several actor classes add nothing of their own —
 /// `AStaticMeshActor` alone is 69,832 exports whose whole tail is this.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ActorTail {
     pub name: Option<FStr>,
     /// `FActorInstanceGuid`: `ActorGuid` then `ActorInstanceGuid`.
@@ -3491,7 +3502,6 @@ impl AkAudioEventTail {
 /// is 56 bytes for the same reason — a double-width reading survived 16,722
 /// models because every one of them has an empty vertex buffer, and blew up on
 /// the two that do not.
-// No `Eq`: the bounds are doubles.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelTail {
     pub global_strip: u8,
@@ -3511,8 +3521,7 @@ pub struct ModelTail {
     /// class's vertex-buffer flag are stripped.
     pub vertex_buffer: Option<FixedArray>,
     pub lighting_guid: Guid,
-    /// `FLightmassPrimitiveSettings` — five four-byte bools and four floats.
-    pub lightmass_settings: FixedArray,
+    pub lightmass_settings: Vec<LightmassPrimitiveSettings>,
 }
 
 impl ModelTail {
@@ -3547,7 +3556,10 @@ impl ModelTail {
             num_unique_vertices,
             vertex_buffer,
             lighting_guid: { let mut g = Guid::default(); g.serialize(r)?; g },
-            lightmass_settings: FixedArray::read(r, "LightmassSettings", 36)?,
+            lightmass_settings: {
+                let n = bounded_count(r.i32()?, "LightmassSettings", r.o - 4)?;
+                read_vec(r, "LightmassSettings", n)?
+            },
         })
     }
 
@@ -3573,12 +3585,12 @@ impl ModelTail {
             _ => bail!("vertex buffer presence disagrees with the strip flags"),
         }
         self.lighting_guid.clone().serialize(ar)?;
-        self.lightmass_settings.write(ar)
+        write_vec(ar, &self.lightmass_settings)
     }
 }
 
 /// One bucket of a level's precomputed visibility.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VisibilityBucket {
     pub cell_data_size: i32,
     /// `FCompressedVisibilityChunk` cells: an `FVector` min and two `uint16`.
@@ -3586,7 +3598,7 @@ pub struct VisibilityBucket {
     pub chunks: Vec<VisibilityChunk>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VisibilityChunk {
     pub compressed: u32,
     pub uncompressed_size: i32,
@@ -3595,7 +3607,6 @@ pub struct VisibilityChunk {
 
 /// `ULevel`'s tail: the actor list, the level's `FURL`, the model and component
 /// references, and the precomputed visibility and distance-field data.
-// No `Eq`: the volume distance field carries an `f32` scale.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LevelTail {
     pub actors: FixedArray,
@@ -3613,7 +3624,7 @@ pub struct LevelTail {
     pub visibility_header: [u8; 32],
     pub visibility_buckets: Vec<VisibilityBucket>,
     pub volume_distance_field_scale: f32,
-    pub volume_distance_field_box: [u8; 49],
+    pub volume_distance_field_box: Box3d,
     pub volume_size: [u8; 12],
     pub volume_distance_field_data: FixedArray,
 }
@@ -3677,7 +3688,7 @@ impl LevelTail {
             visibility_header,
             visibility_buckets,
             volume_distance_field_scale: r.f32()?,
-            volume_distance_field_box: r.take(49)?.try_into().expect("49 bytes"),
+            volume_distance_field_box: { let mut b = Box3d::default(); b.serialize(r)?; b },
             volume_size: r.take(12)?.try_into().expect("12 bytes"),
             volume_distance_field_data: FixedArray::read(r, "distance field data", 4)?,
         })
@@ -3714,14 +3725,14 @@ impl LevelTail {
             }
         }
         ar.f32(&mut self.volume_distance_field_scale.to_owned())?;
-        ar.raw(&mut self.volume_distance_field_box.to_vec(), 49)?;
+        self.volume_distance_field_box.clone().serialize(ar)?;
         ar.raw(&mut self.volume_size.to_vec(), 12)?;
         self.volume_distance_field_data.write(ar)
     }
 }
 
 /// The bone-compression codec's own trailing data, which differs by codec.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum BoneCodecData {
     /// `FACLCompressedAnimDataBase::SerializeCompressedData` — the base key
     /// count then `bCompressionFailed`. The compressed clip itself lives in
@@ -3739,7 +3750,7 @@ pub enum BoneCodecData {
 /// compressed-data block reads that GUID's tail as a track count and reports
 /// 2,039,646,153 tracks — which is what happened, on all 14,130 exports, before
 /// this type existed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AnimSequenceChainTail {
     pub animation_asset_guid: Guid,
     pub sequence: AnimSequenceTail,
@@ -3764,7 +3775,7 @@ impl AnimSequenceChainTail {
 /// The ACL-compressed clip is in `compressed_byte_stream`, and it stays a byte
 /// string here — it is ACL's own container, and decoding it is work item H.
 /// Everything that describes and addresses it is a value.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AnimSequenceTail {
     pub strip_flags: StripDataFlags,
     /// `bSerializeCompressedData`. When clear the tail ends here.
@@ -3914,7 +3925,7 @@ impl AnimSequenceTail {
 /// what this model owns is the *split* — which is not trivial, because the first
 /// stream can be written without a size and the reader has to find where the
 /// second one begins.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DnaAssetTail {
     pub behavior: Vec<u8>,
     pub geometry: Vec<u8>,
@@ -3963,7 +3974,7 @@ impl DnaAssetTail {
 ///
 /// The width is carried so the count can be derived on write instead of stored
 /// twice and allowed to disagree with the payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FixedArray {
     pub element_size: usize,
     pub data: Vec<u8>,
@@ -3993,7 +4004,7 @@ impl FixedArray {
 }
 
 /// `FReferenceSkeleton` — the rig the renderer skins against.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReferenceSkeleton {
     pub bone_info: Vec<MeshBoneInfo>,
     /// How wide an `FTransform` is in this cook, 80 or 40 bytes.
@@ -4056,7 +4067,7 @@ impl ReferenceSkeleton {
 }
 
 /// One `FSkelMeshRenderSection`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SkelRenderSection {
     pub global_strip: u8,
     pub class_strip: u8,
@@ -4065,8 +4076,7 @@ pub struct SkelRenderSection {
     /// `RecomputeTangentsVertexMaskChannel` sits in the middle of it and is
     /// unpadded.
     pub header: [u8; 27],
-    /// `ClothMappingDataLODs`: an array of arrays of 80-byte `FMeshToMeshVertData`.
-    pub cloth_mapping_lods: Vec<FixedArray>,
+    pub cloth_mapping_lods: Vec<Vec<MeshToMeshVertData>>,
     pub bone_map: FixedArray,
     pub num_vertices: u32,
     pub max_bone_influences: i32,
@@ -4081,7 +4091,7 @@ impl SkelRenderSection {
     /// Whether this section carries cloth, which decides what the LOD's buffers
     /// contain further down.
     fn has_cloth(&self) -> bool {
-        self.cloth_mapping_lods.iter().any(|a| !a.data.is_empty())
+        self.cloth_mapping_lods.iter().any(|a| !a.is_empty())
     }
 
     fn read(r: &mut Reader) -> Result<Self> {
@@ -4094,7 +4104,8 @@ impl SkelRenderSection {
         };
         let mut cloth_mapping_lods = Vec::with_capacity(n.min(16));
         for _ in 0..n {
-            cloth_mapping_lods.push(FixedArray::read(r, "cloth mapping data", 80)?);
+            let m = bounded_count(r.i32()?, "cloth mapping data", r.o - 4)?;
+            cloth_mapping_lods.push(read_vec(r, "cloth mapping data", m)?);
         }
         let bone_map = FixedArray::read(r, "BoneMap", 2)?;
         let num_vertices = r.u32()?;
@@ -4134,7 +4145,7 @@ impl SkelRenderSection {
         ar.raw(&mut self.header.to_vec(), 27)?;
         ar.i32(&mut (self.cloth_mapping_lods.len() as i32))?;
         for a in &self.cloth_mapping_lods {
-            a.write(ar)?;
+            write_vec(ar, a)?;
         }
         self.bone_map.write(ar)?;
         ar.u32(&mut self.num_vertices.to_owned())?;
@@ -4154,7 +4165,7 @@ impl SkelRenderSection {
 }
 
 /// One skin-weight profile's override data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SkinWeightProfile {
     pub name: FName,
     pub bone_ids: FixedArray,
@@ -4164,7 +4175,7 @@ pub struct SkinWeightProfile {
 }
 
 /// One named per-vertex attribute buffer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VertexAttributeBuffer {
     pub name: FName,
     pub component_count: i32,
@@ -4174,7 +4185,7 @@ pub struct VertexAttributeBuffer {
 }
 
 /// Compressed morph-target render data, present only when the cook wrote it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MorphTargetData {
     pub morph_data: FixedArray,
     pub minimum_value_per_morph: FixedArray,
@@ -4187,7 +4198,7 @@ pub struct MorphTargetData {
 
 /// `FSkeletalMeshLODRenderData::SerializeStreamedData` — everything a LOD keeps
 /// inline.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SkelStreamedData {
     pub strip_flags: StripDataFlags,
     pub index_data_type_size: u8,
@@ -4427,7 +4438,7 @@ impl SkelStreamedData {
 }
 
 /// The metadata a streamed-out LOD leaves behind in the export.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SkelAvailabilityInfo {
     /// Everything from `DataTypeSize` through the skin-weight lookup count — a
     /// flat run of scalars whose order differs from the streamed form.
@@ -4467,7 +4478,7 @@ impl SkelAvailabilityInfo {
 }
 
 /// One `FSkeletalMeshLODRenderData`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SkeletalMeshLod {
     pub global_strip: u8,
     pub class_strip: u8,
@@ -4479,7 +4490,7 @@ pub struct SkeletalMeshLod {
     pub render: Option<SkeletalMeshLodRender>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SkeletalMeshLodRender {
     pub sections: Vec<SkelRenderSection>,
     pub active_bone_indices: FixedArray,
@@ -4487,7 +4498,7 @@ pub struct SkeletalMeshLodRender {
     pub buffers: SkeletalMeshLodBuffers,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SkeletalMeshLodBuffers {
     Inline(Box<SkelStreamedData>),
     /// Streamed to `.ubulk`. A zero-size payload means the LOD was discarded
@@ -4591,7 +4602,6 @@ impl SkeletalMeshLod {
 }
 
 /// The whole tail of a `USkeletalMesh` export: 415 exports, 470 MiB.
-// No `Eq`: the imported bounds are doubles.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SkeletalMeshTail {
     pub strip_flags: StripDataFlags,
@@ -4608,7 +4618,7 @@ pub struct SkeletalMeshTail {
     pub body_setup: Option<i32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SkeletalMeshMaterial {
     pub material_interface: i32,
     pub slot_name: FName,
@@ -4618,7 +4628,6 @@ pub struct SkeletalMeshMaterial {
     pub uv_channel_info: [u8; 24],
 }
 
-// No `Eq`: the Nanite hierarchy carries float bounds.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SkeletalMeshRenderData {
     pub lods: Vec<SkeletalMeshLod>,
@@ -4732,7 +4741,7 @@ impl SkeletalMeshTail {
 /// serializer's output, and decoding it is its own work item rather than
 /// something the tail model can do on the way past. What the model does supply
 /// is the addressing: which format, which bulk-data index.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CookedFormat {
     pub format: FName,
     pub bulk_index: i32,
@@ -4744,7 +4753,7 @@ pub struct CookedFormat {
 ///
 /// 17,754 exports and 1,051 MiB, the second-largest tail population in the
 /// corpus.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BodySetupTail {
     pub guid: Guid,
     pub cooked: bool,
@@ -4806,7 +4815,7 @@ impl BodySetupTail {
 
 /// One `FMaterialResourceLocOnDisk`: where a resource starts and which
 /// feature/quality level it was compiled for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MaterialResourceLoc {
     pub offset: u32,
     pub feature_level: u8,
@@ -4821,7 +4830,7 @@ pub struct MaterialResourceLoc {
 /// not an encoding of some richer value this codec could recover and re-emit.
 /// What *is* modeled is everything that addresses it — the name table and the
 /// per-resource locations, which is what a tool needs to find a resource.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct InlineShaderMaps {
     /// The resource count that leads the block. Zero or negative ends it
     /// immediately, and nothing below is written at all.

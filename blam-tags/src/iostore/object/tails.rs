@@ -64,7 +64,12 @@ pub(super) fn read_skel_render_section(r: &mut Reader) -> Result<bool> {
     for _ in 0..outer {
         let inner = native_count(r, "cloth mapping data")?;
         has_cloth |= inner > 0;
-        r.take(inner * 80)?; // FMeshToMeshVertData
+        // `FMeshToMeshVertData` is **64** bytes, not 80: three `FVector4f`, four
+        // `uint16` indices, a weight and a padding word
+        // (SkeletalMeshLODRenderData.cpp:193). Nothing in the corpus has a
+        // non-empty cloth mapping, so the old 80 never desynced anything — it
+        // was simply never exercised.
+        r.take(inner * 64)?;
     }
     let bones = native_count(r, "BoneMap")?;
     r.take(bones * 2)?;

@@ -533,7 +533,174 @@ impl LumenCardBuildData {
     }
 }
 
+/// `FInt32Vector`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Int32Vector {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+}
+
+impl Int32Vector {
+    pub const SIZE: usize = 12;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        ar.i32(&mut self.x)?;
+        ar.i32(&mut self.y)?;
+        ar.i32(&mut self.z)
+    }
+}
+
+/// `FVector2f`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Vector2f {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl Vector2f {
+    pub const SIZE: usize = 8;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        ar.f32(&mut self.x)?;
+        ar.f32(&mut self.y)
+    }
+}
+
+/// `FSparseDistanceFieldMip` (DistanceFieldAtlas.h:197). Wire order matches the
+/// declaration (`operator<<` at :219).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SparseDistanceFieldMip {
+    pub indirection_dimensions: Int32Vector,
+    pub num_distance_field_bricks: i32,
+    pub volume_to_virtual_uv_scale: Vector3f,
+    pub volume_to_virtual_uv_add: Vector3f,
+    pub distance_field_to_volume_scale_bias: Vector2f,
+    pub bulk_offset: u32,
+    pub bulk_size: u32,
+}
+
+impl SparseDistanceFieldMip {
+    pub const SIZE: usize = 56;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        self.indirection_dimensions.serialize(ar)?;
+        ar.i32(&mut self.num_distance_field_bricks)?;
+        self.volume_to_virtual_uv_scale.serialize(ar)?;
+        self.volume_to_virtual_uv_add.serialize(ar)?;
+        self.distance_field_to_volume_scale_bias.serialize(ar)?;
+        ar.u32(&mut self.bulk_offset)?;
+        ar.u32(&mut self.bulk_size)
+    }
+}
+
+/// `FStaticMeshLODResources::FStaticMeshBuffersSize` (StaticMeshResources.h:551).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StaticMeshBuffersSize {
+    pub serialized_buffers_size: u32,
+    pub depth_only_ib_size: u32,
+    pub reversed_ibs_size: u32,
+}
+
+impl StaticMeshBuffersSize {
+    pub const SIZE: usize = 12;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        ar.u32(&mut self.serialized_buffers_size)?;
+        ar.u32(&mut self.depth_only_ib_size)?;
+        ar.u32(&mut self.reversed_ibs_size)
+    }
+}
+
+/// `FMeshToMeshVertData` (SkeletalMeshTypes.h:58) — one cloth wrap-deformer
+/// influence.
+///
+/// **64 bytes, not 80.** The walker used 80, and every cloth mapping array in
+/// the corpus is empty, so nothing ever exercised it — a non-zero count with a
+/// 16-byte-per-element error would have desynced the whole LOD immediately.
+/// Read from `operator<<` (SkeletalMeshLODRenderData.cpp:193): three
+/// `FVector4f`, four `uint16` indices, a weight and a padding word. The
+/// pre-`WeightFMeshToMeshVertData` form was also 64 — two padding words instead
+/// of weight-plus-padding.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct MeshToMeshVertData {
+    pub position_bary_coords_and_dist: Vector4f,
+    pub normal_bary_coords_and_dist: Vector4f,
+    pub tangent_bary_coords_and_dist: Vector4f,
+    /// Three source-mesh triangle indices; the fourth is a flag, `0xffff`
+    /// meaning "skin normally, no simulation".
+    pub source_mesh_vert_indices: [u16; 4],
+    pub weight: f32,
+    pub padding: u32,
+}
+
+impl MeshToMeshVertData {
+    pub const SIZE: usize = 64;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        self.position_bary_coords_and_dist.serialize(ar)?;
+        self.normal_bary_coords_and_dist.serialize(ar)?;
+        self.tangent_bary_coords_and_dist.serialize(ar)?;
+        for i in &mut self.source_mesh_vert_indices {
+            ar.u16(i)?;
+        }
+        ar.f32(&mut self.weight)?;
+        ar.u32(&mut self.padding)
+    }
+}
+
+/// `FLightmassPrimitiveSettings`.
+///
+/// Typed from the UHT declaration — four `uint8 b:1` bitfields then five floats,
+/// each bool four bytes through `FArchive`, which is the measured 36. The
+/// *order* is the declaration's; the `operator<<` body is in none of the
+/// obvious translation units, so unlike the rest of this module it is the one
+/// layout whose field order is inferred rather than read.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct LightmassPrimitiveSettings {
+    pub use_two_sided_lighting: u32,
+    pub shadow_indirect_only: u32,
+    pub use_emissive_for_static_lighting: u32,
+    pub use_vertex_normal_for_hemisphere_gather: u32,
+    pub emissive_light_falloff_exponent: f32,
+    pub emissive_light_explicit_influence_radius: f32,
+    pub emissive_boost: f32,
+    pub diffuse_boost: f32,
+    pub fully_occluded_samples_fraction: f32,
+}
+
+impl LightmassPrimitiveSettings {
+    pub const SIZE: usize = 36;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        for b in [
+            &mut self.use_two_sided_lighting,
+            &mut self.shadow_indirect_only,
+            &mut self.use_emissive_for_static_lighting,
+            &mut self.use_vertex_normal_for_hemisphere_gather,
+        ] {
+            ar.u32(b)?;
+        }
+        for f in [
+            &mut self.emissive_light_falloff_exponent,
+            &mut self.emissive_light_explicit_influence_radius,
+            &mut self.emissive_boost,
+            &mut self.diffuse_boost,
+            &mut self.fully_occluded_samples_fraction,
+        ] {
+            ar.f32(f)?;
+        }
+        Ok(())
+    }
+}
+
 ue_structs!(
+    Int32Vector,
+    Vector2f,
+    SparseDistanceFieldMip,
+    StaticMeshBuffersSize,
+    MeshToMeshVertData,
+    LightmassPrimitiveSettings,
     PageStreamingState,
     PackedHierarchyNode,
     LumenCardObb,
