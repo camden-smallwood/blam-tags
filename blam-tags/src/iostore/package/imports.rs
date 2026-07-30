@@ -666,10 +666,215 @@ mod edit_corpus {
         let mut header = header.clone();
         let mut export = export.clone();
         let block = export.properties_mut()?;
-        set_object_property(&mut header, block, "AssetReference", target).ok()?;
+        set_object_property(&mut header, block, "AssetReference", target, class, usmap).ok()?;
         let payload = write_export(class, &export, usmap).ok()?;
         let mut payloads = payloads.to_vec();
         payloads[0] = payload;
         write_package(&header, &payloads, HV).ok().map(|(bytes, _)| bytes)
+    }
+}
+
+/// The wrapper class the cook gives a tag of `group_longname`.
+///
+/// `biped` → `/Script/BlamSynchronization.BlamBipedTagDataAsset`. All 101
+/// shipped groups follow this mechanically. It is a *candidate*: a caller with
+/// the package in hand should hash it and check
+/// `FPackageObjectIndex::create_script_import(..) == export.class_index` rather
+/// than trust the name, because decoding against a wrong class does not error —
+/// it produces plausible values.
+pub fn tag_wrapper_class_path(group_longname: &str) -> String {
+    let mut pascal = String::with_capacity(group_longname.len());
+    for word in group_longname.split('_').filter(|w| !w.is_empty()) {
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            pascal.extend(first.to_uppercase());
+            pascal.push_str(&chars.as_str().to_ascii_lowercase());
+        }
+    }
+    format!("/Script/BlamSynchronization.Blam{pascal}TagDataAsset")
+}
+
+/// Split a cooked tag package path into `(halo-relative path, group long name)`.
+///
+/// `/Game/Tags/objects/characters/elite/elite-biped` →
+/// `("objects/characters/elite/elite", "biped")`. Splits on the **last** hyphen:
+/// tag names contain hyphens, group long names do not contain slashes.
+pub fn split_tag_package(package: &str) -> Option<(&str, &str)> {
+    let rest = package
+        .strip_prefix("/Game/Tags/")
+        .or_else(|| package.strip_prefix("/game/tags/"))?;
+    let (path, group) = rest.rsplit_once('-')?;
+    if path.is_empty() || group.is_empty() || group.contains('/') {
+        return None;
+    }
+    Some((path, group))
+}
+
+#[cfg(test)]
+mod new_package_corpus {
+    use super::*;
+    use crate::iostore::container_header::EIoContainerHeaderVersion;
+    use crate::iostore::object::export::read_export;
+    use crate::iostore::object::value::PropValue;
+    use crate::iostore::package::builder::read_payloads;
+    use crate::iostore::ue_types::EIoStoreTocVersion;
+    use crate::iostore::usmap::Usmap;
+    use crate::iostore::writer::{write_new_tag_container, NewPackage};
+    use crate::iostore::IoStoreArchive;
+    use std::io::Cursor;
+    use std::path::PathBuf;
+
+    const CV: EIoStoreTocVersion = EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash;
+    const HV: EIoContainerHeaderVersion = EIoContainerHeaderVersion::SoftPackageReferences;
+
+    /// A new tag built from a donor template must not inherit the donor's
+    /// bindings.
+    ///
+    /// This was a real defect and a silent one: creating a new biped cloned some
+    /// other biped's wrapper verbatim, so the new tag presented as *that* biped's
+    /// actor and declared that biped's dependencies, with nothing on screen or in
+    /// the file to say so. The check is that the donor's `AssetReference` and
+    /// package imports are gone, and that a requested one takes its place.
+    ///
+    ///   CE_PAKS=... cargo test --features iostore new_package_corpus -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires a Campaign Evolved install; set CE_PAKS"]
+    fn a_new_tag_does_not_inherit_its_donors_bindings() {
+        let root = std::env::var("CE_PAKS").expect("set CE_PAKS");
+        let mut utocs: Vec<PathBuf> = std::fs::read_dir(&root)
+            .expect("read paks dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("utoc")))
+            .filter(|p| !p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("global.utoc")))
+            .collect();
+        utocs.sort();
+        let usmap = Usmap::meteorite().expect("bundled usmap");
+
+        // A donor that actually has something to inherit.
+        let mut donor = None;
+        'outer: for utoc in &utocs {
+            let Ok(archive) = IoStoreArchive::open(utoc) else { continue };
+            for entry in archive.entries() {
+                let lower = entry.path.to_ascii_lowercase().replace('\\', "/");
+                if !lower.ends_with("-biped.uasset") || !lower.contains("/content/tags/") {
+                    continue;
+                }
+                let Ok(bytes) = archive.read(&entry.path) else { continue };
+                let Ok(header) =
+                    FZenPackageHeader::deserialize(&mut Cursor::new(&bytes[..]), None, CV, HV, None)
+                else {
+                    continue;
+                };
+                if header.imported_packages.is_empty() {
+                    continue;
+                }
+                let ubulk = entry.path.replace(".uasset", ".ubulk");
+                let Ok(tag) = archive.read(&ubulk) else { continue };
+                donor = Some((bytes, tag, header));
+                break 'outer;
+            }
+        }
+        let (template, tag_bytes, donor_header) = donor.expect("a biped donor with imports");
+        let donor_packages = donor_header.imported_package_names.clone();
+        assert!(!donor_packages.is_empty());
+        println!("donor imports: {donor_packages:?}");
+
+        const NEW_PKG: &str = "/Game/Tags/objects/characters/test/probe_new-biped";
+        const WANTED: &str = "/Game/_Prototypes/Blueprints/BP_EmptyActor";
+
+        for (label, wanted) in [("unset", None), ("chosen", Some(WANTED))] {
+            let dir = std::env::temp_dir()
+                .join(format!("blam-newtag-{}-{label}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let out = dir.join("probe-WinGDK_P.utoc");
+            // Through `NewPackage` rather than `write_new_tag_container`, so the
+            // "chosen" case actually sets a binding instead of asserting nothing.
+            crate::iostore::writer::write_mod_container_ex(
+                &[],
+                &[NewPackage {
+                    template_uasset: &template,
+                    tag_bytes: &tag_bytes,
+                    new_package_path: NEW_PKG,
+                    redirect_from: None,
+                    asset_reference: wanted.map(|package| ImportTarget {
+                        package: package.to_owned(),
+                        object_hash: public_export_hash(&format!(
+                            "{}_C",
+                            package.rsplit('/').next().unwrap()
+                        )),
+                    }),
+                }],
+                &out,
+            )
+            .expect("write new tag container");
+
+            // Read the wrapper back out of the container it was written into.
+            let modded = IoStoreArchive::open(&out).expect("open the new container");
+            let id = crate::iostore::writer::make_chunk_id(
+                FPackageId::from_name(NEW_PKG).0,
+                0,
+                crate::iostore::CHUNK_TYPE_EXPORT_BUNDLE,
+            );
+            let index = modded.find_chunk(&id).expect("the container carries the wrapper");
+            let bytes = modded.read_chunk(index).expect("read the wrapper");
+
+            let header =
+                FZenPackageHeader::deserialize(&mut Cursor::new(&bytes[..]), None, CV, HV, None)
+                    .expect("the new wrapper parses");
+            println!("{label}: imports now {:?}", header.imported_package_names);
+
+            // The donor's packages must be gone from the declaration entirely,
+            // not merely unreferenced.
+            for donor_pkg in &donor_packages {
+                if wanted == Some(donor_pkg.as_str()) {
+                    continue;
+                }
+                assert!(
+                    !header.imported_package_names.contains(donor_pkg),
+                    "{label}: the new tag still declares the donor's import {donor_pkg}"
+                );
+            }
+
+            let payloads = read_payloads(&header, &bytes).expect("payloads");
+            let names = header.name_map.copy_raw_names();
+            let export = read_export(
+                &payloads[0],
+                &names,
+                &usmap,
+                "BlamBipedTagDataAsset",
+                header.export_map[0].object_flags,
+            )
+            .expect("the new wrapper decodes");
+            let block = export.properties().expect("a block");
+            let reference = block.get("AssetReference").map(PropValue::unwrapped);
+            match wanted {
+                None => assert!(
+                    reference.is_none(),
+                    "{label}: the new tag inherited an AssetReference"
+                ),
+                Some(package) => {
+                    // Resolve it the way the game would, through the import map.
+                    let Some(PropValue::Object(i)) = reference else {
+                        panic!("{label}: the requested AssetReference was not set");
+                    };
+                    let slot = import_slot_of(*i).expect("an import");
+                    let slots = read_import_slots(&header).expect("slots");
+                    let ImportSlot::Package(target) = &slots[slot] else {
+                        panic!("{label}: AssetReference does not name a package import");
+                    };
+                    assert_eq!(target.package, package, "{label}: wrong target");
+                    assert_eq!(
+                        header.imported_package_names,
+                        vec![package.to_owned()],
+                        "{label}: the new tag should declare exactly the chosen package"
+                    );
+                }
+            }
+            assert!(
+                block.get("CookedAssetsReferencedByTag").is_none(),
+                "{label}: the new tag inherited the donor's dependency list"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

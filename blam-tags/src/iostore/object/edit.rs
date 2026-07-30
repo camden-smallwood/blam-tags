@@ -343,7 +343,17 @@ pub fn set_object_property(
     block: &mut PropertyBlock,
     property: &str,
     target: ImportTarget,
+    class: &str,
+    usmap: &Usmap,
 ) -> Result<()> {
+    // Absent is the normal case, not an error: the cooker omits any property
+    // equal to its class default, and a tag that binds nothing has no
+    // `AssetReference` at all. Refusing here made "give this tag an actor"
+    // impossible for exactly the tags that need it most.
+    if !block.entries.iter().any(|e| &*e.name == property) {
+        set_property(block, class, property, PropValue::Object(0), usmap)
+            .with_context(|| format!("inserting {property}"))?;
+    }
     let Some(entry) = block.entries.iter().position(|e| &*e.name == property) else {
         bail!("the block has no property named {property}");
     };

@@ -17,6 +17,9 @@
 //! *encoder* is needed. Layout matches [`crate::iostore::IoStoreArchive`] exactly and is
 //! validated by round-tripping through it.
 
+use crate::iostore::imports::ImportTarget;
+use crate::iostore::ue_types::FPackageObjectIndex;
+use crate::iostore::zen::FZenPackageHeader;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -418,6 +421,14 @@ pub struct NewPackage<'a> {
     pub tag_bytes: &'a [u8],
     pub new_package_path: &'a str,
     pub redirect_from: Option<&'a str>,
+    /// What the new tag's `AssetReference` should point at.
+    ///
+    /// `None` leaves it unset, which is the right default and a change from
+    /// what cloning did. The template is a *donor* -- some other tag of the same
+    /// group -- and copying its export payload verbatim made a new biped
+    /// silently present as whichever biped supplied the template, with that
+    /// tag's dependency list attached. Nothing said so.
+    pub asset_reference: Option<ImportTarget>,
 }
 
 /// Add one same-name override (edited tag, plus the paired `.uasset` with its
@@ -494,6 +505,21 @@ fn add_new_package_to_writer(w: &mut OverrideContainerWriter, pkg: &NewPackage) 
         return Err(IoStoreError::Package("template .uasset has no export"));
     }
     let export_data = pkg.template_uasset[hdr.summary.header_size as usize..].to_vec();
+    // Strip what belongs to the donor rather than to the new tag, and set the
+    // caller's binding if they gave one. Falls back to the verbatim copy only
+    // when the wrapper carries nothing to strip.
+    // On a scratch copy: the sanitizer rewrites import slots before it touches
+    // the payload, so a mid-way bail that fell back to the verbatim export would
+    // ship a header describing imports the payload no longer matches.
+    let mut sanitized_hdr = hdr.clone();
+    let export_data = match sanitize_donated_export(&mut sanitized_hdr, &export_data, pkg) {
+        Ok(bytes) => {
+            hdr = sanitized_hdr;
+            bytes
+        }
+        Err(SanitizeSkip::NothingToStrip) => export_data,
+        Err(SanitizeSkip::Failed(e)) => return Err(e),
+    };
 
     let new_obj = pkg
         .new_package_path
@@ -527,6 +553,141 @@ fn add_new_package_to_writer(w: &mut OverrideContainerWriter, pkg: &NewPackage) 
     Ok(())
 }
 
+/// Why a donated export was left as-is.
+enum SanitizeSkip {
+    /// The wrapper declares nothing that could belong to the donor -- true for
+    /// the 47 bare groups, where cloning was always correct.
+    NothingToStrip,
+    Failed(IoStoreError),
+}
+
+/// Remove the donor tag's own bindings from a cloned wrapper, and apply the
+/// caller's `AssetReference` if they supplied one.
+///
+/// `AssetReference` names the Blueprint the tag presents as, and
+/// `CookedAssetsReferencedByTag` is the donor's dependency list. Both are
+/// properties of the donor, not of the group, so a clone carries them into a
+/// tag they say nothing true about.
+///
+/// `CookedAssetsReferencedByTag` is cleared rather than rebuilt. Deriving the
+/// real set means walking the new tag's body for its references, which is a
+/// larger job; an empty list is a shape 9,118 shipped tags already have, and
+/// resolution is ultimately by name with a group-default fallback, so an absent
+/// entry degrades rather than breaks. Rebuilding it properly is the follow-up.
+fn sanitize_donated_export(
+    hdr: &mut FZenPackageHeader,
+    export_data: &[u8],
+    pkg: &NewPackage<'_>,
+) -> std::result::Result<Vec<u8>, SanitizeSkip> {
+    use crate::iostore::object::export::{read_export, write_export};
+    use crate::iostore::object::value::PropValue;
+    use crate::iostore::package::imports::{
+        read_import_slots, split_tag_package, tag_wrapper_class_path, write_import_slots,
+        ImportSlot,
+    };
+    use crate::iostore::usmap::Usmap;
+
+    let Some((_, group)) = split_tag_package(pkg.new_package_path) else {
+        return Err(SanitizeSkip::NothingToStrip);
+    };
+    let class_path = tag_wrapper_class_path(group);
+    // Verify against the template rather than trusting the name: a donor of a
+    // different group would otherwise be decoded against the wrong schema, which
+    // does not error -- it produces plausible values.
+    let Some(export_entry) = hdr.export_map.first() else {
+        return Err(SanitizeSkip::NothingToStrip);
+    };
+    if export_entry.class_index != FPackageObjectIndex::create_script_import(&class_path) {
+        return Err(SanitizeSkip::NothingToStrip);
+    }
+    let class = class_path.rsplit('.').next().unwrap_or(&class_path).to_owned();
+
+    let Ok(usmap) = Usmap::meteorite() else {
+        return Err(SanitizeSkip::NothingToStrip);
+    };
+    if usmap.get(&class).is_none() {
+        return Err(SanitizeSkip::NothingToStrip);
+    }
+
+    let payload_len = export_entry.cooked_serial_size as usize;
+    let Some(payload) = export_data.get(..payload_len) else {
+        return Err(SanitizeSkip::NothingToStrip);
+    };
+    let trailing = export_data[payload_len.min(export_data.len())..].to_vec();
+
+    let names = hdr.name_map.copy_raw_names();
+    let Ok(mut export) = read_export(payload, &names, &usmap, &class, export_entry.object_flags)
+    else {
+        return Err(SanitizeSkip::NothingToStrip);
+    };
+    let Some(block) = export.properties_mut() else {
+        return Err(SanitizeSkip::NothingToStrip);
+    };
+    let had_donor_data = block.get("AssetReference").is_some()
+        || block.get("CookedAssetsReferencedByTag").is_some();
+    if !had_donor_data && pkg.asset_reference.is_none() {
+        return Err(SanitizeSkip::NothingToStrip);
+    }
+
+    block.entries.retain(|e| {
+        &*e.name != "AssetReference" && &*e.name != "CookedAssetsReferencedByTag"
+    });
+
+    // Every package import existed to serve one of those two properties, so with
+    // both gone only the script imports (class, CDO, module) are still named.
+    // Rebuilding from the surviving slots is what drops the donor's packages
+    // from `imported_packages` too, rather than leaving them declared.
+    let slots: Vec<ImportSlot> = read_import_slots(hdr)
+        .map_err(|_| SanitizeSkip::NothingToStrip)?
+        .into_iter()
+        .filter(|slot| matches!(slot, ImportSlot::Script(_)))
+        .collect();
+    write_import_slots(hdr, &slots).map_err(|_| SanitizeSkip::NothingToStrip)?;
+
+    if let Some(target) = pkg.asset_reference.clone() {
+        let block = export.properties_mut().expect("checked above");
+        // Re-inserted through the same path an edit uses, so the import slot and
+        // the property index are produced by one piece of code.
+        crate::iostore::object::edit::set_object_property(
+            hdr,
+            block,
+            "AssetReference",
+            target,
+            &class,
+            &usmap,
+        )
+        .map_err(|e| {
+            // A requested binding that cannot be applied must fail loudly. The
+            // fallback path ships the donor's wrapper, which is the exact
+            // outcome the caller asked to avoid.
+            let _ = e;
+            SanitizeSkip::Failed(IoStoreError::Package(
+                "could not set the requested AssetReference on a new tag",
+            ))
+        })?;
+    }
+
+    let mut out = write_export(&class, &export, &usmap)
+        .map_err(|_| SanitizeSkip::Failed(IoStoreError::Package("re-encode donated wrapper")))?;
+    hdr.export_map[0].cooked_serial_size = out.len() as u64;
+    out.extend_from_slice(&trailing);
+    // Any object property still pointing into the import map would now be
+    // dangling, since every package slot was dropped.
+    if let Some(block) = export.properties() {
+        if block
+            .entries
+            .iter()
+            .any(|e| matches!(e.value.unwrapped(), PropValue::Object(i) if *i < 0))
+            && pkg.asset_reference.is_none()
+        {
+            return Err(SanitizeSkip::Failed(IoStoreError::Package(
+                "a donated wrapper kept an import reference after sanitizing",
+            )));
+        }
+    }
+    Ok(out)
+}
+
 pub fn write_new_tag_container(
     template_uasset: &[u8],
     tag_bytes: &[u8],
@@ -542,6 +703,7 @@ pub fn write_new_tag_container(
             tag_bytes,
             new_package_path,
             redirect_from,
+            asset_reference: None,
         },
     )?;
     w.write(out_utoc)
