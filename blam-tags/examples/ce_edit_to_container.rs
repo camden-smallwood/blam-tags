@@ -97,7 +97,7 @@ fn main() {
                 else {
                     continue;
                 };
-                let Some(block) = parts.block.as_ref() else { continue };
+                let Some(block) = parts.properties() else { continue };
                 if let Some(entry) = block
                     .entries
                     .iter()
@@ -130,8 +130,7 @@ fn main() {
         )
         .expect("decode");
         parts
-            .block
-            .as_ref()
+            .properties()
             .and_then(|b| b.get(&prop))
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_default()
@@ -152,7 +151,7 @@ fn main() {
         header.export_map[idx].object_flags,
     )
     .expect("decode");
-    let block = parts.block.as_mut().expect("block");
+    let block = parts.properties_mut().expect("block");
     block
         .entries
         .iter_mut()
@@ -232,8 +231,7 @@ fn main() {
     )
     .expect("decode from container");
     let got = parts2
-        .block
-        .as_ref()
+        .properties()
         .and_then(|b| b.get(&prop))
         .and_then(|v| v.as_str().map(str::to_string));
 

@@ -17,6 +17,7 @@ use std::io::Cursor;
 use blam_tags::iostore::IoStoreArchive;
 use blam_tags::iostore::container_header::EIoContainerHeaderVersion;
 use blam_tags::iostore::object::unversioned::{
+    has_schema,
     ExportContext, PackageResolver, read_userdefined_struct_layout, walk_export,
 };
 use blam_tags::iostore::package::builder::read_payloads;
@@ -267,7 +268,7 @@ fn main() {
                     continue;
                 };
                 let short = class.rsplit('.').next().unwrap_or(class);
-                if usmap.flattened_properties(short).is_none() {
+                if !has_schema(short, &usmap) {
                     continue;
                 }
                 let layouts = RefCell::new(HashMap::new());

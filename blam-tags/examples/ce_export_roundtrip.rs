@@ -241,9 +241,6 @@ fn main() {
             for ex in &h.export_map {
                 let Some(class) = by_hash.get(&ex.class_index.raw_index()) else { continue };
                 let short = class.rsplit('.').next().unwrap_or(class);
-                if usmap.flattened_properties(short).is_none() {
-                    continue;
-                }
                 let off = h.summary.header_size as usize + ex.cooked_serial_offset as usize;
                 let end = (off + ex.cooked_serial_size as usize).min(b.len());
                 if off >= b.len() || off > end {

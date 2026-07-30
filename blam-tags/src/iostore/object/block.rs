@@ -318,6 +318,19 @@ pub fn emit_block_in(
 /// where each present index is paired with whether its value is non-zero (a
 /// zero-masked property serializes no bytes — it is the zero value).
 pub(super) fn read_header(r: &mut Reader) -> Result<Header> {
+    Ok(read_header_walked(r)?.0)
+}
+
+/// As [`read_header`], also returning the flattened schema length the header
+/// walks over.
+///
+/// `FUnversionedHeaderBuilder::Finalize` pops trailing skips *down to one*, so
+/// the walked length is the smallest schema the bytes could have been written
+/// against — and for a block with nothing present it is the only thing that
+/// determines them (`skip 1, value 0` is a one-property schema and nothing
+/// else). That makes a header re-emittable without a schema, which is what an
+/// export whose class has no reflection data at all needs.
+pub(super) fn read_header_walked(r: &mut Reader) -> Result<(Header, usize)> {
     let mut frags = Vec::new();
     let mut zero_mask_num = 0usize;
     let mut leading_empty = 0u8;
@@ -379,7 +392,7 @@ pub(super) fn read_header(r: &mut Reader) -> Result<Header> {
             schema_it += 1;
         }
     }
-    Ok(Header { present, leading_empty })
+    Ok((Header { present, leading_empty }, schema_it))
 }
 
 
@@ -427,6 +440,22 @@ pub(super) fn flattened_schema<'u>(
                 .flatten()
         })
         .with_context(|| format!("no .usmap schema for struct {class}"))
+}
+
+/// Whether a schema can be built for `class` at all.
+///
+/// Callers that filter exports must use *this*, not
+/// `Usmap::flattened_properties`: the latter misses the fallbacks
+/// [`flattened_schema`] applies, so filtering on it silently drops 130
+/// `Blam*TagDataAsset` exports that decode perfectly well.
+pub fn has_schema(class: &str, usmap: &Usmap) -> bool {
+    // Equivalent to `flattened_schema(..).is_ok()` — that fails only when the
+    // chain has no head — but without building the flattened Vec, which this
+    // is called for on every one of the corpus's 1.15M exports.
+    usmap.get(class).is_some()
+        || (class.starts_with("Blam")
+            && class.ends_with("TagDataAsset")
+            && usmap.get("BlamTagDataAssetBase").is_some())
 }
 
 /// Whether this property is written as a mask bit rather than as bytes.
@@ -955,9 +984,16 @@ mod tests {
 /// cursor. Note the header is the very first thing in every export that has a
 /// property block, so `bytes` is normally the export itself.
 pub fn parse_header(bytes: &[u8]) -> Result<(Header, usize)> {
+    let (h, used, _) = parse_header_walked(bytes)?;
+    Ok((h, used))
+}
+
+/// As [`parse_header`], also returning the flattened schema length the header
+/// walks over — see [`read_header_walked`]. `(header, bytes_used, schema_len)`.
+pub fn parse_header_walked(bytes: &[u8]) -> Result<(Header, usize, usize)> {
     let mut r = Reader::new(bytes, &[]);
-    let h = read_header(&mut r)?;
-    Ok((h, r.o))
+    let (h, walked) = read_header_walked(&mut r)?;
+    Ok((h, r.o, walked))
 }
 
 /// Emit the `FUnversionedHeader` bytes for `header` against a class whose

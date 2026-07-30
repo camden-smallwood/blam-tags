@@ -163,7 +163,7 @@ fn main() {
                 else {
                     continue;
                 };
-                let Some(block) = parts.block.as_ref() else { continue };
+                let Some(block) = parts.properties() else { continue };
                 walk_block(block, &flat, &usmap, &mut present, 0);
             }
         }

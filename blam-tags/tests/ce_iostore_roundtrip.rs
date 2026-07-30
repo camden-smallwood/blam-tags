@@ -104,7 +104,7 @@ fn every_fixture_block_round_trips() {
         for_each_export(&pkg, &usmap, &classes, |i, class, payload, flags, names| {
             let parts = read_export(payload, names, &usmap, class, flags)
                 .unwrap_or_else(|e| panic!("{name}[{i}] {class}: read_export: {e:#}"));
-            let Some(block) = parts.block.as_ref() else { return };
+            let Some(block) = parts.properties() else { return };
             let (_, used) = blam_tags::iostore::object::unversioned::read_export_struct_len(
                 payload, names, &usmap, class,
             )
@@ -182,7 +182,7 @@ fn the_removals_fixture_really_has_removals() {
     let mut found = false;
     for_each_export(&pkg, &usmap, &classes, |_, class, payload, flags, names| {
         let Ok(parts) = read_export(payload, names, &usmap, class, flags) else { return };
-        let Some(block) = parts.block.as_ref() else { return };
+        let Some(block) = parts.properties() else { return };
         for (_, v) in block.iter() {
             if matches!(v, PropValue::WithRemovals { removals: Some(r), .. } if !r.is_empty()) {
                 found = true;
@@ -202,7 +202,7 @@ fn the_tag_wrapper_fixture_has_leading_empty_fragments() {
     let mut max_leading = 0;
     for_each_export(&pkg, &usmap, &classes, |_, class, payload, flags, names| {
         let Ok(parts) = read_export(payload, names, &usmap, class, flags) else { return };
-        if let Some(block) = parts.block.as_ref() {
+        if let Some(block) = parts.properties() {
             if let BlockLayout::Unversioned { leading_empty, .. } = block.layout {
                 max_leading = max_leading.max(leading_empty);
             }
@@ -241,7 +241,7 @@ fn an_edit_survives_a_package_rebuild() {
         else {
             continue;
         };
-        let Some(block) = parts.block.as_mut() else { continue };
+        let Some(block) = parts.properties_mut() else { continue };
         let Some(entry) = block
             .entries
             .iter_mut()
@@ -279,7 +279,7 @@ fn an_edit_survives_a_package_rebuild() {
     )
     .expect("re-read export");
     assert_eq!(
-        parts2.block.as_ref().and_then(|b| b.get(&prop)).and_then(|v| v.as_str()),
+        parts2.properties().and_then(|b| b.get(&prop)).and_then(|v| v.as_str()),
         Some(NEW),
         "the edit did not survive the rebuild"
     );
@@ -326,7 +326,7 @@ fn editing_a_zero_masked_property_emits_it() {
             let Ok(mut parts) = read_export(&payloads[i], &names, &usmap, &short, flags) else {
                 continue;
             };
-            let Some(block) = parts.block.as_mut() else { continue };
+            let Some(block) = parts.properties_mut() else { continue };
             let Some(pos) = block.entries.iter().position(|e| {
                 e.slot.is_some_and(|s| s.zero_masked)
                     && matches!(
@@ -368,7 +368,7 @@ fn editing_a_zero_masked_property_emits_it() {
             h2.export_map[idx].object_flags,
         )
         .expect("re-read export");
-        let block = parts2.block.as_ref().expect("block");
+        let block = parts2.properties().expect("block");
         let slot = block
             .entries
             .iter()

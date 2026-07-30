@@ -8,6 +8,7 @@ use std::io::Cursor;
 
 use blam_tags::iostore::container_header::EIoContainerHeaderVersion;
 use blam_tags::iostore::object::unversioned::{
+    has_schema,
     read_export_in, read_userdefined_struct_layout, ExportContext, PackageResolver,
 };
 use blam_tags::iostore::package::ue_types::FPackageObjectIndexType;
@@ -214,7 +215,7 @@ fn main() {
             for (i, ex) in h.export_map.iter().enumerate() {
                 let Some(class) = by_hash.get(&ex.class_index.raw_index()) else { continue };
                 let short = class.rsplit('.').next().unwrap_or(class);
-                if usmap.flattened_properties(short).is_none() {
+                if !has_schema(short, &usmap) {
                     continue;
                 }
                 if let Err(err) =

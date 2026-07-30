@@ -107,7 +107,7 @@ fn main() {
                 else {
                     continue;
                 };
-                let Some(block) = parts.block.as_ref() else { continue };
+                let Some(block) = parts.properties() else { continue };
                 if let BlockLayout::Unversioned { leading_empty, .. } = block.layout {
                     if leading_empty > 0 {
                         has.push("leading-empty");

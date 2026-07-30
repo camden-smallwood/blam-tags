@@ -101,7 +101,7 @@ fn main() {
                 else {
                     continue;
                 };
-                let Some(block) = parts.block.as_ref() else { continue };
+                let Some(block) = parts.properties() else { continue };
                 scan(block, &slots, &mut t, &mut wrong_masked, &mut wrong_unmasked, &mut unknown);
             }
         }

@@ -93,7 +93,7 @@ fn main() {
                 else {
                     continue;
                 };
-                let Some(block) = parts.block.as_mut() else { continue };
+                let Some(block) = parts.properties_mut() else { continue };
                 let Some(prop) = flat
                     .iter()
                     .find(|(p, slot)| {
@@ -157,7 +157,7 @@ fn main() {
                 }
                 continue;
             };
-            let block2 = parts2.block.as_ref().expect("block");
+            let block2 = parts2.properties().expect("block");
             if !matches!(block2.get(&prop), Some(PropValue::Int(v)) if *v == PROBE) {
                 *failures.entry("value-missing").or_default() += 1;
                 if samples.len() < 8 {
@@ -191,7 +191,7 @@ fn main() {
                 .iter()
                 .filter_map(|e| e.slot.map(|s| (s.index, format!("{:?}", e.value))))
                 .collect();
-            for entry in &parts0.block.as_ref().expect("block").entries {
+            for entry in &parts0.properties().expect("block").entries {
                 let Some(slot) = entry.slot else { continue };
                 let before = format!("{:?}", entry.value);
                 if after_by_slot.get(&slot.index) != Some(&before) {

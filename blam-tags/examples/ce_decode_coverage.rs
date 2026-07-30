@@ -24,6 +24,7 @@ use std::io::Cursor;
 
 use blam_tags::iostore::container_header::EIoContainerHeaderVersion;
 use blam_tags::iostore::object::unversioned::{
+    ExportBlock,
     read_export_in, read_userdefined_struct_layout, roundtrip_tail, ExportContext, PackageResolver,
     PropValue, PropertyBlock, TailContext,
 };
@@ -245,6 +246,8 @@ fn main() {
     let mut tail_by_class: BTreeMap<String, u64> = BTreeMap::new();
     let mut total_bytes = 0u64;
     let mut modeled_tail = 0u64;
+    let mut unreflected_exports = 0u64;
+    let mut unreflected_by_class: BTreeMap<String, u64> = BTreeMap::new();
 
     let archives: Vec<IoStoreArchive> =
         utocs.iter().filter_map(|u| IoStoreArchive::open(u).ok()).collect();
@@ -293,9 +296,6 @@ fn main() {
             for (i, ex) in h.export_map.iter().enumerate() {
                 let Some(class) = by_hash.get(&ex.class_index.raw_index()) else { continue };
                 let short = class.rsplit('.').next().unwrap_or(class);
-                if usmap.flattened_properties(short).is_none() {
-                    continue;
-                }
                 let Ok(parts) = read_export_in(&payloads[i], &names, &usmap, short, ex.object_flags, &read_ctx)
                 else {
                     continue;
@@ -306,7 +306,7 @@ fn main() {
                 // 12.72% typed while 4.77 GiB of it had been converted.
                 if !parts.tail.is_empty() {
                     let empty = Default::default();
-                    let block = parts.block.as_ref().unwrap_or(&empty);
+                    let block = parts.properties().unwrap_or(&empty);
                     let bulk: Vec<(i64, i64)> =
                         h.bulk_data.iter().map(|x| (x.serial_offset, x.serial_size)).collect();
                     let layouts = RefCell::new(HashMap::new());
@@ -334,11 +334,31 @@ fn main() {
                         }
                     }
                 }
-                if let Some(block) = parts.block.as_ref() {
-                    walk_block(block, &mut u, &mut by_struct);
+                match &parts.block {
+                    ExportBlock::Reflected(block) => walk_block(block, &mut u, &mut by_struct),
+                    ExportBlock::NotSerialized => {}
+                    // The 19 exports of the three `XGTGPerformanceOverlayTool`
+                    // classes, whose module ships no reflection data at all.
+                    // Counted as untyped rather than skipped: a filter here is
+                    // what let the gate call this corpus fully covered while
+                    // never looking at them.
+                    ExportBlock::Unreflected(un) => {
+                        unreflected_exports += 1;
+                        u.raw += un.rest.len() as u64;
+                        *unreflected_by_class.entry(short.to_string()).or_insert(0u64) +=
+                            un.rest.len() as u64;
+                    }
                 }
             }
         }
+    }
+
+    if unreflected_exports > 0 {
+        println!("\nno reflection data anywhere ({unreflected_exports} exports):");
+        for (c, n) in &unreflected_by_class {
+            println!("  {n:>8} B  {c}");
+        }
+        println!("  (see `UnreflectedBlock` — the declaring module is not shipped)");
     }
 
     let untyped = u.tail + u.native_struct_span + u.fixed_native + u.hand_written + u.raw;

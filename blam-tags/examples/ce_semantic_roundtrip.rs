@@ -244,9 +244,6 @@ fn main() {
             for (i, ex) in h.export_map.iter().enumerate() {
                 let Some(class) = by_hash.get(&ex.class_index.raw_index()) else { continue };
                 let short = class.rsplit('.').next().unwrap_or(class);
-                if usmap.flattened_properties(short).is_none() {
-                    continue;
-                }
                 let Ok(first) = read_export_in(&payloads[i], &names, &usmap, short, ex.object_flags, &ctx)
                 else {
                     continue;

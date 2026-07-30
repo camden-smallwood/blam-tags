@@ -101,7 +101,7 @@ fn main() {
                 }
                 // `roundtrip_tail` is the authority on whether a model exists —
                 // families are dispatched by chain, so no name list can be.
-                let Some(block) = parts.block.as_ref() else { continue };
+                let Some(block) = parts.properties() else { continue };
                 let bulk: Vec<(i64, i64)> =
                     h.bulk_data.iter().map(|x| (x.serial_offset, x.serial_size)).collect();
                 let ctx = TailContext {

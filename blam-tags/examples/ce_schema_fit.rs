@@ -1,15 +1,23 @@
-//! Which `EManagedArrayType`s does a geometry collection actually contain?
+//! Recover a missing class schema by finding which known schema the data fits.
 //!
-//! `FManagedArrayCollection` is a tagged union keyed by a runtime type id, so
-//! the typed model is an enum — but writing all 49 variants when the corpus
-//! holds a handful is work with no evidence behind it. This counts them.
+//! Three classes from `/Script/XGTGPerformanceOverlayTool` have cooked assets in
+//! the shipping game but no reflection anywhere: absent from the `.usmap`, from
+//! the UHT header dump, from UE 5.5.4, and — checked byte-wise — from both
+//! shipping executables. The module was stripped and its widget assets were not.
 //!
-//! Run: `ce_managed_array_census [usmap-path]`
+//! A thin subclass that adds no properties of its own has *exactly* its super's
+//! flattened schema, which is why `Blam*TagDataAsset` decodes against
+//! `BlamTagDataAssetBase`. That makes "which schema is it?" a falsifiable
+//! question rather than a guess: try every schema in the `.usmap` and keep only
+//! those under which *every* export of the class decodes, consumes its whole
+//! property region, and re-encodes to the original bytes.
+//!
+//! Run: `ce_schema_fit [usmap-path]`
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 
 use blam_tags::iostore::container_header::EIoContainerHeaderVersion;
-use blam_tags::iostore::object::unversioned::{read_export, GeometryCollectionTail, TailContext};
+use blam_tags::iostore::object::unversioned::{has_schema, read_export, write_export};
 use blam_tags::iostore::package::builder::read_payloads;
 use blam_tags::iostore::script_objects::ScriptObjects;
 use blam_tags::iostore::ue_types::EIoStoreTocVersion;
@@ -20,6 +28,13 @@ use blam_tags::iostore::IoStoreArchive;
 const PAKS: &str = "/Users/camden/Halo/halo-campaign-evolved_pc/Meteorite/Content/Paks";
 const CV: EIoStoreTocVersion = EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash;
 const HV: EIoContainerHeaderVersion = EIoContainerHeaderVersion::SoftPackageReferences;
+
+/// One export to fit: its payload, the package's name map, and its flags.
+struct Sample {
+    payload: Vec<u8>,
+    names: Vec<String>,
+    flags: u32,
+}
 
 fn main() {
     let usmap_path = std::env::args().nth(1).unwrap_or_else(|| {
@@ -38,6 +53,7 @@ fn main() {
             by_hash.insert(e.global_index.raw_index(), p.to_string());
         }
     }
+
     let mut utocs: Vec<_> = std::fs::read_dir(PAKS)
         .expect("read Paks")
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -46,7 +62,7 @@ fn main() {
         .collect();
     utocs.sort();
 
-    let mut seen: BTreeMap<i32, u64> = BTreeMap::new();
+    let mut samples: BTreeMap<String, Vec<Sample>> = BTreeMap::new();
     for u in &utocs {
         let Ok(a) = IoStoreArchive::open(u) else { continue };
         for e in a.entries() {
@@ -64,36 +80,41 @@ fn main() {
             for (i, ex) in h.export_map.iter().enumerate() {
                 let Some(class) = by_hash.get(&ex.class_index.raw_index()) else { continue };
                 let short = class.rsplit('.').next().unwrap_or(class);
-                if short != "GeometryCollection" {
+                if has_schema(short, &usmap) {
                     continue;
                 }
-                let Ok(parts) = read_export(&payloads[i], &names, &usmap, short, ex.object_flags)
-                else {
-                    continue;
-                };
-                let Some(block) = parts.properties() else { continue };
-                let bulk: Vec<(i64, i64)> =
-                    h.bulk_data.iter().map(|x| (x.serial_offset, x.serial_size)).collect();
-                let ctx = TailContext {
-                    bulk_data: &bulk,
-                    origin: payloads[i].len() - parts.tail.len(),
-                    usmap: &usmap,
-                    resolver: None,
-                };
-                let _ = block;
-                let _ = ctx;
-                let mut r = blam_tags::iostore::object::archive_reader(&parts.tail, &names);
-                if let Ok(t) = GeometryCollectionTail::read(&mut r) {
-                    for a in &t.collection.attributes {
-                        *seen.entry(a.type_id).or_default() += 1;
-                    }
-                }
+                samples.entry(short.to_string()).or_default().push(Sample {
+                    payload: payloads[i].clone(),
+                    names: names.clone(),
+                    flags: ex.object_flags,
+                });
             }
         }
     }
-    println!("{:<6} {:<40} {}", "id", "EManagedArrayType", "attributes");
-    for (id, n) in &seen {
-        let name = blam_tags::iostore::object::managed_array_type_name(*id);
-        println!("{id:<6} {name:<40} {n}");
+
+    for (class, group) in &samples {
+        println!("\n=== {class}: {} exports ===", group.len());
+        // Rank fits by how little they leave unexplained. A candidate that
+        // round-trips but leaves 80 bytes of "tail" has explained nothing.
+        let mut fits: Vec<(usize, &str)> = Vec::new();
+        for cand in &usmap.structs {
+            let mut worst_tail = 0usize;
+            let ok = group.iter().all(|s| {
+                let Ok(ex) = read_export(&s.payload, &s.names, &usmap, &cand.name, s.flags) else {
+                    return false;
+                };
+                worst_tail = worst_tail.max(ex.tail.len());
+                write_export(&cand.name, &ex, &usmap).is_ok_and(|w| w == s.payload)
+            });
+            if ok {
+                fits.push((worst_tail, &cand.name));
+            }
+        }
+        fits.sort();
+        println!("  {} schemas fit; tightest:", fits.len());
+        for (tail, name) in fits.iter().take(12) {
+            println!("    tail {tail:>4}B  {name}  (flattened {})",
+                usmap.get(name).map(|s| s.prop_count).unwrap_or(0));
+        }
     }
 }

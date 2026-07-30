@@ -18,6 +18,7 @@ use std::io::Cursor;
 
 use blam_tags::iostore::container_header::EIoContainerHeaderVersion;
 use blam_tags::iostore::object::unversioned::{
+    has_schema,
     read_export, read_userdefined_struct_layout, roundtrip_tail, ExportContext, PackageResolver,
     TailContext,
 };
@@ -233,7 +234,7 @@ fn main() {
                 // dispatched by inheritance chain, so most modeled classes are
                 // never named in that list. `roundtrip_tail` returning `None` is
                 // the authority on "no model yet".
-                if usmap.flattened_properties(short).is_none() {
+                if !has_schema(short, &usmap) {
                     continue;
                 }
                 let Ok(parts) = read_export(&payloads[i], &names, &usmap, short, ex.object_flags)
@@ -249,7 +250,7 @@ fn main() {
                 // skipping them here is what made two exports look unmodeled
                 // when nothing had ever asked.
                 let empty = Default::default();
-                let block = parts.block.as_ref().unwrap_or(&empty);
+                let block = parts.properties().unwrap_or(&empty);
                 let layouts = RefCell::new(HashMap::new());
                 let resolver = PkgResolver {
                     world: &world,

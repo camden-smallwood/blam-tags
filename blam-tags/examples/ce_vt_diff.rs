@@ -94,7 +94,7 @@ fn main() {
                 else {
                     continue;
                 };
-                let Some(block) = parts.block.as_ref() else { continue };
+                let Some(block) = parts.properties() else { continue };
                 if parts.tail.is_empty() {
                     continue;
                 }

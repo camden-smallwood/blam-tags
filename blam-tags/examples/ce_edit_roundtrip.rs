@@ -132,7 +132,7 @@ fn main() {
                 else {
                     continue;
                 };
-                let Some(block) = parts.block.as_ref() else { continue };
+                let Some(block) = parts.properties() else { continue };
                 // Prefer a string (tests resizing); fall back to a name (tests
                 // name-map growth).
                 if let Some(entry) = block.entries.iter().find(|e| {
@@ -175,7 +175,7 @@ fn main() {
             ) else {
                 continue;
             };
-            let block = parts.block.as_mut().expect("checked above");
+            let block = parts.properties_mut().expect("checked above");
             let entry = block
                 .entries
                 .iter_mut()
@@ -241,7 +241,7 @@ fn main() {
                 fail("reread-export", format!("{}: edited export did not decode", h.package_name()), &mut failures, &mut samples);
                 continue;
             };
-            let read_back = parts2.block.as_ref().and_then(|b| b.get(&prop));
+            let read_back = parts2.properties().and_then(|b| b.get(&prop));
             let (got, want) = match kind {
                 Kind::Int => (
                     read_back.map(|v| format!("{v:?}")),

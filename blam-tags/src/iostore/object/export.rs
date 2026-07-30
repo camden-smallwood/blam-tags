@@ -205,11 +205,60 @@ pub enum Trailer {
 /// model is lossless against the span it replaces.
 #[derive(Debug, Clone, Default)]
 pub struct Export {
-    /// `None` for the classes whose `Serialize` never calls `Super`
-    /// (`URigVM`, `URigHierarchy`), which carry no property block at all.
-    pub block: Option<PropertyBlock>,
+    pub block: ExportBlock,
     pub trailer: Trailer,
     pub tail: Vec<u8>,
+}
+
+/// An export's property region, and *why* it looks the way it does.
+///
+/// The three cases are genuinely different claims and were worth separating: an
+/// absent block because the format says so is not the same as an absent block
+/// because the schema is missing, and collapsing them into one `Option` is how
+/// a gate ends up filtering the second away and reporting full coverage.
+#[derive(Debug, Clone, Default)]
+pub enum ExportBlock {
+    /// Decoded against the `.usmap`. Every export in the shipped corpus but 18.
+    Reflected(PropertyBlock),
+    /// The class's `Serialize` never calls `Super`, so there is no property
+    /// block to decode at all (`URigVM`, `URigHierarchy`; see
+    /// [`NO_PROPERTY_BLOCK`]). A positive statement about the format.
+    #[default]
+    NotSerialized,
+    /// The declaring module ships no reflection data anywhere, so the values
+    /// cannot be typed. See [`UnreflectedBlock`].
+    Unreflected(UnreflectedBlock),
+}
+
+/// The property region of an export whose class has no reflection data.
+///
+/// Campaign Evolved cooks six assets from `/Script/XGTGPerformanceOverlayTool`
+/// — a Microsoft performance-overlay plugin — but ships none of its code. Its
+/// three classes (`PerfToolTextBox`, `PerfToolFontSettings`,
+/// `PerformanceOverlayToolCookShim`, 19 exports) appear in no `.usmap`, no UHT
+/// header dump, not in UE 5.5.4, and — searched byte-wise in both UTF-8 and
+/// UTF-16 — in neither shipping executable. `ce_schema_fit` then tried every
+/// one of the 1,724 known schemas against the data and found none that decodes
+/// `PerfToolTextBox` and consumes its value region, which rules out the
+/// "subclass that adds no properties of its own" case that makes
+/// `Blam*TagDataAsset` decodable. The types are not recoverable from anything
+/// shipped.
+///
+/// What *is* recoverable is decoded here, because the unversioned header is
+/// schema-independent: which flattened indices carry a value, which are
+/// zero-masked, and the schema length the header walks. That is enough to
+/// re-emit the header rather than retain it, and enough for a caller to say
+/// "index 6 is set" — just not what index 6 *is*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreflectedBlock {
+    /// Fully decoded: present slots and their zero-mask bits.
+    pub header: super::block::Header,
+    /// The flattened schema length the header walks, which is what re-emits it.
+    pub schema_len: u16,
+    /// Everything after the header. Not split per property — without types
+    /// there is no way to know where one value ends and the next begins, so
+    /// this necessarily swallows the trailer and tail as well.
+    pub rest: Vec<u8>,
 }
 
 impl Export {
@@ -224,12 +273,32 @@ impl Export {
     /// byte comparison for it today and becomes a real value comparison as each
     /// arm is modeled.
     pub fn semantic_eq(&self, other: &Export) -> bool {
+        use ExportBlock::*;
         let block_eq = match (&self.block, &other.block) {
-            (Some(a), Some(b)) => a.semantic_eq(b),
-            (None, None) => true,
+            (Reflected(a), Reflected(b)) => a.semantic_eq(b),
+            (NotSerialized, NotSerialized) => true,
+            (Unreflected(a), Unreflected(b)) => a == b,
             _ => false,
         };
         block_eq && self.trailer == other.trailer && self.tail == other.tail
+    }
+
+    /// The decoded property block, or `None` in either case where there is not
+    /// one. Callers that only want to read properties want this; callers that
+    /// need to distinguish *why* should match [`ExportBlock`] directly.
+    pub fn properties(&self) -> Option<&PropertyBlock> {
+        match &self.block {
+            ExportBlock::Reflected(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// Mutable counterpart of [`Export::properties`].
+    pub fn properties_mut(&mut self) -> Option<&mut PropertyBlock> {
+        match &mut self.block {
+            ExportBlock::Reflected(b) => Some(b),
+            _ => None,
+        }
     }
 }
 
@@ -263,7 +332,24 @@ pub fn read_export_in(
     const RF_CLASS_DEFAULT_OBJECT: u32 = 0x10;
 
     if NO_PROPERTY_BLOCK.contains(&class) {
-        return Ok(Export { block: None, trailer: Trailer::Absent, tail: export.to_vec() });
+        return Ok(Export {
+            block: ExportBlock::NotSerialized,
+            trailer: Trailer::Absent,
+            tail: export.to_vec(),
+        });
+    }
+    if !super::block::has_schema(class, usmap) {
+        let (header, used, schema_len) = super::block::parse_header_walked(export)?;
+        return Ok(Export {
+            block: ExportBlock::Unreflected(UnreflectedBlock {
+                header,
+                schema_len: u16::try_from(schema_len)
+                    .with_context(|| format!("{class}: schema length {schema_len} overflows u16"))?,
+                rest: export[used..].to_vec(),
+            }),
+            trailer: Trailer::Absent,
+            tail: Vec::new(),
+        });
     }
     let mut r = Reader::with_ctx(export, names, ctx);
     let block = read_struct(&mut r, class, usmap, 0)?;
@@ -279,7 +365,7 @@ pub fn read_export_in(
             _ => r.o = at,
         }
     }
-    Ok(Export { block: Some(block), trailer, tail: export[r.o..].to_vec() })
+    Ok(Export { block: ExportBlock::Reflected(block), trailer, tail: export[r.o..].to_vec() })
 }
 
 /// Reassemble the bytes [`read_export`] took apart.
@@ -300,8 +386,17 @@ pub fn write_export_in(
     resolver: Option<&dyn super::archive::PackageResolver>,
 ) -> Result<Vec<u8>> {
     let mut out = match &ex.block {
-        Some(b) => super::block::emit_block_in(class, b, usmap, resolver)?,
-        None => Vec::new(),
+        ExportBlock::Reflected(b) => super::block::emit_block_in(class, b, usmap, resolver)?,
+        ExportBlock::NotSerialized => Vec::new(),
+        // The header is regenerated from the decoded fragments like any other,
+        // not replayed: `schema_len` is what makes that possible without a
+        // schema. Only the value region is carried verbatim, because nothing
+        // shipped says how to type it.
+        ExportBlock::Unreflected(u) => {
+            let mut b = super::block::emit_header(&u.header, u.schema_len as usize);
+            b.extend_from_slice(&u.rest);
+            b
+        }
     };
     match &ex.trailer {
         Trailer::Absent => {}
@@ -417,8 +512,53 @@ mod tests {
         let usmap = probe();
         let raw: Vec<u8> = (0u8..24).collect();
         let ex = read_export(&raw, &[], &usmap, "RigVM", 0).expect("read");
-        assert!(ex.block.is_none(), "RigVM must not decode a property block");
+        assert!(
+            matches!(ex.block, ExportBlock::NotSerialized),
+            "RigVM must not decode a property block"
+        );
         assert_eq!(ex.tail, raw);
         assert_eq!(write_export("RigVM", &ex, &usmap).expect("write"), raw);
+    }
+
+    /// A class with no reflection data anywhere still decodes its header and
+    /// still round-trips — and stays *distinguishable* from a class that has no
+    /// block by design. Conflating the two is what let a gate filter the
+    /// `XGTGPerformanceOverlayTool` exports away and report full coverage.
+    ///
+    /// The bytes are `PerformanceOverlayToolCookShim`'s real payload: a header
+    /// of `skip 1, value 0, last`, then four trailing bytes. Nothing is present,
+    /// so no types are needed to read it — and `skip 1` pins the flattened
+    /// schema length at exactly 1, which is what re-emits those bytes.
+    #[test]
+    fn a_class_with_no_reflection_data_decodes_its_header_and_round_trips() {
+        let usmap = probe();
+        let raw = vec![0x01, 0x01, 0x00, 0x00, 0x00, 0x00];
+        let ex = read_export(&raw, &[], &usmap, "PerformanceOverlayToolCookShim", 0)
+            .expect("read");
+        let ExportBlock::Unreflected(un) = &ex.block else {
+            panic!("expected an unreflected block, got {:?}", ex.block);
+        };
+        assert!(un.header.present.is_empty(), "the header declares no values");
+        assert_eq!(un.schema_len, 1, "`skip 1` is only writable by a 1-property schema");
+        assert_eq!(un.rest, vec![0, 0, 0, 0]);
+        assert!(ex.properties().is_none(), "there is no typed block to hand out");
+        assert_eq!(
+            write_export("PerformanceOverlayToolCookShim", &ex, &usmap).expect("write"),
+            raw,
+            "the header is regenerated from the decoded fragments, not replayed"
+        );
+    }
+
+    /// The two block-less cases must not compare equal to each other, or a
+    /// semantic round-trip would accept turning one into the other.
+    #[test]
+    fn an_unreflected_block_is_not_a_missing_block() {
+        let usmap = probe();
+        let raw = vec![0x01, 0x01, 0x00, 0x00, 0x00, 0x00];
+        let unreflected =
+            read_export(&raw, &[], &usmap, "PerformanceOverlayToolCookShim", 0).expect("read");
+        let none = read_export(&raw, &[], &usmap, "RigVM", 0).expect("read");
+        assert!(!unreflected.semantic_eq(&none));
+        assert!(!none.semantic_eq(&unreflected));
     }
 }
