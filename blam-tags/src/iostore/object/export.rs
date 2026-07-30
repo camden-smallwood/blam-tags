@@ -94,9 +94,6 @@ pub fn walk_export(
     object_flags: u32,
     ctx: &ExportContext<'_>,
 ) -> Result<TailWalk> {
-    /// `RF_ClassDefaultObject`.
-    const RF_CLASS_DEFAULT_OBJECT: u32 = 0x10;
-
     let mut r = Reader::with_ctx(export, names, ctx);
     // A handful of classes override `Serialize` and deliberately do **not**
     // call `Super::Serialize` on the load path, so the export carries no
@@ -118,7 +115,7 @@ pub fn walk_export(
         return Ok(TailWalk { block: props, consumed: r.o, stopped: None });
     }
     let props = read_struct(&mut r, class, usmap, 0)?;
-    if object_flags & RF_CLASS_DEFAULT_OBJECT == 0 && export.len() >= r.o + 4 {
+    if export.len() >= r.o + 4 {
         let at = r.o;
         match r.u32()? {
             0 => {}
@@ -328,9 +325,6 @@ pub fn read_export_in(
     object_flags: u32,
     ctx: &ExportContext<'_>,
 ) -> Result<Export> {
-    /// `RF_ClassDefaultObject`.
-    const RF_CLASS_DEFAULT_OBJECT: u32 = 0x10;
-
     if NO_PROPERTY_BLOCK.contains(&class) {
         return Ok(Export {
             block: ExportBlock::NotSerialized,
@@ -354,7 +348,7 @@ pub fn read_export_in(
     let mut r = Reader::with_ctx(export, names, ctx);
     let block = read_struct(&mut r, class, usmap, 0)?;
     let mut trailer = Trailer::Absent;
-    if object_flags & RF_CLASS_DEFAULT_OBJECT == 0 && export.len() >= r.o + 4 {
+    if export.len() >= r.o + 4 {
         let at = r.o;
         match r.u32()? {
             0 => trailer = Trailer::NoGuid,
@@ -414,11 +408,15 @@ pub fn write_export_in(
 /// block, no `UObject` trailer and no inherited tails.
 pub const NO_PROPERTY_BLOCK: &[&str] = &["RigVM", "RigHierarchy"];
 
-/// The `UObject` trailer every non-CDO export writes after its property block:
-/// a four-byte `hasGuid` and, when set, the 16-byte GUID.
-pub(super) fn read_uobject_trailer(r: &mut Reader, object_flags: u32) -> Result<()> {
-    const RF_CLASS_DEFAULT_OBJECT: u32 = 0x10;
-    if object_flags & RF_CLASS_DEFAULT_OBJECT != 0 || r.b.len() < r.o + 4 {
+/// The `UObject` trailer **every** export writes after its property block: a
+/// four-byte `hasGuid` and, when set, the 16-byte GUID.
+///
+/// Class-default objects included — `FLazyObjectPtr::PossiblySerializeObjectGuid`
+/// (Obj.cpp:148) has no `RF_ClassDefaultObject` branch. `object_flags` is kept
+/// in the signature because callers pass it and the distinction is worth being
+/// explicit about having checked.
+pub(super) fn read_uobject_trailer(r: &mut Reader, _object_flags: u32) -> Result<()> {
+    if r.b.len() < r.o + 4 {
         return Ok(());
     }
     match r.u32()? {
@@ -491,17 +489,28 @@ mod tests {
         assert_eq!(write_export("ExportProbe", &ex, &usmap).expect("write"), raw);
     }
 
-    /// A class-default object writes no trailer at all, so the bytes after the
-    /// block are entirely tail.
+    /// A class-default object writes the trailer like anything else.
+    ///
+    /// This test asserted the opposite for most of the project, and was wrong:
+    /// `UObject::Serialize` calls `FLazyObjectPtr::PossiblySerializeObjectGuid`
+    /// (Obj.cpp:148) unconditionally on save, and that writes
+    /// `TryEnterField(TEXT("Guid"), Guid.IsValid())` — the four-byte presence
+    /// bool — for every object (LazyObjectPtr.cpp). The only `RF_ClassDefaultObject`
+    /// branch nearby is sparse class data, and it is `IsTransacting()`-only.
+    ///
+    /// It stayed wrong because it is hand-built and no *reachable* CDO had a
+    /// tail arm to trip over the four phantom bytes. Once Blueprint-class
+    /// exports became reachable, 970 CDO tails failed at "+4 @ 4"; consuming
+    /// the trailer took that to 1.
     #[test]
-    fn a_class_default_object_has_no_trailer() {
+    fn a_class_default_object_still_writes_a_trailer() {
         const RF_CLASS_DEFAULT_OBJECT: u32 = 0x10;
         let usmap = probe();
         let raw = body(&[], &[0, 0, 0, 0, 7]);
         let ex = read_export(&raw, &[], &usmap, "ExportProbe", RF_CLASS_DEFAULT_OBJECT)
             .expect("read");
-        assert_eq!(ex.trailer, Trailer::Absent);
-        assert_eq!(ex.tail, vec![0, 0, 0, 0, 7]);
+        assert_eq!(ex.trailer, Trailer::NoGuid);
+        assert_eq!(ex.tail, vec![7]);
         assert_eq!(write_export("ExportProbe", &ex, &usmap).expect("write"), raw);
     }
 
