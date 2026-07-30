@@ -2320,6 +2320,20 @@ pub(super) fn read_class_native_tail(
             r.i32()?; // EventGraphFunction
             r.i32()?; // EventGraphCallOffset
         }
+        // `UAnimInstance`: an unversioned property block whose schema is not
+        // identified — see `UnknownSchemaTail`. Consuming it here is what lets
+        // the *walker* reach the end of these exports; `roundtrip_tail` already
+        // regenerates it. Only ever appears on a template, and only after a
+        // trailer flag that is not a boolean, which is the signature of the
+        // whole shape.
+        "AnimInstance" => {
+            if r.o < r.b.len() {
+                let rest = &r.b[r.o..];
+                let (_, _, used) = super::block::parse_header_fragments(rest)?;
+                let _ = used;
+                r.o = r.b.len();
+            }
+        }
         // `UClass`, after `UStruct`: the function map, class flags and
         // ownership, the implemented-interface table, and the class default
         // object.

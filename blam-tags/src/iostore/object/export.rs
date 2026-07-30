@@ -137,24 +137,14 @@ pub fn walk_export(
             1 => {
                 r.take(16)?;
             }
-            // Not a boolean, so this export does not follow the trailer model
-            // (its property walk stopped early, or the class serializes
-            // something else here). Rewind and leave the rest as an unmodeled
-            // tail rather than failing an otherwise good property decode.
-            // Not a boolean, so this export does not follow the trailer model
-            // — the walk stops here and everything from `at` is unmodeled.
-            _ => {
-                r.o = at;
-                return Ok(TailWalk {
-                    block: props,
-                    consumed: r.o,
-                    stopped: Some(TailStop {
-                        class: "UObject".to_string(),
-                        at: r.o,
-                        remaining: export.len() - r.o,
-                    }),
-                });
-            }
+            // Not a boolean, so this export does not follow the trailer
+            // model. Rewind and let the *chain* have the bytes: for a
+            // `UAnimInstance` template they are a property block its arm knows
+            // how to consume. Returning a stop here instead would report those
+            // exports as unmodeled even once they are modeled, and anything the
+            // chain genuinely cannot read still shows up in the bytes-consumed
+            // conservation check rather than being hidden.
+            _ => r.o = at,
         }
     }
     // Walk to the root of the chain, then replay it base → derived.
