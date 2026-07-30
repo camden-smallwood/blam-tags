@@ -984,6 +984,67 @@ mod tests {
         let _ = std::fs::remove_file(utoc.with_extension("ucas"));
     }
 
+    /// A mounted container's `.ucas` is memory-mapped, and Windows will not let a
+    /// mapped file be truncated (`ERROR_USER_MAPPED_FILE`, os error 1224) — so a
+    /// container this process has open cannot be rewritten until the mapping is
+    /// released. Prove the full cycle: read, release, replace the file, map it
+    /// again, read what replaced it. Needs no game files.
+    #[test]
+    fn a_released_partition_can_be_replaced_and_mapped_again() {
+        use super::super::{FIoChunkId, IoStoreArchive, IoStoreError, CHUNK_TYPE_BULK_DATA};
+
+        let mut id_bytes = [0u8; 12];
+        id_bytes[..8].copy_from_slice(&0x1234_5678_9abc_def0u64.to_le_bytes());
+        id_bytes[11] = CHUNK_TYPE_BULK_DATA;
+        let id = FIoChunkId(id_bytes);
+
+        let utoc = std::env::temp_dir().join(format!(
+            "blamtags_release_test-{}_P.utoc",
+            std::process::id()
+        ));
+        let write_with = |payload: &[u8]| {
+            let mut writer = OverrideContainerWriter::new("../../../");
+            writer.add_chunk(id, payload.to_vec());
+            writer.write(&utoc).expect("write container");
+        };
+
+        let first = vec![0xAAu8; 4096];
+        write_with(&first);
+        let mut archive = IoStoreArchive::open(&utoc).expect("open container");
+        assert_eq!(archive.read_chunk(0).expect("read mapped"), first);
+        assert!(archive.is_partition_mapped());
+
+        archive.release_partition();
+        assert!(!archive.is_partition_mapped());
+        assert!(
+            matches!(
+                archive.read_chunk(0),
+                Err(IoStoreError::PartitionReleased)
+            ),
+            "a read while released is refused, not served stale or crashed"
+        );
+
+        // What the release is for: the file is replaced underneath the archive.
+        // Same layout, so the resident `.utoc` still describes it.
+        let second = vec![0x55u8; 4096];
+        write_with(&second);
+
+        archive.remap_partition().expect("map again");
+        assert!(archive.is_partition_mapped());
+        assert_eq!(
+            archive.read_chunk(0).expect("read remapped"),
+            second,
+            "the archive reads what replaced the file, not what it mapped before"
+        );
+        // Idempotent: a caller that cannot tell whether it released may say so
+        // twice.
+        archive.remap_partition().expect("remap is idempotent");
+
+        for extension in ["utoc", "ucas", "pak"] {
+            let _ = std::fs::remove_file(utoc.with_extension(extension));
+        }
+    }
+
     /// The clean-room empty pak stub matches the shipped 339-byte layout: right
     /// size, `FPakInfo` footer (magic, version 11, IndexOffset 0, IndexSize 106),
     /// and — since they hash only the empty sub-index payloads — PathHashIndex /

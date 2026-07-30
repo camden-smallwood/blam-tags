@@ -76,6 +76,9 @@ pub enum IoStoreError {
     /// A `.uasset` Zen package didn't match the expected layout (refuse to
     /// patch rather than risk corruption).
     Package(&'static str),
+    /// The `.ucas` mapping was released so the file could be replaced, and has
+    /// not been mapped again. See [`IoStoreArchive::release_partition`].
+    PartitionReleased,
 }
 
 impl fmt::Display for IoStoreError {
@@ -94,6 +97,9 @@ impl fmt::Display for IoStoreError {
             IoStoreError::NotFound(p) => write!(f, "path not found in container: {p}"),
             IoStoreError::Oodle(e) => write!(f, "{e}"),
             IoStoreError::Package(m) => write!(f, "unexpected .uasset package layout: {m}"),
+            IoStoreError::PartitionReleased => {
+                write!(f, "container partition is released while its files are replaced")
+            }
         }
     }
 }
@@ -204,7 +210,15 @@ pub struct IoStoreArchive {
     /// The `.utoc` bytes, kept resident (tens of MB) for offset/block lookups.
     toc: Vec<u8>,
     /// Memory-mapped `.ucas` partition (may be tens of GB — never read whole).
-    ucas: Mmap,
+    ///
+    /// `None` only while the mapping has been deliberately released by
+    /// [`IoStoreArchive::release_partition`], which is the one way the file can
+    /// be replaced underneath a mounted container: Windows refuses to truncate a
+    /// file that has a mapped section open, so rewriting a container this
+    /// process has mounted is impossible while this is held.
+    ucas: Option<Mmap>,
+    /// Where the partition was mapped from, so it can be mapped again.
+    ucas_path: PathBuf,
     codec: Box<dyn OodleCodec>,
 
     // Header-derived cursors into `toc`.
@@ -219,6 +233,57 @@ pub struct IoStoreArchive {
 }
 
 impl IoStoreArchive {
+    /// The mapped partition, or an error naming what has to happen first.
+    ///
+    /// Reads go through here rather than touching the field, so a released
+    /// mapping is a refused read rather than a panic: the release window belongs
+    /// to a caller replacing this container's files, and anything that reads it
+    /// in the meantime is asking for bytes that are being overwritten.
+    fn partition(&self) -> Result<&Mmap> {
+        self.ucas
+            .as_ref()
+            .ok_or(IoStoreError::PartitionReleased)
+    }
+
+    /// Whether the `.ucas` partition is currently mapped.
+    pub fn is_partition_mapped(&self) -> bool {
+        self.ucas.is_some()
+    }
+
+    /// Drop the mapping of this container's `.ucas`, so the file can be replaced.
+    ///
+    /// Windows refuses to truncate or delete a file that has a mapped section
+    /// open (`ERROR_USER_MAPPED_FILE`, os error 1224), which makes rewriting a
+    /// container this process has mounted impossible while the mapping is held —
+    /// including the common case of re-exporting a mod over an installed copy of
+    /// itself. Reads fail with [`IoStoreError::PartitionReleased`] until
+    /// [`Self::remap_partition`] runs; the `.utoc` index stays resident, so paths
+    /// and chunk ids keep resolving.
+    pub fn release_partition(&mut self) {
+        self.ucas = None;
+    }
+
+    /// Map the `.ucas` partition again, after whatever required its release.
+    ///
+    /// The file may have been replaced in the meantime — that is the point — so
+    /// this maps whatever is at the path now. The `.utoc` index in memory is the
+    /// old one; a caller that replaced the container needs to reopen it rather
+    /// than rely on this.
+    pub fn remap_partition(&mut self) -> Result<()> {
+        if self.ucas.is_some() {
+            return Ok(());
+        }
+        let file = File::open(&self.ucas_path).map_err(|e| {
+            IoStoreError::Io(std::io::Error::new(
+                e.kind(),
+                format!("{}: {e}", self.ucas_path.display()),
+            ))
+        })?;
+        // Safety: as at open — this mapping is only ever read from.
+        self.ucas = Some(unsafe { Mmap::map(&file)? });
+        Ok(())
+    }
+
     /// Open the container whose `.utoc` is at `utoc_path`; the sibling `.ucas`
     /// is opened automatically. Uses the default pure-Rust decode codec.
     pub fn open(utoc_path: impl AsRef<Path>) -> Result<Self> {
@@ -307,7 +372,8 @@ impl IoStoreArchive {
 
         Ok(Self {
             toc,
-            ucas,
+            ucas: Some(ucas),
+            ucas_path,
             codec,
             entry_count,
             chunkid_off,
@@ -557,7 +623,7 @@ impl IoStoreArchive {
             let start = blk.offset as usize;
             let end = start + blk.comp_size as usize;
             let comp = self
-                .ucas
+                .partition()?
                 .get(start..end)
                 .ok_or(IoStoreError::Truncated("block past end of .ucas"))?;
             if blk.method == 0 {
@@ -589,7 +655,7 @@ impl IoStoreArchive {
             let start = blk.offset as usize;
             let end = start + blk.comp_size as usize;
             let comp = self
-                .ucas
+                .partition()?
                 .get(start..end)
                 .ok_or(IoStoreError::Truncated("block past end of .ucas"))?;
             if blk.method == 0 {
