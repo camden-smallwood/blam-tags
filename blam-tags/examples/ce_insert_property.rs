@@ -72,7 +72,9 @@ fn main() {
     };
     blam_tags::iostore::usmap::register_editor_plugin_classes(&mut usmap);
 
-    let world = World::open(PAKS, usmap).expect("mount Paks");
+    let mut world = World::open(PAKS, usmap).expect("mount Paks");
+    let (registered, no_layout) = world.register_generated_classes();
+    println!("registered {registered} generated classes ({no_layout} without a layout)");
     let usmap = world.usmap();
 
     let (mut inserted, mut verified, mut no_candidate) = (0usize, 0usize, 0usize);
@@ -114,10 +116,11 @@ fn main() {
             let mut done: Option<(usize, String, String, PropValue)> = None;
             for i in 0..h.export_map.len() {
                 let ex = &h.export_map[i];
-                let Some(class) = world.class_path(ex.class_index.raw_index()) else {
-                    *why.entry("class not in script objects").or_default() += 1;
+                let Some(class) = world.class_key(&h, ex.class_index) else {
+                    *why.entry("class index unresolvable").or_default() += 1;
                     continue;
                 };
+                let class = class.as_str();
                 let short = class.rsplit('.').next().unwrap_or(class).to_string();
                 let Ok(flat) = flattened_schema(&short, usmap) else {
                     *why.entry("no schema for the class").or_default() += 1;

@@ -52,7 +52,9 @@ fn main() {
     };
     blam_tags::iostore::usmap::register_editor_plugin_classes(&mut usmap);
 
-    let world = World::open(PAKS, usmap).expect("mount Paks");
+    let mut world = World::open(PAKS, usmap).expect("mount Paks");
+    let (registered, no_layout) = world.register_generated_classes();
+    println!("registered {registered} generated classes ({no_layout} without a layout)");
     let usmap = world.usmap();
 
     let mut edited_pkgs = 0usize;
@@ -101,8 +103,7 @@ fn main() {
             // Decode what we can, and find a property worth editing.
             let class_of = |i: usize| -> Option<String> {
                 let ex = &h.export_map[i];
-                let class = world.class_path(ex.class_index.raw_index())?;
-                let short = class.rsplit('.').next().unwrap_or(class).to_string();
+                let short = world.class_key(&h, ex.class_index)?;
                 has_schema(&short, usmap).then_some(short)
             };
 

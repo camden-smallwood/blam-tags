@@ -33,10 +33,16 @@ fn main() {
     };
     blam_tags::iostore::usmap::register_editor_plugin_classes(&mut usmap);
 
-    let world = World::open(PAKS, usmap).expect("mount Paks");
+    let mut world = World::open(PAKS, usmap).expect("mount Paks");
+    // Without this, an export whose class is a Blueprint-generated one has no
+    // schema and gets skipped *before* being counted — which is how this gate
+    // reported 100% of 1,153,987 when the corpus is 1,243,749.
+    let (registered, no_layout) = world.register_generated_classes();
+    println!("registered {registered} generated classes ({no_layout} without a layout)");
     let usmap = world.usmap();
 
     let (mut total, mut same, mut unreadable, mut unwritable) = (0usize, 0usize, 0usize, 0usize);
+    let mut unnamed = 0usize;
     let mut differ_by_class: BTreeMap<String, usize> = BTreeMap::new();
     let mut trailers: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut tail_bytes = 0u64;
@@ -59,8 +65,12 @@ fn main() {
             let resolver = world.resolver(&h, &b, &names);
             let ctx = ExportContext { bulk_data: &bulk, resolver: Some(&resolver) };
             for ex in &h.export_map {
-                let Some(class) = world.class_path(ex.class_index.raw_index()) else { continue };
-                let short = class.rsplit('.').next().unwrap_or(class);
+                total += 1;
+                let Some(short) = world.class_key(&h, ex.class_index) else {
+                    unnamed += 1;
+                    continue;
+                };
+                let short = short.as_str();
                 let off = h.summary.header_size as usize + ex.cooked_serial_offset as usize;
                 let end = (off + ex.cooked_serial_size as usize).min(b.len());
                 if off >= b.len() || off > end {
@@ -71,7 +81,6 @@ fn main() {
                     unreadable += 1;
                     continue;
                 };
-                total += 1;
                 tail_bytes += parts.tail.len() as u64;
                 *trailers
                     .entry(match parts.trailer {
@@ -114,6 +123,7 @@ fn main() {
     println!("differ               {}", total - same - unwritable);
     println!("refused to write     {unwritable}");
     println!("unreadable (skipped) {unreadable}");
+    println!("class unresolvable   {unnamed}");
     println!("tail bytes retained  {tail_bytes} ({:.2} GiB, Phase 4)", tail_bytes as f64 / (1 << 30) as f64);
     println!("trailers             {trailers:?}");
 

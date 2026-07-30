@@ -47,7 +47,9 @@ pub use super::tail_models::{
     StaticMeshComponentTail, TailContext,
     TextureChainTail, TextureCookedData, TextureMip, TexturePlatformData, MODELED_TAILS,
 };
-pub use super::reflect::{read_datatable, read_ufunction_script, read_userdefined_struct_layout};
+pub use super::reflect::{
+    read_datatable, read_ufunction_script, read_userdefined_struct_layout, read_ustruct_layout,
+};
 pub use super::value::{
     BlockLayout, FStr, MeshTransform, PropValue, PropertyBlock, PropertyEntry, SchemaSlot,
     SoftObjectPath,

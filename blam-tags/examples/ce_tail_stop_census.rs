@@ -32,7 +32,13 @@ fn main() {
     };
     blam_tags::iostore::usmap::register_editor_plugin_classes(&mut usmap);
 
-    let world = World::open(PAKS, usmap).expect("mount Paks");
+    let mut world = World::open(PAKS, usmap).expect("mount Paks");
+    // An export whose class is a Blueprint-generated one is reached through a
+    // package import, not the global script objects. Without this it has no
+    // schema and is skipped *before* being counted — 89,762 of the corpus's
+    // 1,243,749 exports, which is why every gate used to say 1,153,987.
+    let (registered, no_layout) = world.register_generated_classes();
+    println!("registered {registered} generated classes ({no_layout} without a layout)");
     let usmap = world.usmap();
 
     // stopping class -> (exports stopped, bytes left unmodeled)
@@ -75,9 +81,10 @@ fn main() {
                 .map(|b| (b.serial_offset, b.serial_size))
                 .collect();
             for (i, ex) in h.export_map.iter().enumerate() {
-                let Some(class) = world.class_path(ex.class_index.raw_index()) else {
+                let Some(class) = world.class_key(&h, ex.class_index) else {
                     continue;
                 };
+                let class = class.as_str();
                 let short = class.rsplit('.').next().unwrap_or(class);
                 if !has_schema(short, usmap) {
                     continue;

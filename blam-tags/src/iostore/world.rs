@@ -23,9 +23,9 @@ use anyhow::{Context, Result};
 
 use super::container_header::EIoContainerHeaderVersion;
 use super::object::archive::PackageResolver;
-use super::object::reflect::read_userdefined_struct_layout;
+use super::object::reflect::{read_userdefined_struct_layout, read_ustruct_layout};
 use super::object::unversioned::ExportContext;
-use super::package::ue_types::FPackageObjectIndexType;
+use super::package::ue_types::{FPackageObjectIndex, FPackageObjectIndexType};
 use super::script_objects::ScriptObjects;
 use super::ue_types::EIoStoreTocVersion;
 use super::usmap::{Usmap, UsmapProperty};
@@ -111,6 +111,123 @@ impl World {
     /// keys by.
     pub fn class_name(&self, hash: u64) -> Option<&str> {
         self.class_path(hash).map(|p| p.rsplit('.').next().unwrap_or(p))
+    }
+
+    /// The `.usmap` key for an export's class.
+    ///
+    /// An export names its class with an `FPackageObjectIndex`, and only the
+    /// `ScriptImport` case is a native class the `.usmap` knows by name. A
+    /// Blueprint-generated class is a *`PackageImport`* — another package's
+    /// export, addressed by public hash — or, when the class lives in the same
+    /// package, an `Export`. Every gate resolved only the first and dropped the
+    /// rest: 89,762 of the corpus's 1,243,749 exports, never read or counted.
+    ///
+    /// The synthetic `pkg#hash` and `pkg.object` forms match what
+    /// [`PkgResolver::struct_name`] produces, so a class registered under one
+    /// is found through the other.
+    pub fn class_key(&self, header: &FZenPackageHeader, class: FPackageObjectIndex) -> Option<String> {
+        match class.kind() {
+            FPackageObjectIndexType::ScriptImport => {
+                Some(self.class_name(class.raw_index())?.to_string())
+            }
+            FPackageObjectIndexType::PackageImport => {
+                let r = class.package_import()?;
+                let pkg = header.imported_package_names.get(r.imported_package_index as usize)?;
+                let hash =
+                    *header.imported_public_export_hashes.get(r.imported_public_export_hash_index as usize)?;
+                Some(format!("{pkg}#{hash:016x}"))
+            }
+            FPackageObjectIndexType::Export => {
+                let ex = header.export_map.get(class.raw_index() as usize)?;
+                let names = header.name_map.copy_raw_names();
+                let object = names.get(ex.object_name.index() as usize)?;
+                Some(format!("{}.{object}", header.package_name()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Recover every Blueprint-generated class in the mount and register it in
+    /// the `.usmap`, so exports of those classes decode like any other.
+    ///
+    /// A `UBlueprintGeneratedClass` export declares the properties the
+    /// Blueprint adds; the rest of its flattened schema is its parent's, which
+    /// `Usmap`'s super chain supplies once the parent is registered too — the
+    /// parent may itself be another generated class, which is why every one is
+    /// registered before any is used.
+    ///
+    /// Each class is registered under **both** keys [`World::class_key`] can
+    /// produce, because an importer addresses it by public hash while the
+    /// declaring package names it by object.
+    ///
+    /// Returns `(classes registered, exports that failed to yield a layout)`.
+    pub fn register_generated_classes(&mut self) -> (usize, usize) {
+        let mut found: Vec<(String, String, Option<String>, Vec<UsmapProperty>)> = Vec::new();
+        let mut failed = 0usize;
+        for ai in 0..self.archives.len() {
+            let entries: Vec<String> = self.archives[ai]
+                .entries()
+                .iter()
+                .map(|e| e.path.clone())
+                .filter(|p| {
+                    let lo = p.to_ascii_lowercase();
+                    lo.ends_with(".uasset") || lo.ends_with(".umap")
+                })
+                .collect();
+            for path in entries {
+                let Ok(b) = self.archives[ai].read(&path) else { continue };
+                let Ok(h) = FZenPackageHeader::deserialize(
+                    &mut Cursor::new(&b),
+                    None,
+                    CE_TOC_VERSION,
+                    CE_HEADER_VERSION,
+                    None,
+                ) else {
+                    continue;
+                };
+                let names = h.name_map.copy_raw_names();
+                let resolver = self.resolver(&h, &b, &names);
+                let bulk: Vec<(i64, i64)> =
+                    h.bulk_data.iter().map(|x| (x.serial_offset, x.serial_size)).collect();
+                let ctx = ExportContext { bulk_data: &bulk, resolver: Some(&resolver) };
+                for ex in &h.export_map {
+                    let Some(class) = self.class_name(ex.class_index.raw_index()) else { continue };
+                    // `UBlueprintGeneratedClass`, and the widget/animation
+                    // subclasses that serialize the same `UStruct` prefix.
+                    if !class.ends_with("GeneratedClass") {
+                        continue;
+                    }
+                    let off = h.summary.header_size as usize + ex.cooked_serial_offset as usize;
+                    let end = (off + ex.cooked_serial_size as usize).min(b.len());
+                    if off >= b.len() || off > end {
+                        continue;
+                    }
+                    let Some(object) = names.get(ex.object_name.index() as usize) else { continue };
+                    match read_ustruct_layout(
+                        &b[off..end],
+                        &names,
+                        &self.usmap,
+                        class,
+                        ex.object_flags,
+                        &ctx,
+                    ) {
+                        Ok((super_index, props)) => found.push((
+                            format!("{}#{:016x}", h.package_name(), ex.public_export_hash),
+                            format!("{}.{object}", h.package_name()),
+                            resolver.struct_name(super_index),
+                            props,
+                        )),
+                        Err(_) => failed += 1,
+                    }
+                }
+            }
+        }
+        let n = found.len();
+        for (hash_key, path_key, super_name, props) in found {
+            self.usmap.register_struct(&hash_key, super_name.clone(), props.clone());
+            self.usmap.register_struct(&path_key, super_name, props);
+        }
+        (n, failed)
     }
 
     /// A resolver scoped to one package. Cheap; make one per package.

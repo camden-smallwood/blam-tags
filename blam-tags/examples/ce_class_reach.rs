@@ -28,7 +28,9 @@ fn main() {
         Err(_) => Usmap::meteorite().expect("bundled usmap"),
     };
     blam_tags::iostore::usmap::register_editor_plugin_classes(&mut usmap);
-    let world = World::open(PAKS, usmap).expect("mount Paks");
+    let mut world = World::open(PAKS, usmap).expect("mount Paks");
+    let (registered, failed) = world.register_generated_classes();
+    println!("registered {registered} generated classes ({failed} exports yielded no layout)\n");
     let usmap = world.usmap();
 
     let mut kinds: BTreeMap<&'static str, u64> = BTreeMap::new();
@@ -62,7 +64,16 @@ fn main() {
                             .or_default() += 1;
                     }
                     FPackageObjectIndexType::PackageImport => {
-                        *kinds.entry("class is another package's export").or_default() += 1;
+                        let key = world.class_key(&h, ci);
+                        *kinds
+                            .entry(match key.as_deref() {
+                                Some(k) if has_schema(k, usmap) => {
+                                    "other package's class, now has a schema"
+                                }
+                                Some(_) => "other package's class, still no schema",
+                                None => "other package's class, unresolvable key",
+                            })
+                            .or_default() += 1;
                         if let Some(r) = ci.package_import() {
                             if let Some(p) =
                                 h.imported_package_names.get(r.imported_package_index as usize)
@@ -72,7 +83,16 @@ fn main() {
                         }
                     }
                     FPackageObjectIndexType::Export => {
-                        *kinds.entry("class is this package's own export").or_default() += 1;
+                        let key = world.class_key(&h, ci);
+                        *kinds
+                            .entry(match key.as_deref() {
+                                Some(k) if has_schema(k, usmap) => {
+                                    "own-package class, now has a schema"
+                                }
+                                Some(_) => "own-package class, still no schema",
+                                None => "own-package class, unresolvable key",
+                            })
+                            .or_default() += 1;
                     }
                     _ => *kinds.entry("class index null/other").or_default() += 1,
                 }

@@ -34,7 +34,13 @@ fn main() {
     };
     blam_tags::iostore::usmap::register_editor_plugin_classes(&mut usmap);
 
-    let world = World::open(PAKS, usmap).expect("mount Paks");
+    let mut world = World::open(PAKS, usmap).expect("mount Paks");
+    // An export whose class is a Blueprint-generated one is reached through a
+    // package import, not the global script objects. Without this it has no
+    // schema and is skipped *before* being counted — 89,762 of the corpus's
+    // 1,243,749 exports, which is why every gate used to say 1,153,987.
+    let (registered, no_layout) = world.register_generated_classes();
+    println!("registered {registered} generated classes ({no_layout} without a layout)");
     let usmap = world.usmap();
 
     // class -> (seen, exact, failed, bytes modeled)
@@ -59,8 +65,8 @@ fn main() {
             let bulk: Vec<(i64, i64)> =
                 h.bulk_data.iter().map(|x| (x.serial_offset, x.serial_size)).collect();
             for (i, ex) in h.export_map.iter().enumerate() {
-                let Some(class) = world.class_path(ex.class_index.raw_index()) else { continue };
-                let short = class.rsplit('.').next().unwrap_or(class);
+                let Some(short) = world.class_key(&h, ex.class_index) else { continue };
+                let short = short.as_str();
                 // Deliberately *not* filtered by `MODELED_TAILS`: families are
                 // dispatched by inheritance chain, so most modeled classes are
                 // never named in that list. `roundtrip_tail` returning `None` is

@@ -279,13 +279,38 @@ pub fn read_userdefined_struct_layout(
     object_flags: u32,
     ctx: &ExportContext<'_>,
 ) -> Result<Vec<UsmapProperty>> {
+    Ok(read_ustruct_layout(export, names, usmap, "UserDefinedStruct", object_flags, ctx)?.1)
+}
+
+/// The declared field layout of *any* `UStruct`-derived export, plus the
+/// `FPackageIndex` of its super.
+///
+/// `UStruct::Serialize` writes `SuperStruct`, the child array and then the
+/// field chain regardless of which subclass it is serializing, so the only
+/// thing that varies is the reflected property block that precedes it — which
+/// is why this takes the class rather than assuming `UserDefinedStruct`.
+///
+/// The super matters for a class and not for a user-defined struct: a
+/// `UBlueprintGeneratedClass` declares only the properties the Blueprint adds,
+/// and the rest of its flattened schema is its parent's. 89,762 of the corpus's
+/// 1,243,749 exports have such a class, and none of them could be decoded while
+/// this only knew how to read a struct.
+pub fn read_ustruct_layout(
+    export: &[u8],
+    names: &[String],
+    usmap: &Usmap,
+    class: &str,
+    object_flags: u32,
+    ctx: &ExportContext<'_>,
+) -> Result<(i32, Vec<UsmapProperty>)> {
     let mut r = Reader::with_ctx(export, names, ctx);
-    read_struct(&mut r, "UserDefinedStruct", usmap, 0).context("UserDefinedStruct property block")?;
+    read_struct(&mut r, class, usmap, 0)
+        .with_context(|| format!("{class} property block"))?;
     read_uobject_trailer(&mut r, object_flags)?;
-    r.i32()?; // SuperStruct
+    let super_struct = r.i32()?;
     let children = native_count(&mut r, "ChildArray")?;
     r.take(children * 4)?;
-    read_field_chain(&mut r)
+    Ok((super_struct, read_field_chain(&mut r)?))
 }
 
 /// Decode a cooked `UDataTable`'s rows into `(row key, field→value)` pairs.
