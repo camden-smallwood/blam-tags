@@ -192,9 +192,14 @@ impl World {
                 let ctx = ExportContext { bulk_data: &bulk, resolver: Some(&resolver) };
                 for ex in &h.export_map {
                     let Some(class) = self.class_name(ex.class_index.raw_index()) else { continue };
-                    // `UBlueprintGeneratedClass`, and the widget/animation
-                    // subclasses that serialize the same `UStruct` prefix.
-                    if !class.ends_with("GeneratedClass") {
+                    // Any export that *is* a class serializes `UStruct`'s
+                    // prefix, so any of them can yield a layout. Testing the
+                    // name for `GeneratedClass` looked equivalent and was not:
+                    // it missed `RigVMMemoryStorageGeneratorClass`, whose two
+                    // exports account for 8,273 of the 83,641 bytes that were
+                    // still untyped. Ask the schema whether it derives from
+                    // `UClass` instead of pattern-matching its name.
+                    if !self.derives_from(class, "Class") {
                         continue;
                     }
                     let off = h.summary.header_size as usize + ex.cooked_serial_offset as usize;
@@ -228,6 +233,21 @@ impl World {
             self.usmap.register_struct(&path_key, super_name, props);
         }
         (n, failed)
+    }
+
+    /// Whether `class` is `base` or has it in its `.usmap` super chain.
+    pub fn derives_from(&self, class: &str, base: &str) -> bool {
+        let mut cur = class;
+        for _ in 0..64 {
+            if cur == base {
+                return true;
+            }
+            match self.usmap.get(cur).and_then(|s| s.super_name.as_deref()) {
+                Some(s) => cur = s,
+                None => return false,
+            }
+        }
+        false
     }
 
     /// A resolver scoped to one package. Cheap; make one per package.
