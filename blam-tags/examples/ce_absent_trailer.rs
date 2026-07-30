@@ -76,6 +76,17 @@ fn main() {
                     continue;
                 }
                 total += 1;
+                let blocklen = (end - off) - parts.tail.len();
+                println!(
+                    "SHAPE export={} block={} tail={} first16={} pkg={} obj={} class={}",
+                    end - off,
+                    blocklen,
+                    parts.tail.len(),
+                    parts.tail.iter().take(16).map(|x| format!("{x:02x}")).collect::<String>(),
+                    h.package_name(),
+                    h.name_map.get(ex.object_name),
+                    class
+                );
                 let slot = hits.entry(class.clone()).or_default();
                 slot.0 += 1;
                 slot.1 += parts.tail.len() as u64;

@@ -124,6 +124,24 @@ fn main() {
                         cands.push(sup.clone());
                         cur = sup;
                     }
+                    // Brute force: does the stranded span parse as a block of
+                    // *any* known struct, consuming exactly?
+                    for skip in [0usize, 4] {
+                        let span = &parts.tail[skip..];
+                        let mut fits: Vec<&str> = Vec::new();
+                        for st in &usmap.structs {
+                            if let Ok((_, n)) = blam_tags::iostore::object::unversioned::read_export_struct_len_in(
+                                span, &names, usmap, &st.name, &ctx,
+                            ) {
+                                if n == span.len() {
+                                    fits.push(&st.name);
+                                }
+                            }
+                        }
+                        println!("  exact-fit schemas for span[{skip}..] ({} bytes): {}",
+                            span.len(),
+                            if fits.is_empty() { "NONE".to_string() } else { fits.join(", ") });
+                    }
                     for cand in &cands {
                         match blam_tags::iostore::object::unversioned::read_export_struct_len(
                             &parts.tail, &names, usmap, cand,

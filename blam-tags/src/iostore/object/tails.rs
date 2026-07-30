@@ -1309,6 +1309,7 @@ pub const CLASSES_WITH_OWN_TAIL: &[&str] = &[
     "AkSwitchValue",
     "AnimSequence",
     "AnimationAsset",
+    "AnimInstance",
     "BlueprintGeneratedClass",
     "BodySetup",
     "Class",

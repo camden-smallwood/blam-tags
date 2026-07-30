@@ -37,7 +37,22 @@ pub fn read_export_struct_len(
     usmap: &Usmap,
     class: &str,
 ) -> Result<(PropertyBlock, usize)> {
-    let mut r = Reader::new(export, names);
+    read_export_struct_len_in(export, names, usmap, class, &ExportContext::new(&[]))
+}
+
+/// As [`read_export_struct_len`], with the package context.
+///
+/// Without it any block containing a user-defined struct or a property bag
+/// fails to read, so a search that uses the context-free form is measuring its
+/// own harness — the failure mode this project has hit five times.
+pub fn read_export_struct_len_in(
+    export: &[u8],
+    names: &[String],
+    usmap: &Usmap,
+    class: &str,
+    ctx: &ExportContext<'_>,
+) -> Result<(PropertyBlock, usize)> {
+    let mut r = Reader::with_ctx(export, names, ctx);
     let props = read_struct(&mut r, class, usmap, 0)?;
     Ok((props, r.o))
 }

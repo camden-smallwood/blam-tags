@@ -3742,6 +3742,77 @@ impl ActorTail {
     }
 }
 
+/// A tail that is demonstrably an unversioned property block whose *schema* is
+/// unidentified — `UAnimInstance`'s CDO tail, 136 exports.
+///
+/// What is established, by measurement rather than inference:
+///
+///  * It is one property block, not `[i32][block]` as the leading `04 00 00 00`
+///    suggests. Those four bytes are two header fragments — `(skip N, 0 values)`
+///    then a wholly empty one — the same leading-empty quirk i343's writer puts
+///    on every `/Game/Tags` wrapper. The header parses in all 136 cases, and the
+///    smallest is unambiguous: a 22-byte export whose whole tail is
+///    `05 00 00 00 7f 01`, an *empty* block over a 127-slot schema.
+///  * The values are 84, 48, 0 … bytes depending on the class, and the block's
+///    present indices begin at that leading skip.
+///
+/// What it is **not**: an `FBoneContainer`, which is what `UAnimInstance::
+/// Serialize` writes (AnimInstance.cpp) — searched every offset against
+/// `operator<<` (BoneContainer.h:487) and `TBitArray::Serialize`, no parse ends
+/// on the last byte. Nor a block of any of the 4,217 schemas the `.usmap` and
+/// the recovered generated classes know, searched *with* a resolver so a nested
+/// user-defined struct could not be what refused it.
+///
+/// So the header is typed and regenerated and the value region is retained,
+/// which is exactly [`UnreflectedBlock`](super::export::UnreflectedBlock)'s
+/// bargain: model everything determinable, and do not invent the rest. Naming
+/// the schema needs the shipping executable — this is where stock UE 5.5.4 and
+/// the measured corpus stop agreeing, and the corpus wins.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnknownSchemaTail {
+    /// The literal fragment run. Not the interpreted [`Header`], because
+    /// i343's writer splits fragments in a way `FUnversionedHeaderBuilder`
+    /// would not and the canonical re-derivation loses it.
+    pub fragments: Vec<super::block::HeaderFragment>,
+    /// Raw zero-mask words. Their width follows from `fragments`; their
+    /// *meaning* needs the schema, which is the one thing missing.
+    pub zero_mask: Vec<u8>,
+    /// The value region, in file order.
+    pub values: Vec<u8>,
+}
+
+impl UnknownSchemaTail {
+    /// The schema indices this header says carry a value, derived from the
+    /// fragment run — knowable without the schema, and the useful half.
+    pub fn present(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        for f in &self.fragments {
+            at += f.skip as usize;
+            for _ in 0..f.value_num {
+                out.push(at);
+                at += 1;
+            }
+        }
+        out
+    }
+
+    pub fn read(tail: &[u8]) -> Result<Self> {
+        let (fragments, zero_mask, used) = super::block::parse_header_fragments(tail)?;
+        Ok(UnknownSchemaTail { fragments, zero_mask, values: tail[used..].to_vec() })
+    }
+
+    pub fn write(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.fragments.len() * 2 + self.values.len());
+        for f in &self.fragments {
+            out.extend_from_slice(&f.pack().to_le_bytes());
+        }
+        out.extend_from_slice(&self.zero_mask);
+        out.extend_from_slice(&self.values);
+        out
+    }
+}
+
 /// `UAnimInstance`'s tail: the proxy's required-bone container.
 ///
 /// `UAnimInstance::Serialize` (AnimInstance.cpp) writes
@@ -5632,6 +5703,16 @@ fn roundtrip_tail_exact(
     ctx: TailContext,
 ) -> Option<Result<Vec<u8>>> {
     match class {
+        // `UAnimInstance`'s CDO tail. See `UnknownSchemaTail` for what this is
+        // and, more usefully, what it is not.
+        "AnimInstance" => Some((|| {
+            let modeled = UnknownSchemaTail::read(tail)?;
+            let out = modeled.write();
+            if out.len() != tail.len() {
+                bail!("model produced {} of {} tail bytes", out.len(), tail.len());
+            }
+            Ok(out)
+        })()),
         "StaticMeshComponent" => Some((|| {
             let mut r = reader(tail, names, ctx);
             let modeled = StaticMeshComponentChainTail::read(&mut r, block)?;

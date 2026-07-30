@@ -442,6 +442,81 @@ pub fn flattened_schema<'u>(
         .with_context(|| format!("no .usmap schema for struct {class}"))
 }
 
+/// One `FFragment` of an `FUnversionedHeader`, as the file stores it.
+///
+/// [`Header`] is the *interpreted* form — which schema indices carry a value —
+/// and is what almost everything wants. It is deliberately lossy about how the
+/// fragment run was split, because [`HeaderBuilder`] re-derives a canonical
+/// split and that reproduces every header Epic's cooker wrote.
+///
+/// It does not reproduce every header *i343's* tools wrote. They emit a
+/// value-less `(skip N)` fragment followed by a wholly empty one where the
+/// builder would emit a single `(skip N, values)` — the same family as
+/// [`Header::leading_empty`]. Somewhere that has to be carried verbatim, and
+/// this is the honest way to carry it: as the engine's own unit, not as bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeaderFragment {
+    pub skip: u8,
+    pub has_zeroes: bool,
+    pub value_num: u8,
+    pub is_last: bool,
+}
+
+impl HeaderFragment {
+    pub fn unpack(p: u16) -> Self {
+        let f = Fragment::unpack(p);
+        HeaderFragment {
+            skip: f.skip,
+            has_zeroes: f.has_zeroes,
+            value_num: f.value_num,
+            is_last: f.is_last,
+        }
+    }
+
+    pub fn pack(&self) -> u16 {
+        Fragment {
+            skip: self.skip,
+            has_zeroes: self.has_zeroes,
+            value_num: self.value_num,
+            is_last: self.is_last,
+        }
+        .pack()
+    }
+}
+
+/// Read an `FUnversionedHeader` as its literal fragment run plus the raw
+/// zero-mask words, for a caller that must reproduce it exactly without a
+/// schema. Returns `(fragments, zero_mask_bytes, bytes_consumed)`.
+///
+/// The zero mask's *width* is a function of how many masked values there are
+/// (`FUnversionedHeader::Load`: one byte up to 8, two up to 16, else whole
+/// 32-bit words), so it is recoverable from the fragments and kept as bytes
+/// only because their meaning needs the schema this caller does not have.
+pub fn parse_header_fragments(bytes: &[u8]) -> Result<(Vec<HeaderFragment>, Vec<u8>, usize)> {
+    let mut r = Reader::new(bytes, &[]);
+    let mut frags = Vec::new();
+    let mut zero_mask_num = 0usize;
+    loop {
+        let f = HeaderFragment::unpack(r.u16()?);
+        if f.has_zeroes {
+            zero_mask_num += f.value_num as usize;
+        }
+        let last = f.is_last;
+        frags.push(f);
+        if last {
+            break;
+        }
+    }
+    let mask_len = match zero_mask_num {
+        0 => 0,
+        n if n <= 8 => 1,
+        n if n <= 16 => 2,
+        n => n.div_ceil(32) * 4,
+    };
+    let mask = r.take(mask_len)?.to_vec();
+    Ok((frags, mask, r.o))
+}
+
 /// Whether a schema can be built for `class` at all.
 ///
 /// Callers that filter exports must use *this*, not
