@@ -756,7 +756,7 @@ impl TexturePlatformData {
 /// and the list; the other classes call the shared serializer directly.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextureCookedData {
-    pub strip_flags: [u8; 2],
+    pub strip_flags: StripDataFlags,
     pub cooked: bool,
     pub serialize_mip_data: Option<bool>,
     pub formats: Vec<TexturePlatformData>,
@@ -772,7 +772,7 @@ pub struct TextureCookedData {
 
 impl TextureCookedData {
     pub fn read(r: &mut Reader, ctx: TailContext, has_mip_data_flag: bool) -> Result<Self> {
-        let strip_flags = [r.u8()?, r.u8()?];
+        let strip_flags = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
         let cooked = r.u32()? != 0;
         if !cooked {
             return Ok(TextureCookedData {
@@ -813,8 +813,7 @@ impl TextureCookedData {
     }
 
     pub fn write(&self, ar: &mut impl Ar) -> Result<()> {
-        ar.u8(&mut self.strip_flags[0].to_owned())?;
-        ar.u8(&mut self.strip_flags[1].to_owned())?;
+        self.strip_flags.clone().serialize(ar)?;
         ar.u32(&mut u32::from(self.cooked))?;
         if !self.cooked {
             return Ok(());
@@ -1285,7 +1284,7 @@ pub struct StaticMeshBuffers {
     pub position_stride: i32,
     pub position_num_vertices: i32,
     pub positions: BulkArray,
-    pub vertex_strip: [u8; 2],
+    pub vertex_strip: StripDataFlags,
     pub num_tex_coords: i32,
     pub num_vertices: i32,
     pub use_full_precision_uvs: u32,
@@ -1293,7 +1292,7 @@ pub struct StaticMeshBuffers {
     /// Tangents and UVs, present unless the vertex buffer's own strip flags say
     /// otherwise.
     pub tangents_and_uvs: Option<(BulkArray, BulkArray)>,
-    pub color_strip: [u8; 2],
+    pub color_strip: StripDataFlags,
     pub color_stride: i32,
     pub color_num_vertices: i32,
     pub colors: Option<BulkArray>,
@@ -1321,20 +1320,20 @@ impl StaticMeshBuffers {
         let position_stride = r.i32()?;
         let position_num_vertices = r.i32()?;
         let positions = BulkArray::read(r, "positions")?;
-        let vertex_strip = [r.u8()?, r.u8()?];
+        let vertex_strip = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
         let num_tex_coords = r.i32()?;
         let num_vertices = r.i32()?;
         let use_full_precision_uvs = r.u32()?;
         let use_high_precision_tangent_basis = r.u32()?;
-        let tangents_and_uvs = if vertex_strip[0] & 2 == 0 {
+        let tangents_and_uvs = if vertex_strip.global & 2 == 0 {
             Some((BulkArray::read(r, "tangents")?, BulkArray::read(r, "UVs")?))
         } else {
             None
         };
-        let color_strip = [r.u8()?, r.u8()?];
+        let color_strip = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
         let color_stride = r.i32()?;
         let color_num_vertices = r.i32()?;
-        let colors = (color_strip[0] & 2 == 0 && color_num_vertices > 0)
+        let colors = (color_strip.global & 2 == 0 && color_num_vertices > 0)
             .then(|| BulkArray::read(r, "vertex colours"))
             .transpose()?;
         let index_buffer = RawStaticIndexBuffer::read(r)?;
@@ -1380,13 +1379,12 @@ impl StaticMeshBuffers {
         ar.i32(&mut self.position_stride.to_owned())?;
         ar.i32(&mut self.position_num_vertices.to_owned())?;
         self.positions.write(ar)?;
-        ar.u8(&mut self.vertex_strip[0].to_owned())?;
-        ar.u8(&mut self.vertex_strip[1].to_owned())?;
+        self.vertex_strip.clone().serialize(ar)?;
         ar.i32(&mut self.num_tex_coords.to_owned())?;
         ar.i32(&mut self.num_vertices.to_owned())?;
         ar.u32(&mut self.use_full_precision_uvs.to_owned())?;
         ar.u32(&mut self.use_high_precision_tangent_basis.to_owned())?;
-        match (&self.tangents_and_uvs, self.vertex_strip[0] & 2 == 0) {
+        match (&self.tangents_and_uvs, self.vertex_strip.global & 2 == 0) {
             (Some((t, u)), true) => {
                 t.write(ar)?;
                 u.write(ar)?;
@@ -1394,11 +1392,10 @@ impl StaticMeshBuffers {
             (None, false) => {}
             _ => bail!("tangent/UV presence disagrees with the vertex strip flags"),
         }
-        ar.u8(&mut self.color_strip[0].to_owned())?;
-        ar.u8(&mut self.color_strip[1].to_owned())?;
+        self.color_strip.clone().serialize(ar)?;
         ar.i32(&mut self.color_stride.to_owned())?;
         ar.i32(&mut self.color_num_vertices.to_owned())?;
-        match (&self.colors, self.color_strip[0] & 2 == 0 && self.color_num_vertices > 0) {
+        match (&self.colors, self.color_strip.global & 2 == 0 && self.color_num_vertices > 0) {
             (Some(c), true) => c.write(ar)?,
             (None, false) => {}
             _ => bail!("vertex colour presence disagrees with the colour buffer's flags"),
@@ -1572,7 +1569,7 @@ impl StaticMeshLod {
 /// hierarchy, the dependencies and the mesh statistics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NaniteResources {
-    pub strip_flags: [u8; 2],
+    pub strip_flags: StripDataFlags,
     pub resource_flags: u32,
     /// `StreamablePages`: a bulk-data handle, never inline in this corpus.
     pub streamable_pages_index: i32,
@@ -1593,7 +1590,7 @@ pub struct NaniteResources {
 
 impl NaniteResources {
     fn read(r: &mut Reader) -> Result<Self> {
-        let strip_flags = [r.u8()?, r.u8()?];
+        let strip_flags = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
         let resource_flags = r.u32()?;
         let streamable_pages_index = r.i32()?;
         let n = {
@@ -1647,8 +1644,7 @@ impl NaniteResources {
     }
 
     fn write(&self, ar: &mut impl Ar) -> Result<()> {
-        ar.u8(&mut self.strip_flags[0].to_owned())?;
-        ar.u8(&mut self.strip_flags[1].to_owned())?;
+        self.strip_flags.clone().serialize(ar)?;
         ar.u32(&mut self.resource_flags.to_owned())?;
         ar.i32(&mut self.streamable_pages_index.to_owned())?;
         ar.i32(&mut (self.root_data.len() as i32))?;
@@ -1688,7 +1684,7 @@ pub struct RayTracingProxyLod {
 /// `FStaticMeshRayTracingProxy`, written only when `bHasRayTracingProxy`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RayTracingProxy {
-    pub strip_flags: [u8; 2],
+    pub strip_flags: StripDataFlags,
     pub using_rendering_lods: u32,
     pub lods: Vec<RayTracingProxyLod>,
 }
@@ -1723,39 +1719,39 @@ pub struct DistanceFieldVolume {
 // No `Eq`: LODs carry `f32` deviations and sampler weights.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StaticMeshTail {
-    pub strip_flags: [u8; 2],
+    pub strip_flags: StripDataFlags,
     pub cooked: u32,
     pub body_setup: i32,
     pub nav_collision: i32,
-    pub lighting_guid: [u8; 16],
+    pub lighting_guid: Guid,
     pub sockets: Vec<i32>,
     pub lods: Vec<StaticMeshLod>,
     pub num_inlined_lods: u8,
     pub nanite: NaniteResources,
     pub ray_tracing_proxy: Option<RayTracingProxy>,
-    pub card_strip: [u8; 2],
+    pub card_strip: StripDataFlags,
     /// Per LOD, `None` where the validity flag was zero. Absent entirely when
     /// the strip flags dropped the whole section.
     pub card_representations: Option<Vec<Option<CardRepresentation>>>,
-    pub distance_field_strip: [u8; 2],
+    pub distance_field_strip: StripDataFlags,
     pub distance_fields: Option<Vec<Option<DistanceFieldVolume>>>,
     /// `Bounds`: an `FBoxSphereBounds`.
-    pub bounds: [u8; 56],
+    pub bounds: BoxSphereBounds,
     pub lods_share_static_lighting: u32,
     /// `ScreenSize[MAX_STATIC_LODS_UE4]`, each an `FPerPlatformFloat`.
     pub screen_sizes: [u8; 64],
-    pub render_data_strip: [u8; 2],
+    pub render_data_strip: StripDataFlags,
     pub has_speed_tree_wind: u32,
     pub materials: Vec<StaticMaterial>,
 }
 
 impl StaticMeshTail {
     pub fn read(r: &mut Reader, ctx: TailContext) -> Result<Self> {
-        let strip_flags = [r.u8()?, r.u8()?];
+        let strip_flags = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
         let cooked = r.u32()?;
         let body_setup = r.i32()?;
         let nav_collision = r.i32()?;
-        let lighting_guid: [u8; 16] = r.take(16)?.try_into().expect("16 bytes");
+        let lighting_guid = { let mut g = Guid::default(); g.serialize(r)?; g };
         let n = {
             let n = r.i32()?;
             super::limits::bounded(n, MAX_NATIVE_COUNT, "Sockets", r.o - 4)?
@@ -1774,7 +1770,7 @@ impl StaticMeshTail {
 
         let ray_tracing_proxy = (r.u32()? != 0)
             .then(|| -> Result<RayTracingProxy> {
-                let strip_flags = [r.u8()?, r.u8()?];
+                let strip_flags = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
                 let using_rendering_lods = r.u32()?;
                 let n = {
                     let n = r.i32()?;
@@ -1817,8 +1813,8 @@ impl StaticMeshTail {
             })
             .transpose()?;
 
-        let card_strip = [r.u8()?, r.u8()?];
-        let card_representations = (card_strip[0] & 2 == 0 && card_strip[1] & 2 == 0)
+        let card_strip = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
+        let card_representations = (card_strip.global & 2 == 0 && card_strip.class & 2 == 0)
             .then(|| -> Result<Vec<Option<CardRepresentation>>> {
                 (0..lods.len())
                     .map(|_| {
@@ -1841,8 +1837,8 @@ impl StaticMeshTail {
             })
             .transpose()?;
 
-        let distance_field_strip = [r.u8()?, r.u8()?];
-        let distance_fields = (distance_field_strip[0] & 2 == 0 && distance_field_strip[1] & 1 == 0)
+        let distance_field_strip = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
+        let distance_fields = (distance_field_strip.global & 2 == 0 && distance_field_strip.class & 1 == 0)
             .then(|| -> Result<Vec<Option<DistanceFieldVolume>>> {
                 (0..lods.len())
                     .map(|_| {
@@ -1868,10 +1864,10 @@ impl StaticMeshTail {
             })
             .transpose()?;
 
-        let bounds = r.take(56)?.try_into().expect("56 bytes");
+        let bounds = { let mut b = BoxSphereBounds::default(); b.serialize(r)?; b };
         let lods_share_static_lighting = r.u32()?;
         let screen_sizes = r.take(64)?.try_into().expect("64 bytes");
-        let render_data_strip = [r.u8()?, r.u8()?];
+        let render_data_strip = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
         let has_speed_tree_wind = r.u32()?;
         let n = bounded_count(r.i32()?, "StaticMaterials", r.o - 4)?;
         let materials: Vec<StaticMaterial> = read_vec(r, "StaticMaterials", n)?;
@@ -1901,12 +1897,11 @@ impl StaticMeshTail {
     }
 
     pub fn write(&self, ar: &mut impl Ar) -> Result<()> {
-        ar.u8(&mut self.strip_flags[0].to_owned())?;
-        ar.u8(&mut self.strip_flags[1].to_owned())?;
+        self.strip_flags.clone().serialize(ar)?;
         ar.u32(&mut self.cooked.to_owned())?;
         ar.i32(&mut self.body_setup.to_owned())?;
         ar.i32(&mut self.nav_collision.to_owned())?;
-        ar.raw(&mut self.lighting_guid.to_vec(), 16)?;
+        self.lighting_guid.clone().serialize(ar)?;
         ar.i32(&mut (self.sockets.len() as i32))?;
         for s in &self.sockets {
             ar.i32(&mut s.to_owned())?;
@@ -1921,8 +1916,7 @@ impl StaticMeshTail {
         match &self.ray_tracing_proxy {
             Some(p) => {
                 ar.u32(&mut 1)?;
-                ar.u8(&mut p.strip_flags[0].to_owned())?;
-                ar.u8(&mut p.strip_flags[1].to_owned())?;
+                p.strip_flags.clone().serialize(ar)?;
                 ar.u32(&mut p.using_rendering_lods.to_owned())?;
                 ar.i32(&mut (p.lods.len() as i32))?;
                 for l in &p.lods {
@@ -1947,9 +1941,8 @@ impl StaticMeshTail {
             None => ar.u32(&mut 0)?,
         }
 
-        ar.u8(&mut self.card_strip[0].to_owned())?;
-        ar.u8(&mut self.card_strip[1].to_owned())?;
-        match (&self.card_representations, self.card_strip[0] & 2 == 0 && self.card_strip[1] & 2 == 0)
+        self.card_strip.clone().serialize(ar)?;
+        match (&self.card_representations, self.card_strip.global & 2 == 0 && self.card_strip.class & 2 == 0)
         {
             (Some(v), true) => {
                 if v.len() != self.lods.len() {
@@ -1974,11 +1967,10 @@ impl StaticMeshTail {
             _ => bail!("card representation presence disagrees with the strip flags"),
         }
 
-        ar.u8(&mut self.distance_field_strip[0].to_owned())?;
-        ar.u8(&mut self.distance_field_strip[1].to_owned())?;
+        self.distance_field_strip.clone().serialize(ar)?;
         match (
             &self.distance_fields,
-            self.distance_field_strip[0] & 2 == 0 && self.distance_field_strip[1] & 1 == 0,
+            self.distance_field_strip.global & 2 == 0 && self.distance_field_strip.class & 1 == 0,
         ) {
             (Some(v), true) => {
                 if v.len() != self.lods.len() {
@@ -2004,11 +1996,10 @@ impl StaticMeshTail {
             _ => bail!("distance field presence disagrees with the strip flags"),
         }
 
-        ar.raw(&mut self.bounds.to_vec(), 56)?;
+        self.bounds.clone().serialize(ar)?;
         ar.u32(&mut self.lods_share_static_lighting.to_owned())?;
         ar.raw(&mut self.screen_sizes.to_vec(), 64)?;
-        ar.u8(&mut self.render_data_strip[0].to_owned())?;
-        ar.u8(&mut self.render_data_strip[1].to_owned())?;
+        self.render_data_strip.clone().serialize(ar)?;
         ar.u32(&mut self.has_speed_tree_wind.to_owned())?;
         write_vec(ar, &self.materials)?;
         Ok(())
@@ -2115,7 +2106,7 @@ pub struct AudioChunk {
 pub struct SoundWaveTail {
     pub flags: u32,
     pub cue_points: Vec<PropertyBlock>,
-    pub compressed_data_guid: [u8; 16],
+    pub compressed_data_guid: Guid,
     pub audio_format: FName,
     pub chunks: Vec<AudioChunk>,
 }
@@ -2136,7 +2127,7 @@ impl SoundWaveTail {
         for _ in 0..n {
             cue_points.push(read_struct(r, "SoundWaveCuePoint", ctx.usmap, 0)?);
         }
-        let compressed_data_guid: [u8; 16] = r.take(16)?.try_into().expect("16 bytes");
+        let compressed_data_guid = { let mut g = Guid::default(); g.serialize(r)?; g };
         let n = {
             let n = r.i32()?;
             super::limits::bounded(n, MAX_NATIVE_COUNT, "audio chunks", r.o - 4)?
@@ -2167,7 +2158,7 @@ impl SoundWaveTail {
         for b in &self.cue_points {
             write_block(ar, b, &flat, ctx.usmap)?;
         }
-        ar.raw(&mut self.compressed_data_guid.to_vec(), 16)?;
+        self.compressed_data_guid.clone().serialize(ar)?;
         ar.i32(&mut (self.chunks.len() as i32))?;
         ar.fname(&mut self.audio_format.clone())?;
         for c in &self.chunks {
@@ -2188,7 +2179,7 @@ impl SoundWaveTail {
 /// One element of a `UModelComponent`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelElement {
-    pub map_build_data_id: [u8; 16],
+    pub map_build_data_id: Guid,
     pub component: i32,
     pub material: i32,
     pub nodes: FixedArray,
@@ -2213,7 +2204,7 @@ impl ModelComponentTail {
         let mut elements = Vec::with_capacity(n.min(64));
         for _ in 0..n {
             elements.push(ModelElement {
-                map_build_data_id: r.take(16)?.try_into().expect("16 bytes"),
+                map_build_data_id: { let mut g = Guid::default(); g.serialize(r)?; g },
                 component: r.i32()?,
                 material: r.i32()?,
                 nodes: FixedArray::read(r, "element nodes", 2)?,
@@ -2231,7 +2222,7 @@ impl ModelComponentTail {
         ar.i32(&mut self.model.to_owned())?;
         ar.i32(&mut (self.elements.len() as i32))?;
         for e in &self.elements {
-            ar.raw(&mut e.map_build_data_id.to_vec(), 16)?;
+            e.map_build_data_id.clone().serialize(ar)?;
             ar.i32(&mut e.component.to_owned())?;
             ar.i32(&mut e.material.to_owned())?;
             e.nodes.write(ar)?;
@@ -2254,8 +2245,8 @@ pub struct RetargetSource {
 pub struct SkeletonTail {
     pub reference_skeleton: ReferenceSkeleton,
     pub retarget_sources: Vec<RetargetSource>,
-    pub guid: [u8; 16],
-    pub strip_flags: [u8; 2],
+    pub guid: Guid,
+    pub strip_flags: StripDataFlags,
 }
 
 impl SkeletonTail {
@@ -2282,7 +2273,7 @@ impl SkeletonTail {
                 reference_pose: r.take(m * tsize)?.to_vec(),
             });
         }
-        let guid = r.take(16)?.try_into().expect("16 bytes");
+        let guid = { let mut g = Guid::default(); g.serialize(r)?; g };
         let smart_names = r.i32()?;
         if smart_names != 0 {
             bail!("non-empty deprecated SmartNames container");
@@ -2291,7 +2282,7 @@ impl SkeletonTail {
             reference_skeleton,
             retarget_sources,
             guid,
-            strip_flags: [r.u8()?, r.u8()?],
+            strip_flags: { let mut f = StripDataFlags::default(); f.serialize(r)?; f },
         })
     }
 
@@ -2309,10 +2300,10 @@ impl SkeletonTail {
             let n = s.reference_pose.len();
             ar.raw(&mut s.reference_pose.clone(), n)?;
         }
-        ar.raw(&mut self.guid.to_vec(), 16)?;
+        self.guid.clone().serialize(ar)?;
         ar.i32(&mut 0)?; // the deprecated SmartNames container, always empty
-        ar.u8(&mut self.strip_flags[0].to_owned())?;
-        ar.u8(&mut self.strip_flags[1].to_owned())
+        ar.u8(&mut self.strip_flags.global.to_owned())?;
+        ar.u8(&mut self.strip_flags.class.to_owned())
     }
 }
 
@@ -2801,8 +2792,8 @@ pub enum ManagedArrayValues {
 /// One attribute of an `FManagedArrayCollection`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedArrayAttribute {
-    /// The attribute `FName` then the group `FName`.
-    pub key: [u8; 16],
+    pub name: FName,
+    pub group: FName,
     pub value_type_version: i32,
     pub type_id: i32,
     /// `GroupIndexDependency` `FName` and `bPersistent`.
@@ -2816,8 +2807,8 @@ pub struct ManagedArrayAttribute {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedArrayCollection {
     pub version: i32,
-    /// An `FName` key and an `FGroupInfo` per group.
-    pub groups: FixedArray,
+    /// An `FName` key and its `FGroupInfo` — a version and a size.
+    pub groups: Vec<(FName, i32, i32)>,
     pub attributes: Vec<ManagedArrayAttribute>,
 }
 
@@ -2828,7 +2819,11 @@ impl ManagedArrayCollection {
             read_bvh_particles, read_chaos_implicit_object, MANAGED_ARRAY_TYPES,
         };
         let version = r.i32()?;
-        let groups = FixedArray::read(r, "collection groups", 16)?;
+        let n = bounded_count(r.i32()?, "collection groups", r.o - 4)?;
+        let mut groups = Vec::with_capacity(n.min(256));
+        for _ in 0..n {
+            groups.push((r.fname()?, r.i32()?, r.i32()?));
+        }
         let n = {
             let n = r.i32()?;
             super::limits::bounded(n, MAX_NATIVE_COUNT, "collection attributes", r.o - 4)?
@@ -2838,17 +2833,18 @@ impl ManagedArrayCollection {
         let mut seen = std::collections::HashSet::new();
         let mut attributes = Vec::with_capacity(n.min(256));
         for _ in 0..n {
-            let key: [u8; 16] = r.take(16)?.try_into().expect("16 bytes");
+            let name = r.fname()?;
+            let group = r.fname()?;
             let value_type_version = r.i32()?;
             let type_id = r.i32()?;
             let group_dependency = r.take(12)?.try_into().expect("12 bytes");
-            let name = MANAGED_ARRAY_TYPES.get(type_id as usize).copied().unwrap_or("?");
+            let ty = MANAGED_ARRAY_TYPES.get(type_id as usize).copied().unwrap_or("?");
             let array_version = r.i32()?;
             let count = |r: &mut Reader, what: &str| -> Result<usize> {
                 let n = r.i32()?;
                 super::limits::bounded(n, MAX_NATIVE_COUNT, what, r.o - 4)
             };
-            let values = if managed_array_is_bulk(name) {
+            let values = if managed_array_is_bulk(ty) {
                 let element_size = r.i32()?;
                 let n = r.i32()?;
                 if element_size < 0 || n < 0 {
@@ -2856,10 +2852,10 @@ impl ManagedArrayCollection {
                 }
                 let bytes = (element_size as usize) * (n as usize);
                 ManagedArrayValues::Bulk { element_size, data: r.take(bytes)?.to_vec() }
-            } else if name == "String" {
+            } else if ty == "String" {
                 let n = count(r, "collection strings")?;
                 ManagedArrayValues::Strings((0..n).map(|_| r.fstring()).collect::<Result<_>>()?)
-            } else if let Some(inner) = managed_array_nested_elem(name) {
+            } else if let Some(inner) = managed_array_nested_elem(ty) {
                 let n = count(r, "collection nested array")?;
                 let mut arrays = Vec::with_capacity(n.min(256));
                 for _ in 0..n {
@@ -2867,16 +2863,16 @@ impl ManagedArrayCollection {
                     arrays.push(r.take(m * inner)?.to_vec());
                 }
                 ManagedArrayValues::Nested { element_size: inner, arrays }
-            } else if let Some(sz) = managed_array_elem(name) {
+            } else if let Some(sz) = managed_array_elem(ty) {
                 ManagedArrayValues::Fixed(FixedArray::read(r, "collection array", sz)?)
-            } else if name == "ImplicitObjectRefCountedPtr" || name == "ConvexRefCountedPtr" {
+            } else if ty == "ImplicitObjectRefCountedPtr" || ty == "ConvexRefCountedPtr" {
                 let n = count(r, "collection implicit objects")?;
                 let mut ptrs = Vec::with_capacity(n.min(256));
                 for _ in 0..n {
                     ptrs.push(ChaosPtr::read(r, &mut seen, read_chaos_implicit_object)?);
                 }
                 ManagedArrayValues::ChaosPointers(ptrs)
-            } else if name == "BVHParticlesFloat3UniquePointer" {
+            } else if ty == "BVHParticlesFloat3UniquePointer" {
                 let n = count(r, "collection BVH particles")?;
                 let mut ptrs = Vec::with_capacity(n.min(256));
                 for _ in 0..n {
@@ -2884,10 +2880,11 @@ impl ManagedArrayCollection {
                 }
                 ManagedArrayValues::ChaosPointers(ptrs)
             } else {
-                bail!("unmodeled managed array type {name} ({type_id}) @ {}", r.o);
+                bail!("unmodeled managed array type {ty} ({type_id}) @ {}", r.o);
             };
             attributes.push(ManagedArrayAttribute {
-                key,
+                name,
+                group,
                 value_type_version,
                 type_id,
                 group_dependency,
@@ -2900,10 +2897,16 @@ impl ManagedArrayCollection {
 
     fn write(&self, ar: &mut impl Ar) -> Result<()> {
         ar.i32(&mut self.version.to_owned())?;
-        self.groups.write(ar)?;
+        ar.i32(&mut (self.groups.len() as i32))?;
+        for (name, version, size) in &self.groups {
+            ar.fname(&mut name.clone())?;
+            ar.i32(&mut version.to_owned())?;
+            ar.i32(&mut size.to_owned())?;
+        }
         ar.i32(&mut (self.attributes.len() as i32))?;
         for a in &self.attributes {
-            ar.raw(&mut a.key.to_vec(), 16)?;
+            ar.fname(&mut a.name.clone())?;
+            ar.fname(&mut a.group.clone())?;
             ar.i32(&mut a.value_type_version.to_owned())?;
             ar.i32(&mut a.type_id.to_owned())?;
             ar.raw(&mut a.group_dependency.to_vec(), 12)?;
@@ -2954,7 +2957,8 @@ impl ManagedArrayCollection {
 }
 
 /// `FGeometryCollectionMeshResources` plus its description.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// No `Eq`: the pre-skinned bounds are doubles.
+#[derive(Debug, Clone, PartialEq)]
 pub struct GeometryCollectionMesh {
     /// The index buffer comes **first** here, unlike `FStaticMeshLODResources`,
     /// and each buffer writes its own strip flags because they are serialized
@@ -2964,10 +2968,10 @@ pub struct GeometryCollectionMesh {
     pub position_stride: i32,
     pub position_num_vertices: i32,
     pub positions: BulkArray,
-    pub vertex_strip: [u8; 2],
+    pub vertex_strip: StripDataFlags,
     pub vertex_header: [u8; 16],
     pub tangents_and_uvs: Option<(BulkArray, BulkArray)>,
-    pub color_strip: [u8; 2],
+    pub color_strip: StripDataFlags,
     pub color_stride: i32,
     pub color_num_vertices: i32,
     pub colors: Option<BulkArray>,
@@ -2976,7 +2980,7 @@ pub struct GeometryCollectionMesh {
     pub bone_map: BulkArray,
     pub description_num_vertices: i32,
     pub description_num_triangles: i32,
-    pub pre_skinned_bounds: [u8; 56],
+    pub pre_skinned_bounds: BoxSphereBounds,
     /// `Sections`, `SectionsNoInternal`, `SubSections` — 20-byte
     /// `FGeometryCollectionMeshElement` each.
     pub sections: [FixedArray; 3],
@@ -2984,7 +2988,8 @@ pub struct GeometryCollectionMesh {
 
 /// `UGeometryCollection`'s tail: the managed array collection, then the cooked
 /// render data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// No `Eq`: the mesh's bounds are doubles.
+#[derive(Debug, Clone, PartialEq)]
 pub struct GeometryCollectionTail {
     pub is_cooked_or_cooking: u32,
     pub collection: ManagedArrayCollection,
@@ -3007,9 +3012,9 @@ impl GeometryCollectionTail {
                 let position_stride = r.i32()?;
                 let position_num_vertices = r.i32()?;
                 let positions = BulkArray::read(r, "collection positions")?;
-                let vertex_strip = [r.u8()?, r.u8()?];
+                let vertex_strip = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
                 let vertex_header: [u8; 16] = r.take(16)?.try_into().expect("16 bytes");
-                let tangents_and_uvs = (vertex_strip[0] & 2 == 0)
+                let tangents_and_uvs = (vertex_strip.global & 2 == 0)
                     .then(|| -> Result<(BulkArray, BulkArray)> {
                         Ok((
                             BulkArray::read(r, "collection tangents")?,
@@ -3017,17 +3022,18 @@ impl GeometryCollectionTail {
                         ))
                     })
                     .transpose()?;
-                let color_strip = [r.u8()?, r.u8()?];
+                let color_strip = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
                 let color_stride = r.i32()?;
                 let color_num_vertices = r.i32()?;
-                let colors = (color_strip[0] & 2 == 0 && color_num_vertices > 0)
+                let colors = (color_strip.global & 2 == 0 && color_num_vertices > 0)
                     .then(|| BulkArray::read(r, "collection vertex colours"))
                     .transpose()?;
                 let bone_map_num_vertices = r.i32()?;
                 let bone_map = BulkArray::read(r, "collection bone map")?;
                 let description_num_vertices = r.i32()?;
                 let description_num_triangles = r.i32()?;
-                let pre_skinned_bounds = r.take(56)?.try_into().expect("56 bytes");
+                let pre_skinned_bounds =
+                    { let mut b = BoxSphereBounds::default(); b.serialize(r)?; b };
                 let sections = [
                     FixedArray::read(r, "Sections", 20)?,
                     FixedArray::read(r, "SectionsNoInternal", 20)?,
@@ -3077,10 +3083,9 @@ impl GeometryCollectionTail {
             ar.i32(&mut m.position_stride.to_owned())?;
             ar.i32(&mut m.position_num_vertices.to_owned())?;
             m.positions.write(ar)?;
-            ar.u8(&mut m.vertex_strip[0].to_owned())?;
-            ar.u8(&mut m.vertex_strip[1].to_owned())?;
+            m.vertex_strip.clone().serialize(ar)?;
             ar.raw(&mut m.vertex_header.to_vec(), 16)?;
-            match (&m.tangents_and_uvs, m.vertex_strip[0] & 2 == 0) {
+            match (&m.tangents_and_uvs, m.vertex_strip.global & 2 == 0) {
                 (Some((t, u)), true) => {
                     t.write(ar)?;
                     u.write(ar)?;
@@ -3088,11 +3093,10 @@ impl GeometryCollectionTail {
                 (None, false) => {}
                 _ => bail!("tangent/UV presence disagrees with the vertex strip flags"),
             }
-            ar.u8(&mut m.color_strip[0].to_owned())?;
-            ar.u8(&mut m.color_strip[1].to_owned())?;
+            m.color_strip.clone().serialize(ar)?;
             ar.i32(&mut m.color_stride.to_owned())?;
             ar.i32(&mut m.color_num_vertices.to_owned())?;
-            match (&m.colors, m.color_strip[0] & 2 == 0 && m.color_num_vertices > 0) {
+            match (&m.colors, m.color_strip.global & 2 == 0 && m.color_num_vertices > 0) {
                 (Some(c), true) => c.write(ar)?,
                 (None, false) => {}
                 _ => bail!("colour presence disagrees with the colour buffer's flags"),
@@ -3101,7 +3105,7 @@ impl GeometryCollectionTail {
             m.bone_map.write(ar)?;
             ar.i32(&mut m.description_num_vertices.to_owned())?;
             ar.i32(&mut m.description_num_triangles.to_owned())?;
-            ar.raw(&mut m.pre_skinned_bounds.to_vec(), 56)?;
+            m.pre_skinned_bounds.clone().serialize(ar)?;
             for s in &m.sections {
                 s.write(ar)?;
             }
@@ -3506,11 +3510,12 @@ impl AkAudioEventTail {
 /// is 56 bytes for the same reason — a double-width reading survived 16,722
 /// models because every one of them has an empty vertex buffer, and blew up on
 /// the two that do not.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// No `Eq`: the bounds are doubles.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelTail {
     pub global_strip: u8,
     pub class_strip: u8,
-    pub bounds: [u8; 56],
+    pub bounds: BoxSphereBounds,
     pub vectors: BulkArray,
     pub points: BulkArray,
     pub nodes: BulkArray,
@@ -3524,7 +3529,7 @@ pub struct ModelTail {
     /// `FModelVertex` — 56 bytes each. Absent when both editor data and the
     /// class's vertex-buffer flag are stripped.
     pub vertex_buffer: Option<FixedArray>,
-    pub lighting_guid: [u8; 16],
+    pub lighting_guid: Guid,
     /// `FLightmassPrimitiveSettings` — five four-byte bools and four floats.
     pub lightmass_settings: FixedArray,
 }
@@ -3533,7 +3538,7 @@ impl ModelTail {
     pub fn read(r: &mut Reader) -> Result<Self> {
         let global_strip = r.u8()?;
         let class_strip = r.u8()?;
-        let bounds = r.take(56)?.try_into().expect("56 bytes");
+        let bounds = { let mut b = BoxSphereBounds::default(); b.serialize(r)?; b };
         let vectors = BulkArray::read(r, "Vectors")?;
         let points = BulkArray::read(r, "Points")?;
         let nodes = BulkArray::read(r, "Nodes")?;
@@ -3560,7 +3565,7 @@ impl ModelTail {
             linked,
             num_unique_vertices,
             vertex_buffer,
-            lighting_guid: r.take(16)?.try_into().expect("16 bytes"),
+            lighting_guid: { let mut g = Guid::default(); g.serialize(r)?; g },
             lightmass_settings: FixedArray::read(r, "LightmassSettings", 36)?,
         })
     }
@@ -3568,7 +3573,7 @@ impl ModelTail {
     pub fn write(&self, ar: &mut impl Ar) -> Result<()> {
         ar.u8(&mut self.global_strip.to_owned())?;
         ar.u8(&mut self.class_strip.to_owned())?;
-        ar.raw(&mut self.bounds.to_vec(), 56)?;
+        self.bounds.clone().serialize(ar)?;
         self.vectors.write(ar)?;
         self.points.write(ar)?;
         self.nodes.write(ar)?;
@@ -3586,7 +3591,7 @@ impl ModelTail {
             (None, false) => {}
             _ => bail!("vertex buffer presence disagrees with the strip flags"),
         }
-        ar.raw(&mut self.lighting_guid.to_vec(), 16)?;
+        self.lighting_guid.clone().serialize(ar)?;
         self.lightmass_settings.write(ar)
     }
 }
@@ -3755,20 +3760,20 @@ pub enum BoneCodecData {
 /// this type existed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnimSequenceChainTail {
-    pub animation_asset_guid: [u8; 16],
+    pub animation_asset_guid: Guid,
     pub sequence: AnimSequenceTail,
 }
 
 impl AnimSequenceChainTail {
     pub fn read(r: &mut Reader) -> Result<Self> {
         Ok(AnimSequenceChainTail {
-            animation_asset_guid: r.take(16)?.try_into().expect("16 bytes"),
+            animation_asset_guid: { let mut g = Guid::default(); g.serialize(r)?; g },
             sequence: AnimSequenceTail::read(r)?,
         })
     }
 
     pub fn write(&self, ar: &mut impl Ar) -> Result<()> {
-        ar.raw(&mut self.animation_asset_guid.to_vec(), 16)?;
+        self.animation_asset_guid.clone().serialize(ar)?;
         self.sequence.write(ar)
     }
 }
@@ -3780,7 +3785,7 @@ impl AnimSequenceChainTail {
 /// Everything that describes and addresses it is a value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnimSequenceTail {
-    pub strip_flags: [u8; 2],
+    pub strip_flags: StripDataFlags,
     /// `bSerializeCompressedData`. When clear the tail ends here.
     pub serialize_compressed_data: bool,
     pub compressed_raw_data_size: i32,
@@ -3808,7 +3813,7 @@ pub struct AnimSequenceTail {
 
 impl AnimSequenceTail {
     pub fn read(r: &mut Reader) -> Result<Self> {
-        let strip_flags = [r.u8()?, r.u8()?];
+        let strip_flags = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
         let serialize_compressed_data = r.u32()? != 0;
         if !serialize_compressed_data {
             return Ok(AnimSequenceTail {
@@ -3876,8 +3881,7 @@ impl AnimSequenceTail {
     }
 
     pub fn write(&self, ar: &mut impl Ar) -> Result<()> {
-        ar.u8(&mut self.strip_flags[0].to_owned())?;
-        ar.u8(&mut self.strip_flags[1].to_owned())?;
+        self.strip_flags.clone().serialize(ar)?;
         ar.u32(&mut u32::from(self.serialize_compressed_data))?;
         if !self.serialize_compressed_data {
             return Ok(());
@@ -4204,58 +4208,58 @@ pub struct MorphTargetData {
 /// inline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkelStreamedData {
-    pub strip_flags: [u8; 2],
+    pub strip_flags: StripDataFlags,
     pub index_data_type_size: u8,
     pub index_buffer: BulkArray,
     pub position_stride: i32,
     pub position_num_vertices: i32,
     pub positions: BulkArray,
-    pub vertex_strip: [u8; 2],
+    pub vertex_strip: StripDataFlags,
     /// `NumTexCoords`, `NumVertices`, and the two precision flags.
     pub vertex_header: [u8; 16],
     pub tangents: BulkArray,
     pub uvs: BulkArray,
-    pub skin_strip: [u8; 2],
+    pub skin_strip: StripDataFlags,
     /// `bVariableBonesPerVertex` through `bUse16BitBoneWeight`.
     pub skin_header: [u8; 24],
     pub skin_weights: BulkArray,
-    pub lookup_strip: [u8; 2],
+    pub lookup_strip: StripDataFlags,
     pub lookup_num_vertices: u32,
     pub skin_weight_lookup: BulkArray,
     /// Present only when the mesh declares vertex colours; the inner option is
     /// the buffer, which serializes only when it has vertices.
-    pub colors: Option<(([u8; 2], i32, u32), Option<BulkArray>)>,
-    pub cloth: Option<([u8; 2], BulkArray, FixedArray)>,
+    pub colors: Option<((StripDataFlags, i32, u32), Option<BulkArray>)>,
+    pub cloth: Option<(StripDataFlags, BulkArray, FixedArray)>,
     pub skin_weight_profiles: Vec<SkinWeightProfile>,
     /// `FRayTracingGeometry::RawData`.
     pub source_ray_tracing_geometry: FixedArray,
     pub morph: Option<MorphTargetData>,
     pub vertex_attributes: Vec<VertexAttributeBuffer>,
-    pub half_edge_strip: [u8; 2],
+    pub half_edge_strip: StripDataFlags,
     pub half_edge: Option<(FixedArray, FixedArray)>,
 }
 
 impl SkelStreamedData {
     fn read(r: &mut Reader, has_vertex_colors: bool, has_cloth: bool) -> Result<Self> {
-        let strip_flags = [r.u8()?, r.u8()?];
+        let strip_flags = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
         let index_data_type_size = r.u8()?;
         let index_buffer = BulkArray::read(r, "index buffer")?;
         let position_stride = r.i32()?;
         let position_num_vertices = r.i32()?;
         let positions = BulkArray::read(r, "positions")?;
-        let vertex_strip = [r.u8()?, r.u8()?];
+        let vertex_strip = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
         let vertex_header: [u8; 16] = r.take(16)?.try_into().expect("16 bytes");
         let tangents = BulkArray::read(r, "tangents")?;
         let uvs = BulkArray::read(r, "UVs")?;
-        let skin_strip = [r.u8()?, r.u8()?];
+        let skin_strip = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
         let skin_header: [u8; 24] = r.take(24)?.try_into().expect("24 bytes");
         let skin_weights = BulkArray::read(r, "skin weights")?;
-        let lookup_strip = [r.u8()?, r.u8()?];
+        let lookup_strip = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
         let lookup_num_vertices = r.u32()?;
         let skin_weight_lookup = BulkArray::read(r, "skin weight lookup")?;
         let colors = has_vertex_colors
             .then(|| -> Result<_> {
-                let strip = [r.u8()?, r.u8()?];
+                let strip = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
                 let stride = r.i32()?;
                 let n = r.u32()?;
                 let buf = (n > 0).then(|| BulkArray::read(r, "vertex colors")).transpose()?;
@@ -4264,8 +4268,10 @@ impl SkelStreamedData {
             .transpose()?;
         let cloth = has_cloth
             .then(|| -> Result<_> {
+                let mut strip = StripDataFlags::default();
+                strip.serialize(r)?;
                 Ok((
-                    [r.u8()?, r.u8()?],
+                    strip,
                     BulkArray::read(r, "cloth vertices")?,
                     FixedArray::read(r, "ClothIndexMapping", 12)?,
                 ))
@@ -4320,8 +4326,8 @@ impl SkelStreamedData {
                 values: BulkArray::read(r, "attribute values")?,
             });
         }
-        let half_edge_strip = [r.u8()?, r.u8()?];
-        let half_edge = (half_edge_strip[1] & 1 == 0)
+        let half_edge_strip = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
+        let half_edge = (half_edge_strip.class & 1 == 0)
             .then(|| -> Result<(FixedArray, FixedArray)> {
                 Ok((
                     FixedArray::read(r, "VertexToEdgeData", 4)?,
@@ -4358,30 +4364,25 @@ impl SkelStreamedData {
     }
 
     fn write(&self, ar: &mut impl Ar, has_vertex_colors: bool, has_cloth: bool) -> Result<()> {
-        ar.u8(&mut self.strip_flags[0].to_owned())?;
-        ar.u8(&mut self.strip_flags[1].to_owned())?;
+        self.strip_flags.clone().serialize(ar)?;
         ar.u8(&mut self.index_data_type_size.to_owned())?;
         self.index_buffer.write(ar)?;
         ar.i32(&mut self.position_stride.to_owned())?;
         ar.i32(&mut self.position_num_vertices.to_owned())?;
         self.positions.write(ar)?;
-        ar.u8(&mut self.vertex_strip[0].to_owned())?;
-        ar.u8(&mut self.vertex_strip[1].to_owned())?;
+        self.vertex_strip.clone().serialize(ar)?;
         ar.raw(&mut self.vertex_header.to_vec(), 16)?;
         self.tangents.write(ar)?;
         self.uvs.write(ar)?;
-        ar.u8(&mut self.skin_strip[0].to_owned())?;
-        ar.u8(&mut self.skin_strip[1].to_owned())?;
+        self.skin_strip.clone().serialize(ar)?;
         ar.raw(&mut self.skin_header.to_vec(), 24)?;
         self.skin_weights.write(ar)?;
-        ar.u8(&mut self.lookup_strip[0].to_owned())?;
-        ar.u8(&mut self.lookup_strip[1].to_owned())?;
+        self.lookup_strip.clone().serialize(ar)?;
         ar.u32(&mut self.lookup_num_vertices.to_owned())?;
         self.skin_weight_lookup.write(ar)?;
         match (&self.colors, has_vertex_colors) {
             (Some(((strip, stride, n), buf)), true) => {
-                ar.u8(&mut strip[0].to_owned())?;
-                ar.u8(&mut strip[1].to_owned())?;
+                strip.clone().serialize(ar)?;
                 ar.i32(&mut stride.to_owned())?;
                 ar.u32(&mut n.to_owned())?;
                 match (buf, *n > 0) {
@@ -4395,8 +4396,7 @@ impl SkelStreamedData {
         }
         match (&self.cloth, has_cloth) {
             (Some((strip, verts, mapping)), true) => {
-                ar.u8(&mut strip[0].to_owned())?;
-                ar.u8(&mut strip[1].to_owned())?;
+                strip.clone().serialize(ar)?;
                 verts.write(ar)?;
                 mapping.write(ar)?;
             }
@@ -4432,9 +4432,8 @@ impl SkelStreamedData {
             ar.i32(&mut a.component_stride.to_owned())?;
             a.values.write(ar)?;
         }
-        ar.u8(&mut self.half_edge_strip[0].to_owned())?;
-        ar.u8(&mut self.half_edge_strip[1].to_owned())?;
-        match (&self.half_edge, self.half_edge_strip[1] & 1 == 0) {
+        self.half_edge_strip.clone().serialize(ar)?;
+        match (&self.half_edge, self.half_edge_strip.class & 1 == 0) {
             (Some((a, b)), true) => {
                 a.write(ar)?;
                 b.write(ar)?;
@@ -4611,11 +4610,12 @@ impl SkeletalMeshLod {
 }
 
 /// The whole tail of a `USkeletalMesh` export: 415 exports, 470 MiB.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// No `Eq`: the imported bounds are doubles.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SkeletalMeshTail {
-    pub strip_flags: [u8; 2],
+    pub strip_flags: StripDataFlags,
     /// `ImportedBounds`, an `FBoxSphereBounds` at LWC precision.
-    pub imported_bounds: [u8; 56],
+    pub imported_bounds: BoxSphereBounds,
     pub materials: Vec<SkeletalMeshMaterial>,
     pub reference_skeleton: ReferenceSkeleton,
     pub cooked: u32,
@@ -4648,8 +4648,8 @@ pub struct SkeletalMeshRenderData {
 impl SkeletalMeshTail {
     pub fn read(r: &mut Reader, block: &PropertyBlock, ctx: TailContext) -> Result<Self> {
         let flag = |name: &str| matches!(block.get(name), Some(PropValue::Bool(true)));
-        let strip_flags = [r.u8()?, r.u8()?];
-        let imported_bounds: [u8; 56] = r.take(56)?.try_into().expect("56 bytes");
+        let strip_flags = { let mut f = StripDataFlags::default(); f.serialize(r)?; f };
+        let imported_bounds = { let mut b = BoxSphereBounds::default(); b.serialize(r)?; b };
         let n = {
             let n = r.i32()?;
             super::limits::bounded(n, MAX_NATIVE_COUNT, "Materials", r.o - 4)?
@@ -4702,9 +4702,8 @@ impl SkeletalMeshTail {
 
     pub fn write(&self, ar: &mut impl Ar, block: &PropertyBlock) -> Result<()> {
         let flag = |name: &str| matches!(block.get(name), Some(PropValue::Bool(true)));
-        ar.u8(&mut self.strip_flags[0].to_owned())?;
-        ar.u8(&mut self.strip_flags[1].to_owned())?;
-        ar.raw(&mut self.imported_bounds.to_vec(), 56)?;
+        self.strip_flags.clone().serialize(ar)?;
+        self.imported_bounds.clone().serialize(ar)?;
         ar.i32(&mut (self.materials.len() as i32))?;
         for m in &self.materials {
             ar.i32(&mut m.material_interface.to_owned())?;
@@ -4765,7 +4764,7 @@ pub struct CookedFormat {
 /// corpus.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BodySetupTail {
-    pub guid: [u8; 16],
+    pub guid: Guid,
     pub cooked: bool,
     /// Written only when cooked, so `None` and `Some(false)` are different
     /// files, not the same one described two ways.
@@ -4775,7 +4774,7 @@ pub struct BodySetupTail {
 
 impl BodySetupTail {
     pub fn read(r: &mut Reader, ctx: TailContext) -> Result<Self> {
-        let guid: [u8; 16] = r.take(16)?.try_into().expect("16 bytes");
+        let guid = { let mut g = Guid::default(); g.serialize(r)?; g };
         let cooked = r.u32()? != 0;
         if !cooked {
             return Ok(BodySetupTail { guid, cooked, has_cooked_data: None, formats: Vec::new() });
@@ -4805,7 +4804,7 @@ impl BodySetupTail {
     }
 
     pub fn write(&self, ar: &mut impl Ar) -> Result<()> {
-        ar.raw(&mut self.guid.to_vec(), 16)?;
+        self.guid.clone().serialize(ar)?;
         ar.u32(&mut u32::from(self.cooked))?;
         match (self.has_cooked_data, self.cooked) {
             (Some(v), true) => ar.u32(&mut u32::from(v))?,
@@ -5029,21 +5028,20 @@ impl MaterialChainTail {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextureChainTail {
     /// `UTexture::Serialize` writes only its strip flags in a cooked stream.
-    pub texture_strip_flags: [u8; 2],
+    pub texture_strip_flags: StripDataFlags,
     pub cooked: TextureCookedData,
 }
 
 impl TextureChainTail {
     pub fn read(r: &mut Reader, ctx: TailContext, has_mip_data_flag: bool) -> Result<Self> {
         Ok(TextureChainTail {
-            texture_strip_flags: [r.u8()?, r.u8()?],
+            texture_strip_flags: { let mut f = StripDataFlags::default(); f.serialize(r)?; f },
             cooked: TextureCookedData::read(r, ctx, has_mip_data_flag)?,
         })
     }
 
     pub fn write(&self, ar: &mut impl Ar) -> Result<()> {
-        ar.u8(&mut self.texture_strip_flags[0].to_owned())?;
-        ar.u8(&mut self.texture_strip_flags[1].to_owned())?;
+        self.texture_strip_flags.clone().serialize(ar)?;
         self.cooked.write(ar)
     }
 }
@@ -5326,11 +5324,11 @@ pub fn roundtrip_tail(
                 };
                 let mut attrs = Vec::with_capacity(n.min(1024));
                 for _ in 0..n {
-                    let name = r.take(8)?.to_vec();
+                    let name = r.fname()?;
                     let type_id = r.i32()?;
                     let entries = FixedArray::read(&mut r, "EntryToValueKeyMap", 12)?;
                     let parent = r.i32()?;
-                    let name2 = r.take(8)?.to_vec();
+                    let name2 = r.fname()?;
                     let attribute_id = r.i32()?;
                     let count = {
                         let c = r.i32()?;
@@ -5378,11 +5376,11 @@ pub fn roundtrip_tail(
                 let mut w = super::archive::Writer::with_resolver(ctx.resolver);
                 w.i32(&mut (attrs.len() as i32))?;
                 for (name, type_id, entries, parent, name2, attribute_id, count, values) in &attrs {
-                    w.raw(&mut name.clone(), 8)?;
+                    w.fname(&mut name.clone())?;
                     w.i32(&mut type_id.to_owned())?;
                     entries.write(&mut w)?;
                     w.i32(&mut parent.to_owned())?;
-                    w.raw(&mut name2.clone(), 8)?;
+                    w.fname(&mut name2.clone())?;
                     w.i32(&mut attribute_id.to_owned())?;
                     w.i32(&mut (*count as i32))?;
                     for v in values {
@@ -5608,7 +5606,9 @@ pub fn roundtrip_tail(
                     let key: Vec<u8> = r.take(24)?.to_vec(); // FGuid + FIntPoint
                     let half_size: Vec<u8> = r.take(24)?.to_vec(); // FVector
                     let stride = r.i32()?;
-                    let layer_names = FixedArray::read(&mut r, "LayerDataNames", 8)?;
+                    let n = bounded_count(r.i32()?, "LayerDataNames", r.o - 4)?;
+                    let layer_names: Vec<FName> =
+                        (0..n).map(|_| r.fname()).collect::<Result<_>>()?;
                     let bulk = InlineBulkPayload::read(&mut r, ctx, "landscape cache entry")?;
                     entries.push((key, half_size, stride, layer_names, bulk));
                 }
@@ -5621,7 +5621,10 @@ pub fn roundtrip_tail(
                     w.raw(&mut key.clone(), 24)?;
                     w.raw(&mut half.clone(), 24)?;
                     w.i32(&mut stride.to_owned())?;
-                    layers.write(&mut w)?;
+                    w.i32(&mut (layers.len() as i32))?;
+                    for n in layers {
+                        w.fname(&mut n.clone())?;
+                    }
                     bulk.write(&mut w)?;
                 }
                 Ok(w.into_bytes())
