@@ -837,7 +837,108 @@ impl EntryToValueKey {
     }
 }
 
+/// `FPlane4f` — a normal and a distance, all floats.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Plane4f {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub w: f32,
+}
+
+impl Plane4f {
+    pub const SIZE: usize = 16;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        ar.f32(&mut self.x)?;
+        ar.f32(&mut self.y)?;
+        ar.f32(&mut self.z)?;
+        ar.f32(&mut self.w)
+    }
+}
+
+/// `FBspSurf` (Model.h:206), in the order `operator<<` writes it (Model.cpp:81).
+///
+/// Holds **two object references** — the material and the owning brush actor —
+/// which is why 56 opaque bytes were the wrong representation.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct BspSurf {
+    pub material: i32,
+    pub poly_flags: u32,
+    pub p_base: i32,
+    pub v_normal: i32,
+    pub v_texture_u: i32,
+    pub v_texture_v: i32,
+    pub i_brush_poly: i32,
+    pub actor: i32,
+    pub plane: Plane4f,
+    pub light_map_scale: f32,
+    pub i_lightmass_index: i32,
+}
+
+impl BspSurf {
+    pub const SIZE: usize = 56;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        ar.i32(&mut self.material)?;
+        ar.u32(&mut self.poly_flags)?;
+        ar.i32(&mut self.p_base)?;
+        ar.i32(&mut self.v_normal)?;
+        ar.i32(&mut self.v_texture_u)?;
+        ar.i32(&mut self.v_texture_v)?;
+        ar.i32(&mut self.i_brush_poly)?;
+        ar.i32(&mut self.actor)?;
+        self.plane.serialize(ar)?;
+        ar.f32(&mut self.light_map_scale)?;
+        ar.i32(&mut self.i_lightmass_index)
+    }
+}
+
+/// `FModelVertex` (Model.h:272).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ModelVertex {
+    pub position: Vector3f,
+    pub tangent_x: Vector3f,
+    pub tangent_z: Vector4f,
+    pub tex_coord: Vector2f,
+    pub shadow_tex_coord: Vector2f,
+}
+
+impl ModelVertex {
+    pub const SIZE: usize = 56;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        self.position.serialize(ar)?;
+        self.tangent_x.serialize(ar)?;
+        self.tangent_z.serialize(ar)?;
+        self.tex_coord.serialize(ar)?;
+        self.shadow_tex_coord.serialize(ar)
+    }
+}
+
+/// `FMorphTargetDelta` — one vertex's morph offset.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct MorphTargetDelta {
+    pub position_delta: Vector3f,
+    pub tangent_z_delta: Vector3f,
+    pub source_idx: u32,
+}
+
+impl MorphTargetDelta {
+    pub const SIZE: usize = 28;
+
+    pub fn serialize(&mut self, ar: &mut impl Ar) -> Result<()> {
+        self.position_delta.serialize(ar)?;
+        self.tangent_z_delta.serialize(ar)?;
+        ar.u32(&mut self.source_idx)
+    }
+}
+
 ue_structs!(
+    Plane4f,
+    BspSurf,
+    ModelVertex,
+    MorphTargetDelta,
     UcsModifiedProperty,
     ClothBufferIndexMapping,
     MemoryImageTypeDependency,

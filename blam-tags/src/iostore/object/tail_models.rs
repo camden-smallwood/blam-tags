@@ -60,7 +60,7 @@ use super::block::{flattened_schema, read_struct, write_block};
 use super::common::read_bulk_array;
 use super::limits::MAX_NATIVE_COUNT;
 use super::ue_struct::{
-    bounded_count, ClothBufferIndexMapping, DuplicatedVertexIndex, EntryToValueKey,
+    bounded_count, BspSurf, HashedName, MeshUvChannelInfo, ModelVertex, MorphTargetDelta, ClothBufferIndexMapping, DuplicatedVertexIndex, EntryToValueKey,
     GrassWeightOffset, MemoryImageTypeDependency, PlatformTypeLayoutParameters,
     UcsModifiedProperty, VTablePatch, Box3d, Box3f, LightmassPrimitiveSettings, MeshToMeshVertData, PerPlatformFloat,
     SparseDistanceFieldMip, StaticMeshBuffersSize, LumenCardBuildData, PackedHierarchyNode, PageStreamingState, read_vec, write_run, write_vec, BoxSphereBounds, ClothingSectionData, FuncMapEntry,
@@ -1015,7 +1015,7 @@ pub struct VirtualTextureTileOffsetData {
 /// One streamed chunk of a virtual texture's built data.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VirtualTextureDataChunk {
-    pub bulk_data_hash: [u8; 20],
+    pub bulk_data_hash: ShaHash,
     pub size_in_bytes: u32,
     pub codec_payload_size: u32,
     /// Per layer, in the order the engine writes them: the codec type then its
@@ -1107,7 +1107,7 @@ impl VirtualTextureBuiltData {
         };
         let mut chunks = Vec::with_capacity(n.min(64));
         for _ in 0..n {
-            let bulk_data_hash: [u8; 20] = r.take(20)?.try_into().expect("20 bytes");
+            let bulk_data_hash = { let mut h = ShaHash::default(); h.serialize(r)?; h };
             let size_in_bytes = r.u32()?;
             let codec_payload_size = r.u32()?;
             let mut codecs = Vec::with_capacity(layers);
@@ -1187,7 +1187,7 @@ impl VirtualTextureBuiltData {
         }
         ar.i32(&mut (self.chunks.len() as i32))?;
         for c in &self.chunks {
-            ar.raw(&mut c.bulk_data_hash.to_vec(), 20)?;
+            c.bulk_data_hash.clone().serialize(ar)?;
             ar.u32(&mut c.size_in_bytes.to_owned())?;
             ar.u32(&mut c.codec_payload_size.to_owned())?;
             for (ty, off) in &c.codecs {
@@ -2013,8 +2013,8 @@ impl StaticMeshTail {
 pub struct MorphLodModel {
     /// `true` when the vertex array was stripped and only its count is written.
     pub stripped: bool,
-    /// The count when stripped, or the 28-byte deltas when not.
-    pub vertices: Result2<i32, FixedArray>,
+    /// The count when stripped, or the deltas themselves when not.
+    pub vertices: Result2<i32, Vec<MorphTargetDelta>>,
     pub num_base_mesh_verts: i32,
     pub section_indices: Vec<i32>,
     pub generated_by_engine: u32,
@@ -2053,7 +2053,10 @@ impl MorphTargetTail {
             let vertices = if stripped {
                 Result2::A(r.i32()?)
             } else {
-                Result2::B(FixedArray::read(r, "morph vertices", 28)?)
+                Result2::B({
+                    let n = bounded_count(r.i32()?, "morph vertices", r.o - 4)?;
+                    read_vec(r, "morph vertices", n)?
+                })
             };
             lods.push(MorphLodModel {
                 stripped,
@@ -2080,7 +2083,7 @@ impl MorphTargetTail {
             ar.u32(&mut u32::from(l.stripped))?;
             match (&l.vertices, l.stripped) {
                 (Result2::A(n), true) => ar.i32(&mut n.to_owned())?,
-                (Result2::B(a), false) => a.write(ar)?,
+                (Result2::B(a), false) => write_vec(ar, a)?,
                 _ => bail!("morph vertex form disagrees with the stripped flag"),
             }
             ar.i32(&mut l.num_base_mesh_verts.to_owned())?;
@@ -3122,7 +3125,7 @@ impl GeometryCollectionTail {
 /// One vtable patch table inside a shader map's pointer table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VTablePatchTable {
-    pub type_name_hash: [u8; 8],
+    pub type_name_hash: HashedName,
     /// `VTableOffset` and `Offset` per patch.
     pub patches: Vec<VTablePatch>,
 }
@@ -3143,7 +3146,7 @@ pub enum ShaderCode {
     Inline {
         resource_hash: [u8; 20],
         /// One `FSHAHash` per shader.
-        shader_hashes: FixedArray,
+        shader_hashes: Vec<ShaHash>,
         /// Each entry is two `FSharedBuffer`s, each a `uint64` length then that
         /// many bytes. The bytecode itself is leaf data.
         resources: Vec<(Vec<u8>, Vec<u8>)>,
@@ -3157,8 +3160,7 @@ pub enum ShaderCode {
 /// tables that address and relocate them are values.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShaderMap {
-    /// `FPlatformTypeLayoutParameters`: max field alignment and flags.
-    pub layout_params: [u8; 8],
+    pub layout_params: PlatformTypeLayoutParameters,
     pub frozen_image: Vec<u8>,
     /// An `FName`, a layout size and an `FSHAHash` per dependency.
     pub type_dependencies: Vec<MemoryImageTypeDependency>,
@@ -3166,20 +3168,24 @@ pub struct ShaderMap {
     /// then the combined run of hashes, so these cannot be read as two
     /// independent count-then-payload arrays — doing so put a vertex-factory
     /// count of 466,651,457 in the middle of the hash data.
-    pub shader_types: Vec<[u8; 8]>,
-    pub vertex_factory_types: Vec<[u8; 8]>,
+    pub shader_types: Vec<HashedName>,
+    pub vertex_factory_types: Vec<HashedName>,
     /// Niagara's pointer table adds the data-interface type names.
     pub data_interface_types: Option<Vec<FStr>>,
     pub vtable_patches: Vec<VTablePatchTable>,
     pub script_name_patches: Vec<NamePatchTable>,
     pub image_name_patches: Vec<NamePatchTable>,
-    pub shader_platform_name: [u8; 8],
+    pub shader_platform_name: HashedName,
     pub code: ShaderCode,
 }
 
 impl ShaderMap {
     fn read(r: &mut Reader, niagara_pointer_table: bool) -> Result<Self> {
-        let layout_params: [u8; 8] = r.take(8)?.try_into().expect("8 bytes");
+        let layout_params = {
+            let mut p = PlatformTypeLayoutParameters::default();
+            p.serialize(r)?;
+            p
+        };
         let n = {
             let n = r.i32()?;
             super::limits::bounded(n, MAX_NATIVE_COUNT, "frozen memory image", r.o - 4)?
@@ -3196,8 +3202,14 @@ impl ShaderMap {
             let n = r.i32()?;
             super::limits::bounded(n, MAX_NATIVE_COUNT, "vertex factory types", r.o - 4)?
         };
-        let mut hashed = |r: &mut Reader, n: usize| -> Result<Vec<[u8; 8]>> {
-            (0..n).map(|_| Ok(r.take(8)?.try_into().expect("8 bytes"))).collect()
+        let mut hashed = |r: &mut Reader, n: usize| -> Result<Vec<HashedName>> {
+            (0..n)
+                .map(|_| {
+                    let mut h = HashedName::default();
+                    h.serialize(r)?;
+                    Ok(h)
+                })
+                .collect()
         };
         let shader_types = hashed(r, n_types)?;
         let vertex_factory_types = hashed(r, n_vf)?;
@@ -3222,7 +3234,7 @@ impl ShaderMap {
         let mut vtable_patches = Vec::with_capacity(n_vtable.min(64));
         for _ in 0..n_vtable {
             vtable_patches.push(VTablePatchTable {
-                type_name_hash: r.take(8)?.try_into().expect("8 bytes"),
+                type_name_hash: { let mut h = HashedName::default(); h.serialize(r)?; h },
                 patches: { let n = bounded_count(r.i32()?, "vtable patches", r.o - 4)?; read_vec(r, "vtable patches", n)? },
             });
         }
@@ -3242,12 +3254,13 @@ impl ShaderMap {
         let script_name_patches = name_table(r, n_script)?;
         let image_name_patches = name_table(r, n_image)?;
         let share_code = r.u32()? != 0;
-        let shader_platform_name = r.take(8)?.try_into().expect("8 bytes");
+        let shader_platform_name = { let mut h = HashedName::default(); h.serialize(r)?; h };
         let code = if share_code {
             ShaderCode::Shared { hash: r.take(20)?.try_into().expect("20 bytes") }
         } else {
             let resource_hash = r.take(20)?.try_into().expect("20 bytes");
-            let shader_hashes = FixedArray::read(r, "shader hashes", 20)?;
+            let n = bounded_count(r.i32()?, "shader hashes", r.o - 4)?;
+            let shader_hashes: Vec<ShaHash> = read_vec(r, "shader hashes", n)?;
             let n = {
                 let n = r.i32()?;
                 super::limits::bounded(n, MAX_NATIVE_COUNT, "shader code resources", r.o - 4)?
@@ -3280,7 +3293,7 @@ impl ShaderMap {
     }
 
     fn write(&self, ar: &mut impl Ar) -> Result<()> {
-        ar.raw(&mut self.layout_params.to_vec(), 8)?;
+        self.layout_params.clone().serialize(ar)?;
         ar.i32(&mut (self.frozen_image.len() as i32))?;
         let n = self.frozen_image.len();
         ar.raw(&mut self.frozen_image.clone(), n)?;
@@ -3288,7 +3301,7 @@ impl ShaderMap {
         ar.i32(&mut (self.shader_types.len() as i32))?;
         ar.i32(&mut (self.vertex_factory_types.len() as i32))?;
         for h in self.shader_types.iter().chain(&self.vertex_factory_types) {
-            ar.raw(&mut h.to_vec(), 8)?;
+            h.clone().serialize(ar)?;
         }
         if let Some(v) = &self.data_interface_types {
             ar.i32(&mut (v.len() as i32))?;
@@ -3300,7 +3313,7 @@ impl ShaderMap {
         ar.i32(&mut (self.script_name_patches.len() as i32))?;
         ar.i32(&mut (self.image_name_patches.len() as i32))?;
         for t in &self.vtable_patches {
-            ar.raw(&mut t.type_name_hash.to_vec(), 8)?;
+            t.type_name_hash.clone().serialize(ar)?;
             write_vec(ar, &t.patches)?;
         }
         for t in self.script_name_patches.iter().chain(&self.image_name_patches) {
@@ -3310,14 +3323,14 @@ impl ShaderMap {
         match &self.code {
             ShaderCode::Shared { hash } => {
                 ar.u32(&mut 1)?;
-                ar.raw(&mut self.shader_platform_name.to_vec(), 8)?;
+                self.shader_platform_name.clone().serialize(ar)?;
                 ar.raw(&mut hash.to_vec(), 20)?;
             }
             ShaderCode::Inline { resource_hash, shader_hashes, resources } => {
                 ar.u32(&mut 0)?;
-                ar.raw(&mut self.shader_platform_name.to_vec(), 8)?;
+                self.shader_platform_name.clone().serialize(ar)?;
                 ar.raw(&mut resource_hash.to_vec(), 20)?;
-                shader_hashes.write(ar)?;
+                write_vec(ar, shader_hashes)?;
                 ar.i32(&mut (resources.len() as i32))?;
                 for (a, b) in resources {
                     for buf in [a, b] {
@@ -3525,16 +3538,15 @@ pub struct ModelTail {
     pub vectors: BulkArray,
     pub points: BulkArray,
     pub nodes: BulkArray,
-    /// `FBspSurf` — 56 bytes each.
-    pub surfs: FixedArray,
+    pub surfs: Vec<BspSurf>,
     pub verts: BulkArray,
     pub num_shared_sides: i32,
     pub root_outside: u32,
     pub linked: u32,
     pub num_unique_vertices: u32,
-    /// `FModelVertex` — 56 bytes each. Absent when both editor data and the
-    /// class's vertex-buffer flag are stripped.
-    pub vertex_buffer: Option<FixedArray>,
+    /// Absent when both editor data and the class's vertex-buffer flag are
+    /// stripped.
+    pub vertex_buffer: Option<Vec<ModelVertex>>,
     pub lighting_guid: Guid,
     pub lightmass_settings: Vec<LightmassPrimitiveSettings>,
 }
@@ -3547,14 +3559,18 @@ impl ModelTail {
         let vectors = BulkArray::read(r, "Vectors")?;
         let points = BulkArray::read(r, "Points")?;
         let nodes = BulkArray::read(r, "Nodes")?;
-        let surfs = FixedArray::read(r, "Surfs", 56)?;
+        let n = bounded_count(r.i32()?, "Surfs", r.o - 4)?;
+        let surfs: Vec<BspSurf> = read_vec(r, "Surfs", n)?;
         let verts = BulkArray::read(r, "Verts")?;
         let num_shared_sides = r.i32()?;
         let root_outside = r.u32()?;
         let linked = r.u32()?;
         let num_unique_vertices = r.u32()?;
         let vertex_buffer = (global_strip & 1 == 0 || class_strip & 1 == 0)
-            .then(|| FixedArray::read(r, "model vertices", 56))
+            .then(|| -> Result<Vec<ModelVertex>> {
+                let n = bounded_count(r.i32()?, "model vertices", r.o - 4)?;
+                read_vec(r, "model vertices", n)
+            })
             .transpose()?;
         Ok(ModelTail {
             global_strip,
@@ -3585,7 +3601,7 @@ impl ModelTail {
         self.vectors.write(ar)?;
         self.points.write(ar)?;
         self.nodes.write(ar)?;
-        self.surfs.write(ar)?;
+        write_vec(ar, &self.surfs)?;
         self.verts.write(ar)?;
         ar.i32(&mut self.num_shared_sides.to_owned())?;
         ar.u32(&mut self.root_outside.to_owned())?;
@@ -3595,7 +3611,7 @@ impl ModelTail {
             &self.vertex_buffer,
             self.global_strip & 1 == 0 || self.class_strip & 1 == 0,
         ) {
-            (Some(v), true) => v.write(ar)?,
+            (Some(v), true) => write_vec(ar, v)?,
             (None, false) => {}
             _ => bail!("vertex buffer presence disagrees with the strip flags"),
         }
@@ -4697,8 +4713,7 @@ pub struct SkeletalMeshMaterial {
     pub slot_name: FName,
     /// The imported slot name only survives a cook that keeps editor data.
     pub imported_slot_name: Option<FName>,
-    /// `FMeshUVChannelInfo`: two 32-bit bools and four floats.
-    pub uv_channel_info: [u8; 24],
+    pub uv_channel_info: MeshUvChannelInfo,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -4727,7 +4742,11 @@ impl SkeletalMeshTail {
                 material_interface,
                 slot_name,
                 imported_slot_name,
-                uv_channel_info: r.take(24)?.try_into().expect("24 bytes"),
+                uv_channel_info: {
+                    let mut u = MeshUvChannelInfo::default();
+                    u.serialize(r)?;
+                    u
+                },
             });
         }
         let reference_skeleton = ReferenceSkeleton::read(r)?;
@@ -4779,7 +4798,7 @@ impl SkeletalMeshTail {
                 }
                 None => ar.u32(&mut 0)?,
             }
-            ar.raw(&mut m.uv_channel_info.to_vec(), 24)?;
+            m.uv_channel_info.clone().serialize(ar)?;
         }
         self.reference_skeleton.write(ar)?;
         ar.u32(&mut self.cooked.to_owned())?;
