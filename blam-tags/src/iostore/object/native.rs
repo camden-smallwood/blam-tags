@@ -12,12 +12,14 @@
 //! determine layout — `FVector2D` (2 × f64), `FLinearColor` (4 × f32) and
 //! `FGuid` (4 × u32) are all sixteen bytes and all different.
 //!
-//! [`NativeStruct::Opaque`] is the escape hatch that lets this land
-//! incrementally: a struct whose size is known but whose fields are not yet
-//! modeled keeps its bytes, and `ce_decode_coverage` still counts it as untyped.
+//! There is no escape hatch. Every name [`native_struct_size`] knows has a typed
+//! variant here, and a name it does not know never reaches [`NativeStruct::decode`]
+//! — so an unmatched name is a *bug*, not a struct awaiting attention, and is
+//! reported as one. This used to be an `Opaque { bytes }` arm; it was unreachable
+//! once the last size was typed, and keeping it would only have made the next
+//! addition easy to leave half-done.
 
 use anyhow::{bail, Result};
-use std::sync::Arc;
 
 use super::structs::native_struct_size;
 
@@ -75,9 +77,6 @@ pub enum NativeStruct {
     /// `FPerPlatform*` / `FPerQualityLevel*` — a four-byte `FArchive` bool then
     /// the default value. The override map is editor-only and absent when cooked.
     PerPlatform { cooked: bool, value: PerPlatformValue },
-    /// A fixed-size native struct whose fields are not modeled yet. Its size is
-    /// known and its bytes are kept; `ce_decode_coverage` counts it as untyped.
-    Opaque { name: Arc<str>, bytes: Vec<u8> },
 }
 
 /// The `Default` of an `FPerPlatform*` / `FPerQualityLevel*`.
@@ -162,7 +161,6 @@ impl NativeStruct {
     /// `ce_decode_coverage` counts.
     pub fn untyped_bytes(&self) -> usize {
         match self {
-            NativeStruct::Opaque { bytes, .. } => bytes.len(),
             _ => 0,
         }
     }
@@ -242,7 +240,12 @@ impl NativeStruct {
             | "Int64Point" | "Int64Vector" | "Int64Vector4" | "UintVector" | "UintVector2"
             | "UintVector4" | "Uint32Point" | "UInt64Point" | "UInt64Vector" | "UInt64Vector4"
             | "IntPoint" => NativeStruct::Ints(decode_ints(name, b)),
-            _ => NativeStruct::Opaque { name: Arc::from(name), bytes: b.to_vec() },
+            // `native_struct_size` knew this name or we would not be here, so a
+            // missing arm means the two tables disagree.
+            _ => bail!(
+                "{name} has a native struct size but no typed layout — \
+                 `native_struct_size` and `NativeStruct::decode` disagree"
+            ),
         })
     }
 
@@ -312,7 +315,6 @@ impl NativeStruct {
                 }
             }
             NativeStruct::Ints(v) => encode_ints(name, v, &mut out)?,
-            NativeStruct::Opaque { bytes, .. } => out.extend_from_slice(bytes),
         }
         if let Some(want) = native_struct_size(name) {
             if out.len() != want {
@@ -375,7 +377,6 @@ mod tests {
         const NORMALIZING: &[&str] =
             &["PerPlatformInt", "PerPlatformFloat", "PerPlatformBool", "PerPlatformFrameRate"];
 
-        let mut opaque = Vec::new();
         for name in super::super::structs::NATIVE_STRUCT_NAMES {
             let size = native_struct_size(name).expect("listed name has a size");
             // Deterministic and non-degenerate: zeroes would hide a field the
@@ -383,11 +384,11 @@ mod tests {
             let bytes: Vec<u8> =
                 (0..size).map(|i| (i as u8).wrapping_mul(7).wrapping_add(3)).collect();
 
+            // Decoding *must* succeed: every name with a size has a typed
+            // layout, and the error arm in `decode` exists to catch the two
+            // tables drifting apart.
             let first = NativeStruct::decode(name, &bytes)
                 .unwrap_or_else(|e| panic!("{name}: decode: {e}"));
-            if matches!(first, NativeStruct::Opaque { .. }) {
-                opaque.push(*name);
-            }
             let encoded = first.encode(name).unwrap_or_else(|e| panic!("{name}: encode: {e}"));
             let second = NativeStruct::decode(name, &encoded)
                 .unwrap_or_else(|e| panic!("{name}: re-decode: {e}"));
@@ -397,9 +398,6 @@ mod tests {
                 assert_eq!(encoded, bytes, "{name}: lossless struct changed its bytes");
             }
         }
-        // Recorded rather than asserted to zero: this is the list A2 works
-        // through, and it must only ever shrink.
-        assert!(opaque.is_empty(), "native structs still unmodeled: {opaque:?}");
     }
 
     /// Size does not determine layout — three sixteen-byte structs, three

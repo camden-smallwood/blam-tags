@@ -68,3 +68,23 @@ required-features = ["iostore"]
 [[example]]
 name = "ce_actor_dump"
 required-features = ["iostore"]
+
+# These four reach into `blam_tags::audio` as well as `iostore`. Without saying
+# so, `cargo build --all-targets --features iostore` tries to build them and
+# fails on a missing module — which reads as a broken feature rather than a
+# missing flag.
+[[example]]
+name = "ce_wem_decode"
+required-features = ["iostore", "audio"]
+
+[[example]]
+name = "ce_event_sweep"
+required-features = ["iostore", "audio"]
+
+[[example]]
+name = "ce_event_cooked"
+required-features = ["iostore", "audio"]
+
+[[example]]
+name = "ce_sound_resolve"
+required-features = ["iostore", "audio"]

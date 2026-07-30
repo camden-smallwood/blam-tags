@@ -2972,7 +2972,7 @@ impl ManagedArrayCollection {
             let persistent = r.u32()?;
             let ty = MANAGED_ARRAY_TYPES.get(type_id as usize).copied().unwrap_or("?");
             let array_version = r.i32()?;
-            let count = |r: &mut Reader, what: &str| -> Result<usize> {
+            let _count = |r: &mut Reader, what: &str| -> Result<usize> {
                 let n = r.i32()?;
                 super::limits::bounded(n, MAX_NATIVE_COUNT, what, r.o - 4)
             };

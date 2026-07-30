@@ -451,6 +451,29 @@ pub enum TextHistory {
         options: Option<NumberFormattingOptions>,
         target_culture: FStr,
     },
+    /// `AsDate` (7), `AsTime` (8) and `AsDateTime` (9) (TextHistory.cpp:1898,
+    /// :1995, :2105). `SourceDateTime` is an `FDateTime`, i.e. a tick count.
+    ///
+    /// `AsDate` carries only a date style, `AsTime` only a time style, and
+    /// `AsDateTime` both — plus a custom pattern when the date style is
+    /// `EDateTimeStyle::Custom` (5).
+    AsDateTime {
+        kind: i8,
+        source_date_time: i64,
+        date_style: Option<i8>,
+        time_style: Option<i8>,
+        custom_pattern: Option<FStr>,
+        time_zone: FStr,
+        target_culture: FStr,
+    },
+    /// `Transform` (10) (TextHistory.cpp:2210) — a source text and the
+    /// transformation applied to it.
+    Transform { source_text: Box<TextValue>, transform_type: u8 },
+    /// `TextGenerator` (12) (TextHistory.cpp:2728) — the generator's type name
+    /// and, when it is not `None`, the bytes it was serialized with. Those
+    /// bytes are read back by a generator registered at runtime, so the engine
+    /// itself keeps them as a `TArray<uint8>`.
+    TextGenerator { generator_type_id: FName, contents: Option<Vec<u8>> },
 }
 
 /// `FFormatArgumentValue`.
@@ -466,6 +489,10 @@ pub enum TextFormatArgument {
     Float(f32),
     Double(f64),
     Text(Box<TextValue>),
+    /// `EFormatArgumentType::Gender` (Text.h:150). Written through the same
+    /// union member as `UInt` (Text.cpp:1325), so it is eight bytes and only the
+    /// tag distinguishes it.
+    Gender(u64),
 }
 
 /// `FNumberFormattingOptions` — three `FArchive` bools, a rounding mode, then
@@ -730,6 +757,7 @@ impl TextFormatArgument {
             2 => TextFormatArgument::Float(r.f32()?),
             3 => TextFormatArgument::Double(r.f64()?),
             4 => TextFormatArgument::Text(Box::new(TextValue::read(r, depth + 1)?)),
+            5 => TextFormatArgument::Gender(r.u64()?),
             other => anyhow::bail!("FText format argument type {other} not modeled (@ {})", r.o - 1),
         })
     }
@@ -755,6 +783,10 @@ impl TextFormatArgument {
                 ar.u8(&mut 4)?;
                 t.write(ar)
             }
+            TextFormatArgument::Gender(v) => {
+                ar.u8(&mut 5)?;
+                ar.u64(&mut v.to_owned())
+            }
         }
     }
     fn semantic_eq(&self, o: &TextFormatArgument) -> bool {
@@ -765,6 +797,7 @@ impl TextFormatArgument {
             (Float(a), Float(b)) => a.to_bits() == b.to_bits(),
             (Double(a), Double(b)) => a.to_bits() == b.to_bits(),
             (Text(a), Text(b)) => a.semantic_eq(b),
+            (Gender(a), Gender(b)) => a == b,
             _ => false,
         }
     }
@@ -828,6 +861,43 @@ impl TextValue {
                     options,
                     target_culture: r.fstring()?,
                 }
+            }
+            // `EDateTimeStyle::Custom` is 5 (Text.h:133).
+            7 | 8 | 9 => {
+                let source_date_time = r.u64()? as i64;
+                let date_style = (kind != 8).then(|| r.u8().map(|v| v as i8)).transpose()?;
+                let time_style = (kind != 7).then(|| r.u8().map(|v| v as i8)).transpose()?;
+                let custom_pattern = (kind == 9 && date_style == Some(5))
+                    .then(|| r.fstring())
+                    .transpose()?;
+                TextHistory::AsDateTime {
+                    kind,
+                    source_date_time,
+                    date_style,
+                    time_style,
+                    custom_pattern,
+                    time_zone: r.fstring()?,
+                    target_culture: r.fstring()?,
+                }
+            }
+            10 => TextHistory::Transform {
+                source_text: Box::new(TextValue::read(r, depth + 1)?),
+                transform_type: r.u8()?,
+            },
+            12 => {
+                let generator_type_id = r.fname()?;
+                let contents = (generator_type_id.as_str() != "None")
+                    .then(|| -> Result<Vec<u8>> {
+                        let n = super::limits::bounded(
+                            r.i32()?,
+                            super::limits::MAX_NATIVE_COUNT,
+                            "text generator contents",
+                            r.o - 4,
+                        )?;
+                        Ok(r.take(n)?.to_vec())
+                    })
+                    .transpose()?;
+                TextHistory::TextGenerator { generator_type_id, contents }
             }
             other => anyhow::bail!("FText history type {other} not modeled (@ {})", r.o - 1),
         };
@@ -910,6 +980,55 @@ impl TextValue {
                 }
                 ar.fstring(&mut target_culture.clone())?;
             }
+            TextHistory::AsDateTime {
+                kind,
+                source_date_time,
+                date_style,
+                time_style,
+                custom_pattern,
+                time_zone,
+                target_culture,
+            } => {
+                ar.u8(&mut (*kind as u8))?;
+                ar.u64(&mut (*source_date_time as u64))?;
+                // Which styles exist is decided by the history type, so a model
+                // that disagrees with its own kind would change the length.
+                match (date_style, *kind != 8) {
+                    (Some(v), true) => ar.u8(&mut (*v as u8))?,
+                    (None, false) => {}
+                    _ => anyhow::bail!("date style does not match FText history type {kind}"),
+                }
+                match (time_style, *kind != 7) {
+                    (Some(v), true) => ar.u8(&mut (*v as u8))?,
+                    (None, false) => {}
+                    _ => anyhow::bail!("time style does not match FText history type {kind}"),
+                }
+                match (custom_pattern, *kind == 9 && *date_style == Some(5)) {
+                    (Some(p), true) => ar.fstring(&mut p.clone())?,
+                    (None, false) => {}
+                    _ => anyhow::bail!("custom pattern does not match the date style"),
+                }
+                ar.fstring(&mut time_zone.clone())?;
+                ar.fstring(&mut target_culture.clone())?;
+            }
+            TextHistory::Transform { source_text, transform_type } => {
+                ar.u8(&mut 10)?;
+                source_text.write(ar)?;
+                ar.u8(&mut transform_type.to_owned())?;
+            }
+            TextHistory::TextGenerator { generator_type_id, contents } => {
+                ar.u8(&mut 12)?;
+                ar.fname(&mut generator_type_id.clone())?;
+                match (contents, generator_type_id.as_str() != "None") {
+                    (Some(c), true) => {
+                        ar.i32(&mut (c.len() as i32))?;
+                        let n = c.len();
+                        ar.raw(&mut c.clone(), n)?;
+                    }
+                    (None, false) => {}
+                    _ => anyhow::bail!("generator contents do not match the generator type"),
+                }
+            }
         }
         Ok(())
     }
@@ -957,6 +1076,30 @@ impl TextValue {
                     && a3 == b3
                     && str_eq(a4, b4)
             }
+            (
+                AsDateTime { kind: a0, source_date_time: a1, date_style: a2, time_style: a3, custom_pattern: a4, time_zone: a5, target_culture: a6 },
+                AsDateTime { kind: b0, source_date_time: b1, date_style: b2, time_style: b3, custom_pattern: b4, time_zone: b5, target_culture: b6 },
+            ) => {
+                a0 == b0
+                    && a1 == b1
+                    && a2 == b2
+                    && a3 == b3
+                    && match (a4, b4) {
+                        (Some(x), Some(y)) => str_eq(x, y),
+                        (Option::None, Option::None) => true,
+                        _ => false,
+                    }
+                    && str_eq(a5, b5)
+                    && str_eq(a6, b6)
+            }
+            (
+                Transform { source_text: a1, transform_type: a2 },
+                Transform { source_text: b1, transform_type: b2 },
+            ) => a1.semantic_eq(b1) && a2 == b2,
+            (
+                TextGenerator { generator_type_id: a1, contents: a2 },
+                TextGenerator { generator_type_id: b1, contents: b2 },
+            ) => a1 == b1 && a2 == b2,
             _ => false,
         }
     }
