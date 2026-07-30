@@ -1,0 +1,16 @@
+[package]
+name = "blam-tags-bindgen"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Offline code generator: reads the rustdoc JSON for `blam-tags` plus a policy
+# manifest and emits the PyO3 wrapper source, the `.pyi` stubs, and a coverage
+# report. Build-time-only developer tooling — it is NOT a dependency of the
+# `blam-tags-py` wheel, which compiles the checked-in generated source on
+# stable Rust.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = "1"

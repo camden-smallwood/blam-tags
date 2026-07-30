@@ -1,5 +1,5 @@
 [workspace]
-members = ["blam-tags", "blam-tag-shell"]
+members = ["blam-tags", "blam-tag-shell", "blam-tags-py", "blam-tags-bindgen"]
 # `fuzz` is a cargo-fuzz crate: it needs nightly and libFuzzer, so it must stay
 # out of the workspace or `cargo build --all-targets` on stable CI would try to
 # build it and fail.

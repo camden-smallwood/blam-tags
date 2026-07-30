@@ -1,0 +1,115 @@
+# Binding policy for `blam-tags` → Python.
+#
+# The generator applies defaults by rule; this file records the human
+# decisions. Every non-`auto` strategy must carry a `reason`, and every reason
+# is reproduced in COVERAGE.md — so the set of unbound API is always visible
+# and deliberate rather than accidental.
+
+[options]
+krate = "blam_tags"
+python_module = "blam_tags"
+
+#---------------------------------------------------------------------------
+# Modules
+#---------------------------------------------------------------------------
+
+# Spike scope: `math` is self-contained, has no lifetime-parameterized types,
+# and exercises tuple structs, associated constants, operator overloading, and
+# a generic type behind four aliases. If the generator handles all of it, the
+# remaining owned types across the crate are the same shapes again.
+[module.math]
+strategy = "auto"
+
+#---------------------------------------------------------------------------
+# Types
+#---------------------------------------------------------------------------
+
+# `Bounds<T>` is generic, so it has no single ABI to wrap. Each concrete
+# instantiation becomes its own Python class. Three of the crate's four Rust
+# aliases collapse onto `Bounds<f32>`; they are re-exported as Python names
+# pointing at the same class rather than duplicated.
+[types.Bounds]
+monomorphize = [
+    { args = ["i16"], name = "ShortBounds" },
+    { args = ["f32"], name = "RealBounds", aliases = [
+        "AngleBounds",
+        "FractionBounds",
+    ] },
+]
+
+# Adds fieldless enums to the generator's repertoire. `Game::of` takes a
+# `&TagFile`, which is not bound yet — it should appear in COVERAGE.md as an
+# unmapped parameter rather than vanish.
+[module.game]
+strategy = "auto"
+
+# `TagFile` is the crate's entry point. It is `Debug`-only — not `Clone` — so
+# its wrapper is reference-only, and its `Result` returns become raising
+# Python methods. Its `root()`/`definitions()` accessors return
+# lifetime-parameterized facade types and are expected in COVERAGE.md as
+# unmapped until those are hand-written.
+[module.file]
+strategy = "auto"
+
+[module.error]
+strategy = "skip"
+reason = "TagReadError surfaces as a generated Python exception, not a class"
+
+# `TagFieldType` is a 71-variant fieldless enum; the three sub-chunk payload
+# structs and the two group-tag helpers are ordinary. `TagFieldData` is not.
+[module.fields]
+strategy = "auto"
+
+# 57 variants, none of them fieldless. It is also unreachable on its own — the
+# only way to obtain one is `api::TagField::value`, and the only way to
+# consume one is `TagFieldMut::set`, both of which need the lifetime-based
+# facade. Binding it before that facade exists would mean guessing at the
+# Python shape with nothing to test it against, so it waits.
+[types.TagFieldData]
+strategy = "manual"
+reason = "57 data-carrying variants; shape depends on the api facade, bound with it"
+
+# The `io` module is primitive read/write helpers — Python has `struct` — but
+# `Endian` is a fieldless enum that several `from_bytes`/`to_bytes` methods
+# take as a parameter, so it is pulled in on its own. A type-level strategy
+# overrides its module's.
+[module.io]
+strategy = "skip"
+reason = "primitive readers/writers; Python has `struct`"
+
+[types.Endian]
+strategy = "auto"
+
+#---------------------------------------------------------------------------
+# The borrowing facade — hand-written
+#---------------------------------------------------------------------------
+# `manual` still registers a type, so generated signatures can name `PyTagFile`
+# even though its definition lives in `src/manual/`. If that module stops
+# defining one of these, the build breaks rather than the type quietly
+# vanishing from the API.
+
+# Every `api` type is three borrows into the owning `TagFile`, which cannot be
+# a `'static` pyclass. The four that carry the editing surface are re-expressed
+# as path handles in `src/manual/handles.rs`; the rest are reached through
+# them rather than exposed directly.
+[module.api]
+strategy = "skip"
+reason = "lifetime-parameterized facade; reached through the hand-written path handles"
+
+[types.TagStruct]
+strategy = "manual"
+reason = "path handle over (TagFile, TagFieldPath)"
+
+[types.TagField]
+strategy = "manual"
+reason = "path handle over (TagFile, TagFieldPath)"
+
+[types.TagBlock]
+strategy = "manual"
+reason = "path handle; structural edits record their path for handle invalidation"
+
+# Hand-written alongside the facade because it owns the structural-edit log the
+# handles validate against.
+[types.TagFile]
+strategy = "manual"
+reason = "root of the facade; owns the edit log that invalidates stale handles"
