@@ -2,7 +2,7 @@
 //! within the FLATTENED schema, but the function concatenates per-struct lists.
 //! Compare, across every class in the usmap.
 use blam_tags::iostore::usmap::Usmap;
-const USMAP: &str = "/Users/camden/Downloads/5.5.4-1097863+++Meteorite+Rel-i343-Meteorite-2606-CU2-Meteorite.usmap";
+const USMAP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/meteorite-5.5.4.usmap");
 fn main(){
     let usmap=Usmap::parse(&std::fs::read(USMAP).unwrap()).unwrap();
     let (mut ok,mut bad,mut nogaps)=(0usize,0usize,0usize);

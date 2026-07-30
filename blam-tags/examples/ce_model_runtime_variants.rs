@@ -20,7 +20,7 @@ use blam_tags::{Model, TagFile};
 
 const PAKS: &str = "/Users/camden/Halo/halo-campaign-evolved_pc/Meteorite/Content/Paks";
 const USMAP: &str =
-    "/Users/camden/Downloads/5.5.4-1097863+++Meteorite+Rel-i343-Meteorite-2606-CU2-Meteorite.usmap";
+    concat!(env!("CARGO_MANIFEST_DIR"), "/assets/meteorite-5.5.4.usmap");
 const CV: EIoStoreTocVersion = EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash;
 const HV: EIoContainerHeaderVersion = EIoContainerHeaderVersion::SoftPackageReferences;
 

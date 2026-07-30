@@ -48,7 +48,7 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "blam-tags/tests/fixtures/ce".to_string());
     let usmap_path = std::env::args().nth(2).unwrap_or_else(|| {
-        "/Users/camden/Downloads/5.5.4-1097863+++Meteorite+Rel-i343-Meteorite-2606-CU2-Meteorite.usmap".into()
+        concat!(env!("CARGO_MANIFEST_DIR"), "/assets/meteorite-5.5.4.usmap").into()
     });
     let mut usmap = match std::fs::read(&usmap_path) {
         Ok(b) => Usmap::parse(&b).expect("parse usmap"),
