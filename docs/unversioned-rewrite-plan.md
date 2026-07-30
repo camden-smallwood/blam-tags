@@ -1034,7 +1034,9 @@ is what makes a re-encode path possible at all rather than decode-only.
 
 ### 7.5 Work items, in dependency order
 
-**A. Hand-written structs → typed models (23 structs, 48 MB, 1.92M spans).**
+**A. Hand-written structs → typed models (23 structs, 48 MB, 1.92M spans). — DONE.**
+`ce_decode_coverage` reports zero hand-written bytes. `FInstancedPropertyBag` was
+the last holdout and is decoded against the schema its own descriptors describe.
 The cheapest population and the one that unblocks the value model: while any
 `PropValue::Struct` can be a `Native` span, no struct is fully typed. Ordered by
 span count — the three Niagara variable types are 1.86M of the 1.92M spans, then
@@ -1129,7 +1131,9 @@ serialized. `FNavAgentSelector` and `FPerPlatformBool` were already cited;
 but unreachable from the edit path; make the recovered `FField` chain a
 first-class schema source.
 
-**A2. Fixed native structs → typed (41.9 MB, 27 types).** `PropValue::Native`
+**A2. Fixed native structs → typed (41.9 MB, 27 types). — DONE.** All 50 names in
+`native_struct_size` have a typed layout; `NativeStruct::Opaque` was deleted once
+it became unreachable, so a name without one is now an error. `PropValue::Native`
 becomes a typed value per struct — `FVector { x, y, z }` rather than 24 bytes.
 Sizes and layouts are already known (`native_struct_size` plus §2.3), the
 population is closed and small, and `MeshTransform::from_prop` and its siblings
@@ -1189,10 +1193,11 @@ matters for **inserted** properties specifically: a property the block never had
 has no recorded flag, so today it is always written longhand. With the table it
 can be masked exactly as the cooker would have.
 
-**F. Format edges.** `TSet` needs its own variant — it currently decodes as
-`PropValue::Array`, indistinguishable from `TArray`. `FStr` drops trailing bytes
-when a declared length exceeds text-plus-terminator. Neither occurs in the
-shipped corpus; both are reachable from a mod.
+**F. Format edges. — DONE.** `PropValue::Set` is distinct from `Array`, with
+`as_set`/`as_sequence` accessors, and `FStr::trailing` keeps the bytes past a
+terminator and counts them back into the length. Neither occurs in the shipped
+corpus, so byte-identity could never have caught either — both were reachable
+from a mod.
 
 ### 7.6 The API, which is a requirement and not a finishing touch
 
