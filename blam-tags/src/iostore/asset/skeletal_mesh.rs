@@ -147,9 +147,13 @@ fn find_ref_skeleton(body: &[u8], names_len: usize) -> Option<usize> {
     None
 }
 
-/// Decode an `FPackedNormal` component (`u8`) to `[-1, 1]`.
+/// Decode a modern UE `FPackedNormal` component to `[-1, 1]`.
+///
+/// RenderingObjectVersion::IncreaseNormalPrecision stores the signed-normal
+/// bit pattern directly. Rebias the sign bit before treating it as UNORM;
+/// without this, CE normals point into unrelated octants and look inverted.
 fn packed_component(b: u8) -> f32 {
-    (b as f32 / 127.5) - 1.0
+    ((b ^ 0x80) as f32 / 127.5) - 1.0
 }
 
 impl SkeletalMesh {
@@ -368,7 +372,7 @@ fn decode_normal(tan: &[u8], v: usize, elem: usize, high: bool) -> [f32; 3] {
         // FPackedRGBA16N: TangentX(8) + TangentZ(8), each 4×u16 mapped [-1,1].
         let z = base + 8;
         let c = |o: usize| {
-            let raw = u16::from_le_bytes([tan[z + o], tan[z + o + 1]]);
+            let raw = u16::from_le_bytes([tan[z + o], tan[z + o + 1]]) ^ 0x8000;
             (raw as f32 / 32767.5) - 1.0
         };
         normalize([c(0), c(2), c(4)])
@@ -441,5 +445,27 @@ fn normalize(v: [f32; 3]) -> [f32; 3] {
         [v[0] / len, v[1] / len, v[2] / len]
     } else {
         [0.0, 0.0, 1.0]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modern_packed_normals_rebase_the_signed_bit_pattern() {
+        let low_positive_x = [0, 0, 0, 0, 0x7f, 0, 0, 0];
+        let normal = decode_normal(&low_positive_x, 0, 8, false);
+        assert!(normal[0] > 0.999);
+        assert!(normal[1].abs() < 0.01 && normal[2].abs() < 0.01);
+
+        let mut high_positive_x = [0u8; 16];
+        high_positive_x[8..10].copy_from_slice(&0x7fffu16.to_le_bytes());
+        let normal = decode_normal(&high_positive_x, 0, 16, true);
+        assert!(normal[0] > 0.999);
+        assert!(normal[1].abs() < 0.001 && normal[2].abs() < 0.001);
+
+        let low_negative_x = [0, 0, 0, 0, 0x80, 0, 0, 0];
+        assert!(decode_normal(&low_negative_x, 0, 8, false)[0] < -0.999);
     }
 }
