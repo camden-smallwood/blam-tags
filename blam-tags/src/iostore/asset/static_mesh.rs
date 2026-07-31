@@ -279,6 +279,7 @@ fn orient_nanite_triangle(
 #[derive(Clone, Copy)]
 struct BoundaryEdge {
     key: u64,
+    vertices: [u32; 2],
 }
 
 #[inline]
@@ -304,6 +305,88 @@ fn nanite_triangle_area_squared(vertices: &[StaticVertex], triangle: &[u32]) -> 
     cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]
 }
 
+#[inline]
+fn nanite_uv_distance_squared(vertices: &[StaticVertex], a: u32, b: u32) -> f32 {
+    let a = vertices[a as usize].uv;
+    let b = vertices[b as usize].uv;
+    let du = a[0] - b[0];
+    let dv = a[1] - b[1];
+    du * du + dv * dv
+}
+
+fn select_nanite_hole_vertices(
+    vertices: &[StaticVertex],
+    canonical_vertices: &[u32],
+    hole: [u32; 3],
+    boundary_edges: &HashMap<u64, [u32; 2]>,
+    placeholder: Option<&[u32]>,
+) -> [u32; 3] {
+    let mut candidates = [Vec::<u32>::new(), Vec::new(), Vec::new()];
+    let hole_index = |canonical: u32| hole.iter().position(|&value| value == canonical);
+
+    for [a, b] in [[hole[0], hole[1]], [hole[1], hole[2]], [hole[2], hole[0]]] {
+        let edge = boundary_edges[&nanite_edge_key(a, b)];
+        for vertex in edge {
+            let canonical = canonical_vertices[vertex as usize];
+            if let Some(index) = hole_index(canonical) {
+                candidates[index].push(vertex);
+            }
+        }
+    }
+    if let Some(placeholder) = placeholder {
+        for &vertex in placeholder {
+            let canonical = canonical_vertices[vertex as usize];
+            if let Some(index) = hole_index(canonical) {
+                candidates[index].push(vertex);
+            }
+        }
+    }
+    for candidates in &mut candidates {
+        candidates.sort_unstable();
+        candidates.dedup();
+    }
+
+    let mut best = [candidates[0][0], candidates[1][0], candidates[2][0]];
+    let mut best_score = (f32::INFINITY, usize::MAX);
+    for &a in &candidates[0] {
+        for &b in &candidates[1] {
+            for &c in &candidates[2] {
+                let selected = [a, b, c];
+                let mut uv_mismatch = 0.0;
+                for [left, right] in [[0usize, 1usize], [1, 2], [2, 0]] {
+                    let edge = boundary_edges[&nanite_edge_key(hole[left], hole[right])];
+                    let expected_left = if canonical_vertices[edge[0] as usize] == hole[left] {
+                        edge[0]
+                    } else {
+                        edge[1]
+                    };
+                    let expected_right = if canonical_vertices[edge[0] as usize] == hole[right] {
+                        edge[0]
+                    } else {
+                        edge[1]
+                    };
+                    uv_mismatch +=
+                        nanite_uv_distance_squared(vertices, selected[left], expected_left);
+                    uv_mismatch +=
+                        nanite_uv_distance_squared(vertices, selected[right], expected_right);
+                }
+                let placeholder_changes = placeholder.map_or(0, |placeholder| {
+                    selected
+                        .iter()
+                        .filter(|&&vertex| !placeholder.contains(&vertex))
+                        .count()
+                });
+                let score = (uv_mismatch, placeholder_changes);
+                if score.0 < best_score.0 || (score.0 == best_score.0 && score.1 < best_score.1) {
+                    best = selected;
+                    best_score = score;
+                }
+            }
+        }
+    }
+    best
+}
+
 /// Repair the isolated one-triangle boundary loops produced when the Nanite
 /// strip decoder emits a zero-area placeholder instead of the cluster's real
 /// face. Only closed three-edge loops are considered: larger authored openings
@@ -316,22 +399,16 @@ fn repair_nanite_triangular_holes(vertices: &[StaticVertex], indices: &mut Vec<u
     }
 
     let mut position_ids = HashMap::<[u32; 3], u32>::new();
-    let mut representatives = Vec::<u32>::new();
     let mut canonical_vertices = Vec::with_capacity(vertices.len());
-    for (vertex_index, vertex) in vertices.iter().enumerate() {
-        let key = vertex.position.map(|value| {
-            if value == 0.0 {
-                0
-            } else {
-                value.to_bits()
-            }
-        });
+    for vertex in vertices {
+        let key = vertex
+            .position
+            .map(|value| if value == 0.0 { 0 } else { value.to_bits() });
         let canonical = match position_ids.get(&key) {
             Some(&canonical) => canonical,
             None => {
                 let canonical = position_ids.len() as u32;
                 position_ids.insert(key, canonical);
-                representatives.push(vertex_index as u32);
                 canonical
             }
         };
@@ -352,15 +429,21 @@ fn repair_nanite_triangular_holes(vertices: &[StaticVertex], indices: &mut Vec<u
         {
             continue;
         }
-        for [a, b] in [[ids[0], ids[1]], [ids[1], ids[2]], [ids[2], ids[0]]] {
+        for [a, b, va, vb] in [
+            [ids[0], ids[1], triangle[0], triangle[1]],
+            [ids[1], ids[2], triangle[1], triangle[2]],
+            [ids[2], ids[0], triangle[2], triangle[0]],
+        ] {
             edges.push(BoundaryEdge {
                 key: nanite_edge_key(a, b),
+                vertices: [va, vb],
             });
         }
     }
     edges.sort_unstable_by_key(|edge| edge.key);
 
     let mut boundary_adjacency = HashMap::<u32, Vec<u32>>::new();
+    let mut boundary_edge_vertices = HashMap::<u64, [u32; 2]>::new();
     let mut cursor = 0usize;
     while cursor < edges.len() {
         let edge = edges[cursor].key;
@@ -373,6 +456,7 @@ fn repair_nanite_triangular_holes(vertices: &[StaticVertex], indices: &mut Vec<u
             let b = edge as u32;
             boundary_adjacency.entry(a).or_default().push(b);
             boundary_adjacency.entry(b).or_default().push(a);
+            boundary_edge_vertices.insert(edge, edges[cursor].vertices);
         }
         cursor = end;
     }
@@ -430,11 +514,14 @@ fn repair_nanite_triangular_holes(vertices: &[StaticVertex], indices: &mut Vec<u
             continue;
         };
         let hole = holes[hole_index];
-        triangle.copy_from_slice(&[
-            representatives[hole[0] as usize],
-            representatives[hole[1] as usize],
-            representatives[hole[2] as usize],
-        ]);
+        let replacement = select_nanite_hole_vertices(
+            vertices,
+            &canonical_vertices,
+            hole,
+            &boundary_edge_vertices,
+            Some(triangle),
+        );
+        triangle.copy_from_slice(&replacement);
         repaired[hole_index] = true;
     }
 
@@ -445,7 +532,13 @@ fn repair_nanite_triangular_holes(vertices: &[StaticVertex], indices: &mut Vec<u
             if repaired[hole_index] {
                 continue;
             }
-            indices.extend(hole.map(|canonical| representatives[canonical as usize]));
+            indices.extend(select_nanite_hole_vertices(
+                vertices,
+                &canonical_vertices,
+                *hole,
+                &boundary_edge_vertices,
+                None,
+            ));
             repaired[hole_index] = true;
         }
     }
@@ -589,6 +682,34 @@ mod tests {
         assert!(repaired.contains(&0));
         assert!(repaired.contains(&1));
         assert!(repaired.contains(&2));
+    }
+
+    #[test]
+    fn nanite_hole_repair_preserves_the_matching_uv_seam() {
+        let mesh = super::super::nanite::NaniteMesh {
+            positions: vec![
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            normals: vec![[0.0, 0.0, 1.0]; 5],
+            uvs: vec![[-4.0, 0.0], [0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.5, 0.5]],
+            triangles: vec![[1, 2, 4], [2, 3, 4], [3, 1, 4], [1, 2, 2]],
+            unresolved_vertices: 0,
+        };
+        let converted = StaticMesh::from_nanite(&mesh);
+        let repaired = &converted.indices[9..12];
+        assert!(repaired.contains(&1));
+        assert!(!repaired.contains(&0));
+        let repaired_uvs = [repaired[0], repaired[1], repaired[2]]
+            .map(|index| converted.vertices[index as usize].uv);
+        for [a, b] in [[0usize, 1usize], [1, 2], [2, 0]] {
+            let du = repaired_uvs[a][0] - repaired_uvs[b][0];
+            let dv = repaired_uvs[a][1] - repaired_uvs[b][1];
+            assert!(du * du + dv * dv <= 2.0);
+        }
     }
 
     #[test]
