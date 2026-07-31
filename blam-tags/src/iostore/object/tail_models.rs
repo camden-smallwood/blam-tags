@@ -6144,6 +6144,31 @@ impl TextureChainTail {
     }
 }
 
+/// Decode a cooked texture tail into its typed model.
+///
+/// [`Export`](super::export::Export) deliberately retains native tails as
+/// bytes so edits round-trip exactly. Asset viewers still need a supported way
+/// to inspect those bytes without duplicating the private archive cursor setup,
+/// particularly the export-relative origin used to distinguish inline mips
+/// from payloads in a sibling bulk chunk.
+pub fn parse_texture_chain_tail(
+    tail: &[u8],
+    names: &[String],
+    ctx: TailContext<'_>,
+    has_mip_data_flag: bool,
+) -> Result<TextureChainTail> {
+    let mut r = reader(tail, names, ctx);
+    let modeled = TextureChainTail::read(&mut r, ctx, has_mip_data_flag)?;
+    if r.o != tail.len() {
+        bail!(
+            "texture model consumed {} of {} tail bytes",
+            r.o,
+            tail.len()
+        );
+    }
+    Ok(modeled)
+}
+
 /// The classes whose whole tail chain this module models, for the gate to
 /// enumerate.
 pub const MODELED_TAILS: &[&str] = &[
