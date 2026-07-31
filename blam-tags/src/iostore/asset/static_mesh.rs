@@ -155,7 +155,11 @@ impl StaticMesh {
                 uv: *mesh.uvs.get(i).unwrap_or(&[0.0; 2]),
             })
             .collect();
-        let indices = mesh.triangles.iter().flatten().copied().collect();
+        let indices = mesh
+            .triangles
+            .iter()
+            .flat_map(|triangle| orient_nanite_triangle(mesh, *triangle))
+            .collect();
         Self { indices, vertices }
     }
 
@@ -216,6 +220,45 @@ impl StaticMesh {
             vertices.push(StaticVertex { position: positions[v], normal, uv });
         }
         Ok(StaticMesh { indices, vertices })
+    }
+}
+
+/// Nanite's strip decoder can yield a small number of triangles with the
+/// opposite winding from the rest of a cluster. Conventional mesh viewers and
+/// exporters then cull those isolated faces as holes. Restore Unreal's
+/// clockwise front-face convention by comparing each geometric face normal
+/// with its decoded vertex normals.
+fn orient_nanite_triangle(
+    mesh: &super::nanite::NaniteMesh,
+    triangle: [u32; 3],
+) -> [u32; 3] {
+    let (Some(&a), Some(&b), Some(&c)) = (
+        mesh.positions.get(triangle[0] as usize),
+        mesh.positions.get(triangle[1] as usize),
+        mesh.positions.get(triangle[2] as usize),
+    ) else {
+        return triangle;
+    };
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let face = [
+        ab[1] * ac[2] - ab[2] * ac[1],
+        ab[2] * ac[0] - ab[0] * ac[2],
+        ab[0] * ac[1] - ab[1] * ac[0],
+    ];
+    let normal = triangle.iter().fold([0.0; 3], |mut total, index| {
+        if let Some(vertex_normal) = mesh.normals.get(*index as usize) {
+            total[0] += vertex_normal[0];
+            total[1] += vertex_normal[1];
+            total[2] += vertex_normal[2];
+        }
+        total
+    });
+    let alignment = face[0] * normal[0] + face[1] * normal[1] + face[2] * normal[2];
+    if alignment.is_finite() && alignment > 0.0 {
+        [triangle[0], triangle[2], triangle[1]]
+    } else {
+        triangle
     }
 }
 
@@ -314,5 +357,25 @@ mod tests {
         let normal = decode_normal(&high_positive_x, 0, 16, true);
         assert!(normal[0] > 0.999);
         assert!(normal[1].abs() < 0.001 && normal[2].abs() < 0.001);
+    }
+
+    #[test]
+    fn nanite_triangles_are_oriented_to_unreal_clockwise_winding() {
+        let mesh = super::super::nanite::NaniteMesh {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 3],
+            uvs: vec![[0.0; 2]; 3],
+            triangles: vec![[0, 1, 2]],
+            unresolved_vertices: 0,
+        };
+        let converted = StaticMesh::from_nanite(&mesh);
+        assert_eq!(converted.indices, [0, 2, 1]);
+
+        let already_clockwise = super::super::nanite::NaniteMesh {
+            triangles: vec![[0, 2, 1]],
+            ..mesh
+        };
+        let converted = StaticMesh::from_nanite(&already_clockwise);
+        assert_eq!(converted.indices, [0, 2, 1]);
     }
 }
