@@ -41,7 +41,7 @@ pub mod world;
 // Back-compatible aliases for the pre-layering paths. Every one of these is the
 // same module under its old name, so existing `iostore::zen::…` imports keep
 // resolving while callers migrate. Deprecated; remove after one release.
-pub use asset::{nanite, skeletal_mesh, static_mesh, wwise_event};
+pub use asset::{actorx, nanite, skeletal_mesh, static_mesh, wwise_event};
 pub use container::{header as container_header, oodle, pak, writer};
 pub use object::{unversioned, usmap};
 pub use package::{imports, name_map, script_objects, ser, ue_types, zen};
