@@ -202,6 +202,7 @@ fn decode_virtual_texture_mip(
     let width_usize = usize::try_from(width)?;
     let height_usize = usize::try_from(height)?;
     let mut out = vec![0; checked_surface_len(width, height, 4)?];
+    let mut decoded_tiles = 0usize;
 
     for address in 0..offsets.max_address {
         let tile_x = reverse_morton_code_2(address);
@@ -234,6 +235,10 @@ fn decode_virtual_texture_mip(
             out[destination..destination + copy_width * 4]
                 .copy_from_slice(&tile[source..source + copy_width * 4]);
         }
+        decoded_tiles += 1;
+    }
+    if decoded_tiles == 0 {
+        bail!("virtual texture mip has no populated tiles");
     }
     Ok(out)
 }
@@ -242,7 +247,12 @@ fn virtual_tile_offset(offsets: &VirtualTextureTileOffsetData, address: u32) -> 
     let block = offsets.addresses.partition_point(|start| *start <= address);
     let block = block.checked_sub(1)?;
     let base = *offsets.offsets.get(block)?;
-    (base != u32::MAX).then(|| base + address - offsets.addresses[block])
+    if base == u32::MAX {
+        return None;
+    }
+    address
+        .checked_sub(offsets.addresses[block])
+        .and_then(|local| base.checked_add(local))
 }
 
 fn reverse_morton_code_2(mut value: u32) -> u32 {
