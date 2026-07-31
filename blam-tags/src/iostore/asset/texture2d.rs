@@ -7,7 +7,9 @@
 
 use anyhow::{Context, Result, bail};
 
-use crate::iostore::object::tail_models::TextureChainTail;
+use crate::iostore::object::tail_models::{
+    TextureChainTail, VirtualTextureBuiltData, VirtualTextureTileOffsetData,
+};
 
 /// One decoded mip suitable for direct upload to a UI texture.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,8 +64,194 @@ pub fn decode_texture2d_preview(
                 Err(error) => last_error = Some(error),
             }
         }
+        if let Some(virtual_data) = &format.virtual_data {
+            match decode_virtual_texture_preview(virtual_data, &mut external_payload) {
+                Ok((width, height, pixel_format, mip_level, rgba8)) => {
+                    return Ok(Texture2dPreview {
+                        width,
+                        height,
+                        pixel_format,
+                        mip_level,
+                        rgba8,
+                    });
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("texture has no displayable cooked mip")))
+}
+
+fn decode_virtual_texture_preview(
+    texture: &VirtualTextureBuiltData,
+    external_payload: &mut impl FnMut(i32) -> Result<Vec<u8>>,
+) -> Result<(u32, u32, String, usize, Vec<u8>)> {
+    if !texture.cooked || texture.tile_size == 0 {
+        bail!("virtual texture is not initialized");
+    }
+    if texture.num_layers == 0 {
+        bail!("virtual texture has no layers");
+    }
+    let pixel_format = texture
+        .layer_types
+        .first()
+        .context("virtual texture is missing its first layer format")?
+        .to_string();
+    let packed_tile_stride = usize::try_from(
+        *texture
+            .tile_data_offset_per_layer
+            .last()
+            .context("virtual texture is missing its layer sizes")?,
+    )?;
+    let physical_tile_size = texture
+        .tile_size
+        .checked_add(
+            texture
+                .tile_border_size
+                .checked_mul(2)
+                .context("virtual texture tile border overflows")?,
+        )
+        .context("virtual texture physical tile size overflows")?;
+
+    let mut last_error = None;
+    for mip_level in 0..texture.num_mips as usize {
+        let Some(offsets) = texture.tile_offset_data.get(mip_level) else {
+            continue;
+        };
+        let width = texture
+            .width
+            .checked_shr(mip_level as u32)
+            .unwrap_or(0)
+            .max(1);
+        let height = texture
+            .height
+            .checked_shr(mip_level as u32)
+            .unwrap_or(0)
+            .max(1);
+        let result = (|| {
+            let chunk_index = *texture
+                .chunk_index_per_mip
+                .get(mip_level)
+                .context("virtual texture mip has no chunk index")?
+                as usize;
+            let chunk = texture
+                .chunks
+                .get(chunk_index)
+                .context("virtual texture mip chunk index is out of range")?;
+            let codec = chunk
+                .codecs
+                .first()
+                .map(|(codec, _)| *codec)
+                .context("virtual texture chunk has no first-layer codec")?;
+            let chunk_data = match &chunk.payload {
+                Some(payload) => payload.clone(),
+                None => external_payload(chunk.bulk_index)
+                    .with_context(|| format!("virtual texture chunk {chunk_index}"))?,
+            };
+            decode_virtual_texture_mip(
+                texture,
+                offsets,
+                mip_level,
+                width,
+                height,
+                physical_tile_size,
+                packed_tile_stride,
+                codec,
+                &pixel_format,
+                &chunk_data,
+            )
+        })();
+        match result {
+            Ok(rgba8) => return Ok((width, height, pixel_format, mip_level, rgba8)),
+            Err(error) => {
+                last_error = Some(error.context(format!("virtual texture mip {mip_level}")))
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("virtual texture has no displayable mip")))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_virtual_texture_mip(
+    texture: &VirtualTextureBuiltData,
+    offsets: &VirtualTextureTileOffsetData,
+    mip_level: usize,
+    width: u32,
+    height: u32,
+    physical_tile_size: u32,
+    packed_tile_size: usize,
+    codec: u8,
+    pixel_format: &str,
+    chunk: &[u8],
+) -> Result<Vec<u8>> {
+    // EVirtualTextureCodec::RawGPU. The payload is already in the layer's GPU
+    // pixel format; only the virtual tile layout and duplicated borders need
+    // to be removed for a conventional image preview.
+    if codec != 4 {
+        bail!("Unreal virtual texture codec {codec} is not supported for preview");
+    }
+    let base_offset = usize::try_from(
+        *texture
+            .base_offset_per_mip
+            .get(mip_level)
+            .context("virtual texture mip has no base offset")?,
+    )?;
+    let tile_size = usize::try_from(texture.tile_size)?;
+    let border = usize::try_from(texture.tile_border_size)?;
+    let physical = usize::try_from(physical_tile_size)?;
+    let width_usize = usize::try_from(width)?;
+    let height_usize = usize::try_from(height)?;
+    let mut out = vec![0; checked_surface_len(width, height, 4)?];
+
+    for address in 0..offsets.max_address {
+        let tile_x = reverse_morton_code_2(address);
+        let tile_y = reverse_morton_code_2(address >> 1);
+        if tile_x >= offsets.width || tile_y >= offsets.height {
+            continue;
+        }
+        let Some(tile_offset) = virtual_tile_offset(offsets, address) else {
+            continue;
+        };
+        let start = base_offset
+            .checked_add(
+                usize::try_from(tile_offset)?
+                    .checked_mul(packed_tile_size)
+                    .context("virtual texture tile offset overflows")?,
+            )
+            .context("virtual texture tile start overflows")?;
+        let packed = chunk
+            .get(start..start.saturating_add(packed_tile_size))
+            .context("virtual texture tile lies outside its bulk chunk")?;
+        let tile =
+            decode_pixel_format(pixel_format, physical_tile_size, physical_tile_size, packed)?;
+        let destination_x = usize::try_from(tile_x)? * tile_size;
+        let destination_y = usize::try_from(tile_y)? * tile_size;
+        let copy_width = tile_size.min(width_usize.saturating_sub(destination_x));
+        let copy_height = tile_size.min(height_usize.saturating_sub(destination_y));
+        for row in 0..copy_height {
+            let source = ((row + border) * physical + border) * 4;
+            let destination = ((destination_y + row) * width_usize + destination_x) * 4;
+            out[destination..destination + copy_width * 4]
+                .copy_from_slice(&tile[source..source + copy_width * 4]);
+        }
+    }
+    Ok(out)
+}
+
+fn virtual_tile_offset(offsets: &VirtualTextureTileOffsetData, address: u32) -> Option<u32> {
+    let block = offsets.addresses.partition_point(|start| *start <= address);
+    let block = block.checked_sub(1)?;
+    let base = *offsets.offsets.get(block)?;
+    (base != u32::MAX).then(|| base + address - offsets.addresses[block])
+}
+
+fn reverse_morton_code_2(mut value: u32) -> u32 {
+    value &= 0x5555_5555;
+    value = (value ^ (value >> 1)) & 0x3333_3333;
+    value = (value ^ (value >> 2)) & 0x0f0f_0f0f;
+    value = (value ^ (value >> 4)) & 0x00ff_00ff;
+    value = (value ^ (value >> 8)) & 0x0000_ffff;
+    value
 }
 
 fn decode_pixel_format(format: &str, width: u32, height: u32, input: &[u8]) -> Result<Vec<u8>> {
@@ -349,6 +537,47 @@ mod tests {
         assert_eq!(preview.rgba8, [255, 0, 0, 255]);
     }
 
+    #[test]
+    fn raw_gpu_virtual_texture_tiles_are_assembled_without_borders() {
+        let texture = VirtualTextureBuiltData {
+            cooked: true,
+            num_layers: 1,
+            width_in_blocks: 1,
+            height_in_blocks: 1,
+            tile_size: 4,
+            tile_border_size: 0,
+            tile_data_offset_per_layer: vec![8],
+            num_mips: 1,
+            width: 8,
+            height: 4,
+            chunk_index_per_mip: vec![0],
+            base_offset_per_mip: vec![4],
+            tile_offset_data: Vec::new(),
+            tile_index_per_chunk: Vec::new(),
+            tile_index_per_mip: Vec::new(),
+            tile_offset_in_chunk: Vec::new(),
+            layer_types: vec![FStr::new("PF_DXT1", false)],
+            layer_fallback_colors: vec![[0.0, 0.0, 0.0, 1.0]],
+            chunks: Vec::new(),
+        };
+        let offsets = VirtualTextureTileOffsetData {
+            width: 2,
+            height: 1,
+            max_address: 4,
+            addresses: vec![0, 2],
+            offsets: vec![0, u32::MAX],
+        };
+        let mut chunk = vec![0; 4];
+        chunk.extend_from_slice(&[0, 248, 0, 248, 0, 0, 0, 0]);
+        chunk.extend_from_slice(&[224, 7, 224, 7, 0, 0, 0, 0]);
+
+        let decoded =
+            decode_virtual_texture_mip(&texture, &offsets, 0, 8, 4, 4, 8, 4, "PF_DXT1", &chunk)
+                .unwrap();
+        assert_eq!(&decoded[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&decoded[4 * 4..5 * 4], &[0, 255, 0, 255]);
+    }
+
     /// Opens real shipped packages, follows streaming bulk-data references and
     /// proves at least one cooked Texture2D reaches RGBA pixels.
     ///
@@ -358,6 +587,7 @@ mod tests {
     #[ignore = "requires a Campaign Evolved install; set CE_PAKS"]
     fn campaign_evolved_textures_decode() {
         let root = std::env::var("CE_PAKS").expect("set CE_PAKS");
+        let target = std::env::var("CE_TEXTURE_PACKAGE").ok();
         let world = World::open(root, Usmap::meteorite().expect("bundled usmap"))
             .expect("open Campaign Evolved");
         let mut texture_exports = 0usize;
@@ -365,6 +595,14 @@ mod tests {
         let mut failures = Vec::new();
 
         'packages: for package in world.packages() {
+            if target.as_deref().is_some_and(|target| {
+                !package
+                    .name
+                    .to_ascii_lowercase()
+                    .contains(&target.to_ascii_lowercase())
+            }) {
+                continue;
+            }
             let Some(provider) = package.active_provider() else {
                 continue;
             };
