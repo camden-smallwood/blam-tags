@@ -150,7 +150,7 @@ impl StaticMesh {
 
     /// Convert a decoded [`super::nanite::NaniteMesh`] into a `StaticMesh`.
     pub fn from_nanite(mesh: &super::nanite::NaniteMesh) -> Self {
-        let vertices: Vec<StaticVertex> = (0..mesh.positions.len())
+        let mut vertices: Vec<StaticVertex> = (0..mesh.positions.len())
             .map(|i| StaticVertex {
                 position: mesh.positions[i],
                 normal: *mesh.normals.get(i).unwrap_or(&[0.0; 3]),
@@ -159,6 +159,7 @@ impl StaticMesh {
             .collect();
         let mut indices = mesh.triangles.iter().flatten().copied().collect();
         repair_nanite_triangular_holes(&vertices, &mut indices);
+        split_nanite_negative_uv_wraps(&mut vertices, &mut indices);
         for triangle in indices.chunks_exact_mut(3) {
             let oriented = orient_nanite_triangle(
                 &vertices,
@@ -312,6 +313,148 @@ fn nanite_uv_distance_squared(vertices: &[StaticVertex], a: u32, b: u32) -> f32 
     let du = a[0] - b[0];
     let dv = a[1] - b[1];
     du * du + dv * dv
+}
+
+fn interpolate_nanite_vertex(a: &StaticVertex, b: &StaticVertex, t: f32) -> StaticVertex {
+    let position =
+        std::array::from_fn(|axis| a.position[axis] + (b.position[axis] - a.position[axis]) * t);
+    let mut normal =
+        std::array::from_fn(|axis| a.normal[axis] + (b.normal[axis] - a.normal[axis]) * t);
+    let normal_length = normal
+        .iter()
+        .map(|component| component * component)
+        .sum::<f32>()
+        .sqrt();
+    if normal_length > 0.0 {
+        for component in &mut normal {
+            *component /= normal_length;
+        }
+    }
+    let uv = std::array::from_fn(|axis| a.uv[axis] + (b.uv[axis] - a.uv[axis]) * t);
+    StaticVertex {
+        position,
+        normal,
+        uv,
+    }
+}
+
+fn clip_nanite_uv_polygon(
+    polygon: &[StaticVertex],
+    axis: usize,
+    boundary: f32,
+    keep_greater: bool,
+) -> Vec<StaticVertex> {
+    let Some(mut previous) = polygon.last() else {
+        return Vec::new();
+    };
+    let mut previous_inside = if keep_greater {
+        previous.uv[axis] >= boundary
+    } else {
+        previous.uv[axis] <= boundary
+    };
+    let mut clipped = Vec::with_capacity(polygon.len() + 1);
+    for current in polygon {
+        let current_inside = if keep_greater {
+            current.uv[axis] >= boundary
+        } else {
+            current.uv[axis] <= boundary
+        };
+        if current_inside != previous_inside {
+            let denominator = current.uv[axis] - previous.uv[axis];
+            if denominator != 0.0 {
+                let t = (boundary - previous.uv[axis]) / denominator;
+                clipped.push(interpolate_nanite_vertex(previous, current, t));
+            }
+        }
+        if current_inside {
+            clipped.push(current.clone());
+        }
+        previous = current;
+        previous_inside = current_inside;
+    }
+    clipped
+}
+
+fn split_nanite_negative_uv_wraps(
+    vertices: &mut Vec<StaticVertex>,
+    indices: &mut Vec<u32>,
+) -> usize {
+    let original_indices = std::mem::take(indices);
+    indices.reserve(original_indices.len());
+    let mut split_triangles = 0usize;
+
+    for triangle in original_indices.chunks_exact(3) {
+        let source =
+            [triangle[0], triangle[1], triangle[2]].map(|index| vertices[index as usize].clone());
+        if nanite_triangle_area_squared(vertices, triangle) <= 1.0e-12 {
+            indices.extend_from_slice(triangle);
+            continue;
+        }
+        let mut polygons = vec![source.to_vec()];
+        let mut split = false;
+
+        for axis in 0..2 {
+            let minimum = source
+                .iter()
+                .map(|vertex| vertex.uv[axis])
+                .fold(f32::INFINITY, f32::min);
+            let maximum = source
+                .iter()
+                .map(|vertex| vertex.uv[axis])
+                .fold(f32::NEG_INFINITY, f32::max);
+            // Negative coordinates cannot name a standard UDIM tile. When a
+            // face spans more than one whole negative tile, UE's wrap sampler
+            // renders it correctly but DCC UV editors draw a long spoke. Split
+            // at each integer boundary and move every piece into 0..1. This is
+            // sampling-equivalent for the repeated negative range while real
+            // non-negative UDIM coordinates remain completely untouched.
+            if !minimum.is_finite()
+                || !maximum.is_finite()
+                || minimum >= -1.0
+                || maximum >= 0.0
+                || maximum - minimum <= 1.0
+            {
+                continue;
+            }
+
+            let first_band = minimum.floor() as i32;
+            let last_band = maximum.floor() as i32;
+            let mut banded = Vec::new();
+            for polygon in polygons {
+                for band in first_band..=last_band {
+                    let lower = band as f32;
+                    let upper = lower + 1.0;
+                    let clipped = clip_nanite_uv_polygon(&polygon, axis, lower, true);
+                    let mut clipped = clip_nanite_uv_polygon(&clipped, axis, upper, false);
+                    if clipped.len() < 3 {
+                        continue;
+                    }
+                    for vertex in &mut clipped {
+                        vertex.uv[axis] -= lower;
+                    }
+                    banded.push(clipped);
+                }
+            }
+            polygons = banded;
+            split = true;
+        }
+
+        if !split {
+            indices.extend_from_slice(triangle);
+            continue;
+        }
+
+        split_triangles += 1;
+        for polygon in polygons {
+            let base = vertices.len() as u32;
+            let polygon_len = polygon.len();
+            vertices.extend(polygon);
+            for corner in 1..polygon_len - 1 {
+                indices.extend_from_slice(&[base, base + corner as u32, base + corner as u32 + 1]);
+            }
+        }
+    }
+    split_triangles
 }
 
 fn select_nanite_hole_vertices(
@@ -710,6 +853,73 @@ mod tests {
             let dv = repaired_uvs[a][1] - repaired_uvs[b][1];
             assert!(du * du + dv * dv <= 2.0);
         }
+    }
+
+    #[test]
+    fn nanite_negative_wrap_spans_are_split_into_local_uv_islands() {
+        let mut vertices = vec![
+            StaticVertex {
+                position: [0.0, 0.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [-0.48, 0.82],
+            },
+            StaticVertex {
+                position: [0.0, 46.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [-2.52, 0.82],
+            },
+            StaticVertex {
+                position: [1.0, 1.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [-0.55, 0.88],
+            },
+        ];
+        let mut indices = vec![0, 1, 2];
+
+        assert_eq!(
+            split_nanite_negative_uv_wraps(&mut vertices, &mut indices),
+            1
+        );
+        assert!(indices.len() > 3);
+        for triangle in indices.chunks_exact(3) {
+            let u =
+                [triangle[0], triangle[1], triangle[2]].map(|index| vertices[index as usize].uv[0]);
+            let minimum = u.iter().copied().fold(f32::INFINITY, f32::min);
+            let maximum = u.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            assert!(minimum >= -1.0e-6);
+            assert!(maximum <= 1.0 + 1.0e-6);
+            assert!(maximum - minimum <= 1.0 + 1.0e-6);
+            assert!(nanite_triangle_area_squared(&vertices, triangle) > 1.0e-12);
+        }
+    }
+
+    #[test]
+    fn nanite_nonnegative_udim_spans_are_not_changed() {
+        let mut vertices = vec![
+            StaticVertex {
+                position: [0.0, 0.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [0.2, 0.2],
+            },
+            StaticVertex {
+                position: [1.0, 0.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [2.3, 0.2],
+            },
+            StaticVertex {
+                position: [0.0, 1.0, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [0.2, 0.8],
+            },
+        ];
+        let mut indices = vec![0, 1, 2];
+
+        assert_eq!(
+            split_nanite_negative_uv_wraps(&mut vertices, &mut indices),
+            0
+        );
+        assert_eq!(vertices.len(), 3);
+        assert_eq!(indices, [0, 1, 2]);
     }
 
     #[test]
