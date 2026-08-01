@@ -118,7 +118,9 @@ impl OverrideContainerWriter {
                 )
                 .is_err()
                 {
-                    return Err(IoStoreError::Package("unsupported container header version"));
+                    return Err(IoStoreError::Package(
+                        "unsupported container header version",
+                    ));
                 }
                 let mut header = FIoContainerHeader::new(
                     EIoContainerHeaderVersion::SoftPackageReferences,
@@ -139,7 +141,10 @@ impl OverrideContainerWriter {
                 let mut bytes = buf.into_inner();
                 let aligned = (bytes.len() + 15) & !15; // 16-byte align
                 bytes.resize(aligned, 0);
-                Some((make_chunk_id(container_id, 0, CHUNK_TYPE_CONTAINER_HEADER), bytes))
+                Some((
+                    make_chunk_id(container_id, 0, CHUNK_TYPE_CONTAINER_HEADER),
+                    bytes,
+                ))
             };
         let entry_count = self.chunks.len() + header_chunk.is_some() as usize;
 
@@ -161,7 +166,12 @@ impl OverrideContainerWriter {
                 let end = (written + COMPRESSION_BLOCK_SIZE as usize).min(data.len());
                 let block = &data[written..end];
                 ucas.write_all(block)?;
-                blocks.push(encode_block(ucas_offset, block.len() as u32, block.len() as u32, 0));
+                blocks.push(encode_block(
+                    ucas_offset,
+                    block.len() as u32,
+                    block.len() as u32,
+                    0,
+                ));
                 ucas_offset += block.len() as u64;
                 written = end;
             }
@@ -361,7 +371,9 @@ pub fn patch_uasset_serial_size(uasset: &mut [u8], old_len: u64, new_len: u64) -
     }
     let ipeh = i32::from_le_bytes(uasset[0x18..0x1c].try_into().unwrap());
     if ipeh < 40 || ipeh as usize > uasset.len() {
-        return Err(IoStoreError::Package("bad imported_public_export_hashes_offset"));
+        return Err(IoStoreError::Package(
+            "bad imported_public_export_hashes_offset",
+        ));
     }
     let ipeh = ipeh as usize;
     let rd = |off: usize| u64::from_le_bytes(uasset[off..off + 8].try_into().unwrap());
@@ -371,13 +383,17 @@ pub fn patch_uasset_serial_size(uasset: &mut [u8], old_len: u64, new_len: u64) -
     let serial_size_off = ipeh - 16; // SerialSize
     let cur = rd(serial_size_off);
     if map_size != 32 {
-        return Err(IoStoreError::Package("expected exactly one bulk-data entry"));
+        return Err(IoStoreError::Package(
+            "expected exactly one bulk-data entry",
+        ));
     }
     if dup != u64::MAX {
         return Err(IoStoreError::Package("bulk-data entry signature mismatch"));
     }
     if cur != old_len {
-        return Err(IoStoreError::Package("current SerialSize != old .ubulk length"));
+        return Err(IoStoreError::Package(
+            "current SerialSize != old .ubulk length",
+        ));
     }
     uasset[serial_size_off..serial_size_off + 8].copy_from_slice(&new_len.to_le_bytes());
     Ok(())
@@ -582,8 +598,8 @@ fn sanitize_donated_export(
     use crate::iostore::object::export::{read_export, write_export};
     use crate::iostore::object::value::PropValue;
     use crate::iostore::package::imports::{
-        read_import_slots, split_tag_package, tag_wrapper_class_path, write_import_slots,
-        ImportSlot,
+        ImportSlot, read_import_slots, split_tag_package, tag_wrapper_class_path,
+        write_import_slots,
     };
     use crate::iostore::usmap::Usmap;
 
@@ -600,7 +616,11 @@ fn sanitize_donated_export(
     if export_entry.class_index != FPackageObjectIndex::create_script_import(&class_path) {
         return Err(SanitizeSkip::NothingToStrip);
     }
-    let class = class_path.rsplit('.').next().unwrap_or(&class_path).to_owned();
+    let class = class_path
+        .rsplit('.')
+        .next()
+        .unwrap_or(&class_path)
+        .to_owned();
 
     let Ok(usmap) = Usmap::meteorite() else {
         return Err(SanitizeSkip::NothingToStrip);
@@ -623,15 +643,15 @@ fn sanitize_donated_export(
     let Some(block) = export.properties_mut() else {
         return Err(SanitizeSkip::NothingToStrip);
     };
-    let had_donor_data = block.get("AssetReference").is_some()
-        || block.get("CookedAssetsReferencedByTag").is_some();
+    let had_donor_data =
+        block.get("AssetReference").is_some() || block.get("CookedAssetsReferencedByTag").is_some();
     if !had_donor_data && pkg.asset_reference.is_none() {
         return Err(SanitizeSkip::NothingToStrip);
     }
 
-    block.entries.retain(|e| {
-        &*e.name != "AssetReference" && &*e.name != "CookedAssetsReferencedByTag"
-    });
+    block
+        .entries
+        .retain(|e| &*e.name != "AssetReference" && &*e.name != "CookedAssetsReferencedByTag");
 
     // Every package import existed to serve one of those two properties, so with
     // both gone only the script imports (class, CDO, module) are still named.
@@ -763,16 +783,22 @@ pub fn write_package_mod_container(
     write_combined_mod_container(&[], overrides, &[], out_utoc)
 }
 
-/// Overwrite one rebuilt package inside the container that currently supplies
-/// it. Both its export-bundle chunk and package-store entry are updated. UCAS
-/// writes are append-only; the original UTOC is restored if reopening and
-/// validating the new package fails.
-pub fn overwrite_package_in_place_with(
+/// One rebuilt package to install into its existing source container.
+pub struct PackageReplacement<'a> {
+    pub uasset_path: &'a str,
+    pub rebuilt_bytes: &'a [u8],
+    pub store: &'a StoreEntry,
+}
+
+/// Overwrite several rebuilt packages inside one source container in a single
+/// append/update operation. Every export-bundle chunk and the package-store
+/// header are validated after reopening. UCAS writes are append-only; the
+/// original UTOC is restored if any package fails validation, which makes the
+/// newly appended bytes unreachable.
+pub fn overwrite_packages_in_place_with(
     archive: &IoStoreArchive,
     utoc_path: &std::path::Path,
-    uasset_path: &str,
-    rebuilt_bytes: &[u8],
-    store: &StoreEntry,
+    replacements: &[PackageReplacement<'_>],
 ) -> Result<()> {
     use crate::iostore::package::ue_types::EIoStoreTocVersion;
     use std::io::Cursor;
@@ -780,69 +806,133 @@ pub fn overwrite_package_in_place_with(
     const HV: EIoContainerHeaderVersion = EIoContainerHeaderVersion::SoftPackageReferences;
     const CV: EIoStoreTocVersion = EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash;
 
-    let package_chunk = archive.chunk_index_for(uasset_path)?;
-    let source_id = archive.chunk_id(package_chunk)?;
-    if source_id.chunk_type() != CHUNK_TYPE_EXPORT_BUNDLE_DATA {
-        return Err(IoStoreError::Package("source path is not an export-bundle package"));
-    }
-    let rebuilt = FZenPackageHeader::deserialize(
-        &mut Cursor::new(rebuilt_bytes), None, CV, HV, None,
-    ).map_err(|_| IoStoreError::Package("rebuilt package did not parse"))?;
-    let package_id = FPackageId::from_name(&rebuilt.package_name());
-    if source_id.package_id() != package_id.0.to_le_bytes() {
-        return Err(IoStoreError::Package("rebuilt package identity changed"));
+    if replacements.is_empty() {
+        return Ok(());
     }
 
-    let header_chunk = (0..archive.chunk_count()).find(|&index| {
-        archive.chunk_id(index)
-            .is_ok_and(|id| id.chunk_type() == CHUNK_TYPE_CONTAINER_HEADER)
-    }).ok_or(IoStoreError::Package("container has no writable package-store header"))?;
+    let mut packages = Vec::with_capacity(replacements.len());
+    let mut seen_chunks = std::collections::BTreeSet::new();
+    for replacement in replacements {
+        let package_chunk = archive.chunk_index_for(replacement.uasset_path)?;
+        if !seen_chunks.insert(package_chunk) {
+            return Err(IoStoreError::Package("the same package was replaced twice"));
+        }
+        let source_id = archive.chunk_id(package_chunk)?;
+        if source_id.chunk_type() != CHUNK_TYPE_EXPORT_BUNDLE_DATA {
+            return Err(IoStoreError::Package(
+                "source path is not an export-bundle package",
+            ));
+        }
+        let rebuilt = FZenPackageHeader::deserialize(
+            &mut Cursor::new(replacement.rebuilt_bytes),
+            None,
+            CV,
+            HV,
+            None,
+        )
+        .map_err(|_| IoStoreError::Package("rebuilt package did not parse"))?;
+        let package_id = FPackageId::from_name(&rebuilt.package_name());
+        if source_id.package_id() != package_id.0.to_le_bytes() {
+            return Err(IoStoreError::Package("rebuilt package identity changed"));
+        }
+        packages.push((package_chunk, source_id, package_id, replacement));
+    }
+
+    let header_chunk = (0..archive.chunk_count())
+        .find(|&index| {
+            archive
+                .chunk_id(index)
+                .is_ok_and(|id| id.chunk_type() == CHUNK_TYPE_CONTAINER_HEADER)
+        })
+        .ok_or(IoStoreError::Package(
+            "container has no writable package-store header",
+        ))?;
     let header_id = archive.chunk_id(header_chunk)?;
-    let mut header = FIoContainerHeader::deserialize(
-        &mut Cursor::new(archive.read_chunk(header_chunk)?), None,
-    ).map_err(|_| IoStoreError::Package("container package-store header did not parse"))?;
+    let mut header =
+        FIoContainerHeader::deserialize(&mut Cursor::new(archive.read_chunk(header_chunk)?), None)
+            .map_err(|_| IoStoreError::Package("container package-store header did not parse"))?;
     crate::iostore::compat::check_writable_container_header_version(header.version)
         .map_err(|_| IoStoreError::Package("unsupported container package-store header"))?;
-    if header.get_store_entry(package_id).is_none() {
-        return Err(IoStoreError::Package("package is absent from the container store"));
+    for (_, _, package_id, replacement) in &packages {
+        if header.get_store_entry(*package_id).is_none() {
+            return Err(IoStoreError::Package(
+                "package is absent from the container store",
+            ));
+        }
+        header.add_package(*package_id, replacement.store.clone());
     }
-    header.add_package(package_id, store.clone());
     let mut serialized = Cursor::new(Vec::new());
-    header.serialize(&mut serialized)
+    header
+        .serialize(&mut serialized)
         .map_err(|_| IoStoreError::Package("container package-store header did not serialize"))?;
     let mut header_bytes = serialized.into_inner();
     header_bytes.resize((header_bytes.len() + 15) & !15, 0);
 
     let original_toc = std::fs::read(utoc_path)?;
-    overwrite_chunks_in_place(utoc_path, &[
-        (package_chunk, rebuilt_bytes.to_vec()),
-        (header_chunk, header_bytes),
-    ])?;
+    let mut chunks: Vec<(u32, Vec<u8>)> = packages
+        .iter()
+        .map(|(chunk, _, _, replacement)| (*chunk, replacement.rebuilt_bytes.to_vec()))
+        .collect();
+    chunks.push((header_chunk, header_bytes));
+    if let Err(error) = overwrite_chunks_in_place(utoc_path, &chunks) {
+        std::fs::write(utoc_path, &original_toc)?;
+        return Err(error);
+    }
 
     let validation = (|| -> Result<()> {
         let reopened = IoStoreArchive::open(utoc_path)?;
-        let package_index = reopened.find_chunk(&source_id)
-            .ok_or(IoStoreError::Package("saved package chunk is absent"))?;
-        if reopened.read_chunk(package_index)? != rebuilt_bytes {
-            return Err(IoStoreError::Package("saved package bytes failed validation"));
+        for (_, source_id, _, replacement) in &packages {
+            let package_index = reopened
+                .find_chunk(source_id)
+                .ok_or(IoStoreError::Package("saved package chunk is absent"))?;
+            if reopened.read_chunk(package_index)? != replacement.rebuilt_bytes {
+                return Err(IoStoreError::Package(
+                    "saved package bytes failed validation",
+                ));
+            }
         }
-        let header_index = reopened.find_chunk(&header_id)
-            .ok_or(IoStoreError::Package("saved package-store header is absent"))?;
+        let header_index = reopened
+            .find_chunk(&header_id)
+            .ok_or(IoStoreError::Package(
+                "saved package-store header is absent",
+            ))?;
         let saved_header = FIoContainerHeader::deserialize(
-            &mut Cursor::new(reopened.read_chunk(header_index)?), None,
-        ).map_err(|_| IoStoreError::Package("saved package-store header did not parse"))?;
-        if saved_header.get_store_entry(package_id).is_none() {
-            return Err(IoStoreError::Package("saved package-store entry is absent"));
+            &mut Cursor::new(reopened.read_chunk(header_index)?),
+            None,
+        )
+        .map_err(|_| IoStoreError::Package("saved package-store header did not parse"))?;
+        for (_, _, package_id, _) in &packages {
+            if saved_header.get_store_entry(*package_id).is_none() {
+                return Err(IoStoreError::Package("saved package-store entry is absent"));
+            }
         }
         Ok(())
     })();
     if let Err(error) = validation {
-        let rollback = utoc_path.with_extension("utoc.rollback");
-        std::fs::write(&rollback, original_toc)?;
-        std::fs::rename(&rollback, utoc_path)?;
+        std::fs::write(utoc_path, original_toc)?;
         return Err(error);
     }
     Ok(())
+}
+
+/// Overwrite one rebuilt package inside the container that currently supplies
+/// it. This compatibility wrapper uses the same transactional batch path.
+pub fn overwrite_package_in_place_with(
+    archive: &IoStoreArchive,
+    utoc_path: &std::path::Path,
+    uasset_path: &str,
+    rebuilt_bytes: &[u8],
+    store: &StoreEntry,
+) -> Result<()> {
+    overwrite_packages_in_place_with(
+        archive,
+        utoc_path,
+        &[PackageReplacement {
+            uasset_path,
+            rebuilt_bytes,
+            store,
+        }],
+    )
 }
 
 /// Bundle several edited tags into ONE override (mod) container — a portable,
@@ -1049,10 +1139,8 @@ pub fn overwrite_chunks_in_place(
     let without_hash = rd(&toc, 96);
 
     let offlen_off = HEADER_SIZE + entry_count as usize * 12;
-    let cblock_off = offlen_off
-        + entry_count as usize * 10
-        + seeds as usize * 4
-        + without_hash as usize * 4;
+    let cblock_off =
+        offlen_off + entry_count as usize * 10 + seeds as usize * 4 + without_hash as usize * 4;
     let cblocks_end = cblock_off + cblock_count as usize * 12;
     let mut p = cblocks_end + cmeth_count as usize * cmeth_len as usize;
     if flags & 0x04 != 0 {
@@ -1079,14 +1167,21 @@ pub fn overwrite_chunks_in_place(
             let end = (off + cbs as usize).min(bytes.len());
             let block = &bytes[off..end];
             ucas.write_all(block)?;
-            appended.push(encode_block(phys, block.len() as u32, block.len() as u32, 0));
+            appended.push(encode_block(
+                phys,
+                block.len() as u32,
+                block.len() as u32,
+                0,
+            ));
             phys += block.len() as u64;
             off = end;
         }
         // Repoint offset/length (logical, block-aligned) + refresh the meta hash.
         let ol = offlen_off + *chunk_index as usize * 10;
-        toc[ol..ol + 10]
-            .copy_from_slice(&encode_offset_length(start_block as u64 * cbs, bytes.len() as u64));
+        toc[ol..ol + 10].copy_from_slice(&encode_offset_length(
+            start_block as u64 * cbs,
+            bytes.len() as u64,
+        ));
         let m = meta_off + *chunk_index as usize * 24;
         let hash = blake3::hash(bytes);
         toc[m..m + 20].copy_from_slice(&hash.as_bytes()[..20]);
@@ -1137,7 +1232,11 @@ fn fetch32(p: &[u8]) -> u64 {
     u32::from_le_bytes(p[..4].try_into().unwrap()) as u64
 }
 fn rotate(val: u64, shift: u32) -> u64 {
-    if shift == 0 { val } else { val.rotate_right(shift) }
+    if shift == 0 {
+        val
+    } else {
+        val.rotate_right(shift)
+    }
 }
 fn shift_mix(val: u64) -> u64 {
     val ^ (val >> 47)
@@ -1219,19 +1318,21 @@ fn hash_len33to64(s: &[u8]) -> u64 {
     let f = fetch64(&s[24..]).wrapping_mul(9);
     let g = fetch64(&s[len - 8..]);
     let h = fetch64(&s[len - 16..]).wrapping_mul(mul);
-    let u = rotate(a.wrapping_add(g), 43)
-        .wrapping_add(rotate(b, 30).wrapping_add(c).wrapping_mul(9));
+    let u =
+        rotate(a.wrapping_add(g), 43).wrapping_add(rotate(b, 30).wrapping_add(c).wrapping_mul(9));
     let v = ((a.wrapping_add(g)) ^ d).wrapping_add(f).wrapping_add(1);
-    let w = (u.wrapping_add(v).wrapping_mul(mul)).swap_bytes().wrapping_add(h);
+    let w = (u.wrapping_add(v).wrapping_mul(mul))
+        .swap_bytes()
+        .wrapping_add(h);
     let x = rotate(e.wrapping_add(f), 42).wrapping_add(c);
-    let y = (w
-        .wrapping_add(v)
-        .wrapping_mul(mul))
-    .swap_bytes()
-    .wrapping_add(g)
-    .wrapping_mul(mul);
+    let y = (w.wrapping_add(v).wrapping_mul(mul))
+        .swap_bytes()
+        .wrapping_add(g)
+        .wrapping_mul(mul);
     let z = e.wrapping_add(f).wrapping_add(c);
-    a = ((x.wrapping_add(z)).wrapping_mul(mul).wrapping_add(y)).swap_bytes().wrapping_add(b);
+    a = ((x.wrapping_add(z)).wrapping_mul(mul).wrapping_add(y))
+        .swap_bytes()
+        .wrapping_add(b);
     b = shift_mix(
         (z.wrapping_add(a).wrapping_mul(mul))
             .wrapping_add(d)
@@ -1287,7 +1388,9 @@ pub fn cityhash64(s: &[u8]) -> u64 {
     let mut remaining = (len - 1) & !63;
     loop {
         x = rotate(
-            x.wrapping_add(y).wrapping_add(v.0).wrapping_add(fetch64(&s[off + 8..])),
+            x.wrapping_add(y)
+                .wrapping_add(v.0)
+                .wrapping_add(fetch64(&s[off + 8..])),
             37,
         )
         .wrapping_mul(K1);
@@ -1327,7 +1430,10 @@ mod tests {
     #[test]
     fn cityhash_matches_real_container_id() {
         // Ground truth: pakchunk0-WinGDK's TOC header container_id.
-        assert_eq!(container_id_from_name("pakchunk0-WinGDK"), 0xfbb7216c3fc8ce45);
+        assert_eq!(
+            container_id_from_name("pakchunk0-WinGDK"),
+            0xfbb7216c3fc8ce45
+        );
     }
 
     #[test]
@@ -1338,8 +1444,14 @@ mod tests {
         // elsewhere). If these hold, tag reference resolution ids are fully
         // computable from names.
         assert_eq!(container_id_from_name("jackal-model"), 0x9595babddd1ed22f); // 24 B
-        assert_eq!(container_id_from_name("plasma_pistol-weapon"), 0x368e3d0b13dcbb23); // 40 B
-        assert_eq!(container_id_from_name("default-sound_combiner"), 0xb7a53f4d676890ac); // 44 B
+        assert_eq!(
+            container_id_from_name("plasma_pistol-weapon"),
+            0x368e3d0b13dcbb23
+        ); // 40 B
+        assert_eq!(
+            container_id_from_name("default-sound_combiner"),
+            0xb7a53f4d676890ac
+        ); // 44 B
     }
 
     const PAK0: &str =
@@ -1350,7 +1462,7 @@ mod tests {
     /// confirm the id and bytes survive. Skipped when the game is absent.
     #[test]
     fn override_container_roundtrip() {
-        use crate::iostore::{is_tag_payload, IoStoreArchive};
+        use crate::iostore::{IoStoreArchive, is_tag_payload};
         if !std::path::Path::new(PAK0).exists() {
             eprintln!("skipping: {PAK0} not present");
             return;
@@ -1391,7 +1503,7 @@ mod tests {
     /// again, read what replaced it. Needs no game files.
     #[test]
     fn a_released_partition_can_be_replaced_and_mapped_again() {
-        use crate::iostore::{FIoChunkId, IoStoreArchive, IoStoreError, CHUNK_TYPE_BULK_DATA};
+        use crate::iostore::{CHUNK_TYPE_BULK_DATA, FIoChunkId, IoStoreArchive, IoStoreError};
 
         let mut id_bytes = [0u8; 12];
         id_bytes[..8].copy_from_slice(&0x1234_5678_9abc_def0u64.to_le_bytes());
@@ -1417,10 +1529,7 @@ mod tests {
         archive.release_partition();
         assert!(!archive.is_partition_mapped());
         assert!(
-            matches!(
-                archive.read_chunk(0),
-                Err(IoStoreError::PartitionReleased)
-            ),
+            matches!(archive.read_chunk(0), Err(IoStoreError::PartitionReleased)),
             "a read while released is refused, not served stale or crashed"
         );
 
@@ -1456,7 +1565,10 @@ mod tests {
         assert_eq!(b.len(), 339, "shipped stub size");
 
         let magic = 0x5A6F_12E1u32.to_le_bytes();
-        let mi = b.windows(4).rposition(|w| w == magic).expect("footer magic");
+        let mi = b
+            .windows(4)
+            .rposition(|w| w == magic)
+            .expect("footer magic");
         assert_eq!(&b[mi + 4..mi + 8], &11i32.to_le_bytes(), "PakFileVersion");
         let idx_off = i64::from_le_bytes(b[mi + 8..mi + 16].try_into().unwrap());
         let idx_size = i64::from_le_bytes(b[mi + 16..mi + 24].try_into().unwrap());
@@ -1473,8 +1585,16 @@ mod tests {
             0x90, 0x69, 0xca, 0x78, 0xe7, 0x45, 0x0a, 0x28, 0x51, 0x73, 0x43, 0x1b, 0x3e, 0x52,
             0xc5, 0xc2, 0x52, 0x99, 0xe4, 0x73,
         ];
-        assert_eq!(&b[0x26..0x3a], &phi_hash, "PathHashIndex hash matches game stub");
-        assert_eq!(&b[0x4e..0x62], &fdi_hash, "FullDirectoryIndex hash matches game stub");
+        assert_eq!(
+            &b[0x26..0x3a],
+            &phi_hash,
+            "PathHashIndex hash matches game stub"
+        );
+        assert_eq!(
+            &b[0x4e..0x62],
+            &fdi_hash,
+            "FullDirectoryIndex hash matches game stub"
+        );
     }
 
     /// Writing any override drops the discovery `.pak` stub beside the
@@ -1483,7 +1603,10 @@ mod tests {
     fn write_emits_pak_stub_sibling() {
         let utoc = std::env::temp_dir().join("blamtags_pakstub-WinGDK_P.utoc");
         let mut w = OverrideContainerWriter::new("../../../");
-        w.add_chunk(make_chunk_id(0x1234_5678, 0, CHUNK_TYPE_BULK_DATA), vec![1, 2, 3, 4]);
+        w.add_chunk(
+            make_chunk_id(0x1234_5678, 0, CHUNK_TYPE_BULK_DATA),
+            vec![1, 2, 3, 4],
+        );
         w.write(&utoc).expect("write override");
 
         for ext in ["utoc", "ucas", "pak"] {
@@ -1558,18 +1681,30 @@ mod tests {
 
         let mut base = IoStoreArchive::open(&base_utoc).expect("open synthetic base");
         assert!(base.recover_entries(&[], Some("Meteorite/Content/")) >= 3);
-        let tag_ubulk = base.entries().iter().find(|entry| {
-            entry.path.ends_with(".ubulk")
-                && base.chunk_id(entry.chunk_index).is_ok_and(|id| {
-                    id.package_id() == tag_id.0.to_le_bytes()
-                })
-        }).expect("tag bulk path").path.clone();
-        let ordinary_uasset = base.entries().iter().find(|entry| {
-            entry.path.ends_with(".uasset")
-                && base.chunk_id(entry.chunk_index).is_ok_and(|id| {
-                    id.package_id() == ordinary_id.0.to_le_bytes()
-                })
-        }).expect("ordinary package path").path.clone();
+        let tag_ubulk = base
+            .entries()
+            .iter()
+            .find(|entry| {
+                entry.path.ends_with(".ubulk")
+                    && base
+                        .chunk_id(entry.chunk_index)
+                        .is_ok_and(|id| id.package_id() == tag_id.0.to_le_bytes())
+            })
+            .expect("tag bulk path")
+            .path
+            .clone();
+        let ordinary_uasset = base
+            .entries()
+            .iter()
+            .find(|entry| {
+                entry.path.ends_with(".uasset")
+                    && base
+                        .chunk_id(entry.chunk_index)
+                        .is_ok_and(|id| id.package_id() == ordinary_id.0.to_le_bytes())
+            })
+            .expect("ordinary package path")
+            .path
+            .clone();
 
         write_combined_mod_container(
             &[TagOverride {
@@ -1586,21 +1721,26 @@ mod tests {
             }],
             &[],
             &out_utoc,
-        ).expect("write combined mod");
+        )
+        .expect("write combined mod");
 
         let output = IoStoreArchive::open(&out_utoc).expect("open combined mod");
-        let tag_chunk = (0..output.chunk_count()).find(|&index| {
-            output.chunk_id(index).is_ok_and(|id| {
-                id.package_id() == tag_id.0.to_le_bytes()
-                    && id.chunk_type() == CHUNK_TYPE_BULK_DATA
+        let tag_chunk = (0..output.chunk_count())
+            .find(|&index| {
+                output.chunk_id(index).is_ok_and(|id| {
+                    id.package_id() == tag_id.0.to_le_bytes()
+                        && id.chunk_type() == CHUNK_TYPE_BULK_DATA
+                })
             })
-        }).expect("combined tag chunk");
-        let package_chunk = (0..output.chunk_count()).find(|&index| {
-            output.chunk_id(index).is_ok_and(|id| {
-                id.package_id() == ordinary_id.0.to_le_bytes()
-                    && id.chunk_type() == CHUNK_TYPE_EXPORT_BUNDLE_DATA
+            .expect("combined tag chunk");
+        let package_chunk = (0..output.chunk_count())
+            .find(|&index| {
+                output.chunk_id(index).is_ok_and(|id| {
+                    id.package_id() == ordinary_id.0.to_le_bytes()
+                        && id.chunk_type() == CHUNK_TYPE_EXPORT_BUNDLE_DATA
+                })
             })
-        }).expect("combined package chunk");
+            .expect("combined package chunk");
         assert_eq!(output.read_chunk(tag_chunk).unwrap(), new_tag);
         assert_eq!(output.read_chunk(package_chunk).unwrap(), ordinary_package);
 
@@ -1622,52 +1762,70 @@ mod tests {
         const HV: EIoContainerHeaderVersion = EIoContainerHeaderVersion::SoftPackageReferences;
         const CV: EIoStoreTocVersion = EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash;
         let original = include_bytes!("../../../tests/fixtures/ce/text.uasset").to_vec();
-        let header = FZenPackageHeader::deserialize(
-            &mut Cursor::new(&original), None, CV, HV, None,
-        ).expect("parse fixture package");
+        let header =
+            FZenPackageHeader::deserialize(&mut Cursor::new(&original), None, CV, HV, None)
+                .expect("parse fixture package");
         let payloads = read_payloads(&header, &original).expect("read fixture payloads");
-        let (_, original_store) = write_package(&header, &payloads, HV)
-            .expect("rebuild original package");
+        let (_, original_store) =
+            write_package(&header, &payloads, HV).expect("rebuild original package");
         let package_id = FPackageId::from_name(&header.package_name());
         let utoc = std::env::temp_dir().join(format!(
-            "blamtags_package_inplace_{}.utoc", std::process::id()
+            "blamtags_package_inplace_{}.utoc",
+            std::process::id()
         ));
         let mut writer = OverrideContainerWriter::new("../../../");
         writer.add_package(
             make_chunk_id(package_id.0, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA),
-            original, package_id, original_store,
+            original,
+            package_id,
+            original_store,
         );
-        writer.write(&utoc).expect("write package fixture container");
+        writer
+            .write(&utoc)
+            .expect("write package fixture container");
 
         let mut archive = IoStoreArchive::open(&utoc).expect("open package fixture container");
         archive.recover_entries(&[], Some("Meteorite/Content/"));
-        let package_path = archive.entries().iter()
+        let package_path = archive
+            .entries()
+            .iter()
             .find(|entry| entry.path.ends_with(".uasset"))
-            .expect("recovered package path").path.clone();
+            .expect("recovered package path")
+            .path
+            .clone();
         let mut edited_payloads = payloads;
-        edited_payloads.last_mut().expect("package export").push(0x5a);
-        let (edited, edited_store) = write_package(&header, &edited_payloads, HV)
-            .expect("write edited package");
-        overwrite_package_in_place_with(
-            &archive, &utoc, &package_path, &edited, &edited_store,
-        ).expect("overwrite package");
+        edited_payloads
+            .last_mut()
+            .expect("package export")
+            .push(0x5a);
+        let (edited, edited_store) =
+            write_package(&header, &edited_payloads, HV).expect("write edited package");
+        overwrite_package_in_place_with(&archive, &utoc, &package_path, &edited, &edited_store)
+            .expect("overwrite package");
         drop(archive);
 
         let reopened = IoStoreArchive::open(&utoc).expect("reopen overwritten container");
-        let package_chunk = (0..reopened.chunk_count()).find(|&index| {
-            reopened.chunk_id(index).is_ok_and(|id| {
-                id.package_id() == package_id.0.to_le_bytes()
-                    && id.chunk_type() == CHUNK_TYPE_EXPORT_BUNDLE_DATA
+        let package_chunk = (0..reopened.chunk_count())
+            .find(|&index| {
+                reopened.chunk_id(index).is_ok_and(|id| {
+                    id.package_id() == package_id.0.to_le_bytes()
+                        && id.chunk_type() == CHUNK_TYPE_EXPORT_BUNDLE_DATA
+                })
             })
-        }).expect("package chunk");
+            .expect("package chunk");
         assert_eq!(reopened.read_chunk(package_chunk).unwrap(), edited);
-        let container_header_chunk = (0..reopened.chunk_count()).find(|&index| {
-            reopened.chunk_id(index)
-                .is_ok_and(|id| id.chunk_type() == CHUNK_TYPE_CONTAINER_HEADER)
-        }).expect("container header chunk");
+        let container_header_chunk = (0..reopened.chunk_count())
+            .find(|&index| {
+                reopened
+                    .chunk_id(index)
+                    .is_ok_and(|id| id.chunk_type() == CHUNK_TYPE_CONTAINER_HEADER)
+            })
+            .expect("container header chunk");
         let container_header = FIoContainerHeader::deserialize(
-            &mut Cursor::new(reopened.read_chunk(container_header_chunk).unwrap()), None,
-        ).expect("parse updated container header");
+            &mut Cursor::new(reopened.read_chunk(container_header_chunk).unwrap()),
+            None,
+        )
+        .expect("parse updated container header");
         assert!(container_header.get_store_entry(package_id).is_some());
 
         for extension in ["utoc", "ucas", "pak"] {
@@ -1733,15 +1891,20 @@ mod tests {
     /// the new tag re-parses and the `.uasset` reports the new length.
     #[test]
     fn size_changing_override_roundtrip() {
-        use crate::iostore::{is_tag_payload, IoStoreArchive};
         use crate::file::TagFile;
+        use crate::iostore::{IoStoreArchive, is_tag_payload};
         if !std::path::Path::new(PAK0).exists() {
             eprintln!("skipping: {PAK0} not present");
             return;
         }
         let base = IoStoreArchive::open(PAK0).expect("open base");
 
-        for tag_name in ["default-biped", "default-weapon", "default-vehicle", "default-effect"] {
+        for tag_name in [
+            "default-biped",
+            "default-weapon",
+            "default-vehicle",
+            "default-effect",
+        ] {
             let Some(ua_path) = base
                 .entries()
                 .iter()
@@ -1779,7 +1942,11 @@ mod tests {
                 block.add_element();
             }
             let new_ubulk = tag.write_to_bytes().unwrap();
-            assert_ne!(new_ubulk.len(), old_ubulk.len(), "{tag_name}: edit should change size");
+            assert_ne!(
+                new_ubulk.len(),
+                old_ubulk.len(),
+                "{tag_name}: edit should change size"
+            );
             assert!(is_tag_payload(&new_ubulk));
 
             // Patch the .uasset to the new length.
@@ -1806,7 +1973,11 @@ mod tests {
             // The patched .uasset reports the new length, and the new tag parses.
             let ipeh = i32::from_le_bytes(got_ua[0x18..0x1c].try_into().unwrap()) as usize;
             let ss = u64::from_le_bytes(got_ua[ipeh - 16..ipeh - 8].try_into().unwrap());
-            assert_eq!(ss, new_ubulk.len() as u64, "{tag_name}: SerialSize == new length");
+            assert_eq!(
+                ss,
+                new_ubulk.len() as u64,
+                "{tag_name}: SerialSize == new length"
+            );
             TagFile::read_from_bytes(&got_ub).expect("new tag re-parses");
 
             eprintln!(
@@ -1842,7 +2013,11 @@ mod tests {
         assert_eq!(a.chunk_count(), 2);
         assert_eq!(a.chunk_id(0).unwrap(), id0);
         assert_eq!(a.chunk_id(1).unwrap(), id1);
-        assert_eq!(a.read_chunk(0).unwrap(), vec![0xAA; 100], "chunk 0 untouched");
+        assert_eq!(
+            a.read_chunk(0).unwrap(),
+            vec![0xAA; 100],
+            "chunk 0 untouched"
+        );
         assert_eq!(a.read_chunk(1).unwrap(), new_bytes, "chunk 1 overwritten");
 
         let _ = std::fs::remove_file(&utoc);
@@ -1854,8 +2029,8 @@ mod tests {
     /// confirm it opens with the expected new chunk ids and a valid tag.
     #[test]
     fn native_create_tag_container() {
-        use crate::iostore::IoStoreArchive;
         use crate::file::TagFile;
+        use crate::iostore::IoStoreArchive;
         if !std::path::Path::new(PAK0).exists() {
             eprintln!("skipping: {PAK0} not present");
             return;
@@ -1892,9 +2067,18 @@ mod tests {
         let c = IoStoreArchive::open(&utoc).expect("open generated");
         assert_eq!(c.chunk_count(), 3, "uasset + ubulk + ContainerHeader");
         let new_pid = container_id_from_name(new_pkg);
-        assert_eq!(c.chunk_id(0).unwrap(), make_chunk_id(new_pid, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA));
-        assert_eq!(c.chunk_id(1).unwrap(), make_chunk_id(new_pid, 0, CHUNK_TYPE_BULK_DATA));
-        assert_eq!(c.chunk_id(2).unwrap().chunk_type(), CHUNK_TYPE_CONTAINER_HEADER);
+        assert_eq!(
+            c.chunk_id(0).unwrap(),
+            make_chunk_id(new_pid, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA)
+        );
+        assert_eq!(
+            c.chunk_id(1).unwrap(),
+            make_chunk_id(new_pid, 0, CHUNK_TYPE_BULK_DATA)
+        );
+        assert_eq!(
+            c.chunk_id(2).unwrap().chunk_type(),
+            CHUNK_TYPE_CONTAINER_HEADER
+        );
         // The generated .ubulk still parses as a Reach tag.
         TagFile::read_from_bytes(&c.read_chunk(1).unwrap()).expect("ubulk is a tag");
 
@@ -1906,8 +2090,8 @@ mod tests {
     /// 2-chunk override (patched uasset + new ubulk); read the ubulk back.
     #[test]
     fn write_tag_override_helper_works() {
-        use crate::iostore::IoStoreArchive;
         use crate::file::TagFile;
+        use crate::iostore::IoStoreArchive;
         if !std::path::Path::new(PAK0).exists() {
             eprintln!("skipping: {PAK0} not present");
             return;
@@ -1940,7 +2124,10 @@ mod tests {
         let over = IoStoreArchive::open(&utoc).unwrap();
         assert_eq!(over.chunk_count(), 2, "uasset + ubulk overridden");
         // Helper adds uasset first, then ubulk.
-        assert_eq!(over.chunk_id(1).unwrap(), base.chunk_id_for(&ub_path).unwrap());
+        assert_eq!(
+            over.chunk_id(1).unwrap(),
+            base.chunk_id_for(&ub_path).unwrap()
+        );
         assert_eq!(over.read_chunk(1).unwrap(), new);
 
         let _ = std::fs::remove_file(&utoc);

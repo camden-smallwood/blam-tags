@@ -31,14 +31,22 @@ pub struct FName {
 
 impl FName {
     pub fn new(index: u32, number: u32, text: impl Into<String>) -> Self {
-        FName { index, number, text: text.into() }
+        FName {
+            index,
+            number,
+            text: text.into(),
+        }
     }
     pub fn as_str(&self) -> &str {
         &self.text
     }
     /// `NAME_None` — what a zero-masked or default-constructed name resolves to.
     pub fn none() -> Self {
-        FName { index: 0, number: 0, text: "None".to_string() }
+        FName {
+            index: 0,
+            number: 0,
+            text: "None".to_string(),
+        }
     }
 }
 
@@ -123,15 +131,41 @@ impl FStr {
         // A non-empty string always has a terminator; the flag only decides the
         // empty case, so defaulting it this way keeps an authored string in the
         // canonical form.
-        FStr { empty_has_terminator: !text.is_empty(), text, wide, trailing: Vec::new() }
+        FStr {
+            empty_has_terminator: !text.is_empty(),
+            text,
+            wide,
+            trailing: Vec::new(),
+        }
     }
 
     /// As [`FStr::new`], recording how an empty string was encoded.
-    pub fn with_terminator(text: impl Into<String>, wide: bool, empty_has_terminator: bool) -> Self {
-        FStr { text: text.into(), wide, empty_has_terminator, trailing: Vec::new() }
+    pub fn with_terminator(
+        text: impl Into<String>,
+        wide: bool,
+        empty_has_terminator: bool,
+    ) -> Self {
+        FStr {
+            text: text.into(),
+            wide,
+            empty_has_terminator,
+            trailing: Vec::new(),
+        }
     }
     pub fn as_str(&self) -> &str {
         &self.text
+    }
+    /// Replace the user-visible text while preserving the encoding choice and
+    /// any trailing bytes the original stream carried.
+    ///
+    /// Editors must not rebuild an existing `FString` through [`FStr::new`]:
+    /// doing so normalizes UTF-16 strings and drops deliberately retained
+    /// bytes even when the user only changed one character.
+    pub fn set_text(&mut self, text: impl Into<String>) {
+        self.text = text.into();
+        if !self.text.is_empty() {
+            self.empty_has_terminator = true;
+        }
     }
     /// Whether this must go out as UTF-16: because the file did, or because the
     /// content cannot be represented as bytes. `FString::operator<<` chooses on
@@ -218,7 +252,10 @@ pub enum BlockLayout {
 
 impl Default for BlockLayout {
     fn default() -> Self {
-        BlockLayout::Unversioned { schema_len: 0, leading_empty: 0 }
+        BlockLayout::Unversioned {
+            schema_len: 0,
+            leading_empty: 0,
+        }
     }
 }
 
@@ -255,7 +292,10 @@ impl PropertyBlock {
     /// what the map did for the `array_dim == 1` case that is all any current
     /// caller reads. Use [`PropertyBlock::slots`] to see every slot.
     pub fn get(&self, name: &str) -> Option<&PropValue> {
-        self.entries.iter().find(|e| &*e.name == name).map(|e| &e.value)
+        self.entries
+            .iter()
+            .find(|e| &*e.name == name)
+            .map(|e| &e.value)
     }
 
     /// Every entry sharing `name`, in schema order — the static-array case.
@@ -300,7 +340,11 @@ impl From<std::collections::BTreeMap<String, PropValue>> for PropertyBlock {
         PropertyBlock {
             entries: m
                 .into_iter()
-                .map(|(k, value)| PropertyEntry { name: Arc::from(k.as_str()), value, slot: None })
+                .map(|(k, value)| PropertyEntry {
+                    name: Arc::from(k.as_str()),
+                    value,
+                    slot: None,
+                })
                 .collect(),
             layout: BlockLayout::default(),
         }
@@ -376,11 +420,17 @@ pub enum PropValue {
     /// fields and written back from them — see [`HandWritten`].
     HandWritten(HandWritten),
     /// `FScriptDelegate`: the bound object and the function it names.
-    Delegate { object: i32, function: FName },
+    Delegate {
+        object: i32,
+        function: FName,
+    },
     /// `FMulticastScriptDelegate`: the invocation list.
     MulticastDelegate(Vec<(i32, FName)>),
     /// `FFieldPath`: the property path and the object it is rooted at.
-    FieldPath { path: Vec<FName>, owner: i32 },
+    FieldPath {
+        path: Vec<FName>,
+        owner: i32,
+    },
     /// A `TOptional` that is not set. Distinct from a set-but-empty value, and
     /// from [`PropValue::Raw`] — no bytes follow the four-byte "is set" flag.
     Unset,
@@ -408,9 +458,10 @@ impl PropertyBlock {
         if !self.layout.semantic_eq(&other.layout) {
             return false;
         }
-        self.entries.iter().zip(&other.entries).all(|(a, b)| {
-            a.name == b.name && a.slot == b.slot && a.value.semantic_eq(&b.value)
-        })
+        self.entries
+            .iter()
+            .zip(&other.entries)
+            .all(|(a, b)| a.name == b.name && a.slot == b.slot && a.value.semantic_eq(&b.value))
     }
 }
 
@@ -418,15 +469,20 @@ impl BlockLayout {
     pub fn semantic_eq(&self, other: &BlockLayout) -> bool {
         match (self, other) {
             (
-                BlockLayout::Unversioned { schema_len: a, leading_empty: b },
-                BlockLayout::Unversioned { schema_len: c, leading_empty: d },
+                BlockLayout::Unversioned {
+                    schema_len: a,
+                    leading_empty: b,
+                },
+                BlockLayout::Unversioned {
+                    schema_len: c,
+                    leading_empty: d,
+                },
             ) => a == c && b == d,
         }
     }
 }
 
 impl PropValue {
-
     /// Look through a [`PropValue::WithRemovals`] wrapper to the container
     /// itself.
     ///
@@ -466,8 +522,14 @@ impl PropValue {
                         .all(|((ak, av), (bk, bv))| ak.semantic_eq(bk) && av.semantic_eq(bv))
             }
             (
-                WithRemovals { removals: ar, inner: ai },
-                WithRemovals { removals: br, inner: bi },
+                WithRemovals {
+                    removals: ar,
+                    inner: ai,
+                },
+                WithRemovals {
+                    removals: br,
+                    inner: bi,
+                },
             ) => {
                 let removals_eq = match (ar, br) {
                     (Some(x), Some(y)) => {
@@ -481,13 +543,27 @@ impl PropValue {
             (Struct(a), Struct(b)) => a.semantic_eq(b),
             (Native(a), Native(b)) => a.semantic_eq(b),
             (HandWritten(a), HandWritten(b)) => a.semantic_eq(b),
-            (Delegate { object: ao, function: af }, Delegate { object: bo, function: bf }) => {
-                ao == bo && af == bf
-            }
+            (
+                Delegate {
+                    object: ao,
+                    function: af,
+                },
+                Delegate {
+                    object: bo,
+                    function: bf,
+                },
+            ) => ao == bo && af == bf,
             (MulticastDelegate(a), MulticastDelegate(b)) => a == b,
-            (FieldPath { path: ap, owner: ao }, FieldPath { path: bp, owner: bo }) => {
-                ap == bp && ao == bo
-            }
+            (
+                FieldPath {
+                    path: ap,
+                    owner: ao,
+                },
+                FieldPath {
+                    path: bp,
+                    owner: bo,
+                },
+            ) => ap == bp && ao == bo,
             (Unset, Unset) => true,
             (Raw(a), Raw(b)) => a == b,
             _ => false,
@@ -629,7 +705,11 @@ mod tests {
     fn same_text_can_mean_two_different_names() {
         let via_number = FName::new(12, 5, "Rocket_4");
         let literal = FName::new(99, 0, "Rocket_4");
-        assert_eq!(via_number.as_str(), literal.as_str(), "they render identically");
+        assert_eq!(
+            via_number.as_str(),
+            literal.as_str(),
+            "they render identically"
+        );
         assert_ne!(via_number, literal, "but they are not the same name");
     }
 
