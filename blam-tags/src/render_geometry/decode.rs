@@ -406,10 +406,20 @@ fn half_to_f32(h: u16) -> f32 {
         0 => {
             if mant == 0 { sign }
             else {
+                // Subnormal: shift the mantissa up until it is normalized, and
+                // let the exponent walk DOWN with it — one step per leading
+                // zero, so it goes negative for all but the largest subnormals.
+                //
+                // Signed because it is signed: as a `u32` this counted down
+                // through `wrapping_sub`, and `e + 127` then overflowed for any
+                // half needing two or more shifts. Release builds wrapped
+                // straight back to the intended value and never noticed;
+                // overflow-checked (dev/test) builds panicked. Reading a Halo 4
+                // monolithic build's render geometry is what found it.
                 let mut m = mant;
-                let mut e = 1u32;
-                while (m & 0x400) == 0 { m <<= 1; e = e.wrapping_sub(1); }
-                sign | ((e + 127 - 15) << 23) | ((m & 0x3FF) << 13)
+                let mut e = 1i32;
+                while (m & 0x400) == 0 { m <<= 1; e -= 1; }
+                sign | (((e + 127 - 15) as u32) << 23) | ((m & 0x3FF) << 13)
             }
         }
         0x1F => sign | 0x7F800000 | (mant << 13),
@@ -460,6 +470,34 @@ mod tests {
         assert!((half_to_f32(0x3C00) - 1.0).abs() < 1e-6);
         assert!((half_to_f32(0xBC00) + 1.0).abs() < 1e-6);
         assert_eq!(half_to_f32(0x0000), 0.0);
+    }
+
+    /// Every subnormal half, against the closed form `mantissa * 2^-24`.
+    ///
+    /// The old exponent accumulator was unsigned and counted downwards, so any
+    /// half needing two or more normalizing shifts — 0x01FF and below, three
+    /// quarters of the subnormal range — overflowed `e + 127` and panicked
+    /// under `debug-assertions`. Reading a Halo 4 monolithic build's render
+    /// geometry hit it; release builds wrapped back to the right answer, which
+    /// is exactly why it survived. Exhaustive because the range is 1023 values
+    /// wide and the failure was a function of the shift count, not of any one
+    /// value.
+    #[test]
+    fn every_subnormal_half_converts() {
+        let scale = 2f32.powi(-24);
+        for mant in 1..=0x3FFu16 {
+            let expected = mant as f32 * scale;
+            assert_eq!(half_to_f32(mant), expected, "half 0x{mant:04X}");
+            assert_eq!(
+                half_to_f32(mant | 0x8000),
+                -expected,
+                "negative half 0x{mant:04X}"
+            );
+        }
+        // The extremes: ten shifts (the deepest, and the first to panic) and
+        // one shift (the largest subnormal, which always worked).
+        assert_eq!(half_to_f32(0x0001), scale);
+        assert_eq!(half_to_f32(0x03FF), 1023.0 * scale);
     }
 
     #[test]
