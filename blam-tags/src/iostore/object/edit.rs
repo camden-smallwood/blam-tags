@@ -8,16 +8,19 @@
 //! comes back with. Handing the writer an `FName` whose index points at nothing
 //! is the obvious failure, and a silent one — the index is just a number.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use std::sync::Arc;
 
-use super::block::flattened_schema;
-use super::usmap::Usmap;
-use super::value::{BlockLayout, FName, PropValue, PropertyBlock, PropertyEntry, SchemaSlot};
+use super::block::{flattened_schema, zero_value};
+use super::hand_written::{HandWritten, TextHistory, TextValue};
+use super::usmap::{PropertyType, Usmap};
+use super::value::{
+    BlockLayout, FName, PropValue, PropertyBlock, PropertyEntry, SchemaSlot, SoftObjectPath,
+};
 use crate::iostore::package::imports::{
-    import_package_index, import_slot_of, read_import_slots, write_import_slots, ImportSlot,
-    ImportTarget,
+    ImportSlot, ImportTarget, import_package_index, import_slot_of, read_import_slots,
+    write_import_slots,
 };
 use crate::iostore::package::name_map::FNameMap;
 use crate::iostore::package::zen::FZenPackageHeader;
@@ -33,6 +36,191 @@ use crate::iostore::package::zen::FZenPackageHeader;
 pub fn intern_name(name_map: &mut FNameMap, text: &str) -> FName {
     let mapped = name_map.store(text);
     FName::new(mapped.index(), mapped.number, text)
+}
+
+/// Resolve the declared type for an entry in a decoded property block.
+///
+/// The value alone is deliberately insufficient: every integer width and enum
+/// collapses to [`PropValue::Int`], object flavours share one representation,
+/// and an empty container carries no element from which an editor could infer
+/// its type.  Editors should use this before choosing a widget or constructing
+/// a new container element.
+pub fn property_type_for_slot(
+    class: &str,
+    slot: SchemaSlot,
+    usmap: &Usmap,
+) -> Result<PropertyType> {
+    let flat = flattened_schema(class, usmap)?;
+    let (property, array_index, _) = flat
+        .get(slot.index as usize)
+        .ok_or_else(|| anyhow::anyhow!("class {class} has no schema slot {}", slot.index))?;
+    if *array_index != slot.array_index {
+        bail!(
+            "class {class} schema slot {} is static-array index {}, not {}",
+            slot.index,
+            array_index,
+            slot.array_index
+        );
+    }
+    Ok(property.ty.clone())
+}
+
+/// Every editable reflected slot declared for a class, in serialized schema
+/// order. This is the authoritative catalog an editor should use when it
+/// offers to materialize a cooker-omitted property or static-array element.
+pub fn editable_schema_slots(
+    class: &str,
+    usmap: &Usmap,
+) -> Result<Vec<(String, SchemaSlot, PropertyType)>> {
+    let flat = flattened_schema(class, usmap)?;
+    Ok(flat
+        .iter()
+        .enumerate()
+        .map(|(index, (property, array_index, _))| {
+            (
+                property.name.clone(),
+                SchemaSlot {
+                    index: index as u32,
+                    array_index: *array_index,
+                    zero_masked: false,
+                },
+                property.ty.clone(),
+            )
+        })
+        .collect())
+}
+
+/// Construct the canonical editable default for a declared property type.
+///
+/// This differs from the private zero-mask helper for destructor-bearing
+/// values: those can never be zero-masked, but an editor still needs a valid
+/// empty string/container/reference when the user adds an element.  Unknown
+/// property kinds are refused rather than represented by invented bytes.
+pub fn default_value_for_type(ty: &PropertyType, usmap: &Usmap) -> Result<PropValue> {
+    Ok(match ty {
+        PropertyType::Bool
+        | PropertyType::Int
+        | PropertyType::Int8
+        | PropertyType::Int16
+        | PropertyType::Int64
+        | PropertyType::UInt16
+        | PropertyType::UInt32
+        | PropertyType::UInt64
+        | PropertyType::Float
+        | PropertyType::Double
+        | PropertyType::Object
+        | PropertyType::Interface
+        | PropertyType::WeakObject
+        | PropertyType::LazyObject
+        | PropertyType::Name
+        | PropertyType::Byte { .. }
+        | PropertyType::Enum { .. } => zero_value(ty),
+        PropertyType::AssetObject => PropValue::Object(0),
+        PropertyType::Str | PropertyType::Utf8Str | PropertyType::AnsiStr => {
+            PropValue::Str(Default::default())
+        }
+        PropertyType::SoftObject => PropValue::SoftObject(SoftObjectPath::default()),
+        PropertyType::Array(_) => PropValue::Array(Vec::new()),
+        PropertyType::Set(_) => PropValue::Set(Vec::new()),
+        PropertyType::Map(_, _) => PropValue::Map(Vec::new()),
+        PropertyType::Delegate => PropValue::Delegate {
+            object: 0,
+            function: FName::none(),
+        },
+        PropertyType::MulticastDelegate => PropValue::MulticastDelegate(Vec::new()),
+        PropertyType::FieldPath => PropValue::FieldPath {
+            path: Vec::new(),
+            owner: 0,
+        },
+        PropertyType::Optional(_) => PropValue::Unset,
+        PropertyType::Text => PropValue::HandWritten(HandWritten::Text(TextValue {
+            flags: 0,
+            history: TextHistory::None {
+                culture_invariant: None,
+            },
+        })),
+        PropertyType::Struct(name) => match zero_value(ty) {
+            PropValue::Struct(_) => {
+                let schema_len = usmap
+                    .flattened_slots(name)
+                    .with_context(|| format!("USMAP has no struct {name}"))?
+                    .len() as u32;
+                PropValue::Struct(PropertyBlock {
+                    entries: Vec::new(),
+                    layout: BlockLayout::Unversioned {
+                        schema_len,
+                        leading_empty: 0,
+                    },
+                })
+            }
+            value => value,
+        },
+        PropertyType::Unknown(kind) => {
+            bail!("USMAP property kind {kind} is unknown; Chimp will preserve it read-only")
+        }
+    })
+}
+
+/// Check that an edited value still has the representation required by its
+/// declared type.  Writers perform the final byte-level validation; this gives
+/// UI callers a cheap, deterministic error before they mark a document dirty.
+pub fn validate_value_for_type(ty: &PropertyType, value: &PropValue) -> Result<()> {
+    use PropertyType as T;
+    let valid = match (ty, value) {
+        (T::Bool, PropValue::Bool(_)) => true,
+        (
+            T::Byte { .. }
+            | T::Int
+            | T::UInt64
+            | T::UInt32
+            | T::UInt16
+            | T::Int64
+            | T::Int16
+            | T::Int8,
+            PropValue::Int(_),
+        ) => true,
+        (T::Enum { inner, .. }, value) => return validate_value_for_type(inner, value),
+        (T::Float | T::Double, PropValue::Float(_)) => true,
+        (T::Name, PropValue::Name(_)) => true,
+        (T::Str | T::Utf8Str | T::AnsiStr, PropValue::Str(_)) => true,
+        (
+            T::Object | T::Interface | T::WeakObject | T::LazyObject | T::AssetObject,
+            PropValue::Object(_),
+        ) => true,
+        (T::SoftObject, PropValue::SoftObject(_)) => true,
+        (T::Array(inner), PropValue::Array(values)) | (T::Set(inner), PropValue::Set(values)) => {
+            for item in values {
+                validate_value_for_type(inner, item)?;
+            }
+            true
+        }
+        (T::Map(key, item), PropValue::Map(values)) => {
+            for (k, v) in values {
+                validate_value_for_type(key, k)?;
+                validate_value_for_type(item, v)?;
+            }
+            true
+        }
+        (T::Array(_) | T::Set(_) | T::Map(_, _), PropValue::WithRemovals { inner, .. }) => {
+            return validate_value_for_type(ty, inner);
+        }
+        (T::Struct(_), PropValue::Struct(_) | PropValue::Native(_) | PropValue::HandWritten(_)) => {
+            true
+        }
+        (T::Text, PropValue::HandWritten(HandWritten::Text(_))) => true,
+        (T::Delegate, PropValue::Delegate { .. }) => true,
+        (T::MulticastDelegate, PropValue::MulticastDelegate(_)) => true,
+        (T::FieldPath, PropValue::FieldPath { .. }) => true,
+        (T::Optional(_), PropValue::Unset) => true,
+        (T::Optional(inner), value) => return validate_value_for_type(inner, value),
+        (T::Unknown(_), PropValue::Raw(_)) => true,
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        bail!("value {value:?} does not match declared property type {ty:?}")
+    }
 }
 
 /// Set a property, **inserting it when the block does not carry it**.
@@ -94,7 +282,11 @@ pub fn set_property_slot(
         );
     }
 
-    match block.entries.iter_mut().find(|e| e.slot.is_some_and(|s| s.index == schema_index)) {
+    match block
+        .entries
+        .iter_mut()
+        .find(|e| e.slot.is_some_and(|s| s.index == schema_index))
+    {
         Some(entry) => {
             entry.value = value;
             // A property that was zero-masked and is being given a value must
@@ -186,9 +378,24 @@ mod tests {
             "InsertProbe",
             None,
             vec![
-                UsmapProperty { schema_index: 0, array_dim: 1, name: "First".into(), ty: PropertyType::Int },
-                UsmapProperty { schema_index: 1, array_dim: 1, name: "Middle".into(), ty: PropertyType::Int },
-                UsmapProperty { schema_index: 2, array_dim: 1, name: "Last".into(), ty: PropertyType::Int },
+                UsmapProperty {
+                    schema_index: 0,
+                    array_dim: 1,
+                    name: "First".into(),
+                    ty: PropertyType::Int,
+                },
+                UsmapProperty {
+                    schema_index: 1,
+                    array_dim: 1,
+                    name: "Middle".into(),
+                    ty: PropertyType::Int,
+                },
+                UsmapProperty {
+                    schema_index: 2,
+                    array_dim: 1,
+                    name: "Last".into(),
+                    ty: PropertyType::Int,
+                },
             ],
         );
         usmap
@@ -214,14 +421,22 @@ mod tests {
         assert_eq!(block.len(), 2, "the fixture should start without Middle");
         assert!(block.get("Middle").is_none());
 
-        set_property(&mut block, "InsertProbe", "Middle", PropValue::Int(22), &usmap)
-            .expect("insert");
+        set_property(
+            &mut block,
+            "InsertProbe",
+            "Middle",
+            PropValue::Int(22),
+            &usmap,
+        )
+        .expect("insert");
 
         let out = emit_block("InsertProbe", &block, &usmap).expect("emit");
-        let (back, _) =
-            read_export_struct_len(&out, &[], &usmap, "InsertProbe").expect("re-read");
+        let (back, _) = read_export_struct_len(&out, &[], &usmap, "InsertProbe").expect("re-read");
         assert!(matches!(back.get("First"), Some(PropValue::Int(11))));
-        assert!(matches!(back.get("Middle"), Some(PropValue::Int(22))), "the inserted property is missing");
+        assert!(
+            matches!(back.get("Middle"), Some(PropValue::Int(22))),
+            "the inserted property is missing"
+        );
         assert!(matches!(back.get("Last"), Some(PropValue::Int(33))));
     }
 
@@ -234,14 +449,35 @@ mod tests {
         let usmap = probe();
         let mut block = PropertyBlock {
             entries: Vec::new(),
-            layout: BlockLayout::Unversioned { schema_len: 3, leading_empty: 0 },
+            layout: BlockLayout::Unversioned {
+                schema_len: 3,
+                leading_empty: 0,
+            },
         };
         // Deliberately inserted out of order.
         set_property(&mut block, "InsertProbe", "Last", PropValue::Int(3), &usmap).unwrap();
-        set_property(&mut block, "InsertProbe", "First", PropValue::Int(1), &usmap).unwrap();
-        set_property(&mut block, "InsertProbe", "Middle", PropValue::Int(2), &usmap).unwrap();
+        set_property(
+            &mut block,
+            "InsertProbe",
+            "First",
+            PropValue::Int(1),
+            &usmap,
+        )
+        .unwrap();
+        set_property(
+            &mut block,
+            "InsertProbe",
+            "Middle",
+            PropValue::Int(2),
+            &usmap,
+        )
+        .unwrap();
 
-        let order: Vec<u32> = block.entries.iter().map(|e| e.slot.unwrap().index).collect();
+        let order: Vec<u32> = block
+            .entries
+            .iter()
+            .map(|e| e.slot.unwrap().index)
+            .collect();
         assert_eq!(order, vec![0, 1, 2], "entries are not in schema order");
 
         let out = emit_block("InsertProbe", &block, &usmap).expect("emit");
@@ -258,12 +494,24 @@ mod tests {
         let usmap = probe();
         let mut block = PropertyBlock {
             entries: Vec::new(),
-            layout: BlockLayout::Unversioned { schema_len: 3, leading_empty: 0 },
+            layout: BlockLayout::Unversioned {
+                schema_len: 3,
+                leading_empty: 0,
+            },
         };
-        let e = set_property(&mut block, "InsertProbe", "NoSuchThing", PropValue::Int(1), &usmap)
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("no property NoSuchThing"), "unhelpful refusal: {e}");
+        let e = set_property(
+            &mut block,
+            "InsertProbe",
+            "NoSuchThing",
+            PropValue::Int(1),
+            &usmap,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("no property NoSuchThing"),
+            "unhelpful refusal: {e}"
+        );
     }
 
     /// Removing a property makes the engine fall back to the class default,
@@ -273,11 +521,24 @@ mod tests {
         let usmap = probe();
         let mut block = PropertyBlock {
             entries: Vec::new(),
-            layout: BlockLayout::Unversioned { schema_len: 3, leading_empty: 0 },
+            layout: BlockLayout::Unversioned {
+                schema_len: 3,
+                leading_empty: 0,
+            },
         };
-        set_property(&mut block, "InsertProbe", "Middle", PropValue::Int(2), &usmap).unwrap();
+        set_property(
+            &mut block,
+            "InsertProbe",
+            "Middle",
+            PropValue::Int(2),
+            &usmap,
+        )
+        .unwrap();
         assert!(remove_property(&mut block, "Middle"));
-        assert!(!remove_property(&mut block, "Middle"), "removing twice should report nothing");
+        assert!(
+            !remove_property(&mut block, "Middle"),
+            "removing twice should report nothing"
+        );
         let out = emit_block("InsertProbe", &block, &usmap).expect("emit");
         let (back, _) = read_export_struct_len(&out, &[], &usmap, "InsertProbe").expect("re-read");
         assert!(back.get("Middle").is_none());
@@ -293,7 +554,11 @@ mod tests {
         );
         let existing = intern_name(&mut map, "Rocket");
         assert_eq!((existing.index, existing.number), (1, 0));
-        assert_eq!(map.copy_raw_names().len(), 2, "an existing name must not be appended");
+        assert_eq!(
+            map.copy_raw_names().len(),
+            2,
+            "an existing name must not be appended"
+        );
 
         let fresh = intern_name(&mut map, "BlamEditProbe");
         assert_eq!(fresh.index, 2);
@@ -306,16 +571,91 @@ mod tests {
     /// second entry that renders identically.
     #[test]
     fn interning_splits_a_trailing_number_like_the_engine_does() {
-        let mut map =
-            FNameMap::create_from_names(EMappedNameType::Package, vec!["Rocket".into()]);
+        let mut map = FNameMap::create_from_names(EMappedNameType::Package, vec!["Rocket".into()]);
         let n = intern_name(&mut map, "Rocket_4");
-        assert_eq!((n.index, n.number), (0, 5), "should reuse `Rocket` with number 5");
+        assert_eq!(
+            (n.index, n.number),
+            (0, 5),
+            "should reuse `Rocket` with number 5"
+        );
         assert_eq!(map.copy_raw_names(), vec!["Rocket".to_string()]);
-        assert_eq!(map.get(crate::iostore::package::name_map::FMappedName::create(
-            n.index,
-            EMappedNameType::Package,
-            n.number
-        )), "Rocket_4");
+        assert_eq!(
+            map.get(crate::iostore::package::name_map::FMappedName::create(
+                n.index,
+                EMappedNameType::Package,
+                n.number
+            )),
+            "Rocket_4"
+        );
+    }
+
+    #[test]
+    fn editor_defaults_keep_container_element_types() {
+        let usmap = probe();
+        let array = PropertyType::Array(Box::new(PropertyType::Int16));
+        let map = PropertyType::Map(
+            Box::new(PropertyType::Name),
+            Box::new(PropertyType::SoftObject),
+        );
+        assert!(matches!(
+            default_value_for_type(&array, &usmap).unwrap(),
+            PropValue::Array(values) if values.is_empty()
+        ));
+        assert!(matches!(
+            default_value_for_type(&map, &usmap).unwrap(),
+            PropValue::Map(values) if values.is_empty()
+        ));
+        assert!(default_value_for_type(&PropertyType::Unknown(222), &usmap).is_err());
+    }
+
+    #[test]
+    fn editor_validation_walks_nested_containers() {
+        let ty = PropertyType::Map(
+            Box::new(PropertyType::Name),
+            Box::new(PropertyType::Array(Box::new(PropertyType::Float))),
+        );
+        let good = PropValue::Map(vec![(
+            PropValue::Name(FName::none()),
+            PropValue::Array(vec![PropValue::Float(1.25)]),
+        )]);
+        let bad = PropValue::Map(vec![(
+            PropValue::Int(0),
+            PropValue::Array(vec![PropValue::Float(1.25)]),
+        )]);
+        validate_value_for_type(&ty, &good).unwrap();
+        assert!(validate_value_for_type(&ty, &bad).is_err());
+    }
+
+    #[test]
+    fn an_entry_slot_resolves_back_to_its_declared_type() {
+        let usmap = probe();
+        let slot = SchemaSlot {
+            index: 1,
+            array_index: 0,
+            zero_masked: false,
+        };
+        assert_eq!(
+            property_type_for_slot("InsertProbe", slot, &usmap).unwrap(),
+            PropertyType::Int
+        );
+    }
+
+    #[test]
+    fn editable_slot_catalog_stays_in_schema_order() {
+        let usmap = probe();
+        let slots = editable_schema_slots("InsertProbe", &usmap).unwrap();
+        assert!(
+            slots
+                .windows(2)
+                .all(|pair| pair[0].1.index < pair[1].1.index)
+        );
+        assert!(!slots.is_empty());
+        for (_, slot, ty) in slots {
+            assert_eq!(
+                property_type_for_slot("InsertProbe", slot, &usmap).unwrap(),
+                ty
+            );
+        }
     }
 }
 

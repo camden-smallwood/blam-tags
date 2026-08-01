@@ -14,13 +14,17 @@
 //! Having exactly one implementation is the fix; it is also the thing an
 //! external caller opening a Campaign Evolved install needs first.
 use std::cell::RefCell;
-use std::rc::Rc;
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 
+use super::IoStoreArchive;
+use super::container::pak::PakArchive;
 use super::container_header::EIoContainerHeaderVersion;
 use super::object::archive::PackageResolver;
 use super::object::reflect::{read_userdefined_struct_layout, read_ustruct_layout};
@@ -30,7 +34,6 @@ use super::script_objects::ScriptObjects;
 use super::ue_types::EIoStoreTocVersion;
 use super::usmap::{Usmap, UsmapProperty};
 use super::zen::{FExportMapEntry, FZenPackageHeader};
-use super::IoStoreArchive;
 
 /// Container and header versions Campaign Evolved ships.
 pub const CE_TOC_VERSION: EIoStoreTocVersion = EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash;
@@ -38,59 +41,411 @@ pub const CE_TOC_VERSION: EIoStoreTocVersion = EIoStoreTocVersion::ReplaceIoChun
 pub const CE_HEADER_VERSION: EIoContainerHeaderVersion =
     EIoContainerHeaderVersion::SoftPackageReferences;
 
+fn collect_utocs(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            collect_utocs(&path, out)?;
+        } else if ty.is_file()
+            && path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("utoc"))
+        {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn collect_paks(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            collect_paks(&path, out)?;
+        } else if ty.is_file()
+            && path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("pak"))
+        {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn mount_key(path: &Path) -> (u32, u32, String) {
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let patch = stem.ends_with("_p");
+    let patch_version = if patch {
+        stem.strip_suffix("_p")
+            .and_then(|stem| stem.rsplit_once('_').map(|(_, tail)| tail))
+            .and_then(|tail| tail.parse::<u32>().ok())
+            .unwrap_or(1)
+    } else {
+        0
+    };
+    let score = if patch {
+        4u32.saturating_add(100u32.saturating_mul(patch_version))
+    } else {
+        4
+    };
+    let chunk = stem
+        .strip_prefix("pakchunk")
+        .map(|tail| {
+            tail.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .filter(|digits| !digits.is_empty())
+        .and_then(|digits| digits.parse::<u32>().ok())
+        .unwrap_or(u32::MAX);
+    (
+        score,
+        chunk,
+        path.to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase(),
+    )
+}
+
+fn compare_mount_paths(a: &PathBuf, b: &PathBuf) -> Ordering {
+    mount_key(a).cmp(&mount_key(b))
+}
+
+fn package_name_from_entry(path: &str) -> Option<(String, String)> {
+    let normalized = path.replace('\\', "/");
+    let lower = normalized.to_ascii_lowercase();
+    let suffix = if lower.ends_with(".uasset") {
+        ".uasset"
+    } else if lower.ends_with(".umap") {
+        ".umap"
+    } else {
+        return None;
+    };
+    let stem = &normalized[..normalized.len() - suffix.len()];
+    let lower_stem = &lower[..lower.len() - suffix.len()];
+    let content = lower_stem.find("/content/")?;
+    let prefix = &stem[..content];
+    let rest = &stem[content + "/content/".len()..];
+    let project = prefix.rsplit('/').next().unwrap_or_default();
+    let mount = if project.eq_ignore_ascii_case("meteorite") {
+        "Game"
+    } else {
+        project
+    };
+    let package = format!("/{mount}/{rest}");
+    Some((package.to_ascii_lowercase(), package))
+}
+
+/// One physical IoStore container in a mounted installation.
+#[derive(Clone, Debug)]
+pub struct WorldContainer {
+    /// Stable index used by [`PackageProvider::container`].
+    pub index: usize,
+    /// Absolute path of the `.utoc`.
+    pub path: PathBuf,
+    /// Increasing mount order. A larger value wins a duplicate package path.
+    pub read_order: u32,
+    /// Whether this container's pathless directory index was reconstructed from
+    /// its chunk ids, package headers and the other mounted containers.
+    pub recovered_directory_index: bool,
+    /// Number of package entries contributed by this container.
+    pub package_count: usize,
+}
+
+/// One physical provider of a cooked package.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackageProvider {
+    /// Index into [`World::containers`] and [`World::archives`].
+    pub container: usize,
+    /// Exact, case-preserving entry path inside the container.
+    pub entry_path: String,
+    /// This provider's increasing mount order. The largest value is active.
+    pub read_order: u32,
+}
+
+/// A logical package and every mounted container that provides it.
+#[derive(Clone, Debug)]
+pub struct PackageRecord {
+    /// Canonical Unreal package name, e.g. `/Game/Foo/Bar`.
+    pub name: String,
+    /// Providers in ascending mount order; the final entry is active.
+    pub providers: Vec<PackageProvider>,
+}
+
+impl PackageRecord {
+    /// The provider the game resolves after applying mount priority.
+    pub fn active_provider(&self) -> Option<&PackageProvider> {
+        self.providers.last()
+    }
+}
+
+/// A non-fatal problem encountered while building a [`World`].
+#[derive(Clone, Debug)]
+pub struct WorldDiagnostic {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+/// One legacy `.pak` container mounted beside the IoStore set.
+#[derive(Clone, Debug)]
+pub struct PakContainer {
+    pub index: usize,
+    pub path: PathBuf,
+    pub read_order: u32,
+    pub file_count: usize,
+}
+
+/// One physical provider of a file from a legacy `.pak`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PakProvider {
+    pub container: usize,
+    pub mounted_path: String,
+    pub read_order: u32,
+}
+
+/// A logical legacy-pak file and all mounted providers for it.
+#[derive(Clone, Debug)]
+pub struct PakFileRecord {
+    pub path: String,
+    pub providers: Vec<PakProvider>,
+}
+
+impl PakFileRecord {
+    pub fn active_provider(&self) -> Option<&PakProvider> {
+        self.providers.last()
+    }
+}
+
 /// Every `.utoc` in an installation, mounted, plus the reflection schema.
 pub struct World {
     archives: Vec<IoStoreArchive>,
-    /// Normalised package path (`/game/foo/bar`) -> (archive index, exact entry).
-    by_pkg: HashMap<String, (usize, String)>,
+    containers: Vec<WorldContainer>,
+    packages: Vec<PackageRecord>,
+    /// Normalised package path (`/game/foo/bar`) -> [`Self::packages`] index.
+    by_pkg: HashMap<String, usize>,
     /// Script-object hash -> full object path, for resolving class imports.
     by_hash: HashMap<u64, String>,
     usmap: Usmap,
+    diagnostics: Vec<WorldDiagnostic>,
+    pak_archives: Vec<Mutex<PakArchive>>,
+    pak_containers: Vec<PakContainer>,
+    pak_files: Vec<PakFileRecord>,
+    by_pak_file: HashMap<String, usize>,
 }
 
 impl World {
-    /// Mount every `.utoc` in `paks_dir` (except `global.utoc`, which supplies
-    /// the script objects) against `usmap`.
+    /// Mount every `.utoc` recursively beneath `paks_dir` (except
+    /// `global.utoc`, which supplies the script objects) against `usmap`.
+    ///
+    /// Container and script-object failures are retained as diagnostics so a
+    /// browser can present a partial mount. The call only fails when the root
+    /// cannot be traversed or no IoStore container can be opened.
     pub fn open(paks_dir: impl AsRef<Path>, usmap: Usmap) -> Result<Self> {
         let paks_dir = paks_dir.as_ref();
-        let global = paks_dir.join("global.utoc");
-        let so = ScriptObjects::load(&global)
-            .with_context(|| format!("load script objects from {}", global.display()))?;
-        let mut by_hash = HashMap::new();
-        for e in so.entries() {
-            if let Some(p) = so.resolve(e.global_index.raw_index()) {
-                by_hash.insert(e.global_index.raw_index(), p.to_string());
-            }
+        let mut paths = Vec::new();
+        collect_utocs(paks_dir, &mut paths)
+            .with_context(|| format!("read {}", paks_dir.display()))?;
+        if paths.is_empty() {
+            anyhow::bail!("no .utoc containers found beneath {}", paks_dir.display());
         }
 
-        let mut utocs: Vec<_> = std::fs::read_dir(paks_dir)
-            .with_context(|| format!("read {}", paks_dir.display()))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("utoc")))
-            .filter(|p| !p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("global.utoc")))
-            .collect();
-        utocs.sort();
-        let archives: Vec<IoStoreArchive> =
-            utocs.iter().filter_map(|u| IoStoreArchive::open(u).ok()).collect();
+        let global = paths
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("global.utoc"))
+            })
+            .cloned();
+        let mut by_hash = HashMap::new();
+        let mut diagnostics = Vec::new();
+        match global.as_ref() {
+            Some(path) => match ScriptObjects::load(path) {
+                Ok(so) => {
+                    for e in so.entries() {
+                        if let Some(p) = so.resolve(e.global_index.raw_index()) {
+                            by_hash.insert(e.global_index.raw_index(), p.to_string());
+                        }
+                    }
+                }
+                Err(error) => diagnostics.push(WorldDiagnostic {
+                    path: path.clone(),
+                    message: format!("could not load script objects: {error:#}"),
+                }),
+            },
+            None => diagnostics.push(WorldDiagnostic {
+                path: paks_dir.to_path_buf(),
+                message: "global.utoc was not found; native class names may be unresolved"
+                    .to_owned(),
+            }),
+        }
 
-        let mut by_pkg: HashMap<String, (usize, String)> = HashMap::new();
-        for (i, a) in archives.iter().enumerate() {
-            for e in a.entries() {
-                let lo = e.path.to_ascii_lowercase().replace('\\', "/");
-                let Some(stem) = lo.strip_suffix(".uasset").or_else(|| lo.strip_suffix(".umap"))
-                else {
+        paths.retain(|path| {
+            !path
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("global.utoc"))
+        });
+        paths.sort_by(compare_mount_paths);
+
+        // Open all containers first. A pathless override needs the mounted base
+        // set in hand before its chunk ids can be named.
+        let mut opened: Vec<(PathBuf, Option<IoStoreArchive>)> = Vec::new();
+        for path in paths {
+            match IoStoreArchive::open(&path) {
+                Ok(archive) => opened.push((path, Some(archive))),
+                Err(error) => diagnostics.push(WorldDiagnostic {
+                    path,
+                    message: error.to_string(),
+                }),
+            }
+        }
+        if opened.is_empty() {
+            anyhow::bail!(
+                "no readable IoStore containers beneath {}",
+                paks_dir.display()
+            );
+        }
+
+        let needs_recovery: Vec<bool> = opened
+            .iter()
+            .map(|(_, archive)| {
+                archive
+                    .as_ref()
+                    .is_some_and(|archive| archive.entries().is_empty())
+            })
+            .collect();
+        for index in 0..opened.len() {
+            if !needs_recovery[index] {
+                continue;
+            }
+            let Some(mut archive) = opened[index].1.take() else {
+                continue;
+            };
+            let bases: Vec<&IoStoreArchive> = opened
+                .iter()
+                .filter_map(|(_, archive)| archive.as_ref())
+                .collect();
+            let recovered = archive.recover_entries(&bases, Some("Meteorite/Content/"));
+            if recovered == 0 {
+                diagnostics.push(WorldDiagnostic {
+                    path: opened[index].0.clone(),
+                    message:
+                        "container has no directory index and its chunk paths could not be recovered"
+                            .to_owned(),
+                });
+            }
+            opened[index].1 = Some(archive);
+        }
+
+        let mut archives = Vec::with_capacity(opened.len());
+        let mut containers = Vec::with_capacity(opened.len());
+        for (read_order, (path, archive)) in opened.into_iter().enumerate() {
+            let Some(archive) = archive else {
+                continue;
+            };
+            let index = archives.len();
+            archives.push(archive);
+            containers.push(WorldContainer {
+                index,
+                path,
+                read_order: read_order as u32,
+                recovered_directory_index: needs_recovery.get(read_order).copied().unwrap_or(false),
+                package_count: 0,
+            });
+        }
+
+        let mut provider_map: BTreeMap<String, (String, Vec<PackageProvider>)> = BTreeMap::new();
+        for (container, archive) in archives.iter().enumerate() {
+            let read_order = containers[container].read_order;
+            for entry in archive.entries() {
+                let Some((key, package)) = package_name_from_entry(&entry.path) else {
                     continue;
                 };
-                let Some((prefix, rest)) = stem.split_once("/content/") else { continue };
-                // `Meteorite` is the project, so its content mounts at `/Game`.
-                let mount = match prefix.rsplit('/').next().unwrap_or("") {
-                    "meteorite" => "game",
-                    m => m,
-                };
-                by_pkg.entry(format!("/{mount}/{rest}")).or_insert((i, e.path.clone()));
+                containers[container].package_count += 1;
+                provider_map
+                    .entry(key)
+                    .or_insert_with(|| (package, Vec::new()))
+                    .1
+                    .push(PackageProvider {
+                        container,
+                        entry_path: entry.path.clone(),
+                        read_order,
+                    });
             }
         }
-        Ok(World { archives, by_pkg, by_hash, usmap })
+
+        let mut packages = Vec::with_capacity(provider_map.len());
+        let mut by_pkg = HashMap::with_capacity(provider_map.len());
+        for (key, (name, providers)) in provider_map {
+            by_pkg.insert(key, packages.len());
+            packages.push(PackageRecord { name, providers });
+        }
+
+        let mut pak_paths = Vec::new();
+        collect_paks(paks_dir, &mut pak_paths)
+            .with_context(|| format!("read {}", paks_dir.display()))?;
+        pak_paths.sort_by(compare_mount_paths);
+        let mut pak_archives = Vec::new();
+        let mut pak_containers = Vec::new();
+        let mut pak_provider_map: BTreeMap<String, (String, Vec<PakProvider>)> = BTreeMap::new();
+        for (read_order, path) in pak_paths.into_iter().enumerate() {
+            match PakArchive::open(&path) {
+                Ok(archive) => {
+                    let index = pak_archives.len();
+                    for file in archive.files() {
+                        let key = file.mounted_path.to_ascii_lowercase();
+                        pak_provider_map
+                            .entry(key)
+                            .or_insert_with(|| (file.mounted_path.clone(), Vec::new()))
+                            .1
+                            .push(PakProvider {
+                                container: index,
+                                mounted_path: file.mounted_path.clone(),
+                                read_order: read_order as u32,
+                            });
+                    }
+                    pak_containers.push(PakContainer {
+                        index,
+                        path,
+                        read_order: read_order as u32,
+                        file_count: archive.files().len(),
+                    });
+                    pak_archives.push(Mutex::new(archive));
+                }
+                Err(error) => diagnostics.push(WorldDiagnostic {
+                    path,
+                    message: format!("could not open legacy pak: {error}"),
+                }),
+            }
+        }
+        let mut pak_files = Vec::with_capacity(pak_provider_map.len());
+        let mut by_pak_file = HashMap::with_capacity(pak_provider_map.len());
+        for (key, (path, providers)) in pak_provider_map {
+            by_pak_file.insert(key, pak_files.len());
+            pak_files.push(PakFileRecord { path, providers });
+        }
+
+        Ok(World {
+            archives,
+            containers,
+            packages,
+            by_pkg,
+            by_hash,
+            usmap,
+            diagnostics,
+            pak_archives,
+            pak_containers,
+            pak_files,
+            by_pak_file,
+        })
     }
 
     pub fn usmap(&self) -> &Usmap {
@@ -99,6 +454,95 @@ impl World {
 
     pub fn archives(&self) -> &[IoStoreArchive] {
         &self.archives
+    }
+
+    /// Physical containers in increasing mount order.
+    pub fn containers(&self) -> &[WorldContainer] {
+        &self.containers
+    }
+
+    /// Logical packages sorted by normalized package name.
+    pub fn packages(&self) -> &[PackageRecord] {
+        &self.packages
+    }
+
+    /// Non-fatal mount errors and compatibility omissions.
+    pub fn diagnostics(&self) -> &[WorldDiagnostic] {
+        &self.diagnostics
+    }
+
+    /// Successfully opened legacy `.pak` containers in increasing mount order.
+    pub fn pak_containers(&self) -> &[PakContainer] {
+        &self.pak_containers
+    }
+
+    /// Legacy-pak files sorted by normalized mounted path.
+    pub fn pak_files(&self) -> &[PakFileRecord] {
+        &self.pak_files
+    }
+
+    /// Resolve a mounted legacy-pak path case-insensitively.
+    pub fn pak_file(&self, path: &str) -> Option<&PakFileRecord> {
+        let index = *self
+            .by_pak_file
+            .get(&path.replace('\\', "/").to_ascii_lowercase())?;
+        self.pak_files.get(index)
+    }
+
+    /// Read the active provider of a legacy-pak file.
+    pub fn read_pak_file(&self, path: &str) -> Result<Vec<u8>> {
+        let record = self
+            .pak_file(path)
+            .with_context(|| format!("legacy-pak file {path} is not mounted"))?;
+        let provider = record
+            .active_provider()
+            .with_context(|| format!("legacy-pak file {path} has no providers"))?;
+        self.read_pak_provider(provider)
+    }
+
+    /// Read one explicit provider of a legacy-pak file.
+    pub fn read_pak_provider(&self, provider: &PakProvider) -> Result<Vec<u8>> {
+        let archive = self
+            .pak_archives
+            .get(provider.container)
+            .with_context(|| format!("legacy pak {} is not mounted", provider.container))?;
+        archive
+            .lock()
+            .map_err(|_| anyhow::anyhow!("legacy pak lock is poisoned"))?
+            .read(&provider.mounted_path)
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("read {}", provider.mounted_path))
+    }
+
+    /// Resolve a package name case-insensitively.
+    pub fn package(&self, package: &str) -> Option<&PackageRecord> {
+        let index = *self
+            .by_pkg
+            .get(&package.replace('\\', "/").to_ascii_lowercase())?;
+        self.packages.get(index)
+    }
+
+    /// Read the active provider of a package.
+    pub fn read_package(&self, package: &str) -> Result<Vec<u8>> {
+        let record = self
+            .package(package)
+            .with_context(|| format!("package {package} is not mounted"))?;
+        let provider = record
+            .active_provider()
+            .with_context(|| format!("package {package} has no providers"))?;
+        self.read_provider(provider)
+    }
+
+    /// Read one explicit provider, including a shadowed version.
+    pub fn read_provider(&self, provider: &PackageProvider) -> Result<Vec<u8>> {
+        let archive = self
+            .archives
+            .get(provider.container)
+            .with_context(|| format!("container {} is not mounted", provider.container))?;
+        archive
+            .read(&provider.entry_path)
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("read {}", provider.entry_path))
     }
 
     /// The class path behind a script-object hash, e.g. an export's
@@ -110,7 +554,8 @@ impl World {
     /// As [`World::class_path`], reduced to the bare class name the `.usmap`
     /// keys by.
     pub fn class_name(&self, hash: u64) -> Option<&str> {
-        self.class_path(hash).map(|p| p.rsplit('.').next().unwrap_or(p))
+        self.class_path(hash)
+            .map(|p| p.rsplit('.').next().unwrap_or(p))
     }
 
     /// The `.usmap` key for an export's class.
@@ -125,16 +570,23 @@ impl World {
     /// The synthetic `pkg#hash` and `pkg.object` forms match what
     /// [`PkgResolver::struct_name`] produces, so a class registered under one
     /// is found through the other.
-    pub fn class_key(&self, header: &FZenPackageHeader, class: FPackageObjectIndex) -> Option<String> {
+    pub fn class_key(
+        &self,
+        header: &FZenPackageHeader,
+        class: FPackageObjectIndex,
+    ) -> Option<String> {
         match class.kind() {
             FPackageObjectIndexType::ScriptImport => {
                 Some(self.class_name(class.raw_index())?.to_string())
             }
             FPackageObjectIndexType::PackageImport => {
                 let r = class.package_import()?;
-                let pkg = header.imported_package_names.get(r.imported_package_index as usize)?;
-                let hash =
-                    *header.imported_public_export_hashes.get(r.imported_public_export_hash_index as usize)?;
+                let pkg = header
+                    .imported_package_names
+                    .get(r.imported_package_index as usize)?;
+                let hash = *header
+                    .imported_public_export_hashes
+                    .get(r.imported_public_export_hash_index as usize)?;
                 Some(format!("{pkg}#{hash:016x}"))
             }
             FPackageObjectIndexType::Export => {
@@ -175,7 +627,9 @@ impl World {
                 })
                 .collect();
             for path in entries {
-                let Ok(b) = self.archives[ai].read(&path) else { continue };
+                let Ok(b) = self.archives[ai].read(&path) else {
+                    continue;
+                };
                 let Ok(h) = FZenPackageHeader::deserialize(
                     &mut Cursor::new(&b),
                     None,
@@ -187,11 +641,19 @@ impl World {
                 };
                 let names = h.name_map.copy_raw_names();
                 let resolver = self.resolver(&h, &b, &names);
-                let bulk: Vec<(i64, i64)> =
-                    h.bulk_data.iter().map(|x| (x.serial_offset, x.serial_size)).collect();
-                let ctx = ExportContext { bulk_data: &bulk, resolver: Some(&resolver) };
+                let bulk: Vec<(i64, i64)> = h
+                    .bulk_data
+                    .iter()
+                    .map(|x| (x.serial_offset, x.serial_size))
+                    .collect();
+                let ctx = ExportContext {
+                    bulk_data: &bulk,
+                    resolver: Some(&resolver),
+                };
                 for ex in &h.export_map {
-                    let Some(class) = self.class_name(ex.class_index.raw_index()) else { continue };
+                    let Some(class) = self.class_name(ex.class_index.raw_index()) else {
+                        continue;
+                    };
                     // Any export that *is* a class serializes `UStruct`'s
                     // prefix, so any of them can yield a layout. Testing the
                     // name for `GeneratedClass` looked equivalent and was not:
@@ -207,7 +669,9 @@ impl World {
                     if off >= b.len() || off > end {
                         continue;
                     }
-                    let Some(object) = names.get(ex.object_name.index() as usize) else { continue };
+                    let Some(object) = names.get(ex.object_name.index() as usize) else {
+                        continue;
+                    };
                     match read_ustruct_layout(
                         &b[off..end],
                         &names,
@@ -229,7 +693,8 @@ impl World {
         }
         let n = found.len();
         for (hash_key, path_key, super_name, props) in found {
-            self.usmap.register_struct(&hash_key, super_name.clone(), props.clone());
+            self.usmap
+                .register_struct(&hash_key, super_name.clone(), props.clone());
             self.usmap.register_struct(&path_key, super_name, props);
         }
         (n, failed)
@@ -257,7 +722,13 @@ impl World {
         bytes: &'a [u8],
         names: &'a [String],
     ) -> PkgResolver<'a> {
-        PkgResolver { world: self, layouts: Rc::default(), header, bytes, names }
+        PkgResolver {
+            world: self,
+            layouts: Rc::default(),
+            header,
+            bytes,
+            names,
+        }
     }
 }
 
@@ -283,7 +754,10 @@ impl PkgResolver<'_> {
         if off >= self.bytes.len() || off > end {
             return None;
         }
-        let ctx = ExportContext { bulk_data: &[], resolver: Some(self) };
+        let ctx = ExportContext {
+            bulk_data: &[],
+            resolver: Some(self),
+        };
         read_userdefined_struct_layout(
             &self.bytes[off..end],
             self.names,
@@ -304,15 +778,22 @@ impl PackageResolver for PkgResolver<'_> {
         }
         let oi = *self.header.import_map.get((-package_index - 1) as usize)?;
         match oi.kind() {
-            FPackageObjectIndexType::ScriptImport => {
-                Some(self.world.by_hash.get(&oi.raw_index())?.rsplit('.').next()?.to_string())
-            }
+            FPackageObjectIndexType::ScriptImport => Some(
+                self.world
+                    .by_hash
+                    .get(&oi.raw_index())?
+                    .rsplit('.')
+                    .next()?
+                    .to_string(),
+            ),
             // Another package's export, addressed by its public hash. The
             // package name alone would be ambiguous.
             FPackageObjectIndexType::PackageImport => {
                 let r = oi.package_import()?;
-                let pkg =
-                    self.header.imported_package_names.get(r.imported_package_index as usize)?;
+                let pkg = self
+                    .header
+                    .imported_package_names
+                    .get(r.imported_package_index as usize)?;
                 let hash = *self
                     .header
                     .imported_public_export_hashes
@@ -335,8 +816,11 @@ impl PackageResolver for PkgResolver<'_> {
             None => (name.rsplit_once('.')?.0, None),
         };
         let out = (|| {
-            let (ai, exact) = self.world.by_pkg.get(&pkg.to_ascii_lowercase())?;
-            let bytes = self.world.archives[*ai].read(exact).ok()?;
+            let record = self.world.package(pkg)?;
+            let provider = record.active_provider()?;
+            let bytes = self.world.archives[provider.container]
+                .read(&provider.entry_path)
+                .ok()?;
             let h = FZenPackageHeader::deserialize(
                 &mut Cursor::new(&bytes),
                 None,
@@ -351,7 +835,9 @@ impl PackageResolver for PkgResolver<'_> {
                 None => {
                     let object = name.rsplit_once('.')?.1;
                     h.export_map.iter().find(|x| {
-                        names.get(x.object_name.index() as usize).is_some_and(|n| n == object)
+                        names
+                            .get(x.object_name.index() as usize)
+                            .is_some_and(|n| n == object)
                     })?
                 }
             };
@@ -364,7 +850,103 @@ impl PackageResolver for PkgResolver<'_> {
             };
             inner.layout_of_export(ex)
         })();
-        self.layouts.borrow_mut().insert(name.to_string(), out.clone());
+        self.layouts
+            .borrow_mut()
+            .insert(name.to_string(), out.clone());
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn package_paths_keep_case_and_map_meteorite_to_game() {
+        assert_eq!(
+            package_name_from_entry("Meteorite/Content/UI/Data/MyTable.uasset"),
+            Some((
+                "/game/ui/data/mytable".to_owned(),
+                "/Game/UI/Data/MyTable".to_owned()
+            ))
+        );
+        assert_eq!(
+            package_name_from_entry("Engine/Content/Maps/Probe.umap"),
+            Some((
+                "/engine/maps/probe".to_owned(),
+                "/Engine/Maps/Probe".to_owned()
+            ))
+        );
+        assert_eq!(package_name_from_entry("Meteorite/Content/Foo.ubulk"), None);
+    }
+
+    #[test]
+    fn mount_order_puts_chunks_before_priority_patches() {
+        let mut paths = vec![
+            PathBuf::from("Paks/~mods/MyMod_2_P.utoc"),
+            PathBuf::from("Paks/pakchunk10-WinGDK.utoc"),
+            PathBuf::from("Paks/pakchunk2-WinGDK.utoc"),
+            PathBuf::from("Paks/~mods/MyMod_P.utoc"),
+        ];
+        paths.sort_by(compare_mount_paths);
+        let names: Vec<&str> = paths
+            .iter()
+            .filter_map(|path| path.file_name()?.to_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "pakchunk2-WinGDK.utoc",
+                "pakchunk10-WinGDK.utoc",
+                "MyMod_P.utoc",
+                "MyMod_2_P.utoc"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_last_provider_is_active() {
+        let record = PackageRecord {
+            name: "/Game/Probe".to_owned(),
+            providers: vec![
+                PackageProvider {
+                    container: 0,
+                    entry_path: "base.uasset".to_owned(),
+                    read_order: 0,
+                },
+                PackageProvider {
+                    container: 1,
+                    entry_path: "patch.uasset".to_owned(),
+                    read_order: 1,
+                },
+            ],
+        };
+        assert_eq!(
+            record.active_provider().map(|provider| provider.container),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn the_last_legacy_pak_provider_is_active() {
+        let record = PakFileRecord {
+            path: "Meteorite/Content/WwiseAudio/probe.wem".to_owned(),
+            providers: vec![
+                PakProvider {
+                    container: 0,
+                    mounted_path: "Meteorite/Content/WwiseAudio/probe.wem".to_owned(),
+                    read_order: 0,
+                },
+                PakProvider {
+                    container: 2,
+                    mounted_path: "Meteorite/Content/WwiseAudio/probe.wem".to_owned(),
+                    read_order: 2,
+                },
+            ],
+        };
+        assert_eq!(
+            record.active_provider().map(|provider| provider.container),
+            Some(2)
+        );
     }
 }
