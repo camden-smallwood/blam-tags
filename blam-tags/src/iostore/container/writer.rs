@@ -763,6 +763,88 @@ pub fn write_package_mod_container(
     write_combined_mod_container(&[], overrides, &[], out_utoc)
 }
 
+/// Overwrite one rebuilt package inside the container that currently supplies
+/// it. Both its export-bundle chunk and package-store entry are updated. UCAS
+/// writes are append-only; the original UTOC is restored if reopening and
+/// validating the new package fails.
+pub fn overwrite_package_in_place_with(
+    archive: &IoStoreArchive,
+    utoc_path: &std::path::Path,
+    uasset_path: &str,
+    rebuilt_bytes: &[u8],
+    store: &StoreEntry,
+) -> Result<()> {
+    use crate::iostore::package::ue_types::EIoStoreTocVersion;
+    use std::io::Cursor;
+
+    const HV: EIoContainerHeaderVersion = EIoContainerHeaderVersion::SoftPackageReferences;
+    const CV: EIoStoreTocVersion = EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash;
+
+    let package_chunk = archive.chunk_index_for(uasset_path)?;
+    let source_id = archive.chunk_id(package_chunk)?;
+    if source_id.chunk_type() != CHUNK_TYPE_EXPORT_BUNDLE_DATA {
+        return Err(IoStoreError::Package("source path is not an export-bundle package"));
+    }
+    let rebuilt = FZenPackageHeader::deserialize(
+        &mut Cursor::new(rebuilt_bytes), None, CV, HV, None,
+    ).map_err(|_| IoStoreError::Package("rebuilt package did not parse"))?;
+    let package_id = FPackageId::from_name(&rebuilt.package_name());
+    if source_id.package_id() != package_id.0.to_le_bytes() {
+        return Err(IoStoreError::Package("rebuilt package identity changed"));
+    }
+
+    let header_chunk = (0..archive.chunk_count()).find(|&index| {
+        archive.chunk_id(index)
+            .is_ok_and(|id| id.chunk_type() == CHUNK_TYPE_CONTAINER_HEADER)
+    }).ok_or(IoStoreError::Package("container has no writable package-store header"))?;
+    let header_id = archive.chunk_id(header_chunk)?;
+    let mut header = FIoContainerHeader::deserialize(
+        &mut Cursor::new(archive.read_chunk(header_chunk)?), None,
+    ).map_err(|_| IoStoreError::Package("container package-store header did not parse"))?;
+    crate::iostore::compat::check_writable_container_header_version(header.version)
+        .map_err(|_| IoStoreError::Package("unsupported container package-store header"))?;
+    if header.get_store_entry(package_id).is_none() {
+        return Err(IoStoreError::Package("package is absent from the container store"));
+    }
+    header.add_package(package_id, store.clone());
+    let mut serialized = Cursor::new(Vec::new());
+    header.serialize(&mut serialized)
+        .map_err(|_| IoStoreError::Package("container package-store header did not serialize"))?;
+    let mut header_bytes = serialized.into_inner();
+    header_bytes.resize((header_bytes.len() + 15) & !15, 0);
+
+    let original_toc = std::fs::read(utoc_path)?;
+    overwrite_chunks_in_place(utoc_path, &[
+        (package_chunk, rebuilt_bytes.to_vec()),
+        (header_chunk, header_bytes),
+    ])?;
+
+    let validation = (|| -> Result<()> {
+        let reopened = IoStoreArchive::open(utoc_path)?;
+        let package_index = reopened.find_chunk(&source_id)
+            .ok_or(IoStoreError::Package("saved package chunk is absent"))?;
+        if reopened.read_chunk(package_index)? != rebuilt_bytes {
+            return Err(IoStoreError::Package("saved package bytes failed validation"));
+        }
+        let header_index = reopened.find_chunk(&header_id)
+            .ok_or(IoStoreError::Package("saved package-store header is absent"))?;
+        let saved_header = FIoContainerHeader::deserialize(
+            &mut Cursor::new(reopened.read_chunk(header_index)?), None,
+        ).map_err(|_| IoStoreError::Package("saved package-store header did not parse"))?;
+        if saved_header.get_store_entry(package_id).is_none() {
+            return Err(IoStoreError::Package("saved package-store entry is absent"));
+        }
+        Ok(())
+    })();
+    if let Err(error) = validation {
+        let rollback = utoc_path.with_extension("utoc.rollback");
+        std::fs::write(&rollback, original_toc)?;
+        std::fs::rename(&rollback, utoc_path)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Bundle several edited tags into ONE override (mod) container — a portable,
 /// non-destructive overlay the game loads on top of the base. Each tag is a
 /// same-name override: `(source_archive, ubulk_rel_path, new_tag_bytes)`. The
@@ -1526,6 +1608,70 @@ mod tests {
             for extension in ["utoc", "ucas", "pak"] {
                 let _ = std::fs::remove_file(path.with_extension(extension));
             }
+        }
+    }
+
+    #[test]
+    fn package_overwrite_updates_chunk_and_store_entry() {
+        use crate::iostore::IoStoreArchive;
+        use crate::iostore::package::builder::{read_payloads, write_package};
+        use crate::iostore::package::ue_types::EIoStoreTocVersion;
+        use crate::iostore::package::zen::FZenPackageHeader;
+        use std::io::Cursor;
+
+        const HV: EIoContainerHeaderVersion = EIoContainerHeaderVersion::SoftPackageReferences;
+        const CV: EIoStoreTocVersion = EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash;
+        let original = include_bytes!("../../../tests/fixtures/ce/text.uasset").to_vec();
+        let header = FZenPackageHeader::deserialize(
+            &mut Cursor::new(&original), None, CV, HV, None,
+        ).expect("parse fixture package");
+        let payloads = read_payloads(&header, &original).expect("read fixture payloads");
+        let (_, original_store) = write_package(&header, &payloads, HV)
+            .expect("rebuild original package");
+        let package_id = FPackageId::from_name(&header.package_name());
+        let utoc = std::env::temp_dir().join(format!(
+            "blamtags_package_inplace_{}.utoc", std::process::id()
+        ));
+        let mut writer = OverrideContainerWriter::new("../../../");
+        writer.add_package(
+            make_chunk_id(package_id.0, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA),
+            original, package_id, original_store,
+        );
+        writer.write(&utoc).expect("write package fixture container");
+
+        let mut archive = IoStoreArchive::open(&utoc).expect("open package fixture container");
+        archive.recover_entries(&[], Some("Meteorite/Content/"));
+        let package_path = archive.entries().iter()
+            .find(|entry| entry.path.ends_with(".uasset"))
+            .expect("recovered package path").path.clone();
+        let mut edited_payloads = payloads;
+        edited_payloads.last_mut().expect("package export").push(0x5a);
+        let (edited, edited_store) = write_package(&header, &edited_payloads, HV)
+            .expect("write edited package");
+        overwrite_package_in_place_with(
+            &archive, &utoc, &package_path, &edited, &edited_store,
+        ).expect("overwrite package");
+        drop(archive);
+
+        let reopened = IoStoreArchive::open(&utoc).expect("reopen overwritten container");
+        let package_chunk = (0..reopened.chunk_count()).find(|&index| {
+            reopened.chunk_id(index).is_ok_and(|id| {
+                id.package_id() == package_id.0.to_le_bytes()
+                    && id.chunk_type() == CHUNK_TYPE_EXPORT_BUNDLE_DATA
+            })
+        }).expect("package chunk");
+        assert_eq!(reopened.read_chunk(package_chunk).unwrap(), edited);
+        let container_header_chunk = (0..reopened.chunk_count()).find(|&index| {
+            reopened.chunk_id(index)
+                .is_ok_and(|id| id.chunk_type() == CHUNK_TYPE_CONTAINER_HEADER)
+        }).expect("container header chunk");
+        let container_header = FIoContainerHeader::deserialize(
+            &mut Cursor::new(reopened.read_chunk(container_header_chunk).unwrap()), None,
+        ).expect("parse updated container header");
+        assert!(container_header.get_store_entry(package_id).is_some());
+
+        for extension in ["utoc", "ucas", "pak"] {
+            let _ = std::fs::remove_file(utoc.with_extension(extension));
         }
     }
 
