@@ -235,6 +235,7 @@ pub struct IoStoreArchive {
 
     // Header-derived cursors into `toc`.
     entry_count: u32,
+    diridx_size: usize,
     chunkid_off: usize,
     offlen_off: usize,
     cblock_off: usize,
@@ -388,6 +389,7 @@ impl IoStoreArchive {
             ucas_path,
             codec,
             entry_count,
+            diridx_size,
             chunkid_off,
             offlen_off,
             cblock_off,
@@ -400,6 +402,34 @@ impl IoStoreArchive {
     /// All files in the container's directory index.
     pub fn entries(&self) -> &[Entry] {
         &self.entries
+    }
+
+    /// The exact `.utoc` bytes this handle parsed at open time.
+    pub(crate) fn toc_bytes(&self) -> &[u8] {
+        &self.toc
+    }
+
+    /// Whether the target TOC carries a serialized directory index.
+    pub(crate) fn has_directory_index(&self) -> bool {
+        self.diridx_size != 0
+    }
+
+    /// Whether `utoc_path` names this handle's sibling `.ucas`.
+    ///
+    /// Compare the caller's path directly first, then canonicalize both paths
+    /// so a relative path or a symlink still identifies the same partition.
+    pub(crate) fn matches_utoc_path(&self, utoc_path: &Path) -> bool {
+        let sibling = ucas_sibling(utoc_path);
+        if self.ucas_path == sibling {
+            return true;
+        }
+        match (
+            std::fs::canonicalize(&self.ucas_path),
+            std::fs::canonicalize(sibling),
+        ) {
+            (Ok(opened), Ok(candidate)) => opened == candidate,
+            _ => false,
+        }
     }
 
     /// Rebuild a file list for a container that carries no directory index.

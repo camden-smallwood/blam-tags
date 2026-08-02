@@ -20,13 +20,15 @@
 use crate::iostore::imports::ImportTarget;
 use crate::iostore::ue_types::FPackageObjectIndex;
 use crate::iostore::zen::FZenPackageHeader;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Cursor, Write};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::header::{EIoContainerHeaderVersion, FIoContainerHeader, StoreEntry};
 use crate::iostore::package::ue_types::{FIoContainerId, FPackageId};
-use crate::iostore::{FIoChunkId, IoStoreArchive, IoStoreError, Result};
+use crate::iostore::{Entry, FIoChunkId, IoStoreArchive, IoStoreError, Result};
 
 /// `EIoChunkType` raw on-disk bytes (UE5 numbering, version 8).
 pub const CHUNK_TYPE_EXPORT_BUNDLE_DATA: u8 = 1;
@@ -396,6 +398,1344 @@ pub fn patch_uasset_serial_size(uasset: &mut [u8], old_len: u64, new_len: u64) -
         ));
     }
     uasset[serial_size_off..serial_size_off + 8].copy_from_slice(&new_len.to_le_bytes());
+    Ok(())
+}
+
+/// The complete input to [`duplicate_tag_in_place_with`].
+///
+/// `source_uasset` is intentionally independent of `archive`: a mounted
+/// lower-priority provider may supply the wrapper while `archive` is the exact
+/// container that receives the new chunks. The two destination filenames are
+/// explicit because an indexless mod has no directory resource from which to
+/// infer them.
+pub struct InPlaceTagDuplicate<'a> {
+    pub source_uasset: &'a [u8],
+    pub tag_bytes: &'a [u8],
+    pub destination_package_path: &'a str,
+    pub destination_uasset_path: &'a str,
+    pub destination_ubulk_path: &'a str,
+}
+
+/// Clone a Campaign Evolved tag package into the exact existing IoStore
+/// container represented by `archive`.
+///
+/// The operation appends all replacement/new bytes to the sibling `.ucas`,
+/// then atomically replaces only the `.utoc`. Existing chunks, compression
+/// blocks, perfect-hash seeds, and directory entries are retained. If reopen
+/// or validation fails, the original `.utoc` is restored; an appended UCAS
+/// tail can therefore remain only as unreachable dead space.
+pub fn duplicate_tag_in_place_with(
+    archive: &IoStoreArchive,
+    utoc_path: &Path,
+    request: &InPlaceTagDuplicate<'_>,
+) -> Result<()> {
+    duplicate_tag_in_place_impl(archive, utoc_path, request, None)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DuplicateFailurePoint {
+    AfterAppend,
+    AfterTocWrite,
+    BeforeValidation,
+}
+
+#[cfg(test)]
+fn duplicate_tag_in_place_with_failure_for_test(
+    archive: &IoStoreArchive,
+    utoc_path: &Path,
+    request: &InPlaceTagDuplicate<'_>,
+    failure: DuplicateFailurePoint,
+) -> Result<()> {
+    duplicate_tag_in_place_impl(archive, utoc_path, request, Some(failure))
+}
+
+struct ClonedTagPackage {
+    source_header: FZenPackageHeader,
+    package: Vec<u8>,
+    export_payload: Vec<u8>,
+    store: StoreEntry,
+    package_id: FPackageId,
+    uasset_id: FIoChunkId,
+    ubulk_id: FIoChunkId,
+    object_name: String,
+}
+
+fn clone_tag_package(
+    request: &InPlaceTagDuplicate<'_>,
+    object_name: &str,
+) -> Result<ClonedTagPackage> {
+    use crate::iostore::compat::{CE_CONTAINER_HEADER_VERSION, CE_TOC_VERSION};
+
+    if request.source_uasset.is_empty() {
+        return Err(IoStoreError::Package("source .uasset is empty"));
+    }
+    let mut source_cursor = Cursor::new(request.source_uasset);
+    let source_header = FZenPackageHeader::deserialize(
+        &mut source_cursor,
+        None,
+        CE_TOC_VERSION,
+        CE_CONTAINER_HEADER_VERSION,
+        None,
+    )
+    .map_err(|_| IoStoreError::Package("failed to parse source .uasset"))?;
+    if source_header.export_map.is_empty() {
+        return Err(IoStoreError::Package("source .uasset has no export"));
+    }
+    if source_header.bulk_data.is_empty() {
+        return Err(IoStoreError::Package("source .uasset has no bulk entry"));
+    }
+
+    let source_header_size = source_header.summary.header_size as usize;
+    if source_header_size > request.source_uasset.len() {
+        return Err(IoStoreError::Package(
+            "source .uasset header exceeds its bytes",
+        ));
+    }
+    for export in &source_header.export_map {
+        let start = source_header_size
+            .checked_add(export.cooked_serial_offset as usize)
+            .ok_or(IoStoreError::Package("source export offset overflow"))?;
+        let end = start
+            .checked_add(export.cooked_serial_size as usize)
+            .ok_or(IoStoreError::Package("source export size overflow"))?;
+        if end > request.source_uasset.len() {
+            return Err(IoStoreError::Package("source export exceeds its .uasset"));
+        }
+    }
+
+    let export_payload = request.source_uasset[source_header_size..].to_vec();
+    if request.tag_bytes.len() > i64::MAX as usize {
+        return Err(IoStoreError::Package(
+            "tag body is too large for SerialSize",
+        ));
+    }
+
+    let mut cloned_header = source_header.clone();
+    cloned_header.summary.name = cloned_header
+        .name_map
+        .store(request.destination_package_path);
+    cloned_header.export_map[0].object_name = cloned_header.name_map.store(object_name);
+    cloned_header.export_map[0].public_export_hash = container_id_from_name(object_name);
+    cloned_header.bulk_data[0].serial_size = request.tag_bytes.len() as i64;
+
+    let mut store = StoreEntry::default();
+    let mut serialized_header = Cursor::new(Vec::new());
+    cloned_header
+        .serialize(
+            &mut serialized_header,
+            &mut store,
+            crate::iostore::compat::CE_CONTAINER_HEADER_VERSION,
+        )
+        .map_err(|_| IoStoreError::Package("failed to serialize cloned .uasset"))?;
+    let mut package = serialized_header.into_inner();
+    package.extend_from_slice(&export_payload);
+
+    let package_id = FPackageId::from_name(request.destination_package_path);
+    let uasset_id = make_chunk_id(package_id.0, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA);
+    let ubulk_id = make_chunk_id(package_id.0, 0, CHUNK_TYPE_BULK_DATA);
+
+    Ok(ClonedTagPackage {
+        source_header,
+        package,
+        export_payload,
+        store,
+        package_id,
+        uasset_id,
+        ubulk_id,
+        object_name: object_name.to_string(),
+    })
+}
+
+fn validate_destination_path_forms(request: &InPlaceTagDuplicate<'_>) -> Result<String> {
+    let package_path = request.destination_package_path;
+    if !valid_package_path(package_path) {
+        return Err(IoStoreError::Package("invalid destination package path"));
+    }
+    let uasset_path = request.destination_uasset_path;
+    let ubulk_path = request.destination_ubulk_path;
+    if !valid_container_path(uasset_path, ".uasset") || !valid_container_path(ubulk_path, ".ubulk")
+    {
+        return Err(IoStoreError::Package("invalid destination asset path"));
+    }
+    let uasset_stem = uasset_path
+        .strip_suffix(".uasset")
+        .ok_or(IoStoreError::Package("destination asset is not a .uasset"))?;
+    let ubulk_stem = ubulk_path
+        .strip_suffix(".ubulk")
+        .ok_or(IoStoreError::Package("destination bulk is not a .ubulk"))?;
+    if uasset_stem != ubulk_stem {
+        return Err(IoStoreError::Package(
+            "destination .uasset and .ubulk stems do not match",
+        ));
+    }
+    let package_leaf = package_path
+        .rsplit('/')
+        .next()
+        .ok_or(IoStoreError::Package("destination package has no leaf"))?;
+    let asset_leaf = uasset_stem
+        .rsplit('/')
+        .next()
+        .ok_or(IoStoreError::Package("destination asset has no leaf"))?;
+    if package_leaf != asset_leaf {
+        return Err(IoStoreError::Package(
+            "destination package and asset leaves do not match",
+        ));
+    }
+    let package_relative = package_path
+        .strip_prefix("/Game/")
+        .ok_or(IoStoreError::Package(
+            "destination package is not a /Game path",
+        ))?;
+    let relative_matches = uasset_stem == package_relative
+        || uasset_stem
+            .strip_suffix(&format!("/{package_relative}"))
+            .is_some();
+    if !relative_matches {
+        return Err(IoStoreError::Package(
+            "destination asset path does not match package path",
+        ));
+    }
+    Ok(package_leaf.to_string())
+}
+
+fn valid_package_path(path: &str) -> bool {
+    path.starts_with("/Game/")
+        && path.len() > "/Game/".len()
+        && !path.contains('\\')
+        && !path.contains("//")
+        && !path.ends_with('/')
+        && path
+            .strip_prefix('/')
+            .unwrap_or(path)
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+        && !path.ends_with(".uasset")
+        && !path.ends_with(".ubulk")
+}
+
+fn valid_container_path(path: &str, extension: &str) -> bool {
+    path.ends_with(extension)
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !path.contains("//")
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+const TOC_MAGIC_BYTES: &[u8; 16] = b"-==--==--==--==-";
+const FLAG_TOC_ENCRYPTED: u32 = 0x02;
+const FLAG_TOC_SIGNED: u32 = 0x04;
+const TOC_HEADER_SIZE: usize = 144;
+const TOC_META_SIZE: usize = 24;
+const MAX_PACKED_BLOCK_VALUE: u64 = (1 << 24) - 1;
+const MAX_PACKED_OFFSET: u64 = (1 << 40) - 1;
+
+struct ParsedToc {
+    original: Vec<u8>,
+    entry_count: u32,
+    block_count: u32,
+    block_size: u64,
+    directory_index_size: usize,
+    container_id: u64,
+    partition_size: u64,
+    chunk_ids: Vec<FIoChunkId>,
+    offset_lengths: Vec<[u8; 10]>,
+    perfect_hash_seeds: Vec<u8>,
+    chunks_without_perfect_hash: Vec<u8>,
+    blocks: Vec<[u8; 12]>,
+    compression_methods: Vec<u8>,
+    directory_index: Vec<u8>,
+    metas: Vec<[u8; TOC_META_SIZE]>,
+    trailing: Vec<u8>,
+}
+
+struct TocAppendItem {
+    chunk_index: u32,
+    id: FIoChunkId,
+    bytes: Vec<u8>,
+    path: Option<String>,
+}
+
+struct NewTocChunk {
+    id: FIoChunkId,
+    bytes: Vec<u8>,
+    path: Option<String>,
+}
+
+struct ExistingTocReplacement {
+    chunk_index: u32,
+    bytes: Vec<u8>,
+}
+
+struct TocAppendPlan {
+    items: Vec<TocAppendItem>,
+    new_chunk_indices: Vec<u32>,
+    new_toc: Vec<u8>,
+}
+
+fn parse_toc(bytes: &[u8]) -> Result<ParsedToc> {
+    if bytes.len() < TOC_HEADER_SIZE || &bytes[..16] != TOC_MAGIC_BYTES {
+        return Err(IoStoreError::BadMagic);
+    }
+    if bytes[16] != 8 {
+        return Err(IoStoreError::UnsupportedVersion(bytes[16]));
+    }
+    if toc_u32(bytes, 20)? as usize != TOC_HEADER_SIZE {
+        return Err(IoStoreError::Truncated("unsupported TOC header size"));
+    }
+
+    let entry_count = toc_u32(bytes, 24)?;
+    let block_count = toc_u32(bytes, 28)?;
+    if toc_u32(bytes, 32)? != 12 {
+        return Err(IoStoreError::Truncated(
+            "unsupported compressed-block entry size",
+        ));
+    }
+    let compression_method_count = toc_u32(bytes, 36)? as usize;
+    let compression_method_len = toc_u32(bytes, 40)? as usize;
+    let block_size = toc_u32(bytes, 44)? as u64;
+    if block_size == 0 || block_size > MAX_PACKED_BLOCK_VALUE {
+        return Err(IoStoreError::Truncated(
+            "unsupported compression block size",
+        ));
+    }
+    let directory_index_size = toc_u32(bytes, 48)? as usize;
+    let partition_count = toc_u32(bytes, 52)?;
+    if partition_count != 1 {
+        return Err(IoStoreError::MultiPartition(partition_count));
+    }
+    let container_id = toc_u64(bytes, 56)?;
+    let flags = toc_u32(bytes, 80)?;
+    if flags & FLAG_TOC_ENCRYPTED != 0 {
+        return Err(IoStoreError::Encrypted);
+    }
+    if flags & FLAG_TOC_SIGNED != 0 {
+        return Err(IoStoreError::Package(
+            "signed TOCs are unsupported for in-place duplication",
+        ));
+    }
+    let seed_count = toc_u32(bytes, 84)? as usize;
+    let partition_size = toc_u64(bytes, 88)?;
+    let without_hash_count = toc_u32(bytes, 96)? as usize;
+
+    let chunkid_off = TOC_HEADER_SIZE;
+    let offlen_off = checked_toc_end(chunkid_off, entry_count as usize, 12, bytes.len())?;
+    let seeds_off = checked_toc_end(offlen_off, entry_count as usize, 10, bytes.len())?;
+    let without_hash_off = checked_toc_end(seeds_off, seed_count, 4, bytes.len())?;
+    let block_off = checked_toc_end(without_hash_off, without_hash_count, 4, bytes.len())?;
+    let methods_off = checked_toc_end(block_off, block_count as usize, 12, bytes.len())?;
+    let directory_off = checked_toc_end(
+        methods_off,
+        compression_method_count,
+        compression_method_len,
+        bytes.len(),
+    )?;
+    let directory_end = directory_off
+        .checked_add(directory_index_size)
+        .ok_or(IoStoreError::Truncated("directory index offset overflow"))?;
+    if directory_end > bytes.len() {
+        return Err(IoStoreError::Truncated("directory index past end of TOC"));
+    }
+    let meta_end = directory_end
+        .checked_add(
+            (entry_count as usize)
+                .checked_mul(TOC_META_SIZE)
+                .ok_or(IoStoreError::Truncated("TOC metadata size overflow"))?,
+        )
+        .ok_or(IoStoreError::Truncated("TOC metadata offset overflow"))?;
+    if meta_end > bytes.len() {
+        return Err(IoStoreError::Truncated("TOC metadata past end of TOC"));
+    }
+
+    let chunk_ids = bytes[chunkid_off..offlen_off]
+        .chunks_exact(12)
+        .map(|raw| {
+            let mut id = [0u8; 12];
+            id.copy_from_slice(raw);
+            FIoChunkId(id)
+        })
+        .collect();
+    let offset_lengths = bytes[offlen_off..seeds_off]
+        .chunks_exact(10)
+        .map(|raw| {
+            let mut value = [0u8; 10];
+            value.copy_from_slice(raw);
+            value
+        })
+        .collect();
+    let blocks = bytes[block_off..methods_off]
+        .chunks_exact(12)
+        .map(|raw| {
+            let mut value = [0u8; 12];
+            value.copy_from_slice(raw);
+            value
+        })
+        .collect();
+    let metas = bytes[directory_end..meta_end]
+        .chunks_exact(TOC_META_SIZE)
+        .map(|raw| {
+            let mut value = [0u8; TOC_META_SIZE];
+            value.copy_from_slice(raw);
+            value
+        })
+        .collect();
+
+    Ok(ParsedToc {
+        original: bytes.to_vec(),
+        entry_count,
+        block_count,
+        block_size,
+        directory_index_size,
+        container_id,
+        partition_size,
+        chunk_ids,
+        offset_lengths,
+        perfect_hash_seeds: bytes[seeds_off..without_hash_off].to_vec(),
+        chunks_without_perfect_hash: bytes[without_hash_off..block_off].to_vec(),
+        blocks,
+        compression_methods: bytes[methods_off..directory_off].to_vec(),
+        directory_index: bytes[directory_off..directory_end].to_vec(),
+        metas,
+        trailing: bytes[meta_end..].to_vec(),
+    })
+}
+
+fn toc_u32(bytes: &[u8], offset: usize) -> Result<u32> {
+    let raw = bytes
+        .get(offset..offset + 4)
+        .ok_or(IoStoreError::Truncated("TOC header field"))?;
+    Ok(u32::from_le_bytes(raw.try_into().unwrap()))
+}
+
+fn toc_u64(bytes: &[u8], offset: usize) -> Result<u64> {
+    let raw = bytes
+        .get(offset..offset + 8)
+        .ok_or(IoStoreError::Truncated("TOC header field"))?;
+    Ok(u64::from_le_bytes(raw.try_into().unwrap()))
+}
+
+fn checked_toc_end(start: usize, count: usize, item_size: usize, total: usize) -> Result<usize> {
+    let size = count
+        .checked_mul(item_size)
+        .ok_or(IoStoreError::Truncated("TOC section size overflow"))?;
+    let end = start
+        .checked_add(size)
+        .ok_or(IoStoreError::Truncated("TOC section offset overflow"))?;
+    if end > total {
+        return Err(IoStoreError::Truncated("TOC section past end of TOC"));
+    }
+    Ok(end)
+}
+
+fn plan_toc_append(
+    toc: &ParsedToc,
+    old_ucas_len: u64,
+    additions: Vec<NewTocChunk>,
+    replacements: Vec<ExistingTocReplacement>,
+    old_entries: &[Entry],
+) -> Result<TocAppendPlan> {
+    let new_entry_count = toc
+        .entry_count
+        .checked_add(additions.len() as u32)
+        .ok_or(IoStoreError::Truncated("TOC chunk count overflow"))?;
+    let mut chunk_ids = toc.chunk_ids.clone();
+    let mut offset_lengths = toc.offset_lengths.clone();
+    let mut metas = toc.metas.clone();
+    let mut blocks = toc.blocks.clone();
+    let mut overflow = toc.chunks_without_perfect_hash.clone();
+    let mut items = Vec::with_capacity(additions.len() + replacements.len());
+    let mut new_chunk_indices = Vec::with_capacity(additions.len());
+
+    for (offset, addition) in additions.into_iter().enumerate() {
+        let chunk_index = toc.entry_count + offset as u32;
+        if addition.bytes.len() as u64 > MAX_PACKED_OFFSET {
+            return Err(IoStoreError::Package("new chunk is too large for a TOC"));
+        }
+        chunk_ids.push(addition.id);
+        offset_lengths.push([0; 10]);
+        metas.push([0; TOC_META_SIZE]);
+        if chunk_index > i32::MAX as u32 {
+            return Err(IoStoreError::Package(
+                "new chunk index exceeds TOC overflow format",
+            ));
+        }
+        overflow.extend_from_slice(&(chunk_index as i32).to_le_bytes());
+        new_chunk_indices.push(chunk_index);
+        items.push(TocAppendItem {
+            chunk_index,
+            id: addition.id,
+            bytes: addition.bytes,
+            path: addition.path,
+        });
+    }
+
+    for replacement in replacements {
+        if replacement.chunk_index >= toc.entry_count {
+            return Err(IoStoreError::Truncated(
+                "replacement chunk index out of range",
+            ));
+        }
+        if replacement.bytes.len() as u64 > MAX_PACKED_OFFSET {
+            return Err(IoStoreError::Package(
+                "replacement chunk is too large for a TOC",
+            ));
+        }
+        if items
+            .iter()
+            .any(|item| item.chunk_index == replacement.chunk_index)
+        {
+            return Err(IoStoreError::Package("the same chunk was appended twice"));
+        }
+        items.push(TocAppendItem {
+            chunk_index: replacement.chunk_index,
+            id: toc.chunk_ids[replacement.chunk_index as usize],
+            bytes: replacement.bytes,
+            path: None,
+        });
+    }
+
+    let mut physical_offset = old_ucas_len;
+    let mut appended_blocks = Vec::new();
+    for item in &items {
+        let start_block = toc
+            .block_count
+            .checked_add(appended_blocks.len() as u32)
+            .ok_or(IoStoreError::Truncated("TOC block count overflow"))?;
+        let logical_offset = (start_block as u64)
+            .checked_mul(toc.block_size)
+            .ok_or(IoStoreError::Truncated("TOC logical offset overflow"))?;
+        if logical_offset > MAX_PACKED_OFFSET {
+            return Err(IoStoreError::Package("new chunk offset exceeds TOC format"));
+        }
+        let mut block_offset = 0usize;
+        while block_offset < item.bytes.len() {
+            let block_end = (block_offset + toc.block_size as usize).min(item.bytes.len());
+            let block_len = block_end - block_offset;
+            if block_len as u64 > MAX_PACKED_BLOCK_VALUE {
+                return Err(IoStoreError::Package("new block is too large for a TOC"));
+            }
+            let physical_end = physical_offset
+                .checked_add(block_len as u64)
+                .ok_or(IoStoreError::Truncated("UCAS length overflow"))?;
+            if physical_offset > MAX_PACKED_OFFSET || physical_end > MAX_PACKED_OFFSET {
+                return Err(IoStoreError::Package("UCAS offset exceeds TOC format"));
+            }
+            appended_blocks.push(encode_block(
+                physical_offset,
+                block_len as u32,
+                block_len as u32,
+                0,
+            ));
+            physical_offset = physical_end;
+            block_offset = block_end;
+        }
+        offset_lengths[item.chunk_index as usize] =
+            encode_offset_length(logical_offset, item.bytes.len() as u64);
+        let hash = blake3::hash(&item.bytes);
+        let mut meta = [0u8; TOC_META_SIZE];
+        meta[..20].copy_from_slice(&hash.as_bytes()[..20]);
+        metas[item.chunk_index as usize] = meta;
+    }
+    blocks.extend(appended_blocks);
+    let block_count = u32::try_from(blocks.len())
+        .map_err(|_| IoStoreError::Truncated("TOC block count overflow"))?;
+    if overflow.len() % 4 != 0 {
+        return Err(IoStoreError::Truncated(
+            "chunks-without-perfect-hash section is not aligned",
+        ));
+    }
+    let overflow_count = u32::try_from(overflow.len() / 4)
+        .map_err(|_| IoStoreError::Truncated("TOC overflow count overflow"))?;
+    let directory_index = if toc.directory_index_size != 0 {
+        let mut entries = old_entries.to_vec();
+        for item in &items {
+            if let Some(path) = &item.path {
+                entries.push(Entry {
+                    path: path.clone(),
+                    chunk_index: item.chunk_index,
+                });
+            }
+        }
+        serialize_directory_index(toc.directory_index.as_slice(), &entries)?
+    } else {
+        Vec::new()
+    };
+    let directory_size = u32::try_from(directory_index.len())
+        .map_err(|_| IoStoreError::Package("directory index is too large"))?;
+
+    if toc.partition_size != u64::MAX && physical_offset > toc.partition_size {
+        return Err(IoStoreError::Package(
+            "appended UCAS data exceeds the partition size",
+        ));
+    }
+
+    let mut header = toc.original[..TOC_HEADER_SIZE].to_vec();
+    header[24..28].copy_from_slice(&new_entry_count.to_le_bytes());
+    header[28..32].copy_from_slice(&block_count.to_le_bytes());
+    header[48..52].copy_from_slice(&directory_size.to_le_bytes());
+    header[96..100].copy_from_slice(&overflow_count.to_le_bytes());
+
+    let mut new_toc = Vec::with_capacity(
+        TOC_HEADER_SIZE
+            + chunk_ids.len() * 12
+            + offset_lengths.len() * 10
+            + toc.perfect_hash_seeds.len()
+            + overflow.len()
+            + blocks.len() * 12
+            + toc.compression_methods.len()
+            + directory_index.len()
+            + metas.len() * TOC_META_SIZE
+            + toc.trailing.len(),
+    );
+    new_toc.extend_from_slice(&header);
+    for id in &chunk_ids {
+        new_toc.extend_from_slice(id.bytes());
+    }
+    for offset_length in &offset_lengths {
+        new_toc.extend_from_slice(offset_length);
+    }
+    new_toc.extend_from_slice(&toc.perfect_hash_seeds);
+    new_toc.extend_from_slice(&overflow);
+    for block in &blocks {
+        new_toc.extend_from_slice(block);
+    }
+    new_toc.extend_from_slice(&toc.compression_methods);
+    new_toc.extend_from_slice(&directory_index);
+    for meta in &metas {
+        new_toc.extend_from_slice(meta);
+    }
+    new_toc.extend_from_slice(&toc.trailing);
+
+    Ok(TocAppendPlan {
+        items,
+        new_chunk_indices,
+        new_toc,
+    })
+}
+
+struct DirectoryNode {
+    name: Option<String>,
+    children: BTreeMap<String, usize>,
+    files: BTreeMap<String, u32>,
+}
+
+fn serialize_directory_index(original: &[u8], entries: &[Entry]) -> Result<Vec<u8>> {
+    if original.is_empty() {
+        return Err(IoStoreError::Truncated("missing source directory index"));
+    }
+    let mut cursor = 0usize;
+    let mount = read_directory_fstring(original, &mut cursor)?;
+    let mount_encoded = original[..cursor].to_vec();
+    let mount_prefix = clean_mount_for_writer(&mount);
+    let mut nodes = vec![DirectoryNode {
+        name: None,
+        children: BTreeMap::new(),
+        files: BTreeMap::new(),
+    }];
+
+    for entry in entries {
+        let relative = if mount_prefix.is_empty() {
+            entry.path.as_str()
+        } else {
+            entry
+                .path
+                .strip_prefix(&mount_prefix)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .ok_or(IoStoreError::Package(
+                    "destination path does not match directory mount point",
+                ))?
+        };
+        let parts: Vec<&str> = relative.split('/').collect();
+        if parts.is_empty() || parts.iter().any(|part| part.is_empty()) {
+            return Err(IoStoreError::Package(
+                "directory index contains an empty path",
+            ));
+        }
+        let mut node_index = 0usize;
+        for (part_index, part) in parts.iter().enumerate() {
+            let last = part_index + 1 == parts.len();
+            if last {
+                if nodes[node_index].children.contains_key(*part) {
+                    return Err(IoStoreError::Package(
+                        "directory index has a file/directory name collision",
+                    ));
+                }
+                if nodes[node_index]
+                    .files
+                    .insert((*part).to_string(), entry.chunk_index)
+                    .is_some()
+                {
+                    return Err(IoStoreError::Package(
+                        "directory index contains a duplicate path",
+                    ));
+                }
+            } else {
+                if nodes[node_index].files.contains_key(*part) {
+                    return Err(IoStoreError::Package(
+                        "directory index has a file/directory name collision",
+                    ));
+                }
+                let next = if let Some(next) = nodes[node_index].children.get(*part) {
+                    *next
+                } else {
+                    let next = nodes.len();
+                    nodes.push(DirectoryNode {
+                        name: Some((*part).to_string()),
+                        children: BTreeMap::new(),
+                        files: BTreeMap::new(),
+                    });
+                    nodes[node_index].children.insert((*part).to_string(), next);
+                    next
+                };
+                node_index = next;
+            }
+        }
+    }
+
+    let mut string_set = BTreeSet::new();
+    for node in &nodes {
+        if let Some(name) = &node.name {
+            string_set.insert(name.clone());
+        }
+        string_set.extend(node.files.keys().cloned());
+    }
+    let strings: Vec<String> = string_set.into_iter().collect();
+    let string_indices: BTreeMap<String, u32> = strings
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (value.clone(), index as u32))
+        .collect();
+
+    const INVALID: u32 = u32::MAX;
+    let mut directories = vec![[INVALID; 4]; nodes.len()];
+    for (index, node) in nodes.iter().enumerate() {
+        if let Some(name) = &node.name {
+            directories[index][0] = *string_indices
+                .get(name)
+                .ok_or(IoStoreError::Truncated("directory name string missing"))?;
+        }
+        let children: Vec<usize> = node.children.values().copied().collect();
+        if let Some(first) = children.first() {
+            directories[index][1] = *first as u32;
+            for pair in children.windows(2) {
+                directories[pair[0]][2] = pair[1] as u32;
+            }
+        }
+    }
+
+    let mut files: Vec<[u32; 3]> = Vec::with_capacity(entries.len());
+    for (directory_index, node) in nodes.iter().enumerate() {
+        let mut first_file = INVALID;
+        let mut previous_file = None;
+        for (name, chunk_index) in &node.files {
+            let current = u32::try_from(files.len())
+                .map_err(|_| IoStoreError::Package("directory file count exceeds TOC format"))?;
+            let name_index = *string_indices
+                .get(name)
+                .ok_or(IoStoreError::Truncated("file name string missing"))?;
+            files.push([name_index, INVALID, *chunk_index]);
+            if let Some(previous) = previous_file {
+                files[previous as usize][1] = current;
+            } else {
+                first_file = current;
+            }
+            previous_file = Some(current);
+        }
+        directories[directory_index][3] = first_file;
+    }
+
+    let directory_count = u32::try_from(directories.len())
+        .map_err(|_| IoStoreError::Package("directory count exceeds TOC format"))?;
+    let file_count = u32::try_from(files.len())
+        .map_err(|_| IoStoreError::Package("directory file count exceeds TOC format"))?;
+    let string_count = u32::try_from(strings.len())
+        .map_err(|_| IoStoreError::Package("directory string count exceeds TOC format"))?;
+    let mut out = Vec::new();
+    out.extend_from_slice(&mount_encoded);
+    out.extend_from_slice(&directory_count.to_le_bytes());
+    for directory in directories {
+        for field in directory {
+            out.extend_from_slice(&field.to_le_bytes());
+        }
+    }
+    out.extend_from_slice(&file_count.to_le_bytes());
+    for file in files {
+        for field in file {
+            out.extend_from_slice(&field.to_le_bytes());
+        }
+    }
+    out.extend_from_slice(&string_count.to_le_bytes());
+    for string in strings {
+        out.extend_from_slice(&encode_directory_fstring(&string)?);
+    }
+    Ok(out)
+}
+
+fn read_directory_fstring(bytes: &[u8], cursor: &mut usize) -> Result<String> {
+    let length_bytes = bytes
+        .get(*cursor..*cursor + 4)
+        .ok_or(IoStoreError::Truncated("directory FString length"))?;
+    let length = i32::from_le_bytes(length_bytes.try_into().unwrap());
+    *cursor += 4;
+    if length == 0 {
+        return Ok(String::new());
+    }
+    if length > 0 {
+        let count = length as usize;
+        let raw = bytes
+            .get(*cursor..*cursor + count)
+            .ok_or(IoStoreError::Truncated("directory FString bytes"))?;
+        *cursor += count;
+        return Ok(String::from_utf8_lossy(
+            raw.split(|byte| *byte == 0).next().unwrap_or_default(),
+        )
+        .into_owned());
+    }
+    let count = length
+        .checked_neg()
+        .ok_or(IoStoreError::Truncated("directory FString length overflow"))?
+        as usize;
+    let byte_count = count
+        .checked_mul(2)
+        .ok_or(IoStoreError::Truncated("directory FString size overflow"))?;
+    let raw = bytes
+        .get(*cursor..*cursor + byte_count)
+        .ok_or(IoStoreError::Truncated("directory UTF-16 FString bytes"))?;
+    *cursor += byte_count;
+    let units: Vec<u16> = raw
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    Ok(String::from_utf16_lossy(&units)
+        .trim_end_matches('\0')
+        .to_string())
+}
+
+fn encode_directory_fstring(value: &str) -> Result<Vec<u8>> {
+    if value.is_ascii() {
+        let bytes = value.as_bytes();
+        let length = i32::try_from(bytes.len() + 1)
+            .map_err(|_| IoStoreError::Package("directory string is too long"))?;
+        let mut out = Vec::with_capacity(4 + bytes.len() + 1);
+        out.extend_from_slice(&length.to_le_bytes());
+        out.extend_from_slice(bytes);
+        out.push(0);
+        return Ok(out);
+    }
+    let units: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+    let length = i32::try_from(units.len())
+        .map_err(|_| IoStoreError::Package("directory string is too long"))?;
+    let mut out = Vec::with_capacity(4 + units.len() * 2);
+    out.extend_from_slice(&(-length).to_le_bytes());
+    for unit in units {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+    Ok(out)
+}
+
+fn clean_mount_for_writer(mount: &str) -> String {
+    let mut value = mount;
+    loop {
+        if let Some(rest) = value.strip_prefix("../") {
+            value = rest;
+        } else if let Some(rest) = value.strip_prefix('/') {
+            value = rest;
+        } else {
+            break;
+        }
+    }
+    value.trim_end_matches('/').to_string()
+}
+
+fn duplicate_tag_in_place_impl(
+    archive: &IoStoreArchive,
+    utoc_path: &Path,
+    request: &InPlaceTagDuplicate<'_>,
+    failure: Option<DuplicateFailurePoint>,
+) -> Result<()> {
+    let object_name = validate_destination_path_forms(request)?;
+    let original_toc_bytes = std::fs::read(utoc_path)?;
+    if !archive.matches_utoc_path(utoc_path) || archive.toc_bytes() != original_toc_bytes {
+        return Err(IoStoreError::Package(
+            "archive handle is stale or targets another container",
+        ));
+    }
+    let toc = parse_toc(&original_toc_bytes)?;
+    if archive.chunk_count() != toc.entry_count {
+        return Err(IoStoreError::Package("archive handle chunk count is stale"));
+    }
+    for (index, expected_id) in toc.chunk_ids.iter().enumerate() {
+        if archive.chunk_id(index as u32)? != *expected_id {
+            return Err(IoStoreError::Package("archive handle chunk ids are stale"));
+        }
+    }
+    let mut raw_ids = BTreeSet::new();
+    for id in &toc.chunk_ids {
+        if !raw_ids.insert(id.0) {
+            return Err(IoStoreError::Package(
+                "target TOC contains a duplicate chunk id",
+            ));
+        }
+    }
+
+    let cloned = clone_tag_package(request, &object_name)?;
+    if toc
+        .chunk_ids
+        .iter()
+        .any(|id| *id == cloned.uasset_id || *id == cloned.ubulk_id)
+    {
+        return Err(IoStoreError::Package("destination chunk id already exists"));
+    }
+    if archive.entries().iter().any(|entry| {
+        entry.path == request.destination_uasset_path
+            || entry.path == request.destination_ubulk_path
+    }) {
+        return Err(IoStoreError::Package("destination path already exists"));
+    }
+
+    let header_indices: Vec<u32> = toc
+        .chunk_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(index, id)| {
+            (id.chunk_type() == CHUNK_TYPE_CONTAINER_HEADER).then_some(index as u32)
+        })
+        .collect();
+    if header_indices.len() > 1 {
+        return Err(IoStoreError::Package(
+            "target has multiple ContainerHeader chunks",
+        ));
+    }
+    let new_header_id = make_chunk_id(toc.container_id, 0, CHUNK_TYPE_CONTAINER_HEADER);
+    let (header_id, header_bytes, header_replacement) = if let Some(&header_index) =
+        header_indices.first()
+    {
+        let header_id = toc.chunk_ids[header_index as usize];
+        if header_id.package_id() != toc.container_id.to_le_bytes() {
+            return Err(IoStoreError::Package(
+                "ContainerHeader id does not match container id",
+            ));
+        }
+        let old_header_bytes = archive.read_chunk(header_index)?;
+        let mut header = FIoContainerHeader::deserialize(&mut Cursor::new(old_header_bytes), None)
+            .map_err(|_| IoStoreError::Package("container package-store header did not parse"))?;
+        if header.container_id.0 != toc.container_id {
+            return Err(IoStoreError::Package(
+                "ContainerHeader payload id does not match TOC",
+            ));
+        }
+        crate::iostore::compat::check_writable_container_header_version(header.version)
+            .map_err(|_| IoStoreError::Package("unsupported container package-store header"))?;
+        if header.get_store_entry(cloned.package_id).is_some() {
+            return Err(IoStoreError::Package(
+                "destination package is already in the package store",
+            ));
+        }
+        header.add_package(cloned.package_id, cloned.store.clone());
+        let bytes = serialize_aligned_container_header(&header)?;
+        (
+            header_id,
+            bytes,
+            Some(ExistingTocReplacement {
+                chunk_index: header_index,
+                bytes: Vec::new(),
+            }),
+        )
+    } else {
+        if toc.chunk_ids.iter().any(|id| *id == new_header_id) {
+            return Err(IoStoreError::Package(
+                "ContainerHeader chunk id already exists",
+            ));
+        }
+        crate::iostore::compat::check_writable_container_header_version(
+            crate::iostore::compat::CE_CONTAINER_HEADER_VERSION,
+        )
+        .map_err(|_| IoStoreError::Package("unsupported container package-store header"))?;
+        let mut header = FIoContainerHeader::new(
+            crate::iostore::compat::CE_CONTAINER_HEADER_VERSION,
+            FIoContainerId(toc.container_id),
+        );
+        header.add_package(cloned.package_id, cloned.store.clone());
+        let bytes = serialize_aligned_container_header(&header)?;
+        (new_header_id, bytes, None)
+    };
+
+    let mut additions = vec![
+        NewTocChunk {
+            id: cloned.uasset_id,
+            bytes: cloned.package.clone(),
+            path: Some(request.destination_uasset_path.to_string()),
+        },
+        NewTocChunk {
+            id: cloned.ubulk_id,
+            bytes: request.tag_bytes.to_vec(),
+            path: Some(request.destination_ubulk_path.to_string()),
+        },
+    ];
+    let mut replacements = Vec::new();
+    if let Some(mut replacement) = header_replacement {
+        replacement.bytes = header_bytes.clone();
+        replacements.push(replacement);
+    } else {
+        additions.push(NewTocChunk {
+            id: header_id,
+            bytes: header_bytes.clone(),
+            path: None,
+        });
+    }
+
+    if additions
+        .iter()
+        .any(|addition| raw_ids.contains(&addition.id.0))
+    {
+        return Err(IoStoreError::Package("destination chunk id already exists"));
+    }
+    let ucas_path = utoc_path.with_extension("ucas");
+    let old_ucas_len = std::fs::metadata(&ucas_path)?.len();
+    let plan = plan_toc_append(
+        &toc,
+        old_ucas_len,
+        additions,
+        replacements,
+        archive.entries(),
+    )?;
+
+    append_ucas_items(&ucas_path, &plan.items)?;
+    if failure == Some(DuplicateFailurePoint::AfterAppend) {
+        return restore_original_toc(
+            utoc_path,
+            &original_toc_bytes,
+            IoStoreError::Package("injected post-append failure"),
+        );
+    }
+    if let Err(error) = atomic_replace_file(utoc_path, &plan.new_toc) {
+        return restore_original_toc(utoc_path, &original_toc_bytes, error);
+    }
+    if failure == Some(DuplicateFailurePoint::AfterTocWrite) {
+        return restore_original_toc(
+            utoc_path,
+            &original_toc_bytes,
+            IoStoreError::Package("injected post-TOC-write failure"),
+        );
+    }
+
+    if failure == Some(DuplicateFailurePoint::BeforeValidation) {
+        return restore_original_toc(
+            utoc_path,
+            &original_toc_bytes,
+            IoStoreError::Package("injected validation failure"),
+        );
+    }
+    let validation = validate_duplicate_result(
+        utoc_path,
+        &toc,
+        archive.entries(),
+        request,
+        &cloned,
+        header_id,
+        &plan,
+    );
+    if let Err(error) = validation {
+        return restore_original_toc(utoc_path, &original_toc_bytes, error);
+    }
+    Ok(())
+}
+
+fn serialize_aligned_container_header(header: &FIoContainerHeader) -> Result<Vec<u8>> {
+    let mut cursor = Cursor::new(Vec::new());
+    header
+        .serialize(&mut cursor)
+        .map_err(|_| IoStoreError::Package("container package-store header did not serialize"))?;
+    let mut bytes = cursor.into_inner();
+    let aligned = (bytes.len() + 15) & !15;
+    bytes.resize(aligned, 0);
+    Ok(bytes)
+}
+
+fn append_ucas_items(ucas_path: &Path, items: &[TocAppendItem]) -> Result<()> {
+    let mut ucas = std::fs::OpenOptions::new().append(true).open(ucas_path)?;
+    for item in items {
+        ucas.write_all(&item.bytes)?;
+    }
+    ucas.flush()?;
+    ucas.sync_all()?;
+    Ok(())
+}
+
+fn restore_original_toc(utoc_path: &Path, original: &[u8], error: IoStoreError) -> Result<()> {
+    match atomic_replace_file(utoc_path, original) {
+        Ok(()) => Err(error),
+        Err(rollback_error) => Err(rollback_error),
+    }
+}
+
+fn atomic_replace_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or(IoStoreError::Truncated("path has no filename"))?
+        .to_string_lossy();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp = parent.join(format!(".{file_name}.codex-{nonce}-{}", std::process::id()));
+    let write_result = (|| -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    write_result
+}
+
+fn validate_duplicate_result(
+    utoc_path: &Path,
+    original_toc: &ParsedToc,
+    old_entries: &[Entry],
+    request: &InPlaceTagDuplicate<'_>,
+    cloned: &ClonedTagPackage,
+    header_id: FIoChunkId,
+    plan: &TocAppendPlan,
+) -> Result<()> {
+    let saved_toc_bytes = std::fs::read(utoc_path)?;
+    let saved_toc = parse_toc(&saved_toc_bytes)?;
+    if saved_toc.perfect_hash_seeds != original_toc.perfect_hash_seeds {
+        return Err(IoStoreError::Package("perfect-hash seeds changed"));
+    }
+    if saved_toc
+        .chunks_without_perfect_hash
+        .get(..original_toc.chunks_without_perfect_hash.len())
+        != Some(original_toc.chunks_without_perfect_hash.as_slice())
+    {
+        return Err(IoStoreError::Package(
+            "existing perfect-hash overflow changed",
+        ));
+    }
+    for index in &plan.new_chunk_indices {
+        if !toc_overflow_contains(&saved_toc.chunks_without_perfect_hash, *index) {
+            return Err(IoStoreError::Package(
+                "new chunk is absent from TOC overflow lookup",
+            ));
+        }
+    }
+
+    let mut reopened = IoStoreArchive::open(utoc_path)?;
+    if reopened.chunk_count() != original_toc.entry_count + plan.new_chunk_indices.len() as u32 {
+        return Err(IoStoreError::Package("reopened chunk count is incorrect"));
+    }
+    let indexed = original_toc.directory_index_size != 0;
+    if !indexed {
+        let prefix = infer_recovery_prefix(old_entries, request);
+        reopened.recover_entries(&[], prefix.as_deref());
+    }
+
+    for (index, expected_id) in original_toc.chunk_ids.iter().enumerate() {
+        let actual_id = reopened.chunk_id(index as u32)?;
+        if actual_id != *expected_id {
+            return Err(IoStoreError::Package("an existing chunk id changed"));
+        }
+        // This deliberately validates every old chunk through the reopened
+        // reader. Existing compressed blocks are copied verbatim, so this is
+        // the final check that the rebuilt section layout still serves them.
+        reopened.read_chunk(index as u32)?;
+    }
+    for item in &plan.items {
+        let index = reopened
+            .find_chunk(&item.id)
+            .ok_or(IoStoreError::Package("saved chunk id is absent"))?;
+        if reopened.read_chunk(index)? != item.bytes {
+            return Err(IoStoreError::Package("saved chunk bytes failed validation"));
+        }
+    }
+
+    for old_entry in old_entries {
+        let id = original_toc
+            .chunk_ids
+            .get(old_entry.chunk_index as usize)
+            .ok_or(IoStoreError::Package(
+                "old directory entry has a bad chunk index",
+            ))?;
+        if reopened.chunk_id_for(&old_entry.path)? != *id {
+            return Err(IoStoreError::Package("an existing directory entry changed"));
+        }
+    }
+    if reopened.chunk_id_for(request.destination_uasset_path)? != cloned.uasset_id
+        || reopened.chunk_id_for(request.destination_ubulk_path)? != cloned.ubulk_id
+    {
+        return Err(IoStoreError::Package(
+            "destination directory entries are incorrect",
+        ));
+    }
+    if indexed != reopened.has_directory_index() {
+        return Err(IoStoreError::Package("directory-index mode changed"));
+    }
+
+    let package_index = reopened
+        .find_chunk(&cloned.uasset_id)
+        .ok_or(IoStoreError::Package("saved cloned package is absent"))?;
+    let package_bytes = reopened.read_chunk(package_index)?;
+    validate_cloned_package(cloned, request, &package_bytes)?;
+
+    let saved_header_index = reopened
+        .find_chunk(&header_id)
+        .ok_or(IoStoreError::Package("saved ContainerHeader is absent"))?;
+    let saved_header = FIoContainerHeader::deserialize(
+        &mut Cursor::new(reopened.read_chunk(saved_header_index)?),
+        None,
+    )
+    .map_err(|_| IoStoreError::Package("saved ContainerHeader did not parse"))?;
+    if saved_header.container_id.0 != original_toc.container_id
+        || saved_header.get_store_entry(cloned.package_id) != Some(cloned.store.clone())
+    {
+        return Err(IoStoreError::Package(
+            "saved package-store entry is incorrect",
+        ));
+    }
+    Ok(())
+}
+
+fn toc_overflow_contains(bytes: &[u8], chunk_index: u32) -> bool {
+    bytes
+        .chunks_exact(4)
+        .any(|raw| i32::from_le_bytes(raw.try_into().unwrap()) == chunk_index as i32)
+}
+
+fn infer_recovery_prefix(
+    old_entries: &[Entry],
+    request: &InPlaceTagDuplicate<'_>,
+) -> Option<String> {
+    old_entries
+        .iter()
+        .find_map(|entry| {
+            entry
+                .path
+                .find("/Content/")
+                .map(|index| entry.path[..index + "/Content/".len()].to_string())
+                .or_else(|| {
+                    entry
+                        .path
+                        .starts_with("Content/")
+                        .then(|| "Content/".to_string())
+                })
+        })
+        .or_else(|| infer_prefix_from_destination(request))
+}
+
+fn infer_prefix_from_destination(request: &InPlaceTagDuplicate<'_>) -> Option<String> {
+    let package_relative = request.destination_package_path.strip_prefix("/Game/")?;
+    let asset_stem = request.destination_uasset_path.strip_suffix(".uasset")?;
+    if asset_stem == package_relative {
+        return Some(String::new());
+    }
+    let suffix = format!("/{package_relative}");
+    asset_stem
+        .strip_suffix(&suffix)
+        .map(|prefix| format!("{prefix}/"))
+}
+
+fn validate_cloned_package(
+    cloned: &ClonedTagPackage,
+    request: &InPlaceTagDuplicate<'_>,
+    package_bytes: &[u8],
+) -> Result<()> {
+    use crate::iostore::compat::{CE_CONTAINER_HEADER_VERSION, CE_TOC_VERSION};
+
+    let mut cursor = Cursor::new(package_bytes);
+    let parsed = FZenPackageHeader::deserialize(
+        &mut cursor,
+        None,
+        CE_TOC_VERSION,
+        CE_CONTAINER_HEADER_VERSION,
+        None,
+    )
+    .map_err(|_| IoStoreError::Package("saved cloned .uasset did not parse"))?;
+    if parsed.package_name() != request.destination_package_path {
+        return Err(IoStoreError::Package(
+            "cloned package identity is incorrect",
+        ));
+    }
+    let export = parsed
+        .export_map
+        .first()
+        .ok_or(IoStoreError::Package("saved cloned .uasset has no export"))?;
+    if parsed.name_map.get(export.object_name) != cloned.object_name
+        || export.public_export_hash != container_id_from_name(&cloned.object_name)
+    {
+        return Err(IoStoreError::Package("cloned export identity is incorrect"));
+    }
+    if parsed.bulk_data.first().map(|entry| entry.serial_size)
+        != Some(request.tag_bytes.len() as i64)
+    {
+        return Err(IoStoreError::Package("cloned bulk SerialSize is incorrect"));
+    }
+
+    let source = &cloned.source_header;
+    if parsed.import_map != source.import_map
+        || parsed.imported_packages != source.imported_packages
+        || parsed.imported_public_export_hashes != source.imported_public_export_hashes
+        || parsed.imported_package_names != source.imported_package_names
+        || parsed.shader_map_hashes != source.shader_map_hashes
+        || parsed.versioning_info != source.versioning_info
+        || parsed.export_bundle_headers != source.export_bundle_headers
+        || parsed.export_bundle_entries != source.export_bundle_entries
+        || parsed.dependency_bundle_headers != source.dependency_bundle_headers
+        || parsed.dependency_bundle_entries != source.dependency_bundle_entries
+        || parsed.internal_dependency_arcs != source.internal_dependency_arcs
+        || parsed.external_package_dependencies != source.external_package_dependencies
+        || parsed.cell_import_map != source.cell_import_map
+        || parsed.cell_export_map != source.cell_export_map
+        || parsed.is_unversioned != source.is_unversioned
+        || parsed.container_header_version != source.container_header_version
+        || parsed.summary.has_versioning_info != source.summary.has_versioning_info
+        || parsed.summary.package_flags != source.summary.package_flags
+        || parsed.summary.cooked_header_size != source.summary.cooked_header_size
+        || parsed.summary.source_name != source.summary.source_name
+    {
+        return Err(IoStoreError::Package("cloned package metadata changed"));
+    }
+
+    let mut expected_exports = source.export_map.clone();
+    expected_exports[0].object_name = export.object_name;
+    expected_exports[0].public_export_hash = export.public_export_hash;
+    if parsed.export_map != expected_exports {
+        return Err(IoStoreError::Package("cloned export metadata changed"));
+    }
+    let mut expected_bulk = source.bulk_data.clone();
+    expected_bulk[0].serial_size = request.tag_bytes.len() as i64;
+    if parsed.bulk_data != expected_bulk {
+        return Err(IoStoreError::Package("cloned bulk metadata changed"));
+    }
+
+    let source_names = source.name_map.copy_raw_names();
+    let parsed_names = parsed.name_map.copy_raw_names();
+    if parsed_names.get(..source_names.len()) != Some(source_names.as_slice()) {
+        return Err(IoStoreError::Package("cloned name map changed"));
+    }
+    let header_size = parsed.summary.header_size as usize;
+    if header_size > package_bytes.len() || &package_bytes[header_size..] != cloned.export_payload {
+        return Err(IoStoreError::Package("cloned export payload changed"));
+    }
+    let source_payloads = crate::iostore::package::builder::read_payloads(
+        source,
+        request.source_uasset,
+    )
+    .map_err(|_| IoStoreError::Package("source export payloads did not parse"))?;
+    let parsed_payloads = crate::iostore::package::builder::read_payloads(&parsed, package_bytes)
+        .map_err(|_| IoStoreError::Package("cloned export payloads did not parse"))?;
+    if parsed_payloads != source_payloads {
+        return Err(IoStoreError::Package("cloned export payloads changed"));
+    }
     Ok(())
 }
 
@@ -2132,5 +3472,648 @@ mod tests {
 
         let _ = std::fs::remove_file(&utoc);
         let _ = std::fs::remove_file(utoc.with_extension("ucas"));
+    }
+
+    fn empty_directory_index_for_test() -> Vec<u8> {
+        let mut bytes = encode_directory_fstring("../../../").expect("mount FString");
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // root directory
+        bytes.extend_from_slice(&[u8::MAX; 16]); // no name/children/files
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // files
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // strings
+        bytes
+    }
+
+    fn add_test_perfect_hash_seed(utoc: &std::path::Path, seed: u32) {
+        let toc = parse_toc(&std::fs::read(utoc).expect("read test TOC")).expect("parse test TOC");
+        assert!(toc.perfect_hash_seeds.is_empty(), "fixture already has seeds");
+        let mut header = toc.original[..TOC_HEADER_SIZE].to_vec();
+        header[84..88].copy_from_slice(&1u32.to_le_bytes());
+        let mut bytes = header;
+        for id in &toc.chunk_ids {
+            bytes.extend_from_slice(id.bytes());
+        }
+        for offset_length in &toc.offset_lengths {
+            bytes.extend_from_slice(offset_length);
+        }
+        bytes.extend_from_slice(&seed.to_le_bytes());
+        bytes.extend_from_slice(&toc.chunks_without_perfect_hash);
+        for block in &toc.blocks {
+            bytes.extend_from_slice(block);
+        }
+        bytes.extend_from_slice(&toc.compression_methods);
+        bytes.extend_from_slice(&toc.directory_index);
+        for meta in &toc.metas {
+            bytes.extend_from_slice(meta);
+        }
+        bytes.extend_from_slice(&toc.trailing);
+        std::fs::write(utoc, bytes).expect("add test perfect-hash seed");
+    }
+
+    fn set_test_partition_size(utoc: &std::path::Path, partition_size: u64) {
+        let mut bytes = std::fs::read(utoc).expect("read test TOC");
+        bytes[88..96].copy_from_slice(&partition_size.to_le_bytes());
+        std::fs::write(utoc, bytes).expect("set test partition size");
+    }
+
+    fn rewrite_test_directory_index(utoc: &std::path::Path, entries: &[Entry]) {
+        let toc = parse_toc(&std::fs::read(utoc).expect("read test TOC")).expect("parse test TOC");
+        let directory = serialize_directory_index(&empty_directory_index_for_test(), entries)
+            .expect("write directory");
+        let mut header = toc.original[..TOC_HEADER_SIZE].to_vec();
+        header[48..52].copy_from_slice(&(directory.len() as u32).to_le_bytes());
+        let mut bytes = header;
+        for id in &toc.chunk_ids {
+            bytes.extend_from_slice(id.bytes());
+        }
+        for offset_length in &toc.offset_lengths {
+            bytes.extend_from_slice(offset_length);
+        }
+        bytes.extend_from_slice(&toc.perfect_hash_seeds);
+        bytes.extend_from_slice(&toc.chunks_without_perfect_hash);
+        for block in &toc.blocks {
+            bytes.extend_from_slice(block);
+        }
+        bytes.extend_from_slice(&toc.compression_methods);
+        bytes.extend_from_slice(&directory);
+        for meta in &toc.metas {
+            bytes.extend_from_slice(meta);
+        }
+        bytes.extend_from_slice(&toc.trailing);
+        std::fs::write(utoc, bytes).expect("rewrite test directory");
+    }
+
+    fn duplicate_fixture(
+        name: &str,
+        with_header: bool,
+        indexed: bool,
+    ) -> (
+        std::path::PathBuf,
+        Vec<u8>,
+        FZenPackageHeader,
+        String,
+        String,
+        Vec<u8>,
+    ) {
+        use crate::iostore::compat::{CE_CONTAINER_HEADER_VERSION, CE_TOC_VERSION};
+        use crate::iostore::package::builder::{read_payloads, write_package};
+
+        let source_uasset =
+            include_bytes!("../../../tests/fixtures/ce/leading-empty.uasset").to_vec();
+        let source_header = FZenPackageHeader::deserialize(
+            &mut Cursor::new(&source_uasset),
+            None,
+            CE_TOC_VERSION,
+            CE_CONTAINER_HEADER_VERSION,
+            None,
+        )
+        .expect("parse source fixture");
+        let payloads = read_payloads(&source_header, &source_uasset).expect("read source payloads");
+        let (_, source_store) =
+            write_package(&source_header, &payloads, CE_CONTAINER_HEADER_VERSION)
+                .expect("source store");
+        let source_id = FPackageId::from_name(&source_header.package_name());
+        let old_bulk = vec![0x31; 73];
+        let utoc = std::env::temp_dir().join(format!(
+            "blamtags_duplicate_{name}_{}_{}.utoc",
+            std::process::id(),
+            source_id.0
+        ));
+        let mut writer = OverrideContainerWriter::new("../../../");
+        if with_header {
+            writer.add_package(
+                make_chunk_id(source_id.0, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA),
+                source_uasset.clone(),
+                source_id,
+                source_store,
+            );
+        } else {
+            writer.add_chunk(
+                make_chunk_id(source_id.0, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA),
+                source_uasset.clone(),
+            );
+        }
+        writer.add_chunk(
+            make_chunk_id(source_id.0, 0, CHUNK_TYPE_BULK_DATA),
+            old_bulk.clone(),
+        );
+        writer.write(&utoc).expect("write duplicate fixture");
+
+        let relative = source_header
+            .package_name()
+            .strip_prefix("/Game/")
+            .expect("fixture package is under /Game/")
+            .to_string();
+        let old_uasset_path = format!("Meteorite/Content/{relative}.uasset");
+        let old_ubulk_path = format!("Meteorite/Content/{relative}.ubulk");
+        if indexed {
+            add_test_perfect_hash_seed(&utoc, 0x1234_5678);
+            rewrite_test_directory_index(
+                &utoc,
+                &[
+                    Entry {
+                        path: old_uasset_path.clone(),
+                        chunk_index: 0,
+                    },
+                    Entry {
+                        path: old_ubulk_path.clone(),
+                        chunk_index: 1,
+                    },
+                ],
+            );
+        }
+        (
+            utoc,
+            source_uasset,
+            source_header,
+            old_uasset_path,
+            old_ubulk_path,
+            old_bulk,
+        )
+    }
+
+    fn remove_duplicate_fixture(utoc: &std::path::Path) {
+        for extension in ["utoc", "ucas", "pak"] {
+            let _ = std::fs::remove_file(utoc.with_extension(extension));
+        }
+    }
+
+    #[test]
+    fn duplicate_tag_indexed_existing_header_preserves_package_and_directory() {
+        let (utoc, source_uasset, source_header, old_uasset_path, old_ubulk_path, old_bulk) =
+            duplicate_fixture("indexed", true, true);
+        let destination_package = "/Game/Tags/Fixture/clone-leading-empty";
+        let destination_uasset = "Meteorite/Content/Tags/Fixture/clone-leading-empty.uasset";
+        let destination_ubulk = "Meteorite/Content/Tags/Fixture/clone-leading-empty.ubulk";
+        let request = InPlaceTagDuplicate {
+            source_uasset: &source_uasset,
+            tag_bytes: &[0x42; 119],
+            destination_package_path: destination_package,
+            destination_uasset_path: destination_uasset,
+            destination_ubulk_path: destination_ubulk,
+        };
+        let original_toc = std::fs::read(&utoc).expect("original TOC");
+        let original = parse_toc(&original_toc).expect("parse original TOC");
+        let original_pak = std::fs::read(utoc.with_extension("pak")).expect("original pak");
+        let archive = IoStoreArchive::open(&utoc).expect("open indexed fixture");
+        assert!(archive.has_directory_index());
+        duplicate_tag_in_place_with(&archive, &utoc, &request).expect("duplicate indexed tag");
+        assert_eq!(
+            std::fs::read(utoc.with_extension("pak")).expect("saved pak"),
+            original_pak,
+            "same-stem .pak is untouched"
+        );
+
+        let reopened = IoStoreArchive::open(&utoc).expect("reopen indexed fixture");
+        assert!(reopened.has_directory_index());
+        assert_eq!(reopened.read(&old_uasset_path).unwrap(), source_uasset);
+        assert_eq!(reopened.read(&old_ubulk_path).unwrap(), old_bulk);
+        assert_eq!(
+            reopened.read(destination_ubulk).unwrap(),
+            vec![0x42; 119],
+            "new body is addressable by directory path"
+        );
+        let new_package = reopened.read(destination_uasset).unwrap();
+        let new_header = FZenPackageHeader::deserialize(
+            &mut Cursor::new(&new_package),
+            None,
+            crate::iostore::compat::CE_TOC_VERSION,
+            crate::iostore::compat::CE_CONTAINER_HEADER_VERSION,
+            None,
+        )
+        .expect("parse cloned package");
+        assert_eq!(new_header.package_name(), destination_package);
+        assert_eq!(
+            new_header
+                .name_map
+                .get(new_header.export_map[0].object_name),
+            "clone-leading-empty"
+        );
+        assert_eq!(
+            new_header.export_map[0].public_export_hash,
+            container_id_from_name("clone-leading-empty")
+        );
+        assert_eq!(new_header.bulk_data[0].serial_size, 119);
+        assert_eq!(new_header.import_map, source_header.import_map);
+        assert_eq!(
+            new_header.imported_public_export_hashes,
+            source_header.imported_public_export_hashes
+        );
+        assert_eq!(new_header.imported_packages, source_header.imported_packages);
+        assert_eq!(new_header.summary.package_flags, source_header.summary.package_flags);
+        assert_eq!(new_header.summary.source_name, source_header.summary.source_name);
+        let mut expected_exports = source_header.export_map.clone();
+        expected_exports[0].object_name = new_header.export_map[0].object_name;
+        expected_exports[0].public_export_hash = new_header.export_map[0].public_export_hash;
+        assert_eq!(new_header.export_map, expected_exports);
+        let mut expected_bulk = source_header.bulk_data.clone();
+        expected_bulk[0].serial_size = 119;
+        assert_eq!(new_header.bulk_data, expected_bulk);
+        assert_eq!(
+            &new_package[new_header.summary.header_size as usize..],
+            &source_uasset[source_header.summary.header_size as usize..]
+        );
+        let source_payloads = crate::iostore::package::builder::read_payloads(
+            &source_header,
+            &source_uasset,
+        )
+        .expect("read source export payloads");
+        let cloned_payloads = crate::iostore::package::builder::read_payloads(
+            &new_header,
+            &new_package,
+        )
+        .expect("read cloned export payloads");
+        assert_eq!(cloned_payloads, source_payloads);
+
+        let saved = parse_toc(&std::fs::read(&utoc).expect("saved TOC")).expect("parse saved TOC");
+        assert_eq!(saved.perfect_hash_seeds, original.perfect_hash_seeds);
+        assert!(!saved.perfect_hash_seeds.is_empty());
+        assert_eq!(
+            &saved.blocks[..original.blocks.len()],
+            &original.blocks,
+            "existing compression blocks are preserved"
+        );
+        assert_eq!(
+            &saved.metas[..original.metas.len() - 1],
+            &original.metas[..original.metas.len() - 1],
+            "unchanged chunk metadata is preserved"
+        );
+        assert_eq!(
+            &saved.offset_lengths[..original.offset_lengths.len() - 1],
+            &original.offset_lengths[..original.offset_lengths.len() - 1],
+            "unchanged chunk offsets are preserved"
+        );
+        assert_eq!(saved.compression_methods, original.compression_methods);
+        assert_eq!(
+            &saved.chunk_ids[..original.entry_count as usize],
+            &original.chunk_ids
+        );
+        assert!(toc_overflow_contains(&saved.chunks_without_perfect_hash, 3));
+        assert!(toc_overflow_contains(&saved.chunks_without_perfect_hash, 4));
+        let new_package_id = FPackageId::from_name(destination_package);
+        assert_eq!(
+            reopened
+                .find_chunk(&make_chunk_id(
+                    new_package_id.0,
+                    0,
+                    CHUNK_TYPE_EXPORT_BUNDLE_DATA,
+                ))
+                .map(|index| reopened.read_chunk(index).unwrap()),
+            Some(new_package.clone())
+        );
+        assert_eq!(
+            reopened.find_chunk(&make_chunk_id(new_package_id.0, 0, CHUNK_TYPE_BULK_DATA)),
+            Some(4)
+        );
+        let header_index = reopened
+            .find_chunk(&make_chunk_id(
+                saved.container_id,
+                0,
+                CHUNK_TYPE_CONTAINER_HEADER,
+            ))
+            .expect("updated ContainerHeader");
+        let container_header = FIoContainerHeader::deserialize(
+            &mut Cursor::new(reopened.read_chunk(header_index).unwrap()),
+            None,
+        )
+        .expect("parse updated ContainerHeader");
+        assert!(container_header.get_store_entry(new_package_id).is_some());
+        remove_duplicate_fixture(&utoc);
+    }
+
+    #[test]
+    fn duplicate_tag_indexless_headerless_overlay_recovers_new_paths() {
+        let (utoc, source_uasset, _source_header, old_uasset_path, old_ubulk_path, old_bulk) =
+            duplicate_fixture("indexless", false, false);
+        let destination_package = "/Game/Tags/Fixture/clone-indexless";
+        let destination_uasset = "Meteorite/Content/Tags/Fixture/clone-indexless.uasset";
+        let destination_ubulk = "Meteorite/Content/Tags/Fixture/clone-indexless.ubulk";
+        let archive = IoStoreArchive::open(&utoc).expect("open indexless fixture");
+        assert!(!archive.has_directory_index());
+        assert!(archive.entries().is_empty());
+        let request = InPlaceTagDuplicate {
+            source_uasset: &source_uasset,
+            tag_bytes: &[0x53; 91],
+            destination_package_path: destination_package,
+            destination_uasset_path: destination_uasset,
+            destination_ubulk_path: destination_ubulk,
+        };
+        duplicate_tag_in_place_with(&archive, &utoc, &request).expect("duplicate indexless tag");
+
+        let mut reopened = IoStoreArchive::open(&utoc).expect("reopen indexless fixture");
+        assert!(!reopened.has_directory_index());
+        assert_eq!(reopened.recover_entries(&[], Some("Meteorite/Content/")), 4);
+        assert_eq!(reopened.read(&old_uasset_path).unwrap(), source_uasset);
+        assert_eq!(reopened.read(&old_ubulk_path).unwrap(), old_bulk);
+        assert_eq!(reopened.read(destination_ubulk).unwrap(), vec![0x53; 91]);
+        let saved = parse_toc(&std::fs::read(&utoc).expect("saved TOC")).expect("parse saved TOC");
+        assert_eq!(saved.entry_count, 5);
+        assert!(
+            saved
+                .chunk_ids
+                .iter()
+                .any(|id| id.chunk_type() == CHUNK_TYPE_CONTAINER_HEADER)
+        );
+        assert!(toc_overflow_contains(&saved.chunks_without_perfect_hash, 2));
+        assert!(toc_overflow_contains(&saved.chunks_without_perfect_hash, 3));
+        assert!(toc_overflow_contains(&saved.chunks_without_perfect_hash, 4));
+        remove_duplicate_fixture(&utoc);
+    }
+
+    #[test]
+    fn duplicate_tag_rejects_bad_paths_stale_handles_and_repeats() {
+        let (utoc, source_uasset, _source_header, _old_uasset_path, _old_ubulk_path, _old_bulk) =
+            duplicate_fixture("reject", true, true);
+        let valid_package = "/Game/Tags/Fixture/clone-reject";
+        let valid_uasset = "Meteorite/Content/Tags/Fixture/clone-reject.uasset";
+        let valid_ubulk = "Meteorite/Content/Tags/Fixture/clone-reject.ubulk";
+        let archive = IoStoreArchive::open(&utoc).expect("open reject fixture");
+        let original_toc = std::fs::read(&utoc).expect("read unchanged TOC");
+        let original_ucas_len = std::fs::metadata(utoc.with_extension("ucas"))
+            .expect("metadata unchanged UCAS")
+            .len();
+        for (package, uasset, ubulk) in [
+            (
+                "/Game/Tags/Fixture/../clone-reject",
+                valid_uasset,
+                valid_ubulk,
+            ),
+            ("/Game//Tags/Fixture/clone-reject", valid_uasset, valid_ubulk),
+            ("/Game/Tags/Fixture/clone-reject", "/Meteorite/Content/Tags/Fixture/clone-reject.uasset", valid_ubulk),
+            ("/Game/Tags/Fixture/clone-reject", "Meteorite\\Content\\Tags\\Fixture\\clone-reject.uasset", valid_ubulk),
+            (valid_package, "Meteorite/Content/Tags/Fixture/other.uasset", "Meteorite/Content/Tags/Fixture/other.ubulk"),
+            (valid_package, "Other/clone-reject.uasset", "Other/clone-reject.ubulk"),
+        ] {
+            let invalid = InPlaceTagDuplicate {
+                source_uasset: &source_uasset,
+                tag_bytes: &[1, 2, 3],
+                destination_package_path: package,
+                destination_uasset_path: uasset,
+                destination_ubulk_path: ubulk,
+            };
+            assert!(duplicate_tag_in_place_with(&archive, &utoc, &invalid).is_err());
+            assert_eq!(std::fs::read(&utoc).unwrap(), original_toc);
+            assert_eq!(
+                std::fs::metadata(utoc.with_extension("ucas"))
+                    .unwrap()
+                    .len(),
+                original_ucas_len
+            );
+        }
+
+        let mut stale = original_toc.clone();
+        stale[140] ^= 1;
+        std::fs::write(&utoc, &stale).expect("make stale target");
+        let stale_request = InPlaceTagDuplicate {
+            source_uasset: &source_uasset,
+            tag_bytes: &[1, 2, 3],
+            destination_package_path: valid_package,
+            destination_uasset_path: valid_uasset,
+            destination_ubulk_path: valid_ubulk,
+        };
+        assert!(duplicate_tag_in_place_with(&archive, &utoc, &stale_request).is_err());
+        assert_eq!(std::fs::read(&utoc).unwrap(), stale);
+        assert_eq!(
+            std::fs::metadata(utoc.with_extension("ucas"))
+                .unwrap()
+                .len(),
+            original_ucas_len
+        );
+        std::fs::write(&utoc, &original_toc).expect("restore stale target");
+
+        let archive = IoStoreArchive::open(&utoc).expect("reopen reject fixture");
+        duplicate_tag_in_place_with(&archive, &utoc, &stale_request).expect("first duplicate");
+        let after_first = std::fs::read(&utoc).expect("read first duplicate");
+        let after_first_ucas = std::fs::metadata(utoc.with_extension("ucas"))
+            .expect("metadata first duplicate")
+            .len();
+        let repeated = IoStoreArchive::open(&utoc).expect("open repeated target");
+        assert!(duplicate_tag_in_place_with(&repeated, &utoc, &stale_request).is_err());
+        assert_eq!(std::fs::read(&utoc).unwrap(), after_first);
+        assert_eq!(
+            std::fs::metadata(utoc.with_extension("ucas"))
+                .unwrap()
+                .len(),
+            after_first_ucas
+        );
+        remove_duplicate_fixture(&utoc);
+    }
+
+    #[test]
+    fn duplicate_tag_rejects_raw_id_collision_without_directory_collision() {
+        let (utoc, source_uasset, source_header, _old_uasset_path, _old_ubulk_path, _old_bulk) =
+            duplicate_fixture("raw-id-collision", false, false);
+        let destination_package = source_header.package_name();
+        let destination_uasset = "Other/Tags/Fixture/leading-empty.uasset";
+        let destination_ubulk = "Other/Tags/Fixture/leading-empty.ubulk";
+        let request = InPlaceTagDuplicate {
+            source_uasset: &source_uasset,
+            tag_bytes: &[0x29; 17],
+            destination_package_path: &destination_package,
+            destination_uasset_path: destination_uasset,
+            destination_ubulk_path: destination_ubulk,
+        };
+        let archive = IoStoreArchive::open(&utoc).expect("open raw-id fixture");
+        assert!(archive.entries().is_empty());
+        let original_toc = std::fs::read(&utoc).expect("original raw-id TOC");
+        let original_ucas_len = std::fs::metadata(utoc.with_extension("ucas"))
+            .expect("original raw-id UCAS")
+            .len();
+        assert!(duplicate_tag_in_place_with(&archive, &utoc, &request).is_err());
+        assert_eq!(std::fs::read(&utoc).unwrap(), original_toc);
+        assert_eq!(
+            std::fs::metadata(utoc.with_extension("ucas"))
+                .unwrap()
+                .len(),
+            original_ucas_len
+        );
+        remove_duplicate_fixture(&utoc);
+    }
+
+    #[test]
+    fn duplicate_tag_rejects_malformed_sources_and_unsupported_toc_flags() {
+        let (utoc, source_uasset, _source_header, _old_uasset_path, _old_ubulk_path, _old_bulk) =
+            duplicate_fixture("malformed", true, true);
+        let archive = IoStoreArchive::open(&utoc).expect("open malformed fixture");
+        let original = std::fs::read(&utoc).expect("read valid TOC");
+        let original_ucas_len = std::fs::metadata(utoc.with_extension("ucas"))
+            .expect("metadata valid UCAS")
+            .len();
+        let malformed_sources: [&[u8]; 3] = [
+            &[],
+            b"not a Zen package",
+            &source_uasset[..source_uasset.len() / 2],
+        ];
+        for source in malformed_sources {
+            let request = InPlaceTagDuplicate {
+                source_uasset: source,
+                tag_bytes: &[1, 2, 3],
+                destination_package_path: "/Game/Tags/Fixture/clone-malformed",
+                destination_uasset_path: "Meteorite/Content/Tags/Fixture/clone-malformed.uasset",
+                destination_ubulk_path: "Meteorite/Content/Tags/Fixture/clone-malformed.ubulk",
+            };
+            assert!(duplicate_tag_in_place_with(&archive, &utoc, &request).is_err());
+            assert_eq!(std::fs::read(&utoc).unwrap(), original);
+            assert_eq!(
+                std::fs::metadata(utoc.with_extension("ucas"))
+                    .unwrap()
+                    .len(),
+                original_ucas_len
+            );
+        }
+
+        let valid_request = InPlaceTagDuplicate {
+            source_uasset: &source_uasset,
+            tag_bytes: &[1, 2, 3],
+            destination_package_path: "/Game/Tags/Fixture/clone-malformed",
+            destination_uasset_path: "Meteorite/Content/Tags/Fixture/clone-malformed.uasset",
+            destination_ubulk_path: "Meteorite/Content/Tags/Fixture/clone-malformed.ubulk",
+        };
+        let mut encrypted = original.clone();
+        encrypted[80..84].copy_from_slice(&FLAG_TOC_ENCRYPTED.to_le_bytes());
+        assert!(matches!(
+            parse_toc(&encrypted),
+            Err(IoStoreError::Encrypted)
+        ));
+        std::fs::write(&utoc, &encrypted).expect("write encrypted test TOC");
+        assert!(duplicate_tag_in_place_with(&archive, &utoc, &valid_request).is_err());
+        assert_eq!(std::fs::read(&utoc).unwrap(), encrypted);
+        assert_eq!(
+            std::fs::metadata(utoc.with_extension("ucas"))
+                .unwrap()
+                .len(),
+            original_ucas_len
+        );
+        std::fs::write(&utoc, &original).expect("restore encrypted test TOC");
+
+        let mut signed = original.clone();
+        signed[80..84].copy_from_slice(&FLAG_TOC_SIGNED.to_le_bytes());
+        assert!(matches!(
+            parse_toc(&signed),
+            Err(IoStoreError::Package(
+                "signed TOCs are unsupported for in-place duplication"
+            ))
+        ));
+        std::fs::write(&utoc, &signed).expect("write signed test TOC");
+        assert!(duplicate_tag_in_place_with(&archive, &utoc, &valid_request).is_err());
+        assert_eq!(std::fs::read(&utoc).unwrap(), signed);
+        assert_eq!(
+            std::fs::metadata(utoc.with_extension("ucas"))
+                .unwrap()
+                .len(),
+            original_ucas_len
+        );
+        std::fs::write(&utoc, &original).expect("restore signed test TOC");
+
+        let mut multipart = original;
+        multipart[52..56].copy_from_slice(&2u32.to_le_bytes());
+        assert!(matches!(
+            parse_toc(&multipart),
+            Err(IoStoreError::MultiPartition(2))
+        ));
+        std::fs::write(&utoc, &multipart).expect("write multipart test TOC");
+        assert!(duplicate_tag_in_place_with(&archive, &utoc, &valid_request).is_err());
+        assert_eq!(std::fs::read(&utoc).unwrap(), multipart);
+        assert_eq!(
+            std::fs::metadata(utoc.with_extension("ucas"))
+                .unwrap()
+                .len(),
+            original_ucas_len
+        );
+        remove_duplicate_fixture(&utoc);
+    }
+
+    #[test]
+    fn duplicate_tag_preserves_finite_partition_size_and_rejects_boundary_crossing() {
+        let (utoc, source_uasset, _source_header, _old_uasset_path, _old_ubulk_path, _old_bulk) =
+            duplicate_fixture("partition-success", true, true);
+        let old_ucas_len = std::fs::metadata(utoc.with_extension("ucas"))
+            .expect("metadata finite-partition UCAS")
+            .len();
+        let finite_partition_size = old_ucas_len + 65_536;
+        set_test_partition_size(&utoc, finite_partition_size);
+        let original_toc = std::fs::read(&utoc).expect("finite-partition TOC");
+        let request = InPlaceTagDuplicate {
+            source_uasset: &source_uasset,
+            tag_bytes: &[0x61; 211],
+            destination_package_path: "/Game/Tags/Fixture/clone-partition-success",
+            destination_uasset_path: "Meteorite/Content/Tags/Fixture/clone-partition-success.uasset",
+            destination_ubulk_path: "Meteorite/Content/Tags/Fixture/clone-partition-success.ubulk",
+        };
+        let archive = IoStoreArchive::open(&utoc).expect("open finite-partition fixture");
+        duplicate_tag_in_place_with(&archive, &utoc, &request).expect("finite partition append");
+        let saved = parse_toc(&std::fs::read(&utoc).expect("saved finite-partition TOC"))
+            .expect("parse saved finite-partition TOC");
+        assert_eq!(saved.partition_size, finite_partition_size);
+        assert_eq!(&saved.original[88..96], &original_toc[88..96]);
+        remove_duplicate_fixture(&utoc);
+
+        let (utoc, source_uasset, _source_header, _old_uasset_path, _old_ubulk_path, _old_bulk) =
+            duplicate_fixture("partition-boundary", true, true);
+        let old_ucas_len = std::fs::metadata(utoc.with_extension("ucas"))
+            .expect("metadata boundary UCAS")
+            .len();
+        set_test_partition_size(&utoc, old_ucas_len + 1);
+        let original_toc = std::fs::read(&utoc).expect("boundary TOC");
+        let archive = IoStoreArchive::open(&utoc).expect("open boundary fixture");
+        let request = InPlaceTagDuplicate {
+            source_uasset: &source_uasset,
+            tag_bytes: &[0x62; 17],
+            destination_package_path: "/Game/Tags/Fixture/clone-partition-boundary",
+            destination_uasset_path: "Meteorite/Content/Tags/Fixture/clone-partition-boundary.uasset",
+            destination_ubulk_path: "Meteorite/Content/Tags/Fixture/clone-partition-boundary.ubulk",
+        };
+        assert!(duplicate_tag_in_place_with(&archive, &utoc, &request).is_err());
+        assert_eq!(std::fs::read(&utoc).unwrap(), original_toc);
+        assert_eq!(
+            std::fs::metadata(utoc.with_extension("ucas"))
+                .unwrap()
+                .len(),
+            old_ucas_len
+        );
+        remove_duplicate_fixture(&utoc);
+    }
+
+    #[test]
+    fn duplicate_tag_rolls_back_utoc_after_each_injected_failure_point() {
+        let (utoc, source_uasset, _source_header, _old_uasset_path, _old_ubulk_path, _old_bulk) =
+            duplicate_fixture("rollback", false, false);
+        let request = InPlaceTagDuplicate {
+            source_uasset: &source_uasset,
+            tag_bytes: &[0x71; 37],
+            destination_package_path: "/Game/Tags/Fixture/clone-rollback",
+            destination_uasset_path: "Meteorite/Content/Tags/Fixture/clone-rollback.uasset",
+            destination_ubulk_path: "Meteorite/Content/Tags/Fixture/clone-rollback.ubulk",
+        };
+        let original_toc = std::fs::read(&utoc).expect("original TOC");
+        let original_pak = std::fs::read(utoc.with_extension("pak")).expect("original pak");
+        let original_ucas_len = std::fs::metadata(utoc.with_extension("ucas"))
+            .expect("original UCAS")
+            .len();
+        let mut archive = IoStoreArchive::open(&utoc).expect("open rollback fixture");
+        archive.recover_entries(&[], Some("Meteorite/Content/"));
+        for failure in [
+            DuplicateFailurePoint::AfterAppend,
+            DuplicateFailurePoint::AfterTocWrite,
+            DuplicateFailurePoint::BeforeValidation,
+        ] {
+            assert!(
+                duplicate_tag_in_place_with_failure_for_test(&archive, &utoc, &request, failure)
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(&utoc).unwrap(), original_toc);
+            assert_eq!(
+                std::fs::read(utoc.with_extension("pak")).unwrap(),
+                original_pak
+            );
+            let reopened = IoStoreArchive::open(&utoc).expect("reopen rolled-back target");
+            assert_eq!(reopened.chunk_count(), 2);
+        }
+        assert!(
+            std::fs::metadata(utoc.with_extension("ucas"))
+                .unwrap()
+                .len()
+                > original_ucas_len
+        );
+        remove_duplicate_fixture(&utoc);
     }
 }
