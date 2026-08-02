@@ -421,9 +421,12 @@ pub struct InPlaceTagDuplicate<'a> {
 ///
 /// The operation appends all replacement/new bytes to the sibling `.ucas`,
 /// then atomically replaces only the `.utoc`. Existing chunks, compression
-/// blocks, perfect-hash seeds, and directory entries are retained. If reopen
-/// or validation fails, the original `.utoc` is restored; an appended UCAS
-/// tail can therefore remain only as unreachable dead space.
+/// blocks, and directory entries are retained. If reopen or validation fails,
+/// the original `.utoc` is restored; an appended UCAS tail can therefore remain
+/// only as unreachable dead space.
+///
+/// A perfect-hash table in the target is **dropped** rather than carried over —
+/// see [`plan_toc_append`] for why an appended entry invalidates one.
 pub fn duplicate_tag_in_place_with(
     archive: &IoStoreArchive,
     utoc_path: &Path,
@@ -432,6 +435,53 @@ pub fn duplicate_tag_in_place_with(
     duplicate_tag_in_place_impl(archive, utoc_path, request, None)
 }
 
+/// Identity of a tag package to retire from the container that holds it.
+///
+/// Deliberately narrower than [`InPlaceTagDuplicate`]: the chunk ids are derived
+/// from `package_path` exactly as duplication derived them, so there is no
+/// second source of truth to disagree with the first.
+pub struct InPlaceTagDeletion<'a> {
+    /// The UE package path whose `.uasset` and `.ubulk` chunks are retired,
+    /// e.g. `/Game/Tags/objects/copy-biped`.
+    pub package_path: &'a str,
+    /// How many chunks the container held before this caller ever appended to
+    /// it. Both target chunks must sit at or past that index.
+    ///
+    /// This is the only provenance evidence that can exist: a `.utoc` records
+    /// nothing about who wrote a chunk, and membership of the
+    /// chunks-without-perfect-hash list proves nothing either — the cooking
+    /// writer puts shipped chunks there whenever a seed bucket's search fails.
+    /// `None` skips the check and trusts the caller entirely.
+    pub minimum_appended_index: Option<u32>,
+    /// When set, the delete only proceeds if these are exactly the directory
+    /// paths currently pointing at the two chunks.
+    pub expected_uasset_path: Option<&'a str>,
+    pub expected_ubulk_path: Option<&'a str>,
+}
+
+/// Retire a previously duplicated tag package from the exact existing IoStore
+/// container represented by `archive`.
+///
+/// Index-stable by construction: the chunk count, every surviving chunk's
+/// index, and every existing compression block are left exactly as they were,
+/// because a TOC's perfect hash maps an id to a *slot* in the chunk-id array and
+/// both the slot count and the slot contents are part of that mapping. Only the
+/// two retired slots, the container header chunk, the directory index and the
+/// overflow list change.
+///
+/// The `.ucas` is appended to (the rewritten container header) and never
+/// truncated; the retired payload stays behind as dead space. The `.utoc` is
+/// replaced atomically and restored if reopen or validation fails.
+pub fn delete_tag_in_place_with(
+    archive: &IoStoreArchive,
+    utoc_path: &Path,
+    request: &InPlaceTagDeletion<'_>,
+) -> Result<()> {
+    delete_tag_in_place_impl(archive, utoc_path, request, None)
+}
+
+/// Where to abort an in-place operation, so the rollback ladder can be tested at
+/// every step. Shared by duplication and deletion — they run the same ladder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DuplicateFailurePoint {
     AfterAppend,
@@ -447,6 +497,16 @@ fn duplicate_tag_in_place_with_failure_for_test(
     failure: DuplicateFailurePoint,
 ) -> Result<()> {
     duplicate_tag_in_place_impl(archive, utoc_path, request, Some(failure))
+}
+
+#[cfg(test)]
+fn delete_tag_in_place_with_failure_for_test(
+    archive: &IoStoreArchive,
+    utoc_path: &Path,
+    request: &InPlaceTagDeletion<'_>,
+    failure: DuplicateFailurePoint,
+) -> Result<()> {
+    delete_tag_in_place_impl(archive, utoc_path, request, Some(failure))
 }
 
 struct ClonedTagPackage {
@@ -668,10 +728,53 @@ struct ExistingTocReplacement {
     bytes: Vec<u8>,
 }
 
+/// A chunk slot retired in place: zero-length payload, retired id, and — this is
+/// the point — the index itself stays occupied.
+///
+/// Removing the slot outright is not an option. A TOC's perfect hash resolves
+/// `slot = Hash(seed, id) % entry_count` and then verifies `ChunkIds[slot] == id`,
+/// so both the entry count and every chunk's position are part of the mapping.
+/// Compacting the arrays would move unrelated chunks — the game's own — off the
+/// slots their seeds point at.
+struct TocTombstone {
+    chunk_index: u32,
+}
+
 struct TocAppendPlan {
     items: Vec<TocAppendItem>,
     new_chunk_indices: Vec<u32>,
+    retired_chunk_indices: Vec<u32>,
+    /// Whether this plan discarded a perfect-hash table the source TOC had.
+    dropped_perfect_hash: bool,
     new_toc: Vec<u8>,
+}
+
+/// `EIoChunkType::Invalid`. Nothing constructs a chunk id with this type —
+/// [`make_chunk_id`] is only ever called with export-bundle, bulk-data, or
+/// container-header — so a retired id can never be resolved, and can never
+/// collide with a live chunk or with a later re-creation of the same package.
+const RETIRED_CHUNK_TYPE: u8 = 0;
+
+/// Retire a chunk id in place, stashing the original type in the pad byte so a
+/// retired slot still says what it used to be.
+fn retire_chunk_id(id: FIoChunkId) -> FIoChunkId {
+    let mut bytes = id.0;
+    bytes[10] = bytes[11];
+    bytes[11] = RETIRED_CHUNK_TYPE;
+    FIoChunkId(bytes)
+}
+
+/// Read the chunks-without-perfect-hash section as the index list it is.
+fn toc_overflow_indices(bytes: &[u8]) -> Result<Vec<i32>> {
+    if bytes.len() % 4 != 0 {
+        return Err(IoStoreError::Truncated(
+            "chunks-without-perfect-hash section is not aligned",
+        ));
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|raw| i32::from_le_bytes(raw.try_into().unwrap()))
+        .collect())
 }
 
 fn parse_toc(bytes: &[u8]) -> Result<ParsedToc> {
@@ -828,12 +931,18 @@ fn checked_toc_end(start: usize, count: usize, item_size: usize, total: usize) -
     Ok(end)
 }
 
+/// Rebuild a TOC with chunks appended, replaced, and/or retired.
+///
+/// `entries` is the directory-index entry set the result should carry — the
+/// caller passes the archive's own entries for an append, and the surviving
+/// subset when retiring slots.
 fn plan_toc_append(
     toc: &ParsedToc,
     old_ucas_len: u64,
     additions: Vec<NewTocChunk>,
     replacements: Vec<ExistingTocReplacement>,
-    old_entries: &[Entry],
+    tombstones: &[TocTombstone],
+    entries: &[Entry],
 ) -> Result<TocAppendPlan> {
     let new_entry_count = toc
         .entry_count
@@ -843,7 +952,7 @@ fn plan_toc_append(
     let mut offset_lengths = toc.offset_lengths.clone();
     let mut metas = toc.metas.clone();
     let mut blocks = toc.blocks.clone();
-    let mut overflow = toc.chunks_without_perfect_hash.clone();
+    let mut overflow = toc_overflow_indices(&toc.chunks_without_perfect_hash)?;
     let mut items = Vec::with_capacity(additions.len() + replacements.len());
     let mut new_chunk_indices = Vec::with_capacity(additions.len());
 
@@ -860,7 +969,7 @@ fn plan_toc_append(
                 "new chunk index exceeds TOC overflow format",
             ));
         }
-        overflow.extend_from_slice(&(chunk_index as i32).to_le_bytes());
+        overflow.push(chunk_index as i32);
         new_chunk_indices.push(chunk_index);
         items.push(TocAppendItem {
             chunk_index,
@@ -894,6 +1003,32 @@ fn plan_toc_append(
             path: None,
         });
     }
+
+    let mut retired_chunk_indices = Vec::with_capacity(tombstones.len());
+    for tombstone in tombstones {
+        let index = tombstone.chunk_index as usize;
+        if tombstone.chunk_index >= toc.entry_count {
+            return Err(IoStoreError::Truncated("retired chunk index out of range"));
+        }
+        if items
+            .iter()
+            .any(|item| item.chunk_index == tombstone.chunk_index)
+        {
+            return Err(IoStoreError::Package(
+                "the same chunk was both rewritten and retired",
+            ));
+        }
+        if retired_chunk_indices.contains(&tombstone.chunk_index) {
+            return Err(IoStoreError::Package("the same chunk was retired twice"));
+        }
+        // The slot keeps its index and loses everything else: no payload, no
+        // content hash, and an id no lookup can construct.
+        chunk_ids[index] = retire_chunk_id(chunk_ids[index]);
+        offset_lengths[index] = [0; 10];
+        metas[index] = [0; TOC_META_SIZE];
+        retired_chunk_indices.push(tombstone.chunk_index);
+    }
+    overflow.retain(|index| !retired_chunk_indices.contains(&(*index as u32)));
 
     let mut physical_offset = old_ucas_len;
     let mut appended_blocks = Vec::new();
@@ -940,15 +1075,34 @@ fn plan_toc_append(
     blocks.extend(appended_blocks);
     let block_count = u32::try_from(blocks.len())
         .map_err(|_| IoStoreError::Truncated("TOC block count overflow"))?;
-    if overflow.len() % 4 != 0 {
-        return Err(IoStoreError::Truncated(
-            "chunks-without-perfect-hash section is not aligned",
-        ));
-    }
-    let overflow_count = u32::try_from(overflow.len() / 4)
+
+    // A perfect-hash table cannot survive an in-place edit. It maps a chunk id
+    // to a *slot in the chunk-id array* — `slot = Hash(seed, id) % entry_count`,
+    // verified against `ChunkIds[slot]` — so appending entries changes the
+    // modulo base for every chunk in the container, and retiring an id makes its
+    // own slot stop verifying. There is no seed generator here to rebuild the
+    // table with, so drop it: with no seeds the runtime indexes every chunk id
+    // directly, which is exactly how the override containers this module has
+    // always written are laid out. The overflow list only catches perfect-hash
+    // misses, so it goes with the table.
+    let drops_perfect_hash = !toc.perfect_hash_seeds.is_empty();
+    let perfect_hash_seeds: &[u8] = if drops_perfect_hash {
+        &[]
+    } else {
+        toc.perfect_hash_seeds.as_slice()
+    };
+    let overflow_bytes: Vec<u8> = if drops_perfect_hash {
+        Vec::new()
+    } else {
+        overflow.iter().flat_map(|index| index.to_le_bytes()).collect()
+    };
+    let seed_count = u32::try_from(perfect_hash_seeds.len() / 4)
+        .map_err(|_| IoStoreError::Truncated("TOC seed count overflow"))?;
+    let overflow_count = u32::try_from(overflow_bytes.len() / 4)
         .map_err(|_| IoStoreError::Truncated("TOC overflow count overflow"))?;
+
     let directory_index = if toc.directory_index_size != 0 {
-        let mut entries = old_entries.to_vec();
+        let mut entries = entries.to_vec();
         for item in &items {
             if let Some(path) = &item.path {
                 entries.push(Entry {
@@ -974,14 +1128,15 @@ fn plan_toc_append(
     header[24..28].copy_from_slice(&new_entry_count.to_le_bytes());
     header[28..32].copy_from_slice(&block_count.to_le_bytes());
     header[48..52].copy_from_slice(&directory_size.to_le_bytes());
+    header[84..88].copy_from_slice(&seed_count.to_le_bytes());
     header[96..100].copy_from_slice(&overflow_count.to_le_bytes());
 
     let mut new_toc = Vec::with_capacity(
         TOC_HEADER_SIZE
             + chunk_ids.len() * 12
             + offset_lengths.len() * 10
-            + toc.perfect_hash_seeds.len()
-            + overflow.len()
+            + perfect_hash_seeds.len()
+            + overflow_bytes.len()
             + blocks.len() * 12
             + toc.compression_methods.len()
             + directory_index.len()
@@ -995,8 +1150,8 @@ fn plan_toc_append(
     for offset_length in &offset_lengths {
         new_toc.extend_from_slice(offset_length);
     }
-    new_toc.extend_from_slice(&toc.perfect_hash_seeds);
-    new_toc.extend_from_slice(&overflow);
+    new_toc.extend_from_slice(perfect_hash_seeds);
+    new_toc.extend_from_slice(&overflow_bytes);
     for block in &blocks {
         new_toc.extend_from_slice(block);
     }
@@ -1010,6 +1165,8 @@ fn plan_toc_append(
     Ok(TocAppendPlan {
         items,
         new_chunk_indices,
+        retired_chunk_indices,
+        dropped_perfect_hash: drops_perfect_hash,
         new_toc,
     })
 }
@@ -1398,6 +1555,7 @@ fn duplicate_tag_in_place_impl(
         old_ucas_len,
         additions,
         replacements,
+        &[],
         archive.entries(),
     )?;
 
@@ -1438,6 +1596,413 @@ fn duplicate_tag_in_place_impl(
     );
     if let Err(error) = validation {
         return restore_original_toc(utoc_path, &original_toc_bytes, error);
+    }
+    Ok(())
+}
+
+struct ResolvedTagDeletion {
+    package_id: FPackageId,
+    uasset_id: FIoChunkId,
+    ubulk_id: FIoChunkId,
+    uasset_index: u32,
+    ubulk_index: u32,
+    removed_paths: Vec<String>,
+    surviving_entries: Vec<Entry>,
+    header_index: u32,
+    header_id: FIoChunkId,
+    header_bytes: Vec<u8>,
+    surviving_package_ids: BTreeSet<FPackageId>,
+}
+
+/// Establish, from the TOC and the container header alone, that exactly two
+/// slots belong to `package_path` and that nothing else still refers to them.
+fn resolve_tag_deletion(
+    archive: &IoStoreArchive,
+    toc: &ParsedToc,
+    request: &InPlaceTagDeletion<'_>,
+) -> Result<ResolvedTagDeletion> {
+    use crate::iostore::compat::{CE_CONTAINER_HEADER_VERSION, CE_TOC_VERSION};
+
+    if request.package_path.is_empty() {
+        return Err(IoStoreError::Package("deletion package path is empty"));
+    }
+    let package_id = FPackageId::from_name(request.package_path);
+    let uasset_id = make_chunk_id(package_id.0, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA);
+    let ubulk_id = make_chunk_id(package_id.0, 0, CHUNK_TYPE_BULK_DATA);
+    let index_of = |wanted: &FIoChunkId| {
+        toc.chunk_ids
+            .iter()
+            .position(|id| id == wanted)
+            .map(|index| index as u32)
+    };
+    let (Some(uasset_index), Some(ubulk_index)) = (index_of(&uasset_id), index_of(&ubulk_id)) else {
+        return Err(IoStoreError::Package(
+            "the package to delete is not in this container",
+        ));
+    };
+
+    if let Some(minimum) = request.minimum_appended_index
+        && (uasset_index < minimum || ubulk_index < minimum)
+    {
+        return Err(IoStoreError::Package(
+            "the package to delete predates this container's appended chunks",
+        ));
+    }
+
+    // Prove the slot really holds the package the caller named, rather than
+    // trusting a hash collision or a stale record.
+    let package_bytes = archive.read_chunk(uasset_index)?;
+    let header = FZenPackageHeader::deserialize(
+        &mut Cursor::new(package_bytes),
+        None,
+        CE_TOC_VERSION,
+        CE_CONTAINER_HEADER_VERSION,
+        None,
+    )
+    .map_err(|_| IoStoreError::Package("the package to delete did not parse"))?;
+    if !header
+        .package_name()
+        .eq_ignore_ascii_case(request.package_path)
+    {
+        return Err(IoStoreError::Package(
+            "the package to delete names a different package",
+        ));
+    }
+
+    // A third chunk sharing the identity (an optional-segment payload, a second
+    // bulk index) would be orphaned by retiring only these two.
+    let package_id_bytes = package_id.0.to_le_bytes();
+    if toc.chunk_ids.iter().enumerate().any(|(index, id)| {
+        id.package_id() == package_id_bytes
+            && index as u32 != uasset_index
+            && index as u32 != ubulk_index
+    }) {
+        return Err(IoStoreError::Package(
+            "the package to delete has more than two chunks",
+        ));
+    }
+
+    let mut removed_paths = Vec::new();
+    let mut surviving_entries = Vec::new();
+    for entry in archive.entries() {
+        if entry.chunk_index == uasset_index || entry.chunk_index == ubulk_index {
+            removed_paths.push(entry.path.clone());
+        } else {
+            surviving_entries.push(entry.clone());
+        }
+    }
+    let path_matches = |expected: Option<&str>, id: &FIoChunkId, index: u32| match expected {
+        None => Ok(()),
+        Some(expected) => {
+            let listed = archive
+                .entries()
+                .iter()
+                .any(|entry| entry.chunk_index == index && entry.path == expected);
+            // An indexless overlay lists nothing, so the id is the only handle
+            // there; an indexed container must agree with the caller exactly.
+            if listed || (toc.directory_index_size == 0 && index_of(id) == Some(index)) {
+                Ok(())
+            } else {
+                Err(IoStoreError::Package(
+                    "the package to delete is at a different path",
+                ))
+            }
+        }
+    };
+    path_matches(request.expected_uasset_path, &uasset_id, uasset_index)?;
+    path_matches(request.expected_ubulk_path, &ubulk_id, ubulk_index)?;
+
+    let header_indices: Vec<u32> = toc
+        .chunk_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(index, id)| {
+            (id.chunk_type() == CHUNK_TYPE_CONTAINER_HEADER).then_some(index as u32)
+        })
+        .collect();
+    if header_indices.len() != 1 {
+        // Duplication always leaves exactly one behind, synthesizing it when the
+        // overlay had none. Any other shape means something else wrote this
+        // container and the store-entry invariant cannot be established.
+        return Err(IoStoreError::Package(
+            "target does not have exactly one ContainerHeader chunk",
+        ));
+    }
+    let header_index = header_indices[0];
+    let header_id = toc.chunk_ids[header_index as usize];
+    if header_id.package_id() != toc.container_id.to_le_bytes() {
+        return Err(IoStoreError::Package(
+            "ContainerHeader id does not match container id",
+        ));
+    }
+    let mut container_header =
+        FIoContainerHeader::deserialize(&mut Cursor::new(archive.read_chunk(header_index)?), None)
+            .map_err(|_| IoStoreError::Package("container package-store header did not parse"))?;
+    if container_header.container_id.0 != toc.container_id {
+        return Err(IoStoreError::Package(
+            "ContainerHeader payload id does not match TOC",
+        ));
+    }
+    crate::iostore::compat::check_writable_container_header_version(container_header.version)
+        .map_err(|_| IoStoreError::Package("unsupported container package-store header"))?;
+    // Each of these is keyed by store-entry ordinal or by package id, and none
+    // of them is rewritten here, so removing a package would silently desync it.
+    if container_header.has_soft_package_references() {
+        return Err(IoStoreError::Package(
+            "container header carries soft package references",
+        ));
+    }
+    if container_header.has_optional_segment() {
+        return Err(IoStoreError::Package(
+            "container header carries an optional segment",
+        ));
+    }
+    if container_header.redirects_to(package_id) {
+        return Err(IoStoreError::Package(
+            "another package redirects to the package to delete",
+        ));
+    }
+    if container_header.is_localized_source(package_id) {
+        return Err(IoStoreError::Package(
+            "the package to delete is a localized source package",
+        ));
+    }
+    if !container_header.remove_package(package_id) {
+        return Err(IoStoreError::Package(
+            "the package to delete is not in the package store",
+        ));
+    }
+    let surviving_package_ids: BTreeSet<FPackageId> = container_header.package_ids().collect();
+    let header_bytes = serialize_aligned_container_header(&container_header)?;
+
+    Ok(ResolvedTagDeletion {
+        package_id,
+        uasset_id,
+        ubulk_id,
+        uasset_index,
+        ubulk_index,
+        removed_paths,
+        surviving_entries,
+        header_index,
+        header_id,
+        header_bytes,
+        surviving_package_ids,
+    })
+}
+
+fn delete_tag_in_place_impl(
+    archive: &IoStoreArchive,
+    utoc_path: &Path,
+    request: &InPlaceTagDeletion<'_>,
+    failure: Option<DuplicateFailurePoint>,
+) -> Result<()> {
+    let original_toc_bytes = std::fs::read(utoc_path)?;
+    if !archive.matches_utoc_path(utoc_path) || archive.toc_bytes() != original_toc_bytes {
+        return Err(IoStoreError::Package(
+            "archive handle is stale or targets another container",
+        ));
+    }
+    let toc = parse_toc(&original_toc_bytes)?;
+    if archive.chunk_count() != toc.entry_count {
+        return Err(IoStoreError::Package("archive handle chunk count is stale"));
+    }
+    for (index, expected_id) in toc.chunk_ids.iter().enumerate() {
+        if archive.chunk_id(index as u32)? != *expected_id {
+            return Err(IoStoreError::Package("archive handle chunk ids are stale"));
+        }
+    }
+    let mut raw_ids = BTreeSet::new();
+    for id in &toc.chunk_ids {
+        if !raw_ids.insert(id.0) {
+            return Err(IoStoreError::Package(
+                "target TOC contains a duplicate chunk id",
+            ));
+        }
+    }
+
+    let resolved = resolve_tag_deletion(archive, &toc, request)?;
+    if resolved.header_index == resolved.uasset_index || resolved.header_index == resolved.ubulk_index
+    {
+        return Err(IoStoreError::Package(
+            "the package to delete is the ContainerHeader chunk",
+        ));
+    }
+
+    let ucas_path = utoc_path.with_extension("ucas");
+    let old_ucas_len = std::fs::metadata(&ucas_path)?.len();
+    let plan = plan_toc_append(
+        &toc,
+        old_ucas_len,
+        Vec::new(),
+        vec![ExistingTocReplacement {
+            chunk_index: resolved.header_index,
+            bytes: resolved.header_bytes.clone(),
+        }],
+        &[
+            TocTombstone {
+                chunk_index: resolved.uasset_index,
+            },
+            TocTombstone {
+                chunk_index: resolved.ubulk_index,
+            },
+        ],
+        &resolved.surviving_entries,
+    )?;
+
+    append_ucas_items(&ucas_path, &plan.items)?;
+    if failure == Some(DuplicateFailurePoint::AfterAppend) {
+        return restore_original_toc(
+            utoc_path,
+            &original_toc_bytes,
+            IoStoreError::Package("injected post-append failure"),
+        );
+    }
+    if let Err(error) = atomic_replace_file(utoc_path, &plan.new_toc) {
+        return restore_original_toc(utoc_path, &original_toc_bytes, error);
+    }
+    if failure == Some(DuplicateFailurePoint::AfterTocWrite) {
+        return restore_original_toc(
+            utoc_path,
+            &original_toc_bytes,
+            IoStoreError::Package("injected post-TOC-write failure"),
+        );
+    }
+    if failure == Some(DuplicateFailurePoint::BeforeValidation) {
+        return restore_original_toc(
+            utoc_path,
+            &original_toc_bytes,
+            IoStoreError::Package("injected validation failure"),
+        );
+    }
+    if let Err(error) = validate_delete_result(utoc_path, &toc, &resolved, &plan) {
+        return restore_original_toc(utoc_path, &original_toc_bytes, error);
+    }
+    Ok(())
+}
+
+fn validate_delete_result(
+    utoc_path: &Path,
+    original_toc: &ParsedToc,
+    resolved: &ResolvedTagDeletion,
+    plan: &TocAppendPlan,
+) -> Result<()> {
+    let saved_toc_bytes = std::fs::read(utoc_path)?;
+    let saved_toc = parse_toc(&saved_toc_bytes)?;
+
+    // The assertion the whole design rests on. A shrinking chunk count would
+    // change the perfect hash's modulo base for chunks nobody asked to touch.
+    if saved_toc.entry_count != original_toc.entry_count {
+        return Err(IoStoreError::Package("deletion changed the TOC chunk count"));
+    }
+    validate_perfect_hash_result(original_toc, &saved_toc, plan)?;
+    if saved_toc.partition_size != original_toc.partition_size
+        || saved_toc.container_id != original_toc.container_id
+        || saved_toc.block_size != original_toc.block_size
+        || saved_toc.compression_methods != original_toc.compression_methods
+    {
+        return Err(IoStoreError::Package("deletion changed TOC header fields"));
+    }
+    if saved_toc.blocks.get(..original_toc.blocks.len()) != Some(original_toc.blocks.as_slice()) {
+        return Err(IoStoreError::Package(
+            "deletion rewrote existing compression blocks",
+        ));
+    }
+
+    let retired = [resolved.uasset_index, resolved.ubulk_index];
+    for (index, original_id) in original_toc.chunk_ids.iter().enumerate() {
+        let saved_id = saved_toc
+            .chunk_ids
+            .get(index)
+            .ok_or(IoStoreError::Package("deletion dropped a chunk slot"))?;
+        let expected_id = if retired.contains(&(index as u32)) {
+            retire_chunk_id(*original_id)
+        } else {
+            *original_id
+        };
+        if *saved_id != expected_id {
+            return Err(IoStoreError::Package("deletion changed a chunk id"));
+        }
+        if retired.contains(&(index as u32)) {
+            if saved_toc.offset_lengths[index] != [0; 10]
+                || saved_toc.metas[index] != [0; TOC_META_SIZE]
+            {
+                return Err(IoStoreError::Package("a retired chunk kept its payload"));
+            }
+        } else if index as u32 != resolved.header_index
+            && (saved_toc.offset_lengths[index] != original_toc.offset_lengths[index]
+                || saved_toc.metas[index] != original_toc.metas[index])
+        {
+            return Err(IoStoreError::Package("deletion moved a surviving chunk"));
+        }
+    }
+
+    let reopened = IoStoreArchive::open(utoc_path)?;
+    if reopened.chunk_count() != original_toc.entry_count {
+        return Err(IoStoreError::Package("reopened chunk count is incorrect"));
+    }
+    if reopened.find_chunk(&resolved.uasset_id).is_some()
+        || reopened.find_chunk(&resolved.ubulk_id).is_some()
+    {
+        return Err(IoStoreError::Package(
+            "the deleted package is still resolvable",
+        ));
+    }
+    let indexed = original_toc.directory_index_size != 0;
+    if indexed != reopened.has_directory_index() {
+        return Err(IoStoreError::Package("directory-index mode changed"));
+    }
+    // Only an indexed container has paths to check. An indexless overlay
+    // addresses everything by id, and the paths it appears to have are
+    // reconstructed by the caller's recovery pass, not stored in the file.
+    if indexed {
+        for entry in &resolved.surviving_entries {
+            let expected = original_toc
+                .chunk_ids
+                .get(entry.chunk_index as usize)
+                .ok_or(IoStoreError::Package(
+                    "a surviving directory entry has a bad chunk index",
+                ))?;
+            if reopened.chunk_id_for(&entry.path)? != *expected {
+                return Err(IoStoreError::Package("a surviving directory entry changed"));
+            }
+        }
+        for path in &resolved.removed_paths {
+            if reopened.contains(path) {
+                return Err(IoStoreError::Package(
+                    "the deleted package is still listed in the directory index",
+                ));
+            }
+        }
+    }
+    // Every surviving chunk is read back through the reopened archive: existing
+    // blocks are copied verbatim, so this is the proof the rebuilt section
+    // layout still serves them.
+    for index in 0..original_toc.entry_count {
+        if retired.contains(&index) {
+            continue;
+        }
+        reopened.read_chunk(index)?;
+    }
+
+    let saved_header_index = reopened
+        .find_chunk(&resolved.header_id)
+        .ok_or(IoStoreError::Package("saved ContainerHeader is absent"))?;
+    let saved_header = FIoContainerHeader::deserialize(
+        &mut Cursor::new(reopened.read_chunk(saved_header_index)?),
+        None,
+    )
+    .map_err(|_| IoStoreError::Package("saved ContainerHeader did not parse"))?;
+    if saved_header.container_id.0 != original_toc.container_id
+        || saved_header.get_store_entry(resolved.package_id).is_some()
+    {
+        return Err(IoStoreError::Package(
+            "the deleted package is still in the package store",
+        ));
+    }
+    if saved_header.package_ids().collect::<BTreeSet<_>>() != resolved.surviving_package_ids {
+        return Err(IoStoreError::Package(
+            "deletion changed another package's store entry",
+        ));
     }
     Ok(())
 }
@@ -1510,23 +2075,14 @@ fn validate_duplicate_result(
 ) -> Result<()> {
     let saved_toc_bytes = std::fs::read(utoc_path)?;
     let saved_toc = parse_toc(&saved_toc_bytes)?;
-    if saved_toc.perfect_hash_seeds != original_toc.perfect_hash_seeds {
-        return Err(IoStoreError::Package("perfect-hash seeds changed"));
-    }
-    if saved_toc
-        .chunks_without_perfect_hash
-        .get(..original_toc.chunks_without_perfect_hash.len())
-        != Some(original_toc.chunks_without_perfect_hash.as_slice())
-    {
-        return Err(IoStoreError::Package(
-            "existing perfect-hash overflow changed",
-        ));
-    }
-    for index in &plan.new_chunk_indices {
-        if !toc_overflow_contains(&saved_toc.chunks_without_perfect_hash, *index) {
-            return Err(IoStoreError::Package(
-                "new chunk is absent from TOC overflow lookup",
-            ));
+    validate_perfect_hash_result(original_toc, &saved_toc, plan)?;
+    if !plan.dropped_perfect_hash {
+        for index in &plan.new_chunk_indices {
+            if !toc_overflow_contains(&saved_toc.chunks_without_perfect_hash, *index) {
+                return Err(IoStoreError::Package(
+                    "new chunk is absent from TOC overflow lookup",
+                ));
+            }
         }
     }
 
@@ -1600,6 +2156,44 @@ fn validate_duplicate_result(
     {
         return Err(IoStoreError::Package(
             "saved package-store entry is incorrect",
+        ));
+    }
+    Ok(())
+}
+
+/// Assert the saved TOC's perfect-hash state is the one the plan intended:
+/// either the table was dropped wholesale (along with the overflow list it
+/// serves), or it survived byte-for-byte with the existing overflow entries
+/// intact and only the retired indices removed.
+///
+/// This is checked on the TOC bytes rather than through the reopened reader on
+/// purpose. [`IoStoreArchive::find_chunk`] resolves ids with a linear scan, so
+/// it would happily confirm every chunk in a container whose hash table no
+/// longer addresses them — the failure is invisible until the game mounts it.
+fn validate_perfect_hash_result(
+    original_toc: &ParsedToc,
+    saved_toc: &ParsedToc,
+    plan: &TocAppendPlan,
+) -> Result<()> {
+    if plan.dropped_perfect_hash {
+        if !saved_toc.perfect_hash_seeds.is_empty()
+            || !saved_toc.chunks_without_perfect_hash.is_empty()
+        {
+            return Err(IoStoreError::Package(
+                "perfect-hash table was not dropped as planned",
+            ));
+        }
+        return Ok(());
+    }
+    if saved_toc.perfect_hash_seeds != original_toc.perfect_hash_seeds {
+        return Err(IoStoreError::Package("perfect-hash seeds changed"));
+    }
+    let mut expected = toc_overflow_indices(&original_toc.chunks_without_perfect_hash)?;
+    expected.retain(|index| !plan.retired_chunk_indices.contains(&(*index as u32)));
+    let saved = toc_overflow_indices(&saved_toc.chunks_without_perfect_hash)?;
+    if saved.get(..expected.len()) != Some(expected.as_slice()) {
+        return Err(IoStoreError::Package(
+            "existing perfect-hash overflow changed",
         ));
     }
     Ok(())
@@ -3725,8 +4319,13 @@ mod tests {
         assert_eq!(cloned_payloads, source_payloads);
 
         let saved = parse_toc(&std::fs::read(&utoc).expect("saved TOC")).expect("parse saved TOC");
-        assert_eq!(saved.perfect_hash_seeds, original.perfect_hash_seeds);
-        assert!(!saved.perfect_hash_seeds.is_empty());
+        // The fixture ships a live seed, and appending entries changes the
+        // modulo base every seeded lookup in the container depends on. There is
+        // no seed generator here to rebuild the table with, so it is dropped and
+        // the runtime falls back to indexing chunk ids directly.
+        assert!(!original.perfect_hash_seeds.is_empty());
+        assert!(saved.perfect_hash_seeds.is_empty());
+        assert!(saved.chunks_without_perfect_hash.is_empty());
         assert_eq!(
             &saved.blocks[..original.blocks.len()],
             &original.blocks,
@@ -3747,8 +4346,17 @@ mod tests {
             &saved.chunk_ids[..original.entry_count as usize],
             &original.chunk_ids
         );
-        assert!(toc_overflow_contains(&saved.chunks_without_perfect_hash, 3));
-        assert!(toc_overflow_contains(&saved.chunks_without_perfect_hash, 4));
+        // With the seed table gone the overflow list has nothing left to catch,
+        // so the appended chunks resolve through the id index instead — which
+        // the `find_chunk` assertions below exercise directly.
+        assert!(!toc_overflow_contains(
+            &saved.chunks_without_perfect_hash,
+            3
+        ));
+        assert!(!toc_overflow_contains(
+            &saved.chunks_without_perfect_hash,
+            4
+        ));
         let new_package_id = FPackageId::from_name(destination_package);
         assert_eq!(
             reopened
@@ -4115,5 +4723,347 @@ mod tests {
                 > original_ucas_len
         );
         remove_duplicate_fixture(&utoc);
+    }
+
+    const DELETE_FIXTURE_PACKAGE: &str = "/Game/Tags/Fixture/clone-leading-empty";
+    const DELETE_FIXTURE_UASSET: &str = "Meteorite/Content/Tags/Fixture/clone-leading-empty.uasset";
+    const DELETE_FIXTURE_UBULK: &str = "Meteorite/Content/Tags/Fixture/clone-leading-empty.ubulk";
+
+    /// Build a fixture and duplicate one tag into it, returning the container
+    /// and the TOC as it stood *before* the duplicate — the state a delete is
+    /// expected to walk the container back to.
+    fn fixture_with_one_duplicate(
+        name: &str,
+        with_header: bool,
+        indexed: bool,
+    ) -> (std::path::PathBuf, Vec<u8>, Vec<u8>, String, String) {
+        let (utoc, source_uasset, _source_header, old_uasset_path, old_ubulk_path, _old_bulk) =
+            duplicate_fixture(name, with_header, indexed);
+        let before_duplicate = std::fs::read(&utoc).expect("pre-duplicate TOC");
+        let request = InPlaceTagDuplicate {
+            source_uasset: &source_uasset,
+            tag_bytes: &[0x42; 119],
+            destination_package_path: DELETE_FIXTURE_PACKAGE,
+            destination_uasset_path: DELETE_FIXTURE_UASSET,
+            destination_ubulk_path: DELETE_FIXTURE_UBULK,
+        };
+        let archive = IoStoreArchive::open(&utoc).expect("open fixture");
+        duplicate_tag_in_place_with(&archive, &utoc, &request).expect("duplicate fixture tag");
+        (
+            utoc,
+            before_duplicate,
+            source_uasset,
+            old_uasset_path,
+            old_ubulk_path,
+        )
+    }
+
+    fn delete_request(minimum: Option<u32>) -> InPlaceTagDeletion<'static> {
+        InPlaceTagDeletion {
+            package_path: DELETE_FIXTURE_PACKAGE,
+            minimum_appended_index: minimum,
+            expected_uasset_path: Some(DELETE_FIXTURE_UASSET),
+            expected_ubulk_path: Some(DELETE_FIXTURE_UBULK),
+        }
+    }
+
+    #[test]
+    fn delete_tag_retires_the_duplicate_and_leaves_the_originals_readable() {
+        let (utoc, before_duplicate, source_uasset, old_uasset_path, old_ubulk_path) =
+            fixture_with_one_duplicate("delete-indexed", true, true);
+        let before = parse_toc(&before_duplicate).expect("parse pre-duplicate TOC");
+        let after_duplicate =
+            parse_toc(&std::fs::read(&utoc).expect("TOC")).expect("parse duplicated TOC");
+        let original_pak = std::fs::read(utoc.with_extension("pak")).expect("pak");
+        let package_id = FPackageId::from_name(DELETE_FIXTURE_PACKAGE);
+
+        let archive = IoStoreArchive::open(&utoc).expect("open duplicated fixture");
+        delete_tag_in_place_with(&archive, &utoc, &delete_request(Some(before.entry_count)))
+            .expect("delete the duplicate");
+
+        let saved = parse_toc(&std::fs::read(&utoc).expect("saved TOC")).expect("parse saved TOC");
+        assert_eq!(
+            saved.entry_count, after_duplicate.entry_count,
+            "retiring a slot must not change the chunk count"
+        );
+        assert_eq!(
+            std::fs::read(utoc.with_extension("pak")).expect("saved pak"),
+            original_pak,
+            "same-stem .pak is untouched"
+        );
+
+        let reopened = IoStoreArchive::open(&utoc).expect("reopen after delete");
+        assert!(
+            reopened
+                .find_chunk(&make_chunk_id(package_id.0, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA))
+                .is_none()
+        );
+        assert!(
+            reopened
+                .find_chunk(&make_chunk_id(package_id.0, 0, CHUNK_TYPE_BULK_DATA))
+                .is_none()
+        );
+        assert!(!reopened.contains(DELETE_FIXTURE_UASSET));
+        assert!(!reopened.contains(DELETE_FIXTURE_UBULK));
+        assert_eq!(reopened.read(&old_uasset_path).unwrap(), source_uasset);
+        assert_eq!(reopened.read(&old_ubulk_path).unwrap().len(), 73);
+
+        let header_index = reopened
+            .find_chunk(&make_chunk_id(
+                saved.container_id,
+                0,
+                CHUNK_TYPE_CONTAINER_HEADER,
+            ))
+            .expect("container header survives");
+        let header = FIoContainerHeader::deserialize(
+            &mut Cursor::new(reopened.read_chunk(header_index).unwrap()),
+            None,
+        )
+        .expect("parse saved header");
+        assert!(header.get_store_entry(package_id).is_none());
+        remove_duplicate_fixture(&utoc);
+    }
+
+    #[test]
+    fn delete_tag_keeps_every_surviving_chunk_on_its_own_index() {
+        // The regression test for the whole design: a TOC's perfect hash maps an
+        // id to a slot in the chunk-id array, so shrinking the array or moving a
+        // chunk would break lookups for chunks nobody asked to touch. Asserted on
+        // the raw TOC because `find_chunk` is a linear scan and cannot see it.
+        let (utoc, before_duplicate, _source, _uasset_path, _ubulk_path) =
+            fixture_with_one_duplicate("delete-stable", true, true);
+        let before = parse_toc(&before_duplicate).expect("parse pre-duplicate TOC");
+        let duplicated_bytes = std::fs::read(&utoc).expect("TOC");
+        let duplicated = parse_toc(&duplicated_bytes).expect("parse duplicated TOC");
+        let package_id = FPackageId::from_name(DELETE_FIXTURE_PACKAGE);
+        let retired: Vec<u32> = [
+            make_chunk_id(package_id.0, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA),
+            make_chunk_id(package_id.0, 0, CHUNK_TYPE_BULK_DATA),
+        ]
+        .iter()
+        .map(|id| {
+            duplicated
+                .chunk_ids
+                .iter()
+                .position(|existing| existing == id)
+                .expect("duplicate chunk is present") as u32
+        })
+        .collect();
+
+        let archive = IoStoreArchive::open(&utoc).expect("open duplicated fixture");
+        delete_tag_in_place_with(&archive, &utoc, &delete_request(Some(before.entry_count)))
+            .expect("delete the duplicate");
+
+        let saved_bytes = std::fs::read(&utoc).expect("saved TOC");
+        let saved = parse_toc(&saved_bytes).expect("parse saved TOC");
+        assert_eq!(
+            saved_bytes[24..28],
+            duplicated_bytes[24..28],
+            "the header's chunk count is unchanged"
+        );
+        for (index, id) in duplicated.chunk_ids.iter().enumerate() {
+            if retired.contains(&(index as u32)) {
+                assert_eq!(saved.chunk_ids[index], retire_chunk_id(*id));
+                assert_eq!(saved.offset_lengths[index], [0; 10]);
+                assert_eq!(saved.metas[index], [0; TOC_META_SIZE]);
+            } else {
+                assert_eq!(saved.chunk_ids[index], *id, "chunk {index} moved or changed");
+            }
+        }
+        assert_eq!(
+            &saved.blocks[..duplicated.blocks.len()],
+            &duplicated.blocks,
+            "existing compression blocks are preserved"
+        );
+        remove_duplicate_fixture(&utoc);
+    }
+
+    #[test]
+    fn delete_tag_works_on_an_indexless_headerless_overlay() {
+        let (utoc, before_duplicate, _source, _uasset_path, _ubulk_path) =
+            fixture_with_one_duplicate("delete-indexless", false, false);
+        let before = parse_toc(&before_duplicate).expect("parse pre-duplicate TOC");
+        let package_id = FPackageId::from_name(DELETE_FIXTURE_PACKAGE);
+
+        let archive = IoStoreArchive::open(&utoc).expect("open duplicated overlay");
+        assert!(!archive.has_directory_index());
+        // Duplication synthesizes the container header for a headerless overlay,
+        // so the chunks being retired are not the last entries — which is the
+        // case tail-truncation could never have handled.
+        delete_tag_in_place_with(
+            &archive,
+            &utoc,
+            &InPlaceTagDeletion {
+                package_path: DELETE_FIXTURE_PACKAGE,
+                minimum_appended_index: Some(before.entry_count),
+                expected_uasset_path: None,
+                expected_ubulk_path: None,
+            },
+        )
+        .expect("delete the duplicate");
+
+        let reopened = IoStoreArchive::open(&utoc).expect("reopen after delete");
+        assert!(!reopened.has_directory_index());
+        assert!(
+            reopened
+                .find_chunk(&make_chunk_id(package_id.0, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA))
+                .is_none()
+        );
+        let saved = parse_toc(&std::fs::read(&utoc).expect("saved TOC")).expect("parse saved TOC");
+        assert_eq!(saved.directory_index_size, 0);
+        assert!(
+            reopened
+                .find_chunk(&make_chunk_id(
+                    saved.container_id,
+                    0,
+                    CHUNK_TYPE_CONTAINER_HEADER
+                ))
+                .is_some(),
+            "the synthesized container header is never removed"
+        );
+        remove_duplicate_fixture(&utoc);
+    }
+
+    #[test]
+    fn a_deleted_package_path_can_be_duplicated_again() {
+        let (utoc, before_duplicate, source_uasset, _uasset_path, _ubulk_path) =
+            fixture_with_one_duplicate("delete-recreate", true, true);
+        let before = parse_toc(&before_duplicate).expect("parse pre-duplicate TOC");
+        let archive = IoStoreArchive::open(&utoc).expect("open duplicated fixture");
+        delete_tag_in_place_with(&archive, &utoc, &delete_request(Some(before.entry_count)))
+            .expect("delete the duplicate");
+
+        // A retired id must not keep the path reserved: the retired type is one
+        // nothing can construct, so re-creating the same tag is not a collision.
+        let archive = IoStoreArchive::open(&utoc).expect("reopen after delete");
+        duplicate_tag_in_place_with(
+            &archive,
+            &utoc,
+            &InPlaceTagDuplicate {
+                source_uasset: &source_uasset,
+                tag_bytes: &[0x43; 64],
+                destination_package_path: DELETE_FIXTURE_PACKAGE,
+                destination_uasset_path: DELETE_FIXTURE_UASSET,
+                destination_ubulk_path: DELETE_FIXTURE_UBULK,
+            },
+        )
+        .expect("re-create the deleted tag");
+
+        let reopened = IoStoreArchive::open(&utoc).expect("reopen after re-create");
+        assert_eq!(reopened.read(DELETE_FIXTURE_UBULK).unwrap(), vec![0x43; 64]);
+        remove_duplicate_fixture(&utoc);
+    }
+
+    #[test]
+    fn delete_tag_refuses_shipped_chunks_and_unknown_packages() {
+        let (utoc, before_duplicate, _source, _uasset_path, _ubulk_path) =
+            fixture_with_one_duplicate("delete-refuses", true, true);
+        let before = parse_toc(&before_duplicate).expect("parse pre-duplicate TOC");
+        let untouched = std::fs::read(&utoc).expect("TOC");
+        let ucas_len = std::fs::metadata(utoc.with_extension("ucas")).unwrap().len();
+        let archive = IoStoreArchive::open(&utoc).expect("open duplicated fixture");
+
+        // The container's own tag predates anything this caller appended.
+        let shipped = InPlaceTagDeletion {
+            package_path: "/Game/Fixture/leading-empty",
+            minimum_appended_index: Some(before.entry_count),
+            expected_uasset_path: None,
+            expected_ubulk_path: None,
+        };
+        assert!(delete_tag_in_place_with(&archive, &utoc, &shipped).is_err());
+
+        // A package that was never in this container at all.
+        let absent = InPlaceTagDeletion {
+            package_path: "/Game/Tags/Fixture/never-existed",
+            minimum_appended_index: None,
+            expected_uasset_path: None,
+            expected_ubulk_path: None,
+        };
+        assert!(delete_tag_in_place_with(&archive, &utoc, &absent).is_err());
+
+        // The right package under the wrong path.
+        let wrong_path = InPlaceTagDeletion {
+            package_path: DELETE_FIXTURE_PACKAGE,
+            minimum_appended_index: None,
+            expected_uasset_path: Some("Meteorite/Content/Tags/Fixture/elsewhere.uasset"),
+            expected_ubulk_path: None,
+        };
+        assert!(delete_tag_in_place_with(&archive, &utoc, &wrong_path).is_err());
+
+        assert_eq!(
+            std::fs::read(&utoc).expect("TOC after refusals"),
+            untouched,
+            "a refused delete leaves the TOC byte-identical"
+        );
+        assert_eq!(
+            std::fs::metadata(utoc.with_extension("ucas")).unwrap().len(),
+            ucas_len,
+            "a refused delete does not touch the UCAS"
+        );
+        remove_duplicate_fixture(&utoc);
+    }
+
+    #[test]
+    fn delete_tag_rolls_back_utoc_after_each_injected_failure_point() {
+        for failure in [
+            DuplicateFailurePoint::AfterAppend,
+            DuplicateFailurePoint::AfterTocWrite,
+            DuplicateFailurePoint::BeforeValidation,
+        ] {
+            let (utoc, before_duplicate, _source, _uasset_path, _ubulk_path) =
+                fixture_with_one_duplicate("delete-rollback", true, true);
+            let before = parse_toc(&before_duplicate).expect("parse pre-duplicate TOC");
+            let duplicated = std::fs::read(&utoc).expect("TOC");
+            let original_pak = std::fs::read(utoc.with_extension("pak")).expect("pak");
+            let ucas_len = std::fs::metadata(utoc.with_extension("ucas")).unwrap().len();
+            let archive = IoStoreArchive::open(&utoc).expect("open duplicated fixture");
+
+            assert!(
+                delete_tag_in_place_with_failure_for_test(
+                    &archive,
+                    &utoc,
+                    &delete_request(Some(before.entry_count)),
+                    failure,
+                )
+                .is_err()
+            );
+            assert_eq!(
+                std::fs::read(&utoc).expect("restored TOC"),
+                duplicated,
+                "{failure:?} must restore the TOC"
+            );
+            assert_eq!(
+                std::fs::read(utoc.with_extension("pak")).expect("pak"),
+                original_pak
+            );
+            assert!(
+                std::fs::metadata(utoc.with_extension("ucas")).unwrap().len() >= ucas_len,
+                "the UCAS is only ever appended to"
+            );
+            let reopened = IoStoreArchive::open(&utoc).expect("reopen after rollback");
+            assert!(reopened.contains(DELETE_FIXTURE_UBULK), "{failure:?}");
+            remove_duplicate_fixture(&utoc);
+        }
+    }
+
+    #[test]
+    fn retired_chunk_ids_are_distinct_and_cannot_be_constructed() {
+        let package_id = FPackageId::from_name(DELETE_FIXTURE_PACKAGE);
+        let uasset = make_chunk_id(package_id.0, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA);
+        let ubulk = make_chunk_id(package_id.0, 0, CHUNK_TYPE_BULK_DATA);
+        let retired_uasset = retire_chunk_id(uasset);
+        let retired_ubulk = retire_chunk_id(ubulk);
+
+        assert_ne!(retired_uasset, retired_ubulk, "one package, two live slots");
+        assert_eq!(retired_uasset.chunk_type(), RETIRED_CHUNK_TYPE);
+        assert_eq!(retired_ubulk.chunk_type(), RETIRED_CHUNK_TYPE);
+        for chunk_type in [
+            CHUNK_TYPE_EXPORT_BUNDLE_DATA,
+            CHUNK_TYPE_BULK_DATA,
+            CHUNK_TYPE_CONTAINER_HEADER,
+        ] {
+            assert_ne!(make_chunk_id(package_id.0, 0, chunk_type), retired_uasset);
+            assert_ne!(make_chunk_id(package_id.0, 0, chunk_type), retired_ubulk);
+        }
     }
 }

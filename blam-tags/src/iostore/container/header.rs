@@ -263,6 +263,61 @@ impl FIoContainerHeader {
     pub fn get_store_entry(&self, package_id: FPackageId) -> Option<StoreEntry> {
         self.packages.get(package_id)
     }
+
+    /// Drop a package's store entry, reporting whether one was there.
+    ///
+    /// Serialization rebuilds the count, the key list and every
+    /// `offset_to_data_from_this` from the map, so removing a key is complete on
+    /// its own — but only for the store. The members below are keyed by
+    /// store-entry *ordinal* or by package id, and callers that remove a package
+    /// have to check them separately.
+    pub fn remove_package(&mut self, package_id: FPackageId) -> bool {
+        self.packages.0.remove(&package_id).is_some()
+    }
+
+    /// Whether a soft-package-reference block is present.
+    ///
+    /// Its `package_indices` buffer is keyed by store-entry ordinal, and the
+    /// store is a `BTreeMap` over `FPackageId` — so adding or removing any
+    /// package renumbers ordinals that this block, round-tripped verbatim, does
+    /// not follow. Mutating the store of such a container is refused rather than
+    /// reasoned about.
+    pub fn has_soft_package_references(&self) -> bool {
+        self.soft_package_references.is_some()
+    }
+
+    /// Whether the optional segment declares any package. Its two parallel
+    /// arrays have the same ordinal coupling as the soft references.
+    pub fn has_optional_segment(&self) -> bool {
+        !self.optional_segment_package_ids.is_empty()
+    }
+
+    /// Whether any redirect, new-style or legacy, points at `package_id`.
+    /// Removing its target would leave the redirect resolving to nothing.
+    pub fn redirects_to(&self, package_id: FPackageId) -> bool {
+        self.package_redirects
+            .iter()
+            .any(|redirect| redirect.target_package_id == package_id)
+            || self
+                .legacy_package_redirects
+                .iter()
+                .any(|redirect| redirect.target_package_id == package_id)
+            || self
+                .package_redirect_lookup
+                .values()
+                .any(|target| *target == package_id)
+    }
+
+    /// Whether `package_id` is registered as a localized source package, in
+    /// either the new list or the legacy culture map.
+    pub fn is_localized_source(&self, package_id: FPackageId) -> bool {
+        self.localized_source_package_ids.contains(&package_id)
+            || self.legacy_culture_package_map.0.values().any(|packages| {
+                packages
+                    .iter()
+                    .any(|(source, localized)| *source == package_id || *localized == package_id)
+            })
+    }
     pub fn package_ids(&self) -> std::iter::Copied<std::collections::btree_map::Keys<'_, FPackageId, StoreEntry>> {
         self.packages.0.keys().copied()
     }
