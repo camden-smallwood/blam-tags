@@ -1909,32 +1909,23 @@ fn validate_delete_result(
     }
 
     let retired = [resolved.uasset_index, resolved.ubulk_index];
-    for (index, original_id) in original_toc.chunk_ids.iter().enumerate() {
-        let saved_id = saved_toc
+    for index in retired {
+        let original_id = original_toc
             .chunk_ids
-            .get(index)
-            .ok_or(IoStoreError::Package("deletion dropped a chunk slot"))?;
-        let expected_id = if retired.contains(&(index as u32)) {
-            retire_chunk_id(*original_id)
-        } else {
-            *original_id
-        };
-        if *saved_id != expected_id {
-            return Err(IoStoreError::Package("deletion changed a chunk id"));
+            .get(index as usize)
+            .ok_or(IoStoreError::Package("retired chunk index out of range"))?;
+        if saved_toc.chunk_ids.get(index as usize) != Some(&retire_chunk_id(*original_id)) {
+            return Err(IoStoreError::Package("a retired chunk kept its id"));
         }
-        if retired.contains(&(index as u32)) {
-            if saved_toc.offset_lengths[index] != [0; 10]
-                || saved_toc.metas[index] != [0; TOC_META_SIZE]
-            {
-                return Err(IoStoreError::Package("a retired chunk kept its payload"));
-            }
-        } else if index as u32 != resolved.header_index
-            && (saved_toc.offset_lengths[index] != original_toc.offset_lengths[index]
-                || saved_toc.metas[index] != original_toc.metas[index])
+        if saved_toc.offset_lengths[index as usize] != [0; 10]
+            || saved_toc.metas[index as usize] != [0; TOC_META_SIZE]
         {
-            return Err(IoStoreError::Package("deletion moved a surviving chunk"));
+            return Err(IoStoreError::Package("a retired chunk kept its payload"));
         }
     }
+    let mut touched = retired.to_vec();
+    touched.push(resolved.header_index);
+    validate_untouched_chunks(original_toc, &saved_toc, &touched)?;
 
     let reopened = IoStoreArchive::open(utoc_path)?;
     if reopened.chunk_count() != original_toc.entry_count {
@@ -1974,16 +1965,6 @@ fn validate_delete_result(
             }
         }
     }
-    // Every surviving chunk is read back through the reopened archive: existing
-    // blocks are copied verbatim, so this is the proof the rebuilt section
-    // layout still serves them.
-    for index in 0..original_toc.entry_count {
-        if retired.contains(&index) {
-            continue;
-        }
-        reopened.read_chunk(index)?;
-    }
-
     let saved_header_index = reopened
         .find_chunk(&resolved.header_id)
         .ok_or(IoStoreError::Package("saved ContainerHeader is absent"))?;
@@ -2096,16 +2077,8 @@ fn validate_duplicate_result(
         reopened.recover_entries(&[], prefix.as_deref());
     }
 
-    for (index, expected_id) in original_toc.chunk_ids.iter().enumerate() {
-        let actual_id = reopened.chunk_id(index as u32)?;
-        if actual_id != *expected_id {
-            return Err(IoStoreError::Package("an existing chunk id changed"));
-        }
-        // This deliberately validates every old chunk through the reopened
-        // reader. Existing compressed blocks are copied verbatim, so this is
-        // the final check that the rebuilt section layout still serves them.
-        reopened.read_chunk(index as u32)?;
-    }
+    let touched: Vec<u32> = plan.items.iter().map(|item| item.chunk_index).collect();
+    validate_untouched_chunks(original_toc, &saved_toc, &touched)?;
     for item in &plan.items {
         let index = reopened
             .find_chunk(&item.id)
@@ -2157,6 +2130,50 @@ fn validate_duplicate_result(
         return Err(IoStoreError::Package(
             "saved package-store entry is incorrect",
         ));
+    }
+    Ok(())
+}
+
+/// Assert that every chunk the operation did not touch still addresses exactly
+/// the bytes it did before: same id, same offset and length, same content hash,
+/// and an unchanged prefix of the compression-block array.
+///
+/// This is deliberately structural rather than a read-back of the whole
+/// container. Decompressing every chunk of a shipping pak costs minutes per
+/// edit, and — worse — it fails on chunks the bundled Oodle implementation
+/// cannot decode at all, which a real game pak contains and which no in-place
+/// edit has any bearing on. Those reads never proved anything the offsets and
+/// blocks do not: a chunk whose entry and blocks are byte-identical resolves to
+/// byte-identical input, whether or not this crate happens to be able to
+/// decompress it.
+fn validate_untouched_chunks(
+    original_toc: &ParsedToc,
+    saved_toc: &ParsedToc,
+    touched: &[u32],
+) -> Result<()> {
+    for (index, original_id) in original_toc.chunk_ids.iter().enumerate() {
+        if touched.contains(&(index as u32)) {
+            continue;
+        }
+        if saved_toc.chunk_ids.get(index) != Some(original_id) {
+            return Err(IoStoreError::Package("an existing chunk id changed"));
+        }
+        if saved_toc.offset_lengths.get(index) != Some(&original_toc.offset_lengths[index]) {
+            return Err(IoStoreError::Package("an existing chunk moved"));
+        }
+        if saved_toc.metas.get(index) != Some(&original_toc.metas[index]) {
+            return Err(IoStoreError::Package("an existing chunk's metadata changed"));
+        }
+    }
+    if saved_toc.blocks.get(..original_toc.blocks.len()) != Some(original_toc.blocks.as_slice()) {
+        return Err(IoStoreError::Package(
+            "existing compression blocks were rewritten",
+        ));
+    }
+    if saved_toc.block_size != original_toc.block_size
+        || saved_toc.compression_methods != original_toc.compression_methods
+    {
+        return Err(IoStoreError::Package("compression parameters changed"));
     }
     Ok(())
 }
@@ -4765,6 +4782,80 @@ mod tests {
             expected_uasset_path: Some(DELETE_FIXTURE_UASSET),
             expected_ubulk_path: Some(DELETE_FIXTURE_UBULK),
         }
+    }
+
+    /// Mark one compression block as compressed with a codec that cannot decode
+    /// its bytes, so the chunk it belongs to fails to read. A real shipping pak
+    /// has chunks this crate's Oodle implementation cannot decode either.
+    fn corrupt_test_block_method(utoc: &std::path::Path, block_index: usize) {
+        let bytes = std::fs::read(utoc).expect("read test TOC");
+        let toc = parse_toc(&bytes).expect("parse test TOC");
+        let entries = toc.entry_count as usize;
+        let block_off = TOC_HEADER_SIZE
+            + entries * 12
+            + entries * 10
+            + toc.perfect_hash_seeds.len()
+            + toc.chunks_without_perfect_hash.len();
+        let mut bytes = bytes;
+        let field = block_off + block_index * 12 + 8;
+        let mut packed = u32::from_le_bytes(bytes[field..field + 4].try_into().unwrap());
+        packed = (packed & 0x00ff_ffff) | (1u32 << 24);
+        bytes[field..field + 4].copy_from_slice(&packed.to_le_bytes());
+        std::fs::write(utoc, bytes).expect("corrupt test block");
+    }
+
+    #[test]
+    fn duplicating_does_not_require_decoding_chunks_it_never_touches() {
+        // A 40 GB shipping pak contains chunks this crate cannot decompress.
+        // They have nothing to do with an in-place edit, and re-reading the
+        // whole container to "validate" it made every duplicate fail on them.
+        let (utoc, source_uasset, _header, old_uasset_path, _old_ubulk_path, _old_bulk) =
+            duplicate_fixture("undecodable", true, true);
+        corrupt_test_block_method(&utoc, 1);
+        {
+            let archive = IoStoreArchive::open(&utoc).expect("open corrupted fixture");
+            assert!(
+                archive.read_chunk(1).is_err(),
+                "the fixture must contain a chunk that cannot be decoded"
+            );
+        }
+
+        let archive = IoStoreArchive::open(&utoc).expect("open corrupted fixture");
+        duplicate_tag_in_place_with(
+            &archive,
+            &utoc,
+            &InPlaceTagDuplicate {
+                source_uasset: &source_uasset,
+                tag_bytes: &[0x42; 119],
+                destination_package_path: DELETE_FIXTURE_PACKAGE,
+                destination_uasset_path: DELETE_FIXTURE_UASSET,
+                destination_ubulk_path: DELETE_FIXTURE_UBULK,
+            },
+        )
+        .expect("an undecodable neighbour must not block a duplicate");
+
+        let reopened = IoStoreArchive::open(&utoc).expect("reopen");
+        assert_eq!(reopened.read(DELETE_FIXTURE_UBULK).unwrap(), vec![0x42; 119]);
+        assert_eq!(reopened.read(&old_uasset_path).unwrap(), source_uasset);
+        assert!(
+            reopened.read_chunk(1).is_err(),
+            "the undecodable chunk is left exactly as it was"
+        );
+
+        // And it must still be deletable afterwards.
+        let archive = IoStoreArchive::open(&utoc).expect("reopen for delete");
+        delete_tag_in_place_with(
+            &archive,
+            &utoc,
+            &InPlaceTagDeletion {
+                package_path: DELETE_FIXTURE_PACKAGE,
+                minimum_appended_index: None,
+                expected_uasset_path: None,
+                expected_ubulk_path: None,
+            },
+        )
+        .expect("an undecodable neighbour must not block a delete");
+        remove_duplicate_fixture(&utoc);
     }
 
     #[test]
