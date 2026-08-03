@@ -4,6 +4,7 @@
 //! asset kind out of the values that machinery produces.
 
 pub mod actorx;
+pub mod level;
 pub mod mesh_sync;
 pub mod nanite;
 pub mod skeletal_mesh;
