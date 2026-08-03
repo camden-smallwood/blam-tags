@@ -2067,15 +2067,11 @@ fn validate_duplicate_result(
         }
     }
 
-    let mut reopened = IoStoreArchive::open(utoc_path)?;
+    let reopened = IoStoreArchive::open(utoc_path)?;
     if reopened.chunk_count() != original_toc.entry_count + plan.new_chunk_indices.len() as u32 {
         return Err(IoStoreError::Package("reopened chunk count is incorrect"));
     }
     let indexed = original_toc.directory_index_size != 0;
-    if !indexed {
-        let prefix = infer_recovery_prefix(old_entries, request);
-        reopened.recover_entries(&[], prefix.as_deref());
-    }
 
     let touched: Vec<u32> = plan.items.iter().map(|item| item.chunk_index).collect();
     validate_untouched_chunks(original_toc, &saved_toc, &touched)?;
@@ -2088,23 +2084,37 @@ fn validate_duplicate_result(
         }
     }
 
-    for old_entry in old_entries {
-        let id = original_toc
-            .chunk_ids
-            .get(old_entry.chunk_index as usize)
-            .ok_or(IoStoreError::Package(
-                "old directory entry has a bad chunk index",
-            ))?;
-        if reopened.chunk_id_for(&old_entry.path)? != *id {
-            return Err(IoStoreError::Package("an existing directory entry changed"));
+    // Only an indexed container has paths to check — the same rule the deletion
+    // path follows. An indexless overlay stores no paths at all: the ones it
+    // appears to have were reconstructed by the caller, from whichever base
+    // containers it had, and those carry the *base's* casing. Re-deriving them
+    // here from package names alone disagrees with that for 7,534 of the
+    // shipped corpus's 12,329 tag packages — `Tags/objects/Characters/Marine/`
+    // against `/Game/Tags/objects/characters/marine/` — so every lookup of a
+    // caller-supplied path missed and rolled a correct write back.
+    //
+    // Nothing is lost by skipping them. Both new chunks are already verified by
+    // id and compared byte for byte above, every untouched chunk is checked by
+    // `validate_untouched_chunks`, and the package-store entry is checked below.
+    if indexed {
+        for old_entry in old_entries {
+            let id = original_toc
+                .chunk_ids
+                .get(old_entry.chunk_index as usize)
+                .ok_or(IoStoreError::Package(
+                    "old directory entry has a bad chunk index",
+                ))?;
+            if reopened.chunk_id_for(&old_entry.path)? != *id {
+                return Err(IoStoreError::Package("an existing directory entry changed"));
+            }
         }
-    }
-    if reopened.chunk_id_for(request.destination_uasset_path)? != cloned.uasset_id
-        || reopened.chunk_id_for(request.destination_ubulk_path)? != cloned.ubulk_id
-    {
-        return Err(IoStoreError::Package(
-            "destination directory entries are incorrect",
-        ));
+        if reopened.chunk_id_for(request.destination_uasset_path)? != cloned.uasset_id
+            || reopened.chunk_id_for(request.destination_ubulk_path)? != cloned.ubulk_id
+        {
+            return Err(IoStoreError::Package(
+                "destination directory entries are incorrect",
+            ));
+        }
     }
     if indexed != reopened.has_directory_index() {
         return Err(IoStoreError::Package("directory-index mode changed"));
@@ -2220,39 +2230,6 @@ fn toc_overflow_contains(bytes: &[u8], chunk_index: u32) -> bool {
     bytes
         .chunks_exact(4)
         .any(|raw| i32::from_le_bytes(raw.try_into().unwrap()) == chunk_index as i32)
-}
-
-fn infer_recovery_prefix(
-    old_entries: &[Entry],
-    request: &InPlaceTagDuplicate<'_>,
-) -> Option<String> {
-    old_entries
-        .iter()
-        .find_map(|entry| {
-            entry
-                .path
-                .find("/Content/")
-                .map(|index| entry.path[..index + "/Content/".len()].to_string())
-                .or_else(|| {
-                    entry
-                        .path
-                        .starts_with("Content/")
-                        .then(|| "Content/".to_string())
-                })
-        })
-        .or_else(|| infer_prefix_from_destination(request))
-}
-
-fn infer_prefix_from_destination(request: &InPlaceTagDuplicate<'_>) -> Option<String> {
-    let package_relative = request.destination_package_path.strip_prefix("/Game/")?;
-    let asset_stem = request.destination_uasset_path.strip_suffix(".uasset")?;
-    if asset_stem == package_relative {
-        return Some(String::new());
-    }
-    let suffix = format!("/{package_relative}");
-    asset_stem
-        .strip_suffix(&suffix)
-        .map(|prefix| format!("{prefix}/"))
 }
 
 fn validate_cloned_package(
@@ -4508,6 +4485,94 @@ mod tests {
         .expect("parse updated ContainerHeader");
         assert!(container_header.get_store_entry(new_package_id).is_some());
         remove_duplicate_fixture(&utoc);
+    }
+
+    /// Upper-case the first letter of every path segment under `Content/`, the
+    /// way the shipped directory index capitalises folders its package names do
+    /// not (`Tags/objects/Characters/Marine/` for `/Game/Tags/objects/characters/marine/`).
+    fn shift_directory_case(path: &str) -> String {
+        let Some(split) = path.find("/Content/") else {
+            return path.to_owned();
+        };
+        let cut = split + "/Content/".len();
+        let shifted = path[cut..]
+            .split('/')
+            .map(|segment| match segment.chars().next() {
+                Some(first) => format!("{}{}", first.to_ascii_uppercase(), &segment[first.len_utf8()..]),
+                None => segment.to_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        format!("{}{shifted}", &path[..cut])
+    }
+
+    /// Duplicating into a mod overlay whose entry paths were recovered from the
+    /// containers it overrides.
+    ///
+    /// This is the shape Baboon mounts: an overlay carries no directory index,
+    /// so its paths are reconstructed — and when a base container is available
+    /// to reconstruct them from, they carry the *base's* casing. The shipped
+    /// corpus makes that casing differ from the package name's for 7,534 of its
+    /// 12,329 tag packages, so validating the overlay by re-deriving paths from
+    /// package names alone cannot find them again.
+    ///
+    /// `duplicate_tag_indexless_headerless_overlay_recovers_new_paths` cannot
+    /// catch this: it hands over an archive whose `entries()` is still empty, so
+    /// the old-entry loop has nothing to walk, and its fixture paths are built
+    /// from the package name and therefore agree with it by construction.
+    #[test]
+    fn duplicate_into_indexless_overlay_whose_paths_came_from_a_base() {
+        let (overlay_utoc, source_uasset, _header, package_uasset, package_ubulk, old_bulk) =
+            duplicate_fixture("case-overlay", false, false);
+        let (base_utoc, ..) = duplicate_fixture("case-base", true, true);
+        let based_uasset = shift_directory_case(&package_uasset);
+        let based_ubulk = shift_directory_case(&package_ubulk);
+        assert_ne!(based_uasset, package_uasset, "fixture must diverge in case");
+        rewrite_test_directory_index(
+            &base_utoc,
+            &[
+                Entry {
+                    path: based_uasset.clone(),
+                    chunk_index: 0,
+                },
+                Entry {
+                    path: based_ubulk.clone(),
+                    chunk_index: 1,
+                },
+            ],
+        );
+        let base = IoStoreArchive::open(&base_utoc).expect("open base fixture");
+
+        let mut overlay = IoStoreArchive::open(&overlay_utoc).expect("open overlay fixture");
+        assert!(!overlay.has_directory_index());
+        overlay.recover_entries(&[&base], None);
+        assert!(
+            overlay.entries().iter().any(|e| e.path == based_uasset),
+            "the overlay should have taken the base container's casing"
+        );
+
+        let request = InPlaceTagDuplicate {
+            source_uasset: &source_uasset,
+            tag_bytes: &[0x77; 83],
+            destination_package_path: "/Game/Tags/Fixture/clone-cased",
+            destination_uasset_path: "Meteorite/Content/Tags/Fixture/clone-cased.uasset",
+            destination_ubulk_path: "Meteorite/Content/Tags/Fixture/clone-cased.ubulk",
+        };
+        duplicate_tag_in_place_with(&overlay, &overlay_utoc, &request)
+            .expect("duplicate into a recovered overlay");
+
+        let mut reopened = IoStoreArchive::open(&overlay_utoc).expect("reopen overlay");
+        reopened.recover_entries(&[&base], None);
+        assert_eq!(reopened.read(&based_uasset).unwrap(), source_uasset);
+        assert_eq!(reopened.read(&based_ubulk).unwrap(), old_bulk);
+        assert_eq!(
+            reopened
+                .read("Meteorite/Content/Tags/Fixture/clone-cased.ubulk")
+                .unwrap(),
+            vec![0x77; 83]
+        );
+        remove_duplicate_fixture(&overlay_utoc);
+        remove_duplicate_fixture(&base_utoc);
     }
 
     #[test]
