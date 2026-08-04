@@ -2120,12 +2120,40 @@ fn append_collision_surfaces(
         if polygon.len() < 3 {
             continue;
         }
+        let ring: Vec<RealPoint3d> = polygon
+            .iter()
+            .map(|&vi| bsp_points.get(vi as usize).copied().unwrap_or(RealPoint3d::ZERO))
+            .collect();
+        // Face normal by Newell's method: sum the edge cross-products around
+        // the whole ring rather than crossing one arbitrary pair, so a
+        // collinear or repeated pair of edges doesn't decide the answer.
+        //
+        // Derived from the ring rather than read from the surface's `plane`
+        // because it is then consistent with the winding of the triangles
+        // fanned below by construction. Collision planes are shared between
+        // the surfaces on either side of them, so a plane's normal faces the
+        // right way for only one of the two, and taking it directly would
+        // light half the hull inside-out.
+        let mut normal = RealVector3d { i: 0.0, j: 0.0, k: 0.0 };
+        for (a, b) in ring.iter().zip(ring.iter().cycle().skip(1)).take(ring.len()) {
+            normal.i += (a.y - b.y) * (a.z + b.z);
+            normal.j += (a.z - b.z) * (a.x + b.x);
+            normal.k += (a.x - b.x) * (a.y + b.y);
+        }
+        // Degenerate ring (zero area): keep the old constant rather than emit
+        // a zero vector, which some importers read as "no normal" and others
+        // as a black face.
+        let normal = if normal.length_squared() > 0.0 {
+            normal.normalized()
+        } else {
+            RealVector3d { i: 0.0, j: 0.0, k: 1.0 }
+        };
+
         let base_for_fan = verts.len() as u32;
-        for &vi in &polygon {
-            let pos = bsp_points.get(vi as usize).copied().unwrap_or(RealPoint3d::ZERO);
+        for &pos in &ring {
             verts.push(AssVertex {
                 position: pos,
-                normal: RealVector3d { i: 0.0, j: 0.0, k: 1.0 },
+                normal,
                 color: RealRgbColor::default(),
                 node_set: Vec::new(),
                 uvs: vec![RealPoint3d::ZERO],
