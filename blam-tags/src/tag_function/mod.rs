@@ -66,6 +66,7 @@
 //! - **v2 functions** (`function_definitions_v2.{h,cpp}`) — Reach-era
 //!   successor, irrelevant for H3 MCC tags.
 
+use crate::io::Endian;
 use crate::math::RealRgbColor;
 
 /// 11 function types defined in Halo's `e_function_type` enum
@@ -1607,6 +1608,42 @@ fn build_default_variant(target: FunctionType, header: TagFunctionHeader) -> (Fu
             4,
         ),
     }
+}
+
+/// The `data` blob a freshly-created `mapping_function` starts life with.
+///
+/// This is what the engine writes, not a plausible-looking blank. Reach's
+/// `c_function_definition::tag_placement_new` calls
+/// `initialize_from_garbage_memory`, which is four steps:
+///
+/// - `ensure_valid` — a blob under 32 bytes is resized to 32 and zeroed, which
+///   is the engine's own verdict that a 0-byte function is not a valid one;
+/// - `set_clamp_range_max(1.0)` — writes 1.0 at offset 8 (scalar graphs only);
+/// - `set_function_type(0)` — `Identity`. A no-op here: it re-runs only when the
+///   type byte or the blob size would change, and both already match, since
+///   Identity's compact size is 0 so the total stays `2 * 0 + 32`;
+/// - `set_clamped(true)` then `postprocess` — Identity has no per-type pass (the
+///   switch is on `type - 2`, which underflows), so `can_be_gpu` stays set and
+///   the flags end as `GPU | CLAMPED`, with `OPTIMIZED` explicitly cleared.
+///
+/// Gated against the shipped corpus rather than trusted: of 361,707 function
+/// blobs across Reach, Halo 3 and Halo 4, exactly 70 are Identity-typed, and 69
+/// of those are byte-identical to what this returns. (The odd one out differs
+/// only by a stale `OPTIMIZED` bit, which `postprocess` clears.)
+pub fn default_function_definition_bytes(endian: Endian) -> Vec<u8> {
+    let mut bytes = vec![0u8; 32];
+    bytes[0] = FunctionType::Identity as u8;
+    bytes[1] = FunctionFlags::CLAMPED | FunctionFlags::GPU;
+    // `clamp_range_max` at offset 8. The rest of the header — clamp_range_min,
+    // the colour union, both exclusion bounds and the trailing compact size —
+    // stays zeroed: that is what `ensure_valid`'s memset leaves behind, and
+    // nothing later in the sequence overwrites it.
+    let max = 1.0f32;
+    bytes[8..12].copy_from_slice(&match endian {
+        Endian::Le => max.to_le_bytes(),
+        Endian::Be => max.to_be_bytes(),
+    });
+    bytes
 }
 
 #[cfg(test)]

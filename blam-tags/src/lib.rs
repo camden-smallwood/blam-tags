@@ -144,7 +144,7 @@ pub use render_model::{
 };
 pub use tag_function::{
     ColorGraphType, FunctionFlags, FunctionKind, FunctionType, TagFunction, TagFunctionError,
-    TagFunctionHeader,
+    TagFunctionHeader, default_function_definition_bytes,
 };
 pub use tag_function::curve::{CurvePointMode, CurveSegmentType};
 pub use tag_function::editor::{

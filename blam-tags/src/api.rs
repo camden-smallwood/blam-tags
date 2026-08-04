@@ -860,6 +860,32 @@ impl<'a> TagField<'a> {
         crate::TagFunction::parse(bytes).ok()
     }
 
+    /// The schema name of a `data` field's definition (`function_definition_data`,
+    /// `shader_constant_data`, …). `None` for non-data fields.
+    ///
+    /// This is what tells a caller *what a data field is for* when its bytes
+    /// cannot say so themselves — an empty or malformed blob has no header to
+    /// read, but the definition name is still there. [`Self::as_function`]
+    /// answers "do these bytes parse as a function"; this answers "is this field
+    /// meant to hold one", which is the question a UI has to ask before it can
+    /// offer to author a function that does not exist yet.
+    pub fn data_definition_name(&self) -> Option<&'a str> {
+        let field = &self.layout.fields[self.field_index];
+        if field.field_type != TagFieldType::Data {
+            return None;
+        }
+        self.layout
+            .data_definition_name_offsets
+            .get(field.definition as usize)
+            .and_then(|offset| self.layout.get_string(*offset))
+    }
+
+    /// Whether this field is declared to hold a `mapping_function`, whatever its
+    /// bytes currently say. See [`Self::data_definition_name`].
+    pub fn is_function_data(&self) -> bool {
+        self.data_definition_name() == Some("function_definition_data")
+    }
+
     /// Step into a `pageable_resource` field. `None` if this isn't a
     /// resource field or if the sub-chunk is missing.
     pub fn as_resource(&self) -> Option<TagResource<'a>> {
