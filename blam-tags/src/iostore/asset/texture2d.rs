@@ -31,16 +31,64 @@ pub struct TextureSurface {
     /// reassembled while still compressed.
     pub pixel_format: String,
     pub data: Result<Vec<u8>, String>,
+    /// Tile cells at this level that carry no data, as `(tile_x, tile_y)`.
+    ///
+    /// A UDIM set may author its blocks at different resolutions. A half-size
+    /// block simply has no tiles at the finest levels, so its region of this
+    /// surface is untouched. The engine resolves that by sampling the finest
+    /// level a page is resident at; the equivalent here is
+    /// [`Texture2dSurfaces::display_rgba8`] for viewing, or starting that
+    /// block's mip chain lower down for a lossless export.
+    pub missing_tiles: Vec<(u32, u32)>,
+    /// Tile edge in pixels, for interpreting `missing_tiles`. 0 when the
+    /// surface is not tiled.
+    pub tile_size: u32,
 }
 
 impl TextureSurface {
-    /// Expand this surface to straight RGBA8 for display.
+    /// Expand this surface to straight RGBA8.
+    ///
+    /// Regions listed in `missing_tiles` are left as transparent black — use
+    /// [`Texture2dSurfaces::display_rgba8`] to fill them from a coarser level.
     pub fn to_rgba8(&self) -> Result<Vec<u8>> {
         let data = match &self.data {
             Ok(data) => data,
             Err(error) => bail!("{error}"),
         };
         decode_pixel_format(&self.pixel_format, self.width, self.height, data)
+    }
+
+    /// Whether `block` of a `blocks_x` x `blocks_y` UDIM grid has every tile.
+    pub fn covers_block(&self, blocks_x: u32, blocks_y: u32, block_x: u32, block_y: u32) -> bool {
+        if self.missing_tiles.is_empty() {
+            return true;
+        }
+        let (Some(block_w), Some(block_h)) = (
+            self.tile_grid_width().checked_div(blocks_x.max(1)),
+            self.tile_grid_height().checked_div(blocks_y.max(1)),
+        ) else {
+            return false;
+        };
+        if block_w == 0 || block_h == 0 {
+            return false;
+        }
+        !self.missing_tiles.iter().any(|(x, y)| {
+            x / block_w == block_x && y / block_h == block_y
+        })
+    }
+
+    fn tile_grid_width(&self) -> u32 {
+        match self.tile_size {
+            0 => 0,
+            tile => self.width.div_ceil(tile),
+        }
+    }
+
+    fn tile_grid_height(&self) -> u32 {
+        match self.tile_size {
+            0 => 0,
+            tile => self.height.div_ceil(tile),
+        }
     }
 }
 
@@ -70,6 +118,57 @@ impl Texture2dSurfaces {
     /// True when this texture is a UDIM set rather than one image.
     pub fn is_udim(&self) -> bool {
         self.width_in_blocks.saturating_mul(self.height_in_blocks) > 1
+    }
+
+    /// One layer and level as RGBA8, with any tiles this level does not carry
+    /// filled in from the next coarser level.
+    ///
+    /// A mixed-resolution UDIM set leaves whole blocks empty at its finest
+    /// levels. Showing those as blank is wrong — the data exists, one level
+    /// down, at the resolution it was authored at — so they are magnified from
+    /// the coarser level exactly as the engine's page table resolves them. The
+    /// blocks that *do* carry this level keep their full detail.
+    pub fn display_rgba8(&self, layer: usize, level: usize) -> Result<Vec<u8>> {
+        let layer_surfaces = self.layers.get(layer).context("texture has no such layer")?;
+        let surface = layer_surfaces
+            .mips
+            .get(level)
+            .context("texture layer has no such mip")?;
+        let mut rgba = surface.to_rgba8()?;
+        if surface.missing_tiles.is_empty() || surface.tile_size == 0 {
+            return Ok(rgba);
+        }
+        let Ok(coarser) = self.display_rgba8(layer, level + 1) else {
+            // Nothing coarser to borrow from; the gaps stay empty.
+            return Ok(rgba);
+        };
+        let coarser_width = (self.width >> (level + 1).min(31)).max(1) as usize;
+        let coarser_height = (self.height >> (level + 1).min(31)).max(1) as usize;
+        let width = surface.width as usize;
+        let height = surface.height as usize;
+        let tile = surface.tile_size as usize;
+
+        for (tile_x, tile_y) in &surface.missing_tiles {
+            let origin_x = *tile_x as usize * tile;
+            let origin_y = *tile_y as usize * tile;
+            for row in 0..tile.min(height.saturating_sub(origin_y)) {
+                let y = origin_y + row;
+                // Point sampling: the coarser level is exactly half size, so
+                // each of its texels covers a 2x2 block here.
+                let source_y = (y / 2).min(coarser_height.saturating_sub(1));
+                for column in 0..tile.min(width.saturating_sub(origin_x)) {
+                    let x = origin_x + column;
+                    let source_x = (x / 2).min(coarser_width.saturating_sub(1));
+                    let source = (source_y * coarser_width + source_x) * 4;
+                    let destination = (y * width + x) * 4;
+                    let Some(texel) = coarser.get(source..source + 4) else {
+                        continue;
+                    };
+                    rgba[destination..destination + 4].copy_from_slice(texel);
+                }
+            }
+        }
+        Ok(rgba)
     }
 }
 
@@ -118,6 +217,8 @@ pub fn decode_texture2d_surfaces(
                     height,
                     pixel_format: pixel_format.clone(),
                     data,
+                    missing_tiles: Vec::new(),
+                    tile_size: 0,
                 }
             })
             .collect();
@@ -235,17 +336,21 @@ fn virtual_texture_surfaces(
                         external_payload,
                     );
                     match data {
-                        Ok((format, bytes)) => TextureSurface {
+                        Ok((format, bytes, missing_tiles)) => TextureSurface {
                             width,
                             height,
                             pixel_format: format,
                             data: Ok(bytes),
+                            missing_tiles,
+                            tile_size: texture.tile_size,
                         },
                         Err(error) => TextureSurface {
                             width,
                             height,
                             pixel_format: pixel_format.clone(),
                             data: Err(format!("{error:#}")),
+                            missing_tiles: Vec::new(),
+                            tile_size: texture.tile_size,
                         },
                     }
                 })
@@ -408,7 +513,7 @@ fn virtual_texture_mip(
     pixel_format: &str,
     chunk_cache: &mut [Option<std::rc::Rc<Result<Vec<u8>, String>>>],
     external_payload: &mut impl FnMut(i32) -> Result<Vec<u8>>,
-) -> Result<(String, Vec<u8>)> {
+) -> Result<(String, Vec<u8>, Vec<(u32, u32)>)> {
     let grid = virtual_mip_grid(texture, level)?;
     let physical = texture
         .tile_size
@@ -484,6 +589,7 @@ fn virtual_texture_mip(
     };
     let mut out = vec![0u8; out_len];
     let mut placed = 0usize;
+    let mut missing_tiles = Vec::new();
     let mut last_error = None;
 
     for address in 0..grid.max_address {
@@ -494,6 +600,10 @@ fn virtual_texture_mip(
         }
         let Some((chunk_index, offset)) = virtual_tile_location(texture, level, address, layer)?
         else {
+            // In-grid but with no data. A mixed-resolution UDIM set leaves whole
+            // blocks empty at its finest levels; record the gap so callers can
+            // fill it from a coarser level rather than show a hole.
+            missing_tiles.push((tile_x, tile_y));
             continue;
         };
         let chunk = texture
@@ -572,7 +682,12 @@ fn virtual_texture_mip(
         return Err(last_error
             .unwrap_or_else(|| anyhow::anyhow!("virtual texture mip has no populated tiles")));
     }
-    Ok((out_format, out))
+    // A tile that was present but unreadable is a genuine failure, not the
+    // authored-lower-resolution case `missing_tiles` describes.
+    if let Some(error) = last_error {
+        return Err(error.context("virtual texture mip is incomplete"));
+    }
+    Ok((out_format, out, missing_tiles))
 }
 
 /// The colour a constant `EVirtualTextureCodec` stands for, if it is one.
@@ -1218,6 +1333,59 @@ mod tests {
         assert_eq!((surfaces.width_in_blocks, surfaces.height_in_blocks), (7, 2));
     }
 
+    /// A UDIM set may author its blocks at different resolutions, so the
+    /// lower-resolution ones have no tiles at the finest level. Those gaps must
+    /// be reported, and filled from the coarser level for display, rather than
+    /// left as the blank regions the raw assembly leaves behind.
+    #[test]
+    fn mixed_resolution_udim_blocks_fill_from_the_coarser_level() {
+        // Two 4x4-pixel UDIM blocks side by side, one tile each. Only block 1
+        // has data at mip 0; both have it at mip 1.
+        let mut texture = virtual_texture(1, 4, 8, 4, vec![8]);
+        texture.width_in_blocks = 2;
+        texture.height_in_blocks = 1;
+        texture.num_mips = 2;
+        texture.chunk_index_per_mip = vec![0, 0];
+        texture.base_offset_per_mip = vec![4, 12];
+        texture.tile_offset_data = vec![
+            // Mip 0: addresses 0 and 1 are the two blocks; address 0 is absent.
+            VirtualTextureTileOffsetData {
+                width: 2,
+                height: 1,
+                max_address: 4,
+                addresses: vec![0, 1],
+                offsets: vec![u32::MAX, 0],
+            },
+            VirtualTextureTileOffsetData {
+                width: 1,
+                height: 1,
+                max_address: 1,
+                addresses: vec![0],
+                offsets: vec![0],
+            },
+        ];
+        let mut chunk = vec![0; 4];
+        chunk.extend_from_slice(&[0, 248, 0, 248, 0, 0, 0, 0]); // mip 0 tile: red
+        chunk.extend_from_slice(&[224, 7, 224, 7, 0, 0, 0, 0]); // mip 1 tile: green
+        texture.chunks = vec![chunk_of(chunk)];
+
+        let surfaces =
+            virtual_texture_surfaces(&texture, &mut |_| bail!("no external chunk")).unwrap();
+        let mip0 = &surfaces.layers[0].mips[0];
+        assert_eq!(mip0.missing_tiles, vec![(0, 0)]);
+        assert!(!mip0.covers_block(2, 1, 0, 0), "block 0 has no mip 0");
+        assert!(mip0.covers_block(2, 1, 1, 0), "block 1 has mip 0");
+
+        // Raw: the absent block is left as untouched (zeroed) blocks.
+        let raw = mip0.to_rgba8().unwrap();
+        assert_eq!(&raw[0..4], &[0, 0, 0, 255]);
+        // Display: it is magnified from mip 1, and the resident block keeps its
+        // own full-resolution pixels.
+        let shown = surfaces.display_rgba8(0, 0).unwrap();
+        assert_eq!(&shown[0..4], &[0, 255, 0, 255], "gap filled from mip 1");
+        assert_eq!(&shown[4 * 4..5 * 4], &[255, 0, 0, 255], "resident block kept");
+    }
+
     fn virtual_texture(
         layers: u32,
         tile_size: u32,
@@ -1659,14 +1827,95 @@ mod tests {
                         vt.tile_data_offset_per_layer,
                     );
                     for (index, chunk) in vt.chunks.iter().enumerate() {
+                        let fetched = match &chunk.payload {
+                            Some(payload) => format!("inline {}", payload.len()),
+                            None => match header.bulk_data.get(chunk.bulk_index.max(0) as usize) {
+                                Some(bulk) => {
+                                    let read = archive
+                                        .read_bulk_for(package_chunk, bulk.cooked_index as u16)
+                                        .map(|bytes| bytes.len())
+                                        .unwrap_or(0);
+                                    format!(
+                                        "bulk flags={:#x} cooked_index={} offset={} size={} chunk_len={read}",
+                                        bulk.flags,
+                                        bulk.cooked_index,
+                                        bulk.serial_offset,
+                                        bulk.serial_size
+                                    )
+                                }
+                                None => "no bulk entry".to_owned(),
+                            },
+                        };
                         println!(
-                            "    chunk {index}: size_in_bytes={} codec_payload_size={} codecs={:?} bulk_index={} inline={}",
+                            "    chunk {index}: size_in_bytes={} codec_payload_size={} codecs={:?} bulk_index={} [{fetched}]",
                             chunk.size_in_bytes,
                             chunk.codec_payload_size,
                             chunk.codecs,
                             chunk.bulk_index,
-                            chunk.payload.is_some(),
                         );
+                    }
+                    // Where does each mip's tile data actually land?
+                    let stride =
+                        vt.tile_data_offset_per_layer.last().copied().unwrap_or(0) as u64;
+                    for (level, offsets) in vt.tile_offset_data.iter().enumerate() {
+                        let mut valid = 0u32;
+                        let mut in_grid = 0u32;
+                        let mut max_offset = 0u32;
+                        for address in 0..offsets.max_address {
+                            let x = reverse_morton_code_2(address);
+                            let y = reverse_morton_code_2(address >> 1);
+                            if x >= offsets.width || y >= offsets.height {
+                                continue;
+                            }
+                            in_grid += 1;
+                            if let Some(offset) = virtual_tile_offset(offsets, address) {
+                                valid += 1;
+                                max_offset = max_offset.max(offset);
+                            }
+                        }
+                        let base = vt.base_offset_per_mip.get(level).copied().unwrap_or(0) as u64;
+                        let extent = base + (max_offset as u64 + 1) * stride;
+                        let chunk_len = vt
+                            .chunk_index_per_mip
+                            .get(level)
+                            .and_then(|index| vt.chunks.get(*index as usize))
+                            .map(|chunk| chunk.size_in_bytes as u64)
+                            .unwrap_or(0);
+                        println!(
+                            "    mip {level} tiles: grid_cells={in_grid} with_offset={valid} max_offset={max_offset} needs={extent} chunk_size={chunk_len} {}",
+                            if extent > chunk_len { "OVERFLOWS" } else { "fits" }
+                        );
+                        // Which UDIM block does each missing tile belong to?
+                        if valid < in_grid {
+                            let bw = offsets.width / vt.width_in_blocks.max(1);
+                            let bh = offsets.height / vt.height_in_blocks.max(1);
+                            let mut per_block = vec![
+                                0u32;
+                                (vt.width_in_blocks.max(1) * vt.height_in_blocks.max(1))
+                                    as usize
+                            ];
+                            for address in 0..offsets.max_address {
+                                let x = reverse_morton_code_2(address);
+                                let y = reverse_morton_code_2(address >> 1);
+                                if x >= offsets.width || y >= offsets.height {
+                                    continue;
+                                }
+                                if virtual_tile_offset(offsets, address).is_some()
+                                    && bw > 0
+                                    && bh > 0
+                                {
+                                    let block =
+                                        (y / bh) * vt.width_in_blocks.max(1) + (x / bw);
+                                    if let Some(slot) = per_block.get_mut(block as usize) {
+                                        *slot += 1;
+                                    }
+                                }
+                            }
+                            println!(
+                                "      block tile counts (of {} each): {per_block:?}",
+                                bw * bh
+                            );
+                        }
                     }
 
                     // Reassemble every VT mip. The preview API stops at the first
@@ -1702,11 +1951,12 @@ mod tests {
                                         .unwrap_or_else(|| "no grid".to_owned());
                                     match &surface.data {
                                         Ok(bytes) => println!(
-                                            "    layer {layer_index} mip {level}: {}x{} {grid} ok ({} bytes {})",
+                                            "    layer {layer_index} mip {level}: {}x{} {grid} ok ({} bytes {}) missing_tiles={}",
                                             surface.width,
                                             surface.height,
                                             bytes.len(),
                                             surface.pixel_format,
+                                            surface.missing_tiles.len(),
                                         ),
                                         Err(error) => {
                                             println!(
