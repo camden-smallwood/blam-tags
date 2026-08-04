@@ -2372,18 +2372,29 @@ pub fn write_tag_override(
 
 /// Generate an override container that adds a NEW or RENAMED tag package.
 ///
-/// Mutates `template_uasset`'s identity to `new_package_path` (a template is
-/// typically an existing same-group tag's `.uasset`), sets the tag content in
+/// Retargets `template_uasset` to `new_package_path` -- identity *and* group,
+/// so the donor need not be of the destination group -- sets the tag content in
 /// the `.ubulk`, and writes the container with a ContainerHeader package-store
 /// entry so the new package is locatable by the engine. `redirect_from` (the
 /// old `/Game/Tags/...` package path) adds a rename redirect so existing
 /// references resolve to the renamed tag. All hashing/ids derive from the
 /// names; nothing depends on retoc at runtime.
-/// A brand-new tag package to add to an override container: the source `.uasset`
-/// template (typically an existing same-group tag's), the new tag `.ubulk` bytes,
-/// the target UE package path (`/Game/Tags/<rel>-<group>`), and an optional
-/// old→new package redirect for renames.
+/// A brand-new tag package to add to an override container: a donor `.uasset`
+/// to take the package structure from, the new tag `.ubulk` bytes, the target UE
+/// package path (`/Game/Tags/<rel>-<group>`), and an optional old→new package
+/// redirect for renames.
 pub struct NewPackage<'a> {
+    /// Any shipped tag's `.uasset`, for its package *structure* only.
+    ///
+    /// It does not have to be of the destination group. Everything group-shaped
+    /// -- the wrapper class, its CDO, the script imports naming them, and the
+    /// flag pair -- is derived from `new_package_path`, because the game ships
+    /// no tag at all for 38 of the 139 defined groups and those could otherwise
+    /// never be created.
+    ///
+    /// A donor of another group must carry no properties of its own: they are
+    /// positional against the donor class's schema and would name different
+    /// properties under the destination's. The 47 bare groups all qualify.
     pub template_uasset: &'a [u8],
     pub tag_bytes: &'a [u8],
     pub new_package_path: &'a str,
@@ -2455,10 +2466,11 @@ fn add_override_to_writer(
     Ok(())
 }
 
-/// Add one brand-new tag package (mutating the template `.uasset`'s identity to
-/// `new_package_path`, setting the `.ubulk` content, plus an optional redirect)
-/// to an in-progress override container writer.
+/// Add one brand-new tag package (retargeting the donor `.uasset` to
+/// `new_package_path`'s identity and group, setting the `.ubulk` content, plus
+/// an optional redirect) to an in-progress override container writer.
 fn add_new_package_to_writer(w: &mut OverrideContainerWriter, pkg: &NewPackage) -> Result<()> {
+    use crate::iostore::package::imports::split_tag_package;
     use crate::iostore::package::ue_types::EIoStoreTocVersion;
     use crate::iostore::package::zen::FZenPackageHeader;
     const HV: EIoContainerHeaderVersion = EIoContainerHeaderVersion::SoftPackageReferences;
@@ -2479,7 +2491,9 @@ fn add_new_package_to_writer(w: &mut OverrideContainerWriter, pkg: &NewPackage) 
     // the payload, so a mid-way bail that fell back to the verbatim export would
     // ship a header describing imports the payload no longer matches.
     let mut sanitized_hdr = hdr.clone();
-    let export_data = match sanitize_donated_export(&mut sanitized_hdr, &export_data, pkg) {
+    let sanitized = sanitize_donated_export(&mut sanitized_hdr, &export_data, pkg);
+    let donor_was_same_group = sanitized.is_ok();
+    let export_data = match sanitized {
         Ok(bytes) => {
             hdr = sanitized_hdr;
             bytes
@@ -2487,6 +2501,43 @@ fn add_new_package_to_writer(w: &mut OverrideContainerWriter, pkg: &NewPackage) 
         Err(SanitizeSkip::NothingToStrip) => export_data,
         Err(SanitizeSkip::Failed(e)) => return Err(e),
     };
+
+    // A donor only supplies structure. Everything that makes the wrapper belong
+    // to a *group* is derived from the destination path, so a tag can be created
+    // in a group the game ships no instance of -- there are 38 such groups, and
+    // before this they could not be created at all.
+    let Some((_, group)) = split_tag_package(pkg.new_package_path) else {
+        return Err(IoStoreError::Package(
+            "a new tag package path must be /Game/Tags/<path>-<group>",
+        ));
+    };
+    if !donor_was_same_group {
+        // `sanitize_donated_export` decodes against the donor's own class, and
+        // declines when that is not the destination group's. So a cross-group
+        // donor arrives here unsanitized, and only an *empty* property block is
+        // transferable: a present property is indexed against the donor class's
+        // schema and would name a different property under the new class.
+        //
+        // Nothing shipped needs the general case -- every caller creating a tag
+        // donates from one of the 47 bare groups -- so this is a guard, not a
+        // limitation to work around.
+        if !crate::iostore::object::export::export_block_is_empty(&export_data)
+            .map_err(|_| IoStoreError::Package("could not read a donated wrapper's property block"))?
+        {
+            return Err(IoStoreError::Package(
+                "a new tag needs a donor of its own group, or one whose wrapper carries no properties",
+            ));
+        }
+        if pkg.asset_reference.is_some() {
+            // Applying it would mean encoding against the destination class with
+            // a block laid out for the donor's. Failing beats silently dropping
+            // the binding the caller asked for.
+            return Err(IoStoreError::Package(
+                "a new tag's AssetReference needs a donor of its own group",
+            ));
+        }
+    }
+    retarget_wrapper_to_group(&mut hdr, group)?;
 
     let new_obj = pkg
         .new_package_path
@@ -2517,6 +2568,60 @@ fn add_new_package_to_writer(w: &mut OverrideContainerWriter, pkg: &NewPackage) 
     if let Some(old) = pkg.redirect_from {
         w.add_redirect(old, FPackageId(new_pid));
     }
+    Ok(())
+}
+
+/// Point a wrapper at `group`'s tag-data-asset class.
+///
+/// Four things in a tag `.uasset` say which group it is -- the export's class
+/// and its CDO, the script imports naming those two, and the flag pair -- and
+/// all four are mechanically derivable from the group long name. Deriving them
+/// is what lets any tag donate its structure to any other group; without it a
+/// donor had to already be of the destination group, and the game ships no tag
+/// at all for 38 of the 139 defined groups.
+///
+/// Identity (package name, object name, `public_export_hash`, bulk size) is the
+/// caller's; this only handles what is group-shaped.
+fn retarget_wrapper_to_group(hdr: &mut FZenPackageHeader, group: &str) -> Result<()> {
+    use crate::iostore::package::imports::{
+        read_import_slots, tag_package_flags, tag_wrapper_cdo_path, tag_wrapper_class_path,
+        write_import_slots, ImportSlot, TAG_WRAPPER_MODULE_PATH,
+    };
+
+    let class = FPackageObjectIndex::create_script_import(&tag_wrapper_class_path(group));
+    let cdo = FPackageObjectIndex::create_script_import(&tag_wrapper_cdo_path(group));
+    let module = FPackageObjectIndex::create_script_import(TAG_WRAPPER_MODULE_PATH);
+    let (object_flags, package_flags) = tag_package_flags(group);
+
+    let export = hdr
+        .export_map
+        .first_mut()
+        .ok_or(IoStoreError::Package("a tag wrapper has no export"))?;
+    export.class_index = class;
+    export.template_index = cdo;
+    export.object_flags = object_flags;
+    hdr.summary.package_flags = package_flags;
+
+    // Rewritten in place rather than rebuilt: an export property names an import
+    // by slot index, so reordering the map would silently re-point it. Every
+    // shipped tag has exactly these three script imports, in this order.
+    let mut slots = read_import_slots(hdr)
+        .map_err(|_| IoStoreError::Package("could not read a donated wrapper's import map"))?;
+    let mut retargeted = [class, cdo, module].into_iter();
+    for slot in slots.iter_mut() {
+        if let ImportSlot::Script(index) = slot {
+            *index = retargeted.next().ok_or(IoStoreError::Package(
+                "a donated wrapper has more than the three script imports a tag carries",
+            ))?;
+        }
+    }
+    if retargeted.next().is_some() {
+        return Err(IoStoreError::Package(
+            "a donated wrapper has fewer than the three script imports a tag carries",
+        ));
+    }
+    write_import_slots(hdr, &slots)
+        .map_err(|_| IoStoreError::Package("could not rewrite a donated wrapper's import map"))?;
     Ok(())
 }
 

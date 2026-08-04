@@ -388,6 +388,22 @@ pub fn write_export(class: &str, ex: &Export, usmap: &Usmap) -> Result<Vec<u8>> 
     write_export_in(class, ex, usmap, None)
 }
 
+/// Whether an export's property block has **nothing present** — every property
+/// absent, so the block means "class defaults" whatever the class turns out to
+/// be.
+///
+/// Schema-free on purpose. `FUnversionedHeader` records presence positionally
+/// against the class's flattened schema, but an all-absent header collapses to
+/// a single `skip 1, value 0` fragment (`FUnversionedHeaderBuilder::Finalize`
+/// pops trailing skips down to one), so emptiness can be read without knowing
+/// which class the bytes were written against. That is what makes such a body
+/// safe to donate across groups: it asserts nothing about the schema it is
+/// re-pointed at. A body with anything present is not transferable, because the
+/// present indices name properties of the *donor's* class.
+pub fn export_block_is_empty(payload: &[u8]) -> Result<bool> {
+    Ok(super::block::parse_header(payload)?.0.present.is_empty())
+}
+
 /// As [`write_export`], with the package context. Regenerating a nested block's
 /// header needs the same layout the reader used, and for a property bag or a
 /// user-defined struct that layout lives in another package.
