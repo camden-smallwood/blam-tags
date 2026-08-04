@@ -267,7 +267,11 @@ impl AssFile {
     /// - one MESH per `instanced geometries definitions[]` entry
     ///   (definition-local space, decompressed against the def's own
     ///   `compression index`; content-deduped so byte-identical defs
-    ///   collapse to one shared OBJECT)
+    ///   collapse to one shared OBJECT). On a BSP with no render
+    ///   geometry at all — an empty `render geometry/per mesh
+    ///   temporary`, which is how Halo: Campaign Evolved ships, Unreal
+    ///   owning the rendered mesh — these come from each definition's
+    ///   `collision info` instead, under `@collision_only`.
     /// - one MESH per cluster portal (`+portal_N` name, fan-triangulated
     ///   from `cluster portals[i].vertices`)
     /// - one MESH per weather polyhedron (`+weather_N` name, convex hull
@@ -315,6 +319,23 @@ impl AssFile {
             .ok_or(AssError::MissingField("render geometry/meshes"))?;
         let pmt = root.field_path("render geometry/per mesh temporary").and_then(|f| f.as_block())
             .ok_or(AssError::MissingField("render geometry/per mesh temporary"))?;
+
+        // Halo: Campaign Evolved is a Blam/Unreal hybrid: the Blam tag
+        // owns collision and placement while Unreal owns everything
+        // rendered. Its BSPs therefore carry no render geometry at all
+        // — `per mesh temporary` is empty and every mesh reports
+        // `index buffer index = -1` — but a complete collision model,
+        // one `collision info` per instanced geometry definition.
+        // Recognise that shape and source the definition meshes from
+        // collision instead, so these BSPs export their real content
+        // rather than an almost-empty scene.
+        //
+        // Deliberately gated on the whole block being empty rather than
+        // per-definition: H3/ODST/Reach/H4 also have definitions whose
+        // render mesh is missing, and quietly emitting collision for
+        // just those would change their long-standing output (51 of 428
+        // definitions on Reach's cex_beaver_creek alone).
+        let collision_only = pmt.is_empty();
 
         let mut objects: Vec<AssObject> = Vec::new();
         let mut instances: Vec<AssInstance> = Vec::new();
@@ -443,24 +464,46 @@ impl AssFile {
             // as instances pointing at one underlying mesh.
             let mut def_object_index: Vec<Option<i32>> = vec![None; defs.len()];
             let mut content_to_object_index: std::collections::HashMap<Vec<u8>, i32> = std::collections::HashMap::new();
+            // Collision-sourced definition meshes carry the
+            // `@collision_only` marker material, same as the structure
+            // collision BSP below, so Tool.exe re-extracts them into
+            // collision rather than treating them as render geometry.
+            let def_coll_mat_idx = if collision_only {
+                ensure_special_material(&mut materials, "@collision_only") as i32
+            } else {
+                -1
+            };
             for di in 0..defs.len() {
                 let def = defs.element(di).unwrap();
-                let mesh_idx = def.read_int_any("mesh index").unwrap_or(-1);
-                let comp_idx = def.read_int_any("compression index").unwrap_or(0).max(0) as usize;
-                if mesh_idx < 0 || (mesh_idx as usize) >= meshes.len() { continue; }
-                if (mesh_idx as usize) >= pmt.len() { continue; }
-                let bounds = read_compression_bounds_at(&root, comp_idx);
-                // Compression-bounds chirality: when an ODD number of
-                // axes have negative span (mx < mn), the unpacker's
-                // Jacobian flips sign and triangle winding inverts vs
-                // the stored vertex normals. Detect + swap b/c per
-                // triangle inside build_cluster_object. Rare in
-                // shipped Guardian content but a documented
-                // safety-net per the H3 Blender Toolset's decoder.
-                let flip_winding = compute_axis_flip(&bounds);
-                let mesh = meshes.element(mesh_idx as usize).unwrap();
-                let mesh_pmt = pmt.element(mesh_idx as usize).unwrap();
-                let object = build_cluster_object(&mesh, &mesh_pmt, &bounds, flip_winding)?;
+                let object = if collision_only {
+                    let mut verts: Vec<AssVertex> = Vec::new();
+                    let mut tris: Vec<AssTriangle> = Vec::new();
+                    if let Some(coll) = def.field("collision info").and_then(|f| f.as_struct()) {
+                        append_collision_surfaces(&coll, def_coll_mat_idx, &mut verts, &mut tris);
+                    }
+                    AssObject {
+                        xref_filepath: String::new(),
+                        xref_objectname: String::new(),
+                        payload: AssObjectPayload::Mesh { vertices: verts, triangles: tris },
+                    }
+                } else {
+                    let mesh_idx = def.read_int_any("mesh index").unwrap_or(-1);
+                    let comp_idx = def.read_int_any("compression index").unwrap_or(0).max(0) as usize;
+                    if mesh_idx < 0 || (mesh_idx as usize) >= meshes.len() { continue; }
+                    if (mesh_idx as usize) >= pmt.len() { continue; }
+                    let bounds = read_compression_bounds_at(&root, comp_idx);
+                    // Compression-bounds chirality: when an ODD number of
+                    // axes have negative span (mx < mn), the unpacker's
+                    // Jacobian flips sign and triangle winding inverts vs
+                    // the stored vertex normals. Detect + swap b/c per
+                    // triangle inside build_cluster_object. Rare in
+                    // shipped Guardian content but a documented
+                    // safety-net per the H3 Blender Toolset's decoder.
+                    let flip_winding = compute_axis_flip(&bounds);
+                    let mesh = meshes.element(mesh_idx as usize).unwrap();
+                    let mesh_pmt = pmt.element(mesh_idx as usize).unwrap();
+                    build_cluster_object(&mesh, &mesh_pmt, &bounds, flip_winding)?
+                };
                 if object.vertices_len() == 0 { continue; }
                 let key = object_content_key(&object);
                 if let Some(&existing) = content_to_object_index.get(&key) {
@@ -640,58 +683,29 @@ impl AssFile {
         // single MESH OBJECT with `@collision_only`-named material
         // so Tool.exe re-extracts it into the tag's collision BSP
         // on recompile. Reuses crate::geometry::walk_surface_ring.
-        if let Some(coll_block) = root.field_path("resource interface/raw_resources[0]/raw_items/collision bsp")
-            .and_then(|f| f.as_block())
-        {
+        // Which field holds the sealed world varies by generation, and
+        // reading only one silently loses it: H3/ODST have just
+        // `collision bsp` (and Campaign Evolved fills the same one),
+        // while Reach/H4/H2A moved it to `large collision bsp` — same
+        // surfaces/edges/vertices shape, 46,178 surfaces on Reach's
+        // cex_beaver_creek. Read whichever are present.
+        let coll_blocks: Vec<_> = ["collision bsp", "large collision bsp"]
+            .into_iter()
+            .filter_map(|name| {
+                root.field_path(&format!(
+                    "resource interface/raw_resources[0]/raw_items/{name}"
+                ))
+                .and_then(|f| f.as_block())
+            })
+            .collect();
+        if !coll_blocks.is_empty() {
             let coll_mat_idx = ensure_special_material(&mut materials, "@collision_only") as i32;
             let mut coll_verts: Vec<AssVertex> = Vec::new();
             let mut coll_tris: Vec<AssTriangle> = Vec::new();
-            let mut next_index: u32 = 0;
-            for ci in 0..coll_block.len() {
-                let bsp = coll_block.element(ci).unwrap();
-                let surfaces = match bsp.field("surfaces").and_then(|f| f.as_block()) { Some(b) => b, None => continue };
-                let edges = match bsp.field("edges").and_then(|f| f.as_block()) { Some(b) => b, None => continue };
-                let bsp_verts = match bsp.field("vertices").and_then(|f| f.as_block()) { Some(b) => b, None => continue };
-                let edge_cache: Vec<crate::geometry::EdgeRow> = (0..edges.len()).map(|k| {
-                    let e = edges.element(k).unwrap();
-                    crate::geometry::EdgeRow {
-                        start_vertex: e.read_int_any("start vertex").unwrap_or(-1) as i32,
-                        end_vertex: e.read_int_any("end vertex").unwrap_or(-1) as i32,
-                        forward_edge: e.read_int_any("forward edge").unwrap_or(-1) as i32,
-                        reverse_edge: e.read_int_any("reverse edge").unwrap_or(-1) as i32,
-                        left_surface: e.read_int_any("left surface").unwrap_or(-1) as i32,
-                        right_surface: e.read_int_any("right surface").unwrap_or(-1) as i32,
-                    }
-                }).collect();
-                let bsp_points: Vec<RealPoint3d> = (0..bsp_verts.len()).map(|k| {
-                    bsp_verts.element(k).unwrap().read_point3d("point") * SCALE
-                }).collect();
-                for si in 0..surfaces.len() {
-                    let surface = surfaces.element(si).unwrap();
-                    let first_edge = surface.read_int_any("first edge").unwrap_or(-1) as i32;
-                    if first_edge < 0 { continue; }
-                    let polygon = crate::geometry::walk_surface_ring(si as i32, first_edge, &edge_cache);
-                    if polygon.len() < 3 { continue; }
-                    // Triangle-fan the convex polygon.
-                    let base_for_fan = next_index;
-                    for &vi in &polygon {
-                        let pos = bsp_points.get(vi as usize).copied().unwrap_or(RealPoint3d::ZERO);
-                        coll_verts.push(AssVertex {
-                            position: pos,
-                            normal: RealVector3d { i: 0.0, j: 0.0, k: 1.0 },
-                            color: RealRgbColor::default(),
-                            node_set: Vec::new(),
-                            uvs: vec![RealPoint3d::ZERO],
-                        });
-                    }
-                    let n = polygon.len() as u32;
-                    for k in 1..n - 1 {
-                        coll_tris.push(AssTriangle {
-                            material: coll_mat_idx,
-                            v: [base_for_fan, base_for_fan + k, base_for_fan + k + 1],
-                        });
-                    }
-                    next_index += n;
+            for coll_block in &coll_blocks {
+                for ci in 0..coll_block.len() {
+                    let bsp = coll_block.element(ci).unwrap();
+                    append_collision_surfaces(&bsp, coll_mat_idx, &mut coll_verts, &mut coll_tris);
                 }
             }
             if !coll_verts.is_empty() {
@@ -2048,6 +2062,83 @@ fn polyhedron_from_planes(planes: &[RealPlane3d], material_index: i32) -> (Vec<A
         }
     }
     (vertices, tris)
+}
+
+/// Fan-triangulate one collision-BSP struct's `surfaces` onto the end
+/// of `verts` / `tris`, under `material`.
+///
+/// The `surfaces` + `edges` + `vertices` triple is the same shape
+/// wherever Blam stores collision: the sbsp's own structure collision
+/// BSP, and each `instanced geometries definitions[i]/collision info`.
+/// A surface is recovered by walking its edge ring — every edge is
+/// shared by two surfaces, and which side matches decides whether the
+/// edge contributes its start or end vertex — then fanned into
+/// triangles. Vertices are converted to ASS centimetres on the way in.
+///
+/// Vertices are appended rather than indexed into a shared pool, so
+/// each surface owns its own ring; that matches how the structure
+/// collision path has always emitted and keeps winding independent
+/// per surface.
+fn append_collision_surfaces(
+    bsp: &TagStruct<'_>,
+    material: i32,
+    verts: &mut Vec<AssVertex>,
+    tris: &mut Vec<AssTriangle>,
+) {
+    let (Some(surfaces), Some(edges), Some(bsp_verts)) = (
+        bsp.field("surfaces").and_then(|f| f.as_block()),
+        bsp.field("edges").and_then(|f| f.as_block()),
+        bsp.field("vertices").and_then(|f| f.as_block()),
+    ) else {
+        return;
+    };
+
+    let edge_cache: Vec<crate::geometry::EdgeRow> = (0..edges.len())
+        .map(|k| {
+            let e = edges.element(k).unwrap();
+            crate::geometry::EdgeRow {
+                start_vertex: e.read_int_any("start vertex").unwrap_or(-1) as i32,
+                end_vertex: e.read_int_any("end vertex").unwrap_or(-1) as i32,
+                forward_edge: e.read_int_any("forward edge").unwrap_or(-1) as i32,
+                reverse_edge: e.read_int_any("reverse edge").unwrap_or(-1) as i32,
+                left_surface: e.read_int_any("left surface").unwrap_or(-1) as i32,
+                right_surface: e.read_int_any("right surface").unwrap_or(-1) as i32,
+            }
+        })
+        .collect();
+    let bsp_points: Vec<RealPoint3d> = (0..bsp_verts.len())
+        .map(|k| bsp_verts.element(k).unwrap().read_point3d("point") * SCALE)
+        .collect();
+
+    for si in 0..surfaces.len() {
+        let surface = surfaces.element(si).unwrap();
+        let first_edge = surface.read_int_any("first edge").unwrap_or(-1) as i32;
+        if first_edge < 0 {
+            continue;
+        }
+        let polygon = crate::geometry::walk_surface_ring(si as i32, first_edge, &edge_cache);
+        if polygon.len() < 3 {
+            continue;
+        }
+        let base_for_fan = verts.len() as u32;
+        for &vi in &polygon {
+            let pos = bsp_points.get(vi as usize).copied().unwrap_or(RealPoint3d::ZERO);
+            verts.push(AssVertex {
+                position: pos,
+                normal: RealVector3d { i: 0.0, j: 0.0, k: 1.0 },
+                color: RealRgbColor::default(),
+                node_set: Vec::new(),
+                uvs: vec![RealPoint3d::ZERO],
+            });
+        }
+        let n = polygon.len() as u32;
+        for k in 1..n - 1 {
+            tris.push(AssTriangle {
+                material,
+                v: [base_for_fan, base_for_fan + k, base_for_fan + k + 1],
+            });
+        }
+    }
 }
 
 /// Find or append a "special" material (used by recompile-marker
