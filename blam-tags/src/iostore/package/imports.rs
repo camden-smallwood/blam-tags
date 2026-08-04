@@ -1077,6 +1077,73 @@ mod new_package_corpus {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// What generation the game's own tag blobs claim.
+    ///
+    /// A created tag has to carry the same one: the simulation reads the blob,
+    /// not the wrapper, so a tag whose header says something the game does not
+    /// expect is a tag that only ever works inside an editor. `TagFile::new`
+    /// leaves all three at zero, which is exactly the value nothing shipped has.
+    ///
+    /// Reads the fixed 64-byte header directly rather than parsing the tag:
+    /// `pad[36] | build_version | build_number | version | group_tag |
+    /// group_version | checksum | signature`, little-endian, so the `BLAM`
+    /// signature reads as `MALB` in the raw bytes.
+    ///
+    ///   CE_PAKS=... cargo test --features iostore new_package_corpus -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires a Campaign Evolved install; set CE_PAKS"]
+    fn the_shipped_tag_header_generation() {
+        let archives = open_shipped_archives();
+        let mut census: std::collections::BTreeMap<(i32, i32, u32), usize> = Default::default();
+        let mut by_group: std::collections::BTreeMap<(i32, i32, u32), Vec<String>> =
+            Default::default();
+        let mut total = 0usize;
+        for archive in &archives {
+            for entry in archive.entries() {
+                let lower = entry.path.to_ascii_lowercase().replace('\\', "/");
+                if !lower.ends_with(".ubulk") || !lower.contains("/content/tags/") {
+                    continue;
+                }
+                let Ok(bytes) = archive.read(&entry.path) else { continue };
+                if bytes.len() < 64 || &bytes[60..64] != b"MALB" {
+                    continue;
+                }
+                let key = (
+                    i32::from_le_bytes(bytes[36..40].try_into().unwrap()),
+                    i32::from_le_bytes(bytes[40..44].try_into().unwrap()),
+                    u32::from_le_bytes(bytes[44..48].try_into().unwrap()),
+                );
+                *census.entry(key).or_default() += 1;
+                let group = lower
+                    .strip_suffix(".ubulk")
+                    .and_then(|s| s.rsplit('/').next())
+                    .and_then(|stem| stem.rsplit_once('-').map(|(_, g)| g.to_owned()))
+                    .unwrap_or_default();
+                let seen = by_group.entry(key).or_default();
+                if !seen.contains(&group) {
+                    seen.push(group);
+                }
+                total += 1;
+            }
+        }
+        println!("read {total} shipped tag blobs");
+        for (key, count) in &census {
+            let (build_version, build_number, version) = *key;
+            let groups = &by_group[key];
+            println!(
+                "build_version={build_version} build_number={build_number} \
+                 version={version} ({version:#010x}) -> {count} tags, {} groups{}",
+                groups.len(),
+                if groups.len() <= 6 {
+                    format!(" {groups:?}")
+                } else {
+                    String::new()
+                }
+            );
+        }
+        assert!(total > 10_000, "expected the whole tag corpus, read {total}");
+    }
+
     /// The derivations are checked against the 101 groups that *do* ship, which
     /// is the only ground truth available for the 38 that do not.
     ///
