@@ -40,7 +40,13 @@
 //! Zero-byte editor sentinels (`custom`, `explanation`) are skipped: they carry
 //! no data and the two toolsets do not agree on how many of them to emit.
 //! Padding *is* kept, because it consumes bytes and therefore moves everything
-//! after it.
+//! after it. Enum and flag option *names* are not compared either: they are
+//! editor strings, the simulation reads the stored value, and a shipped tag
+//! routinely carries a shorter list than the current schema dump — an HREK
+//! animation graph declares 14 user flags where the schema declares 16.
+//! Refusing on that would call every real tag incompatible with its own game.
+//! Whether the meaning survives is [`compare_group_layouts`]'s question, and it
+//! answers with [`FieldVerdict::OptionsLost`].
 
 use std::collections::HashMap;
 use std::fmt;
@@ -106,9 +112,6 @@ pub enum WireMismatch {
         source: String,
         target: String,
     },
-    /// An enum or flags field declares a different number of options. The bytes
-    /// would transfer, but their *meaning* would not.
-    OptionCount { path: String, source: usize, target: usize },
     /// Two `data` fields name different data definitions.
     DataDefinition { path: String, source: String, target: String },
     /// A field is a container on one side and not on the other.
@@ -134,7 +137,6 @@ impl WireMismatch {
             | WireMismatch::FieldName { path, .. }
             | WireMismatch::FieldOffset { path, .. }
             | WireMismatch::WireClass { path, .. }
-            | WireMismatch::OptionCount { path, .. }
             | WireMismatch::DataDefinition { path, .. }
             | WireMismatch::ContainerShape { path, .. }
             | WireMismatch::ApiInteropGuid { path }
@@ -160,9 +162,6 @@ impl fmt::Display for WireMismatch {
             }
             WireMismatch::WireClass { path, source, target } => {
                 write!(f, "{path} is {source} on one side and {target} on the other")
-            }
-            WireMismatch::OptionCount { path, source, target } => {
-                write!(f, "{path} declares {source} options on one side and {target} on the other")
             }
             WireMismatch::DataDefinition { path, source, target } => {
                 write!(f, "{path} names data definition `{source}` on one side and `{target}` on the other")
@@ -408,19 +407,14 @@ fn compare_field(
     }
 
     match a.class {
-        // Same bytes, but an option list of a different length means a stored
-        // ordinal or bit would name something else on the other side.
-        WireClass::Enum | WireClass::Flags => {
-            let source = a.definition.option_names().count();
-            let target = b.definition.option_names().count();
-            if source != target {
-                return Err(WireMismatch::OptionCount {
-                    path: path.to_owned(),
-                    source,
-                    target,
-                });
-            }
-        }
+        // Option *names* are editor strings; the simulation reads the stored
+        // value. A layout that knows fewer names still describes the same
+        // bytes, and shipped tags routinely carry an older, shorter list than
+        // the current schema dumps -- an HREK animation graph declares 14 user
+        // flags where the schema declares 16. Refusing on that would call every
+        // real tag incompatible with its own game. Whether the *meaning*
+        // survives is a different question, and `compare_group_layouts` answers
+        // it with `OptionsLost`.
         WireClass::LeafChunk(TagFieldType::Data) => {
             let source = a.definition.data_definition_name().unwrap_or_default();
             let target = b.definition.data_definition_name().unwrap_or_default();
