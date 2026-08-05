@@ -148,7 +148,7 @@ pub(crate) fn needs_decode_for_dds(format: BitmapFormat) -> bool {
         | X8r8g8b8 | A8r8g8b8 | A2r10g10b10
         | V8u8 | Q8w8v8u8 | A16b16g16r16
         | Abgrfp16 | Abgrfp32
-        | Dxt1 | Dxt3 | Dxt5 | Dxt5a | Dxn
+        | Dxt1 | Dxt3 | Dxt5 | Dxt5a | Dxn | DxnSnorm
         | Signedr16g16b16a16
     )
 }
@@ -276,6 +276,7 @@ fn dxgi_format(format: BitmapFormat) -> u32 {
         Dxt5 => DXGI_FORMAT_BC3_UNORM,
         Dxt5a => DXGI_FORMAT_BC4_UNORM,
         Dxn => DXGI_FORMAT_BC5_UNORM,
+        DxnSnorm => DXGI_FORMAT_BC5_SNORM,
         V8u8 => DXGI_FORMAT_R8G8_SNORM,
         Q8w8v8u8 => DXGI_FORMAT_R8G8B8A8_SNORM,
         Abgrfp16 => DXGI_FORMAT_R16G16B16A16_FLOAT,

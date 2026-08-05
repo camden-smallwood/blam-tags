@@ -133,6 +133,11 @@ pub struct Bitmap<'a> {
     /// Which engine's p8 palette to decode palettized-normal images with
     /// (Halo 1 and Halo 2 use different tables). Derived from the tag.
     p8_palette: P8Palette,
+    /// `true` when the pixel bytes came from the Xbox 360 side of the
+    /// tag (`xenon bitmaps[]` + per-image texture resources) rather
+    /// than the PC `processed pixel data` blob. Only `dxn` cares:
+    /// the two builds disagree about whether its endpoints are signed.
+    x360: bool,
 }
 
 impl<'a> Bitmap<'a> {
@@ -220,6 +225,7 @@ impl<'a> Bitmap<'a> {
             per_image_pixels,
             per_image_mip_override,
             p8_palette,
+            x360: use_x360,
         })
     }
 
@@ -270,7 +276,13 @@ impl<'a> Bitmap<'a> {
         let elem = self.bitmaps.element(index)?;
         let pixels = self.per_image_pixels.get(index)?.as_slice();
         let mip_override = self.per_image_mip_override.get(index).copied().flatten();
-        Some(BitmapImage { elem, pixels, mip_override, p8_palette: self.p8_palette })
+        Some(BitmapImage {
+            elem,
+            pixels,
+            mip_override,
+            p8_palette: self.p8_palette,
+            x360: self.x360,
+        })
     }
 
     /// Iterate every image in declaration order.
@@ -278,11 +290,13 @@ impl<'a> Bitmap<'a> {
         let per_image = &self.per_image_pixels;
         let overrides = &self.per_image_mip_override;
         let p8_palette = self.p8_palette;
+        let x360 = self.x360;
         self.bitmaps.iter().enumerate().map(move |(i, elem)| BitmapImage {
             elem,
             pixels: per_image[i].as_slice(),
             mip_override: overrides[i],
             p8_palette,
+            x360,
         })
     }
 
@@ -721,6 +735,9 @@ pub struct BitmapImage<'a> {
     mip_override: Option<u32>,
     /// Engine p8 palette to use for palettized-normal decode (from the tag).
     p8_palette: P8Palette,
+    /// `true` when these pixels came from the tag's Xbox 360 side.
+    /// See [`Bitmap::x360`] — it decides how `dxn` endpoints are read.
+    x360: bool,
 }
 
 impl<'a> BitmapImage<'a> {
@@ -752,10 +769,19 @@ impl<'a> BitmapImage<'a> {
     }
 
     /// The format mapped to a known [`BitmapFormat`], if supported.
+    ///
+    /// The schema spells both DXN encodings `dxn`, but PC builds store
+    /// signed endpoints and Xbox 360 builds store unsigned ones, so
+    /// this resolves the PC spelling to [`BitmapFormat::DxnSnorm`].
+    /// [`Self::format_name`] still reports what the tag says.
     pub fn format(&self) -> Result<BitmapFormat, BitmapError> {
         let name = self.format_name().ok_or(BitmapError::NotABitmapTag)?;
-        BitmapFormat::from_schema_name(&name)
-            .ok_or(BitmapError::FormatNotSupported(name))
+        let format = BitmapFormat::from_schema_name(&name)
+            .ok_or(BitmapError::FormatNotSupported(name))?;
+        Ok(match format {
+            BitmapFormat::Dxn if !self.x360 => BitmapFormat::DxnSnorm,
+            other => other,
+        })
     }
 
     /// The schema's per-image type name (e.g. `"2D texture"`, `"cube map"`).
