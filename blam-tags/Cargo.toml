@@ -46,3 +46,18 @@ ruzstd = { version = "0.7", optional = true }
 audio = ["dep:lewton", "dep:log", "dep:opus", "dep:vorbis_rs"]
 iostore = ["dep:oozextract", "dep:memmap2", "dep:blake3", "dep:anyhow", "dep:byteorder", "dep:sha1", "dep:ruzstd"]
 
+
+# Each of these mounts a Campaign Evolved IoStore container, so they only build
+# with the feature that provides one. Without this, `cargo test --all-targets`
+# (which builds every example) fails on a default-feature checkout.
+[[example]]
+name = "ce_group_census"
+required-features = ["iostore"]
+
+[[example]]
+name = "ce_new_bare_tag_e2e"
+required-features = ["iostore"]
+
+[[example]]
+name = "ce_synth_bytes"
+required-features = ["iostore"]
