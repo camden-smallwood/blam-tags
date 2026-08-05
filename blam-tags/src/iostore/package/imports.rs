@@ -213,6 +213,37 @@ mod tests {
         // `sq_grunt_major_pp_2` one identity.
         assert_eq!(public_export_hash("JACKAL-MODEL"), public_export_hash("jackal-model"));
     }
+
+    /// The CDO is the class path with `Default__` on the *object* name. Pinned
+    /// on a group the game ships no tag of, which is the case that needs these
+    /// derived rather than read off a donor.
+    #[test]
+    fn the_cdo_path_prefixes_the_object_name_not_the_module() {
+        assert_eq!(
+            tag_wrapper_class_path("cinematic_scene"),
+            "/Script/BlamSynchronization.BlamCinematicSceneTagDataAsset"
+        );
+        assert_eq!(
+            tag_wrapper_cdo_path("cinematic_scene"),
+            "/Script/BlamSynchronization.Default__BlamCinematicSceneTagDataAsset"
+        );
+        assert_eq!(
+            tag_wrapper_cdo_path("biped"),
+            "/Script/BlamSynchronization.Default__BlamBipedTagDataAsset"
+        );
+    }
+
+    /// Only the five `_Generated_` groups carry `PKG_CookGenerated`. Getting
+    /// this backwards is invisible in the editor and only shows up in-game.
+    #[test]
+    fn only_the_generated_groups_get_the_cook_generated_flags() {
+        for group in GENERATED_GROUPS {
+            assert_eq!(tag_package_flags(group), (0x1, 0x8800_2200), "{group}");
+        }
+        for group in ["cinematic_scene", "biped", "collision_model", "sound", "model"] {
+            assert_eq!(tag_package_flags(group), (0xb, 0x8000_2200), "{group}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -683,6 +714,33 @@ mod edit_corpus {
 /// than trust the name, because decoding against a wrong class does not error —
 /// it produces plausible values.
 pub fn tag_wrapper_class_path(group_longname: &str) -> String {
+    format!(
+        "{TAG_WRAPPER_MODULE_PATH}.Blam{}TagDataAsset",
+        tag_wrapper_class_stem(group_longname)
+    )
+}
+
+/// The class-default object of [`tag_wrapper_class_path`] — every tag export's
+/// `template_index`.
+///
+/// The `Default__` prefix goes on the *object* name, not the module path, so
+/// this is not a prefix of the class path and cannot be derived by string
+/// concatenation from it.
+pub fn tag_wrapper_cdo_path(group_longname: &str) -> String {
+    format!(
+        "{TAG_WRAPPER_MODULE_PATH}.Default__Blam{}TagDataAsset",
+        tag_wrapper_class_stem(group_longname)
+    )
+}
+
+/// The module package every tag wrapper imports alongside its class and CDO.
+/// Those three are the entire script-import set of a shipped tag — 12,290 of
+/// 12,291, the exception being `player_model_customization_globals` at five.
+pub const TAG_WRAPPER_MODULE_PATH: &str = "/Script/BlamSynchronization";
+
+/// `frame_event_list` → `FrameEventList`. Shared by the class and its CDO so
+/// the two spellings cannot drift apart.
+fn tag_wrapper_class_stem(group_longname: &str) -> String {
     let mut pascal = String::with_capacity(group_longname.len());
     for word in group_longname.split('_').filter(|w| !w.is_empty()) {
         let mut chars = word.chars();
@@ -691,7 +749,33 @@ pub fn tag_wrapper_class_path(group_longname: &str) -> String {
             pascal.push_str(&chars.as_str().to_ascii_lowercase());
         }
     }
-    format!("/Script/BlamSynchronization.Blam{pascal}TagDataAsset")
+    pascal
+}
+
+/// The groups the cook emits as `_Generated_` level content, which carry
+/// `PKG_CookGenerated` and drop `RF_Standalone`/`RF_Transactional`.
+///
+/// All 312 of them live in per-level paks, never `pakchunk0`.
+const GENERATED_GROUPS: &[&str] = &[
+    "scenario",
+    "scenario_structure_bsp",
+    "scenario_structure_lighting_info",
+    "structure_design",
+    "structure_seams",
+];
+
+/// `(object_flags, package_flags)` for a tag wrapper of `group_longname`.
+///
+/// Measured over all 12,291 shipped tag packages: `0xb`/`0x80002200` for every
+/// group except the five in [`GENERATED_GROUPS`]. 2,563 `sound` and one
+/// `ai_mission_dialogue` ship `0x3` instead, dropping `RF_Transactional`, which
+/// is inert in a cooked build — so the majority value is used for them too.
+pub fn tag_package_flags(group_longname: &str) -> (u32, u32) {
+    if GENERATED_GROUPS.contains(&group_longname) {
+        (0x1, 0x8800_2200)
+    } else {
+        (0xb, 0x8000_2200)
+    }
 }
 
 /// Split a cooked tag package path into `(halo-relative path, group long name)`.
@@ -876,5 +960,250 @@ mod new_package_corpus {
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// Open every `.utoc` under `CE_PAKS`, newest chunk last.
+    fn open_shipped_archives() -> Vec<IoStoreArchive> {
+        let root = std::env::var("CE_PAKS").expect("set CE_PAKS");
+        let mut utocs: Vec<PathBuf> = std::fs::read_dir(&root)
+            .expect("read paks dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("utoc")))
+            .filter(|p| !p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("global.utoc")))
+            .collect();
+        utocs.sort();
+        utocs.iter().filter_map(|p| IoStoreArchive::open(p).ok()).collect()
+    }
+
+    /// The first shipped wrapper of a group whose tags carry no properties at
+    /// all, which is what makes its export body transferable to any group.
+    fn bare_donor(archives: &[IoStoreArchive]) -> (Vec<u8>, Vec<u8>) {
+        for archive in archives {
+            for entry in archive.entries() {
+                let lower = entry.path.to_ascii_lowercase().replace('\\', "/");
+                if !lower.ends_with("-collision_model.uasset") || !lower.contains("/content/tags/") {
+                    continue;
+                }
+                let Ok(bytes) = archive.read(&entry.path) else { continue };
+                let Ok(tag) = archive.read(&entry.path.replace(".uasset", ".ubulk")) else {
+                    continue;
+                };
+                return (bytes, tag);
+            }
+        }
+        panic!("no collision_model donor in the shipped paks");
+    }
+
+    /// A group the game ships no tag of can still be authored.
+    ///
+    /// `cinematic_scene` is the reported case: 38 of the 139 defined groups have
+    /// no shipped instance, so there is no same-group wrapper to donate and the
+    /// tag could not be created at all. The wrapper is instead retargeted onto a
+    /// bare donor, and this asserts every group-shaped field came from the
+    /// destination rather than the donor.
+    ///
+    ///   CE_PAKS=... cargo test --features iostore new_package_corpus -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires a Campaign Evolved install; set CE_PAKS"]
+    fn a_group_with_no_shipped_tag_can_still_be_created() {
+        let archives = open_shipped_archives();
+        let usmap = Usmap::meteorite().expect("bundled usmap");
+        let (template, tag_bytes) = bare_donor(&archives);
+
+        const NEW_PKG: &str = "/Game/Tags/objects/test/probe_new-cinematic_scene";
+        let dir = std::env::temp_dir().join(format!("blam-newgroup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let out = dir.join("probe-WinGDK_P.utoc");
+        write_new_tag_container(&template, &tag_bytes, NEW_PKG, None, &out)
+            .expect("a group with no shipped tag must still build");
+
+        let modded = IoStoreArchive::open(&out).expect("open the new container");
+        let id = crate::iostore::writer::make_chunk_id(
+            FPackageId::from_name(NEW_PKG).0,
+            0,
+            crate::iostore::CHUNK_TYPE_EXPORT_BUNDLE,
+        );
+        let index = modded.find_chunk(&id).expect("the container carries the wrapper");
+        let bytes = modded.read_chunk(index).expect("read the wrapper");
+        let header = FZenPackageHeader::deserialize(&mut Cursor::new(&bytes[..]), None, CV, HV, None)
+            .expect("the new wrapper parses");
+
+        // Identity and class both come from the destination path, not the donor.
+        let class = FPackageObjectIndex::create_script_import(&tag_wrapper_class_path(
+            "cinematic_scene",
+        ));
+        let cdo =
+            FPackageObjectIndex::create_script_import(&tag_wrapper_cdo_path("cinematic_scene"));
+        let module = FPackageObjectIndex::create_script_import(TAG_WRAPPER_MODULE_PATH);
+        assert_eq!(header.export_map[0].class_index, class, "class is still the donor's");
+        assert_eq!(header.export_map[0].template_index, cdo, "CDO is still the donor's");
+        assert_eq!(
+            header.export_map[0].public_export_hash,
+            public_export_hash("probe_new-cinematic_scene")
+        );
+        let (object_flags, package_flags) = tag_package_flags("cinematic_scene");
+        assert_eq!(header.export_map[0].object_flags, object_flags);
+        assert_eq!(header.summary.package_flags, package_flags);
+
+        let script: Vec<FPackageObjectIndex> = read_import_slots(&header)
+            .expect("slots")
+            .into_iter()
+            .filter_map(|slot| match slot {
+                ImportSlot::Script(index) => Some(index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(script, vec![class, cdo, module], "script imports name the wrong class");
+        assert!(
+            header.imported_package_names.is_empty(),
+            "a fresh tag declares no package imports"
+        );
+
+        // And it decodes as the class it now claims to be, carrying nothing.
+        let payloads = read_payloads(&header, &bytes).expect("payloads");
+        let names = header.name_map.copy_raw_names();
+        let export = read_export(
+            &payloads[0],
+            &names,
+            &usmap,
+            "BlamCinematicSceneTagDataAsset",
+            header.export_map[0].object_flags,
+        )
+        .expect("the new wrapper decodes as its own class");
+        assert!(
+            export.properties().expect("a block").entries.is_empty(),
+            "a fresh tag's wrapper carries no properties"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What generation the game's own tag blobs claim.
+    ///
+    /// A created tag has to carry the same one: the simulation reads the blob,
+    /// not the wrapper, so a tag whose header says something the game does not
+    /// expect is a tag that only ever works inside an editor. `TagFile::new`
+    /// leaves all three at zero, which is exactly the value nothing shipped has.
+    ///
+    /// Reads the fixed 64-byte header directly rather than parsing the tag:
+    /// `pad[36] | build_version | build_number | version | group_tag |
+    /// group_version | checksum | signature`, little-endian, so the `BLAM`
+    /// signature reads as `MALB` in the raw bytes.
+    ///
+    ///   CE_PAKS=... cargo test --features iostore new_package_corpus -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires a Campaign Evolved install; set CE_PAKS"]
+    fn the_shipped_tag_header_generation() {
+        let archives = open_shipped_archives();
+        let mut census: std::collections::BTreeMap<(i32, i32, u32), usize> = Default::default();
+        let mut by_group: std::collections::BTreeMap<(i32, i32, u32), Vec<String>> =
+            Default::default();
+        let mut total = 0usize;
+        for archive in &archives {
+            for entry in archive.entries() {
+                let lower = entry.path.to_ascii_lowercase().replace('\\', "/");
+                if !lower.ends_with(".ubulk") || !lower.contains("/content/tags/") {
+                    continue;
+                }
+                let Ok(bytes) = archive.read(&entry.path) else { continue };
+                if bytes.len() < 64 || &bytes[60..64] != b"MALB" {
+                    continue;
+                }
+                let key = (
+                    i32::from_le_bytes(bytes[36..40].try_into().unwrap()),
+                    i32::from_le_bytes(bytes[40..44].try_into().unwrap()),
+                    u32::from_le_bytes(bytes[44..48].try_into().unwrap()),
+                );
+                *census.entry(key).or_default() += 1;
+                let group = lower
+                    .strip_suffix(".ubulk")
+                    .and_then(|s| s.rsplit('/').next())
+                    .and_then(|stem| stem.rsplit_once('-').map(|(_, g)| g.to_owned()))
+                    .unwrap_or_default();
+                let seen = by_group.entry(key).or_default();
+                if !seen.contains(&group) {
+                    seen.push(group);
+                }
+                total += 1;
+            }
+        }
+        println!("read {total} shipped tag blobs");
+        for (key, count) in &census {
+            let (build_version, build_number, version) = *key;
+            let groups = &by_group[key];
+            println!(
+                "build_version={build_version} build_number={build_number} \
+                 version={version} ({version:#010x}) -> {count} tags, {} groups{}",
+                groups.len(),
+                if groups.len() <= 6 {
+                    format!(" {groups:?}")
+                } else {
+                    String::new()
+                }
+            );
+        }
+        assert!(total > 10_000, "expected the whole tag corpus, read {total}");
+    }
+
+    /// The derivations are checked against the 101 groups that *do* ship, which
+    /// is the only ground truth available for the 38 that do not.
+    ///
+    /// Retargeting a bare donor to a shipped group must reproduce that group's
+    /// own class, CDO and flag pair exactly as the cooker wrote them.
+    ///
+    ///   CE_PAKS=... cargo test --features iostore new_package_corpus -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires a Campaign Evolved install; set CE_PAKS"]
+    fn the_group_derivations_match_every_shipped_group() {
+        let archives = open_shipped_archives();
+        let mut checked = 0usize;
+        let mut seen: std::collections::BTreeSet<String> = Default::default();
+        for archive in &archives {
+            for entry in archive.entries() {
+                let lower = entry.path.to_ascii_lowercase().replace('\\', "/");
+                if !lower.ends_with(".uasset") || !lower.contains("/content/tags/") {
+                    continue;
+                }
+                let Some(stem) = lower.strip_suffix(".uasset").and_then(|s| s.rsplit('/').next())
+                else {
+                    continue;
+                };
+                let Some((_, group)) = stem.rsplit_once('-') else { continue };
+                if !seen.insert(group.to_owned()) {
+                    continue;
+                }
+                let Ok(bytes) = archive.read(&entry.path) else { continue };
+                let Ok(header) =
+                    FZenPackageHeader::deserialize(&mut Cursor::new(&bytes[..]), None, CV, HV, None)
+                else {
+                    continue;
+                };
+                let Some(export) = header.export_map.first() else { continue };
+                assert_eq!(
+                    export.class_index,
+                    FPackageObjectIndex::create_script_import(&tag_wrapper_class_path(group)),
+                    "class derivation is wrong for {group}"
+                );
+                assert_eq!(
+                    export.template_index,
+                    FPackageObjectIndex::create_script_import(&tag_wrapper_cdo_path(group)),
+                    "CDO derivation is wrong for {group}"
+                );
+                let (object_flags, package_flags) = tag_package_flags(group);
+                assert_eq!(
+                    header.summary.package_flags, package_flags,
+                    "package flags are wrong for {group}"
+                );
+                // `sound` and `ai_mission_dialogue` ship `0x3`, dropping
+                // `RF_Transactional`, which is inert in a cooked build.
+                assert!(
+                    export.object_flags == object_flags || export.object_flags == 0x3,
+                    "object flags are wrong for {group}: {:#x}",
+                    export.object_flags
+                );
+                checked += 1;
+            }
+        }
+        println!("checked {checked} groups");
+        assert!(checked >= 90, "expected ~101 shipped groups, saw {checked}");
     }
 }

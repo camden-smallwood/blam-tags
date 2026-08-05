@@ -305,16 +305,58 @@ pub fn write_dds_dx10(
     layer_count: u32,
     pixel_bytes: &[u8],
 ) -> std::io::Result<()> {
+    let block = format
+        .is_compressed()
+        .then(|| (4, 4, format.level_bytes(4, 4) as u32));
+    write_dds_dxgi(
+        out,
+        dxgi_format(format),
+        width,
+        height,
+        mipmap_levels,
+        layer_count,
+        block.map(|(bx, by, bytes)| (bx, by, bytes)),
+        (!format.is_compressed()).then(|| format.bytes_per_pixel() * 8),
+        pixel_bytes,
+    )
+}
+
+/// Write a DDS file with the DXT10 extension header for a caller that already
+/// knows its `DXGI_FORMAT`.
+///
+/// This is the format-agnostic half of [`write_dds_dx10`]. It exists because the
+/// `BitmapFormat` enum describes Halo's formats and has no expression for BC7 or
+/// BC6H, which cooked Unreal textures use constantly — those callers know the
+/// DXGI value directly and should not have to round-trip through a Halo enum.
+///
+/// `block` is `(block width, block height, bytes per block)` for a compressed
+/// format; pass `None` and `bits_per_pixel` for an uncompressed one. Surface
+/// bytes are mip-major, then layer-major, exactly as DDS expects.
+#[allow(clippy::too_many_arguments)]
+pub fn write_dds_dxgi(
+    out: &mut impl Write,
+    dxgi_format: u32,
+    width: u32,
+    height: u32,
+    mipmap_levels: u32,
+    layer_count: u32,
+    block: Option<(u32, u32, u32)>,
+    bits_per_pixel: Option<u32>,
+    pixel_bytes: &[u8],
+) -> std::io::Result<()> {
     // Pixelformat block uses fourcc "DX10" as the extension marker.
     let mut flags = DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PIXELFORMAT;
     if mipmap_levels > 1 { flags |= DDSD_MIPMAPCOUNT; }
-    let pitch_or_linear_size = if format.is_compressed() {
-        format.level_bytes(width, height) as u32
-    } else {
-        let bpp = format.bytes_per_pixel() * 8;
-        (width * bpp + 7) / 8
+    let pitch_or_linear_size = match block {
+        Some((block_x, block_y, block_bytes)) => {
+            flags |= DDSD_LINEARSIZE;
+            width.div_ceil(block_x) * height.div_ceil(block_y) * block_bytes
+        }
+        None => {
+            flags |= DDSD_PITCH;
+            (width * bits_per_pixel.unwrap_or(32) + 7) / 8
+        }
     };
-    flags |= if format.is_compressed() { DDSD_LINEARSIZE } else { DDSD_PITCH };
 
     let mut caps = DDSCAPS_TEXTURE;
     if mipmap_levels > 1 { caps |= DDSCAPS_MIPMAP | DDSCAPS_COMPLEX; }
@@ -347,7 +389,7 @@ pub fn write_dds_dx10(
     write_u32(out, 0)?;
 
     // DDS_HEADER_DXT10 (20 bytes)
-    write_u32(out, dxgi_format(format))?;
+    write_u32(out, dxgi_format)?;
     write_u32(out, D3D10_RESOURCE_DIMENSION_TEXTURE2D)?;
     write_u32(out, 0)?;                    // miscFlag (0; cubemap arrays would set bit 2)
     write_u32(out, layer_count)?;          // arraySize
@@ -355,6 +397,52 @@ pub fn write_dds_dx10(
 
     out.write_all(pixel_bytes)?;
     Ok(())
+}
+
+const DXGI_FORMAT_R8G8B8A8_UNORM: u32 = 28;
+const DXGI_FORMAT_R32_FLOAT: u32 = 41;
+const DXGI_FORMAT_R16_FLOAT: u32 = 54;
+const DXGI_FORMAT_R16_UNORM: u32 = 56;
+const DXGI_FORMAT_R10G10B10A2_UNORM: u32 = 24;
+const DXGI_FORMAT_R16G16_UNORM: u32 = 35;
+const DXGI_FORMAT_B5G6R5_UNORM: u32 = 85;
+const DXGI_FORMAT_BC6H_UF16: u32 = 95;
+const DXGI_FORMAT_BC7_UNORM: u32 = 98;
+const DXGI_FORMAT_BC4_SNORM: u32 = 81;
+const DXGI_FORMAT_BC5_SNORM: u32 = 84;
+
+/// Map an Unreal `EPixelFormat` name to its `DXGI_FORMAT`.
+///
+/// Returns `None` for a format with no DDS expression, so a caller can say what
+/// it could not export rather than writing a file that lies about its contents.
+pub fn ue_dxgi_format(format: &str) -> Option<u32> {
+    let normalized = format.trim().to_ascii_uppercase();
+    Some(match normalized.as_str() {
+        "PF_DXT1" | "PF_BC1" => DXGI_FORMAT_BC1_UNORM,
+        "PF_DXT3" | "PF_BC2" => DXGI_FORMAT_BC2_UNORM,
+        "PF_DXT5" | "PF_BC3" => DXGI_FORMAT_BC3_UNORM,
+        "PF_BC4" => DXGI_FORMAT_BC4_UNORM,
+        "PF_BC4_SNORM" => DXGI_FORMAT_BC4_SNORM,
+        "PF_BC5" => DXGI_FORMAT_BC5_UNORM,
+        "PF_BC5_SNORM" => DXGI_FORMAT_BC5_SNORM,
+        "PF_BC6H" => DXGI_FORMAT_BC6H_UF16,
+        "PF_BC7" => DXGI_FORMAT_BC7_UNORM,
+        "PF_B8G8R8A8" => DXGI_FORMAT_B8G8R8A8_UNORM,
+        "PF_R8G8B8A8" => DXGI_FORMAT_R8G8B8A8_UNORM,
+        "PF_R8G8B8A8_SNORM" => DXGI_FORMAT_R8G8B8A8_SNORM,
+        "PF_G8" | "PF_R8" => DXGI_FORMAT_R8_UNORM,
+        "PF_A8" => DXGI_FORMAT_A8_UNORM,
+        "PF_G16" => DXGI_FORMAT_R16_UNORM,
+        "PF_R16F" | "PF_R16F_FILTER" => DXGI_FORMAT_R16_FLOAT,
+        "PF_R32_FLOAT" => DXGI_FORMAT_R32_FLOAT,
+        "PF_G16R16" => DXGI_FORMAT_R16G16_UNORM,
+        "PF_A2B10G10R10" => DXGI_FORMAT_R10G10B10A2_UNORM,
+        "PF_R5G6B5_UNORM" => DXGI_FORMAT_B5G6R5_UNORM,
+        "PF_FLOATRGBA" => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        "PF_A16B16G16R16" | "PF_R16G16B16A16_UNORM" => DXGI_FORMAT_R16G16B16A16_UNORM,
+        "PF_A32B32G32R32F" => DXGI_FORMAT_R32G32B32A32_FLOAT,
+        _ => return None,
+    })
 }
 
 //================================================================================
