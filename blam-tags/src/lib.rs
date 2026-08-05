@@ -70,6 +70,7 @@ pub mod field_name;
 pub mod layout;
 pub mod schema;
 pub mod schema_compare;
+pub mod schema_compat;
 pub mod data;
 pub mod path;
 pub mod field_path;
@@ -128,6 +129,7 @@ pub use schema::{TagGroupMeta, TagSchemaError};
 pub use schema_compare::{
     compare_root_layout, field_key, FieldDiff, FieldKey, LayoutComparison, LayoutSeverity,
 };
+pub use schema_compat::{struct_trees_are_wire_identical, StructIndexMap, WireMismatch};
 pub use bitmap::{Bitmap, BitmapError, BitmapFormat, BitmapImage};
 pub use jms::{
     JmsBox, JmsCapsule, JmsConvex, JmsError, JmsFile, JmsHinge, JmsMarker, JmsMaterial,
