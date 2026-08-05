@@ -162,12 +162,6 @@ impl<'a> TagFieldDefinition<'a> {
         self.layout.field_types[record.type_index as usize].size
     }
 
-    /// The `{alias}` in this field's name — the name it used to carry — if it
-    /// has one. See [`crate::field_name`].
-    pub fn alias(&self) -> Option<&'a str> {
-        crate::field_name::parse_field_name(self.name()).alias
-    }
-
     /// Option names for an enum or flags field, in declaration order. Empty for
     /// every other field type.
     ///

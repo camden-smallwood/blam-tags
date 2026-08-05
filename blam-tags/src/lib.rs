@@ -129,7 +129,11 @@ pub use schema::{TagGroupMeta, TagSchemaError};
 pub use schema_compare::{
     compare_root_layout, field_key, FieldDiff, FieldKey, LayoutComparison, LayoutSeverity,
 };
-pub use schema_compat::{struct_trees_are_wire_identical, StructIndexMap, WireMismatch};
+pub use schema_compat::{
+    compare_group_layouts, struct_trees_are_wire_identical, AliasIndex, BlockReason,
+    CompatSeverity, FieldComparison, FieldFacts, FieldVerdict, GroupComparison, StructComparison,
+    StructIndexMap, StructPairId, TypeEquivalence, WireMismatch,
+};
 pub use bitmap::{Bitmap, BitmapError, BitmapFormat, BitmapImage};
 pub use jms::{
     JmsBox, JmsCapsule, JmsConvex, JmsError, JmsFile, JmsHinge, JmsMarker, JmsMaterial,
