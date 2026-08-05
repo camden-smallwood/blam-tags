@@ -142,6 +142,134 @@ pub(crate) enum TagResourceChunk {
     Xsync { version: u32, payload: Vec<u8> },
 }
 
+/// Rebuild `source`'s struct tree against `target_layout`, translating every
+/// layout-table index through `map` and leaving every byte alone.
+///
+/// Layout table indices are layout-local: `struct_index`, `field_index` and
+/// `block_index` are positions in the tag's *own* tables, so a tree parsed
+/// against one layout describes different fields when read against another.
+/// This is what makes moving a parsed subtree between two tags expressible —
+/// and it is only sound because [`crate::schema_compat`] has already proven the
+/// two layouts describe the same shape, which is why `map` is the proof's
+/// return value rather than something a caller can assemble.
+///
+/// Entry order in `sub_chunks` is preserved exactly, including
+/// [`TagSubChunkContent::EmptyPlaceholder`]. That is what keeps the write
+/// byte-exact: `write_sub_chunks` dispatches on the variant and on position and
+/// never reads `field_index`, so remapping indices while holding order emits an
+/// identical byte stream. Placeholders survive at their original positions for
+/// the same reason they can: the identity proof established that both sides
+/// declare the same field sequence, so a placeholder emitted before field *k*
+/// on one side belongs before field *k* on the other.
+pub(crate) fn retarget_struct_data(
+    source: &TagStructData,
+    map: &crate::schema_compat::StructIndexMap,
+    target_layout: &TagLayout,
+) -> Result<TagStructData, crate::api::TagResourceCopyError> {
+    use crate::api::TagResourceCopyError as Refusal;
+
+    // A Halo 2 struct carries a 16-byte on-disk header describing itself.
+    // Classic tags have no pageable resources, so this is a can't-happen guard
+    // rather than a gap: refuse rather than emit a header describing the wrong
+    // struct.
+    if source.classic_struct_header.is_some() {
+        return Err(Refusal::ClassicContainer);
+    }
+    let struct_index = map
+        .struct_index(source.struct_index as usize)
+        .ok_or(Refusal::UnmappedStruct)? as u32;
+
+    let mut sub_chunks = Vec::with_capacity(source.sub_chunks.len());
+    for entry in &source.sub_chunks {
+        let field_index = match entry.field_index {
+            Some(index) => Some(map.field_index(index as usize).ok_or(Refusal::UnmappedField)? as u32),
+            None => None,
+        };
+        let content = match &entry.content {
+            TagSubChunkContent::Struct(nested) => {
+                TagSubChunkContent::Struct(retarget_struct_data(nested, map, target_layout)?)
+            }
+            TagSubChunkContent::Block(block) => {
+                TagSubChunkContent::Block(retarget_block_data(block, map, target_layout)?)
+            }
+            TagSubChunkContent::Array(elements) => TagSubChunkContent::Array(
+                elements
+                    .iter()
+                    .map(|element| retarget_struct_data(element, map, target_layout))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            // Layout-independent payloads: a tag reference is a group tag plus a
+            // path, string ids are utf-8, and a `data` payload is opaque bytes
+            // whose definition name the identity proof already compared.
+            TagSubChunkContent::TagReference(bytes) => {
+                TagSubChunkContent::TagReference(bytes.clone())
+            }
+            TagSubChunkContent::StringId(bytes) => TagSubChunkContent::StringId(bytes.clone()),
+            TagSubChunkContent::OldStringId(bytes) => TagSubChunkContent::OldStringId(bytes.clone()),
+            TagSubChunkContent::Data(bytes) => TagSubChunkContent::Data(bytes.clone()),
+            TagSubChunkContent::EmptyPlaceholder => TagSubChunkContent::EmptyPlaceholder,
+            // A runtime pointer into the process that wrote it. Matching
+            // schemas do not make one meaningful anywhere else.
+            TagSubChunkContent::ApiInterop(_) => return Err(Refusal::ApiInterop),
+            // Not seen in the shipped corpora. Refuse rather than guess at what
+            // a resource inside a resource means.
+            TagSubChunkContent::Resource(_) => return Err(Refusal::NestedResource),
+        };
+        sub_chunks.push(TagSubChunkEntry { field_index, content });
+    }
+
+    Ok(TagStructData { struct_index, classic_struct_header: None, sub_chunks })
+}
+
+fn retarget_block_data(
+    source: &TagBlockData,
+    map: &crate::schema_compat::StructIndexMap,
+    target_layout: &TagLayout,
+) -> Result<TagBlockData, crate::api::TagResourceCopyError> {
+    use crate::api::TagResourceCopyError as Refusal;
+
+    if source.classic_block_header.is_some() || source.classic_trailing.is_some() {
+        return Err(Refusal::ClassicContainer);
+    }
+    let block_index = map
+        .block_index(source.block_index as usize)
+        .ok_or(Refusal::UnmappedStruct)? as u32;
+
+    // `block_element_size` infers an element's size from
+    // `raw_data.len() / elements.len()`, so a block whose bytes disagree with
+    // the target's declared struct size would not fail loudly — it would
+    // silently change how every later read slices this block. Check here,
+    // where the expected size is known.
+    let element_size =
+        target_layout.struct_layouts[target_layout.block_layouts[block_index as usize].struct_index as usize].size;
+    let expected = element_size * source.elements.len();
+    if source.raw_data.len() != expected {
+        return Err(Refusal::ElementSizeMismatch {
+            block: target_layout
+                .get_string(target_layout.block_layouts[block_index as usize].name_offset)
+                .unwrap_or("")
+                .to_owned(),
+            expected,
+            got: source.raw_data.len(),
+        });
+    }
+
+    Ok(TagBlockData {
+        block_index,
+        flags: source.flags,
+        raw_data: source.raw_data.clone(),
+        endian: source.endian,
+        elements: source
+            .elements
+            .iter()
+            .map(|element| retarget_struct_data(element, map, target_layout))
+            .collect::<Result<Vec<_>, _>>()?,
+        classic_block_header: None,
+        classic_structural_dirty: false,
+        classic_trailing: None,
+    })
+}
+
 /// Match a struct field's stored name against a lookup query, comparing the
 /// *clean* (markup-free) form of both sides.
 ///

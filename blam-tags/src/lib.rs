@@ -108,7 +108,7 @@ pub mod iostore;
 pub use api::{
     TagArray, TagArrayMut, TagBlock, TagBlockElement, TagBlockMut, TagField, TagFieldMut, TagFlag,
     TagFlagMut, TagFlagOption, TagGroup, TagIndexError, TagOptions, TagPasteError, TagResource,
-    TagResourceKind, TagSetError, TagStruct, TagStructMut,
+    TagResourceCopyError, TagResourceKind, TagSetError, TagStruct, TagStructMut,
 };
 pub use definition::{
     TagApiInteropDefinition, TagArrayDefinition, TagBlockDefinition, TagDefinitions,
