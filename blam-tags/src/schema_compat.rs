@@ -599,6 +599,16 @@ pub enum FieldVerdict {
     Renamed { alias: String },
     /// Same bytes under a different type name.
     TypeEquivalent { reason: TypeEquivalence },
+    /// The same kind of value at a different width — a `word flags` facing a
+    /// `long flags`, say. The bytes are *not* interchangeable, but the value is:
+    /// a converter re-encodes it, and reports any value the narrower side
+    /// cannot hold.
+    ///
+    /// Distinct from [`Self::Blocked`] on purpose. Refusing these would call
+    /// `scenario` unconvertible over a flags field that widened by two bytes,
+    /// which is both wrong and the difference between a usable catalogue and
+    /// one that says "no" to everything interesting.
+    Requantized { source_width: u32, target_width: u32 },
     /// Enum or flags matched by option *name*. Every source option has a home,
     /// though possibly at a different ordinal or bit — `remap` gives the
     /// translation.
@@ -653,6 +663,14 @@ impl FieldVerdict {
     pub fn severity(&self) -> CompatSeverity {
         match self {
             FieldVerdict::Identical => CompatSeverity::Identical,
+            // Widening always fits; narrowing might not, and the converter
+            // reports the values that do not when it re-encodes them.
+            FieldVerdict::Requantized { source_width, target_width }
+                if target_width >= source_width =>
+            {
+                CompatSeverity::Lossless
+            }
+            FieldVerdict::Requantized { .. } => CompatSeverity::Lossy,
             FieldVerdict::Renamed { .. }
             | FieldVerdict::TypeEquivalent { .. }
             | FieldVerdict::OptionsRemapped { .. }
@@ -1000,7 +1018,7 @@ impl Builder {
             );
         }
 
-        if a.class != b.class || a.definition.wire_width() != b.definition.wire_width() {
+        if a.class != b.class {
             return (
                 FieldVerdict::Blocked(BlockReason::TypeIncompatible {
                     source: a.class.describe(a.definition.type_name(), a.definition.wire_width()),
@@ -1008,6 +1026,30 @@ impl Builder {
                 }),
                 None,
             );
+        }
+
+        // Same kind of value, different width. For enums and flags the option
+        // *names* are the contract, so the width is incidental and the real
+        // question is answered below. For numbers a converter re-encodes. For
+        // anything else — a fixed-width string, an opaque leaf — a width change
+        // is a shape change with no defined translation.
+        let (source_width, target_width) = (a.definition.wire_width(), b.definition.wire_width());
+        if source_width != target_width {
+            match a.class {
+                WireClass::Enum | WireClass::Flags | WireClass::BlockIndex => {}
+                WireClass::Integer | WireClass::Real => {
+                    return (FieldVerdict::Requantized { source_width, target_width }, None);
+                }
+                _ => {
+                    return (
+                        FieldVerdict::Blocked(BlockReason::TypeIncompatible {
+                            source: a.class.describe(a.definition.type_name(), source_width),
+                            target: b.class.describe(b.definition.type_name(), target_width),
+                        }),
+                        None,
+                    );
+                }
+            }
         }
 
         let verdict = match a.class {
@@ -1043,6 +1085,14 @@ impl Builder {
             // whose meaning is bound to the engine that wrote them.
             WireClass::Opaque(_) => FieldVerdict::Blocked(BlockReason::OpaqueBytes),
             _ => self.same_bytes_verdict(guids, a, b),
+        };
+        // An enum, flags or block index whose options line up but whose storage
+        // widened is not "identical" — the value carries, the bytes do not.
+        let verdict = match verdict {
+            FieldVerdict::Identical if source_width != target_width => {
+                FieldVerdict::Requantized { source_width, target_width }
+            }
+            other => other,
         };
         (verdict, None)
     }
@@ -1517,6 +1567,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A flags field that widened between the two games carries its value fine
+    /// — a converter re-encodes it bit by bit, by name — so it must not be
+    /// reported as blocked.
+    ///
+    /// This distinction is load-bearing for usefulness rather than for safety.
+    /// Calling these blocked marked seventeen shared groups unconvertible,
+    /// `scenario` among them, over flags fields that grew by two bytes.
+    #[test]
+    fn a_widened_flags_field_is_requantized_not_blocked() {
+        let comparison = compare("haloreach_mcc", "haloce_evolved", "scenario");
+        let object = comparison
+            .structs
+            .iter()
+            .find(|s| s.source_name == "scenario_object_datum_struct")
+            .expect("scenario declares object data");
+        let flags = object
+            .fields
+            .iter()
+            .find(|row| row.source.as_ref().is_some_and(|f| f.clean_name == "manual bsp flags"))
+            .expect("object data carries manual bsp flags");
+
+        assert_eq!(
+            flags.verdict,
+            FieldVerdict::Requantized { source_width: 2, target_width: 4 },
+            "Campaign Evolved widened this from word to long",
+        );
+        assert_eq!(
+            flags.verdict.severity(),
+            CompatSeverity::Lossless,
+            "widening always fits",
+        );
+    }
+
+    /// The mirror: narrowing might not fit, so it costs something.
+    #[test]
+    fn a_narrowed_field_is_reported_as_lossy() {
+        let widening = FieldVerdict::Requantized { source_width: 2, target_width: 4 };
+        let narrowing = FieldVerdict::Requantized { source_width: 4, target_width: 2 };
+        assert_eq!(widening.severity(), CompatSeverity::Lossless);
+        assert_eq!(narrowing.severity(), CompatSeverity::Lossy);
     }
 
     /// A group both games declare identically has nothing to report at all.
