@@ -109,8 +109,24 @@ pub enum BitmapFormat {
     /// BC4-shaped 4-bit per pixel where the 4 bits are unpacked as
     /// 4 binary channels (R/G/B/A).
     Dxt3a1111,
-    /// Two-channel BC5/ATI2. 16 bytes/block.
+    /// Two-channel BC5/ATI2 with *unsigned* endpoints. 16 bytes/block.
+    /// This is how the Xbox 360 builds store `dxn`; PC/MCC tags use
+    /// [`Self::DxnSnorm`] instead — see [`Self::DxnSnorm`] for why.
     Dxn,
+    /// The same BC5/ATI2 block layout as [`Self::Dxn`], but the
+    /// endpoints are *signed* (SNORM, `-127..=127`).
+    ///
+    /// `tool.exe` emits this for every bump/zbump usage on PC, and the
+    /// schema calls both encodings plain `dxn` — the distinction is the
+    /// build, not the tag. [`super::BitmapImage::format`] resolves the
+    /// schema's `dxn` to this variant on the PC path and to
+    /// [`Self::Dxn`] on the X360 path, matching Reclaimer's
+    /// `TextureUtils.DXNSwap(format, platform == PC)`.
+    ///
+    /// Decoding these blocks as unsigned wrecks the normal: measured
+    /// across 40 H3EK bump tags, only 10% of endpoint pairs satisfy
+    /// `x² + y² <= 1` when read unsigned, versus 98% when read signed.
+    DxnSnorm,
     /// BC1-shaped (8 bytes/block) two-channel normal map. Color
     /// endpoints are 8-8 rather than 5-6-5 RGB; Z is reconstructed.
     Ctx1,
@@ -175,6 +191,7 @@ impl BitmapFormat {
                 | R16g16
                 | Signedr16g16b16a16
                 | Dxn
+                | DxnSnorm
                 | Ctx1
                 | Dxt5nm
         )
@@ -254,6 +271,7 @@ impl BitmapFormat {
                 | Self::Dxt5nm
                 | Self::Dxt5a
                 | Self::Dxn
+                | Self::DxnSnorm
                 | Self::DxnMonoAlpha
                 | Self::Dxt3a
                 | Self::Dxt3a1111
@@ -271,7 +289,11 @@ impl BitmapFormat {
     /// Whether the format only has a clean DDS expression via the
     /// DXT10 extension header. Currently just `signedr16g16b16a16`.
     pub fn requires_dxt10(self) -> bool {
-        matches!(self, Self::Signedr16g16b16a16)
+        // `DxnSnorm` is here because the legacy `ATI2` fourcc says
+        // nothing about signedness — readers assume BC5_UNORM — so the
+        // only way to write those blocks verbatim and have them read
+        // back correctly is the DXT10 header's `BC5_SNORM`.
+        matches!(self, Self::Signedr16g16b16a16 | Self::DxnSnorm)
     }
 
     /// Whether channel values are stored as signed integers and need
@@ -283,6 +305,7 @@ impl BitmapFormat {
                 | Self::Q8w8v8u8
                 | Self::V16u16
                 | Self::Signedr16g16b16a16
+                | Self::DxnSnorm
         )
     }
 
@@ -313,6 +336,7 @@ impl BitmapFormat {
             | Self::Dxt5
             | Self::Dxt5nm
             | Self::Dxn
+            | Self::DxnSnorm
             | Self::DxnMonoAlpha
             | Self::Dxt5Red
             | Self::Dxt5Green
