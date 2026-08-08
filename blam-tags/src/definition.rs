@@ -80,6 +80,16 @@ impl<'a> TagStructDefinition<'a> {
         self.layout.struct_layouts[self.struct_index].version
     }
 
+    /// This struct's position in its layout's `struct_layouts` table.
+    ///
+    /// A layout-local coordinate, not an identity: the same struct has
+    /// different indices in two tags. Callers that need to *translate* between
+    /// two layouts (see [`crate::schema_compat`]) key on it; callers comparing
+    /// two schemas should not.
+    pub fn index(&self) -> usize {
+        self.struct_index
+    }
+
     /// Walk this struct's field definitions in declaration order,
     /// stopping before the terminator. Does *not* skip padding — use
     /// [`TagFieldDefinition::is_padding`] to filter if needed.
@@ -134,6 +144,35 @@ impl<'a> TagFieldDefinition<'a> {
         self.layout.fields[self.field_index].offset
     }
 
+    /// This field's position in its layout's `fields` table. Layout-local, with
+    /// the same caveat as [`TagStructDefinition::index`].
+    pub fn index(&self) -> usize {
+        self.field_index
+    }
+
+    /// Bytes this field occupies in its containing struct's raw region.
+    ///
+    /// Read from the field *type* table rather than inferred from the type
+    /// name, so `long integer` and `dword integer` — the same four bytes under
+    /// two spellings — report the same width. That equivalence is what lets
+    /// cross-game comparison accept a signedness rename without a hand-written
+    /// table of synonyms.
+    pub fn wire_width(&self) -> u32 {
+        let record = &self.layout.fields[self.field_index];
+        self.layout.field_types[record.type_index as usize].size
+    }
+
+    /// Option names for an enum or flags field, in declaration order. Empty for
+    /// every other field type.
+    ///
+    /// Cross-game matching pairs options by *name*, never by ordinal: two games
+    /// routinely declare the same options in a different order, and an ordinal
+    /// carried across would silently mean something else.
+    pub fn option_names(&self) -> impl Iterator<Item = &'a str> + 'a {
+        let record = &self.layout.fields[self.field_index];
+        crate::fields::field_option_names(self.layout, record)
+    }
+
     /// `true` for pad / useless_pad / skip / explanation / unknown /
     /// terminator fields. These have no user-visible value.
     pub fn is_padding(&self) -> bool {
@@ -146,6 +185,23 @@ impl<'a> TagFieldDefinition<'a> {
                 | TagFieldType::Unknown
                 | TagFieldType::Terminator,
         )
+    }
+
+    /// For a `Data` field, the name of the data definition it references
+    /// (e.g. `"aligned_animation_data_definition_v1"`). `None` for every other
+    /// field type.
+    ///
+    /// The payload itself is opaque bytes, so the definition *name* is the only
+    /// thing that says whether two games mean the same thing by it.
+    pub fn data_definition_name(&self) -> Option<&'a str> {
+        let record = &self.layout.fields[self.field_index];
+        if record.field_type != TagFieldType::Data {
+            return None;
+        }
+        self.layout
+            .data_definition_name_offsets
+            .get(record.definition as usize)
+            .and_then(|&offset| self.layout.get_string(offset))
     }
 
     /// If this is a `Struct` field, return the nested struct
@@ -260,6 +316,12 @@ impl<'a> TagBlockDefinition<'a> {
     /// runtime.
     pub fn max_count(&self) -> u32 {
         self.layout.block_layouts[self.block_layout_index].max_count
+    }
+
+    /// This block's position in its layout's `block_layouts` table.
+    /// Layout-local, with the same caveat as [`TagStructDefinition::index`].
+    pub fn index(&self) -> usize {
+        self.block_layout_index
     }
 
     /// The struct definition for one element of this block.

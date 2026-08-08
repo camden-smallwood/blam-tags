@@ -70,6 +70,7 @@ pub mod field_name;
 pub mod layout;
 pub mod schema;
 pub mod schema_compare;
+pub mod schema_compat;
 pub mod data;
 pub mod path;
 pub mod field_path;
@@ -107,7 +108,7 @@ pub mod iostore;
 pub use api::{
     TagArray, TagArrayMut, TagBlock, TagBlockElement, TagBlockMut, TagField, TagFieldMut, TagFlag,
     TagFlagMut, TagFlagOption, TagGroup, TagIndexError, TagOptions, TagPasteError, TagResource,
-    TagResourceKind, TagSetError, TagStruct, TagStructMut,
+    TagResourceCopyError, TagResourceKind, TagSetError, TagStruct, TagStructMut,
 };
 pub use definition::{
     TagApiInteropDefinition, TagArrayDefinition, TagBlockDefinition, TagDefinitions,
@@ -127,6 +128,11 @@ pub use layout::TagLayout;
 pub use schema::{TagGroupMeta, TagSchemaError};
 pub use schema_compare::{
     compare_root_layout, field_key, FieldDiff, FieldKey, LayoutComparison, LayoutSeverity,
+};
+pub use schema_compat::{
+    compare_group_layouts, struct_trees_are_wire_identical, AliasIndex, BlockReason,
+    CompatSeverity, FieldComparison, FieldFacts, FieldVerdict, GroupComparison, StructComparison,
+    StructIndexMap, StructPairId, TypeEquivalence, WireMismatch,
 };
 pub use bitmap::{Bitmap, BitmapError, BitmapFormat, BitmapImage};
 pub use jms::{

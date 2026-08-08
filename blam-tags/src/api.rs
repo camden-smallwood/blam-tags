@@ -1264,7 +1264,86 @@ impl<'a> TagResource<'a> {
             _ => None,
         }
     }
+
+    /// Whether `target` declares a struct tree this resource's payload can be
+    /// read against unchanged.
+    ///
+    /// The predicate behind [`TagFieldMut::copy_resource_from`]'s gate, exposed
+    /// so a caller can decide *before* paying for the copy — a
+    /// `model_animation_graph` resource runs to tens of megabytes.
+    ///
+    /// Note that it compares the resource definitions the two *tags* carry, not
+    /// two schema files. Every tag embeds the layout current when it was saved,
+    /// so the only authoritative answer for a given file comes from the file.
+    pub fn layout_matches(&self, target: &crate::TagResourceDefinition<'_>) -> bool {
+        crate::schema_compat::struct_trees_are_wire_identical(
+            self.definition().struct_definition(),
+            target.struct_definition(),
+        )
+        .is_ok()
+    }
 }
+
+/// Why a [`TagFieldMut::copy_resource_from`] was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagResourceCopyError {
+    /// The destination field is not a `pageable_resource`.
+    NotAResourceField,
+    /// The two tags were loaded with different byte orders, so the payload
+    /// bytes are not interchangeable.
+    EndianMismatch,
+    /// The source is an un-hydrated `tgxc` resource. Its payload names
+    /// cache-resident data, which a standalone tag cannot carry. Read it
+    /// through [`crate::monolithic::MonolithicCache`] first — hydration turns
+    /// it into the exploded shape, which does copy.
+    XsyncNotSupported,
+    /// The two resource definitions do not describe the same shape, so the
+    /// bytes would be read at the wrong offsets on the other side.
+    LayoutMismatch(Box<crate::schema_compat::WireMismatch>),
+    /// A block's byte length disagrees with the destination's declared element
+    /// size — the source was saved against a layout that drifted from the one
+    /// its own schema now declares.
+    ElementSizeMismatch { block: String, expected: usize, got: usize },
+    /// The payload holds api-interop data: a pointer into the process that
+    /// wrote it, with no meaning anywhere else.
+    ApiInterop,
+    /// The payload nests a pageable resource inside a resource. Not seen in the
+    /// shipped corpora; refused rather than guessed at.
+    NestedResource,
+    /// The payload carries classic Halo 2 container headers, which describe the
+    /// structs they precede and cannot be re-pointed.
+    ClassicContainer,
+    /// The identity proof did not cover a struct or field the payload uses.
+    /// Reachable only if a caller supplies a map from a different comparison
+    /// than the one that proved this pair.
+    UnmappedStruct,
+    /// As [`Self::UnmappedStruct`], for a field.
+    UnmappedField,
+}
+
+impl std::fmt::Display for TagResourceCopyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAResourceField => write!(f, "the destination is not a pageable resource field"),
+            Self::EndianMismatch => write!(f, "the two tags have different byte orders"),
+            Self::XsyncNotSupported => {
+                write!(f, "the resource names cache-resident data and has not been hydrated")
+            }
+            Self::LayoutMismatch(mismatch) => write!(f, "{mismatch}"),
+            Self::ElementSizeMismatch { block, expected, got } => write!(
+                f,
+                "block `{block}` holds {got} bytes where the destination declares {expected}",
+            ),
+            Self::ApiInterop => write!(f, "the payload holds api-interop runtime pointers"),
+            Self::NestedResource => write!(f, "the payload nests a pageable resource"),
+            Self::ClassicContainer => write!(f, "the payload carries classic container headers"),
+            Self::UnmappedStruct => write!(f, "a struct in the payload was not covered by the proof"),
+            Self::UnmappedField => write!(f, "a field in the payload was not covered by the proof"),
+        }
+    }
+}
+
+impl std::error::Error for TagResourceCopyError {}
 
 /// Wire-format shape of a `pageable_resource` field.
 #[derive(Debug, Clone, Copy)]
@@ -1576,6 +1655,173 @@ impl<'a> TagFieldMut<'a> {
             elements,
             endian: self.endian,
         })
+    }
+
+    /// The resource definition this field declares, if it is a
+    /// `pageable_resource`.
+    fn resource_definition(&self) -> Option<crate::TagResourceDefinition<'_>> {
+        let field = &self.layout.fields[self.field_index];
+        (field.field_type == TagFieldType::PageableResource)
+            .then(|| crate::TagResourceDefinition::new(self.layout, field.definition as usize))
+    }
+
+    /// Replace this field's sub-chunk content, inserting an entry if the field
+    /// has none yet.
+    fn set_sub_chunk(&mut self, content: TagSubChunkContent) {
+        let field_index = self.field_index as u32;
+        match self
+            .struct_data
+            .sub_chunks
+            .iter_mut()
+            .find(|entry| entry.field_index == Some(field_index))
+        {
+            Some(entry) => entry.content = content,
+            None => self
+                .struct_data
+                .sub_chunks
+                .push(crate::data::TagSubChunkEntry { field_index: Some(field_index), content }),
+        }
+    }
+
+    /// Move `source`'s pageable resource onto this field: payload bytes
+    /// verbatim, layout indices retargeted onto this tag's schema.
+    ///
+    /// Refuses unless the two resource definitions describe the same shape all
+    /// the way down. That gate is the whole safety argument, and it is a shape
+    /// comparison rather than a GUID one on purpose — struct GUIDs track a
+    /// definition's lineage, not its current size, and the animation-graph
+    /// corpus contains a struct carrying one GUID at two different sizes.
+    ///
+    /// Past the header struct the payload is an opaque codec stream that
+    /// nothing here can reinterpret, so "verbatim" is not a shortcut: any
+    /// transformation would be a bug. What does change is the tree of layout
+    /// indices wrapping it, which are positions in the *source* tag's tables
+    /// and would name different fields when read against this one.
+    ///
+    /// Takes the borrowed [`TagResource`] rather than an owned snapshot
+    /// deliberately. A `model_animation_graph` payload runs to well over a
+    /// hundred megabytes; an intermediate copy would make peak memory three
+    /// times the source instead of twice.
+    pub fn copy_resource_from(
+        &mut self,
+        source: &TagResource<'_>,
+    ) -> Result<(), TagResourceCopyError> {
+        let target = self
+            .resource_definition()
+            .ok_or(TagResourceCopyError::NotAResourceField)?;
+
+        let (exploded, struct_data) = match source.chunk {
+            // Clearing is the honest translation of "the source had none".
+            TagResourceChunk::Null => {
+                self.set_sub_chunk(TagSubChunkContent::Resource(TagResourceChunk::Null));
+                return Ok(());
+            }
+            TagResourceChunk::Xsync { .. } => return Err(TagResourceCopyError::XsyncNotSupported),
+            TagResourceChunk::Exploded { exploded, struct_data, .. } => (exploded, struct_data),
+        };
+
+        if source.endian != self.endian {
+            return Err(TagResourceCopyError::EndianMismatch);
+        }
+
+        let map = crate::schema_compat::struct_trees_are_wire_identical(
+            source.definition().struct_definition(),
+            target.struct_definition(),
+        )
+        .map_err(|mismatch| TagResourceCopyError::LayoutMismatch(Box::new(mismatch)))?;
+
+        let retargeted = crate::data::retarget_struct_data(struct_data, &map, self.layout)?;
+
+        // The eight inline bytes at the field's own offset are a runtime handle
+        // stub the engine refills at load. Carrying them is the more faithful
+        // reading of "move this resource" than zeroing them, and either is safe.
+        let start = self.layout.fields[self.field_index].offset as usize;
+        let width = source.inline_bytes().len().min(self.struct_raw.len() - start);
+        self.struct_raw[start..start + width].copy_from_slice(&source.inline_bytes()[..width]);
+
+        self.set_sub_chunk(TagSubChunkContent::Resource(TagResourceChunk::Exploded {
+            exploded: exploded.clone(),
+            struct_data: retargeted,
+            // Dropped on purpose: it describes where a monolithic cache kept
+            // the payload, it is never written back, and the hydrated form
+            // serializes as a plain `tgrc` regardless.
+            xsync_state: None,
+        }));
+        Ok(())
+    }
+
+    /// Walk an `Exploded` resource's header struct for mutation — the
+    /// post-copy hook for re-pointing tag references and string ids inside a
+    /// payload that has already been moved.
+    pub fn as_resource_struct_mut(&mut self) -> Option<TagStructMut<'_>> {
+        let field = &self.layout.fields[self.field_index];
+        if field.field_type != TagFieldType::PageableResource {
+            return None;
+        }
+        let resource_layout_index = field.definition as usize;
+        let struct_size = self.layout.struct_layouts
+            [self.layout.resource_layouts[resource_layout_index].struct_index as usize]
+            .size;
+        let field_index = self.field_index as u32;
+        let (exploded, struct_data) = self
+            .struct_data
+            .sub_chunks
+            .iter_mut()
+            .find(|entry| entry.field_index == Some(field_index))
+            .and_then(|entry| match &mut entry.content {
+                TagSubChunkContent::Resource(TagResourceChunk::Exploded {
+                    exploded,
+                    struct_data,
+                    ..
+                }) => Some((exploded, struct_data)),
+                _ => None,
+            })?;
+        // Unlike every other struct, an exploded resource's header bytes live at
+        // the head of its own payload rather than in the enclosing block's
+        // raw region.
+        if exploded.len() < struct_size {
+            return None;
+        }
+        Some(TagStructMut {
+            layout: self.layout,
+            struct_data,
+            struct_raw: &mut exploded[..struct_size],
+            endian: self.endian,
+        })
+    }
+
+    /// Reset this resource field to the null shape.
+    pub fn clear_resource(&mut self) -> Result<(), TagResourceCopyError> {
+        if self.resource_definition().is_none() {
+            return Err(TagResourceCopyError::NotAResourceField);
+        }
+        self.set_sub_chunk(TagSubChunkContent::Resource(TagResourceChunk::Null));
+        Ok(())
+    }
+
+    /// Seed an exploded resource with a default header struct and `payload`
+    /// appended after it.
+    ///
+    /// Test-only. Real exploded resources arrive from a tag on disk or from
+    /// monolithic-cache hydration; this exists so the copy path can be tested
+    /// without either an editing kit or a cache, which CI has neither of.
+    #[cfg(test)]
+    pub(crate) fn seed_exploded_resource(&mut self, payload: &[u8]) -> Option<()> {
+        let field = &self.layout.fields[self.field_index];
+        if field.field_type != TagFieldType::PageableResource {
+            return None;
+        }
+        let struct_index =
+            self.layout.resource_layouts[field.definition as usize].struct_index as usize;
+        let struct_size = self.layout.struct_layouts[struct_index].size;
+        let mut exploded = vec![0u8; struct_size];
+        exploded.extend_from_slice(payload);
+        self.set_sub_chunk(TagSubChunkContent::Resource(TagResourceChunk::Exploded {
+            exploded,
+            struct_data: TagStructData::new_default(self.layout, struct_index, self.endian),
+            xsync_state: None,
+        }));
+        Some(())
     }
 }
 
@@ -1929,4 +2175,158 @@ pub enum TagSetError {
 pub enum TagIndexError {
     /// An index argument was outside the block / array's `0..len` range.
     OutOfRange { index: usize, len: usize },
+}
+
+#[cfg(test)]
+mod resource_copy_tests {
+    use crate::file::TagFile;
+    use std::path::{Path, PathBuf};
+
+    fn definitions() -> PathBuf {
+        Path::new("../definitions").to_path_buf()
+    }
+
+    fn jmad(game: &str) -> TagFile {
+        TagFile::new(definitions().join(game).join("model_animation_graph.json"))
+            .unwrap_or_else(|error| panic!("build {game} jmad: {error}"))
+    }
+
+    /// A recognizable stand-in for a compressed animation blob: long enough to
+    /// straddle chunk boundaries, and byte-varied so a misaligned copy shows up
+    /// as a difference rather than as a run of matching zeroes.
+    fn payload() -> Vec<u8> {
+        (0..4096u32).map(|i| (i.wrapping_mul(31) >> 3) as u8).collect()
+    }
+
+    /// Seed a resource on the first `tag resource groups` element and return
+    /// the tag.
+    fn with_seeded_resource(mut tag: TagFile, payload: &[u8]) -> TagFile {
+        {
+            let mut root = tag.root_mut();
+            let mut groups_field = root
+                .field_path_mut("tag resource groups")
+                .expect("jmad declares tag resource groups");
+            let mut groups = groups_field.as_block_mut().expect("it is a block");
+            let index = groups.add_element();
+            let mut element = groups.element_mut(index).expect("the element we just added");
+            let mut resource = element
+                .field_path_mut("tag_resource")
+                .expect("a resource group holds a tag_resource");
+            resource
+                .seed_exploded_resource(payload)
+                .expect("tag_resource is a pageable resource");
+        }
+        tag
+    }
+
+    /// The claim the whole Reach-to-Campaign-Evolved animation import rests on,
+    /// tested without an editing kit: an exploded resource moved between the two
+    /// games' layouts survives a write/read round trip byte-for-byte.
+    ///
+    /// This is the load-bearing assertion. The copy rewrites every layout index
+    /// in the payload's struct tree while touching none of its bytes, and the
+    /// writer emits sub-chunks by variant and position without ever reading
+    /// those indices. If that reasoning is wrong, the payload comes back
+    /// different here.
+    #[test]
+    fn a_resource_copied_across_games_survives_a_round_trip() {
+        let blob = payload();
+        let reach = with_seeded_resource(jmad("haloreach_mcc"), &blob);
+        let mut evolved = with_seeded_resource(jmad("haloce_evolved"), &[]);
+
+        {
+            let source_root = reach.root();
+            let source = source_root
+                .field_path("tag resource groups[0]/tag_resource")
+                .expect("the resource we seeded")
+                .as_resource()
+                .expect("it is a resource");
+
+            let mut target_root = evolved.root_mut();
+            let mut target = target_root
+                .field_path_mut("tag resource groups[0]/tag_resource")
+                .expect("the destination resource field");
+            target
+                .copy_resource_from(&source)
+                .expect("the two games declare the jmad resource identically");
+        }
+
+        let written = evolved.write_to_bytes().expect("serialize the copied tag");
+        let reopened = TagFile::read_from_bytes(&written).expect("read the copied tag back");
+        let root = reopened.root();
+        let resource = root
+            .field_path("tag resource groups[0]/tag_resource")
+            .expect("the resource survived the write")
+            .as_resource()
+            .expect("still a resource");
+
+        let payload_back = resource.exploded_payload().expect("an exploded resource");
+        assert!(
+            payload_back.ends_with(&blob),
+            "the animation payload must come back byte-for-byte: {} bytes in, {} out",
+            blob.len(),
+            payload_back.len(),
+        );
+    }
+
+    /// The gate. Halo 3 packs animation sizes into a 16-byte struct where Reach
+    /// and Campaign Evolved use 68, so the copy must refuse rather than write a
+    /// payload the destination would read at the wrong offsets.
+    #[test]
+    fn a_resource_is_refused_when_the_layouts_disagree() {
+        let reach = with_seeded_resource(jmad("haloreach_mcc"), &payload());
+        let mut halo3 = with_seeded_resource(jmad("halo3_mcc"), &[]);
+
+        let source_root = reach.root();
+        let source = source_root
+            .field_path("tag resource groups[0]/tag_resource")
+            .expect("the resource we seeded")
+            .as_resource()
+            .expect("it is a resource");
+
+        let mut target_root = halo3.root_mut();
+        let mut target = target_root
+            .field_path_mut("tag resource groups[0]/tag_resource")
+            .expect("the destination resource field");
+        let error = target
+            .copy_resource_from(&source)
+            .expect_err("Halo 3 packs animation sizes differently");
+        assert!(
+            matches!(error, super::TagResourceCopyError::LayoutMismatch(_)),
+            "{error}",
+        );
+    }
+
+    /// `layout_matches` is the same question asked without paying for the copy,
+    /// so it has to give the same answer.
+    #[test]
+    fn layout_matches_agrees_with_the_copy() {
+        let reach = with_seeded_resource(jmad("haloreach_mcc"), &[1, 2, 3]);
+        let root = reach.root();
+        let source = root
+            .field_path("tag resource groups[0]/tag_resource")
+            .expect("the resource we seeded")
+            .as_resource()
+            .expect("it is a resource");
+
+        for (game, expected) in [("haloce_evolved", true), ("halo3_mcc", false)] {
+            let other = jmad(game);
+            let other_root = other.root();
+            let target = other_root
+                .field_path("tag resource groups")
+                .expect("jmad declares tag resource groups")
+                .as_block()
+                .expect("it is a block")
+                .definition()
+                .struct_definition()
+                .fields()
+                .find_map(|field| field.as_resource())
+                .expect("a resource group declares a tag_resource");
+            assert_eq!(
+                source.layout_matches(&target),
+                expected,
+                "{game}",
+            );
+        }
+    }
 }
