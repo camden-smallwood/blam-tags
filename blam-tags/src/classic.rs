@@ -443,6 +443,62 @@ fn classic_struct_size(layout: &TagLayout, struct_index: u32, engine: ClassicEng
     size
 }
 
+/// Rewrite a layout's precomputed field offsets, struct sizes, and
+/// `old_string_id` width to the ones `engine` actually uses on disk.
+///
+/// The decoder and encoder already walk per engine — they advance by
+/// [`classic_field_size`] and never consult `field.offset`. Everything that
+/// *reads a value*, though, addresses the field at `layout.fields[i].offset`,
+/// which is precomputed for the modern form. On a legacy-width tag the element
+/// stride is therefore right and every field inside it is at the wrong place:
+/// `LAMB` stores an `old_string_id` as 32 inline bytes rather than a 4-byte
+/// slot, so everything after a name is read 28 bytes early. A Halo 2
+/// `render_model` node is 124 bytes there against the layout's 96, and its
+/// `parent node` was read out of the middle of the name.
+///
+/// Adjusting the layout once, here, fixes every reader and every editor at the
+/// same time, because they all go through those two numbers. The width of the
+/// `old_string_id` field *type* is updated too: it is what tells a reader with
+/// no engine in hand that the string is inline rather than in a sub-chunk.
+fn adjust_layout_for_engine(layout: &mut TagLayout, engine: ClassicEngine) {
+    if !engine.legacy_strings() && !engine.legacy_padding() {
+        return;
+    }
+    if engine.legacy_strings() {
+        for field in &layout.fields {
+            if field.field_type == TagFieldType::OldStringId {
+                layout.field_types[field.type_index as usize].size = 32;
+            }
+        }
+    }
+    // Computed first, applied after: `classic_field_size` reads the layout, and
+    // recursing into an inline struct would otherwise see a half-adjusted one.
+    // It never reads `offset` or `size`, so the order it sees does not matter —
+    // but keeping the passes separate makes that independence explicit.
+    let mut offsets: Vec<(usize, u32)> = Vec::new();
+    let mut sizes: Vec<(usize, usize)> = Vec::new();
+    for (struct_index, struct_layout) in layout.struct_layouts.iter().enumerate() {
+        let mut offset = 0usize;
+        let mut field_index = struct_layout.first_field_index as usize;
+        loop {
+            let field = &layout.fields[field_index];
+            if field.field_type == TagFieldType::Terminator {
+                break;
+            }
+            offsets.push((field_index, offset as u32));
+            offset += classic_field_size(layout, field, engine);
+            field_index += 1;
+        }
+        sizes.push((struct_index, offset));
+    }
+    for (field_index, offset) in offsets {
+        layout.fields[field_index].offset = offset;
+    }
+    for (struct_index, size) in sizes {
+        layout.struct_layouts[struct_index].size = size;
+    }
+}
+
 /// Decode then re-encode a classic tag body, returning the re-encoded
 /// bytes. The byte-exact roundtrip gate: `classic_roundtrip(body, ..) ==
 /// body` for a well-formed tag. Keeps the internal
@@ -464,8 +520,11 @@ pub fn classic_roundtrip(
 ///
 /// Returns [`ClassicError::NotClassic`] if the offset-60 engine word
 /// isn't a known classic engine (caller should route to the MCC reader).
-pub fn read_classic_tag_file(bytes: &[u8], layout: TagLayout) -> Result<TagFile, ClassicError> {
+pub fn read_classic_tag_file(bytes: &[u8], mut layout: TagLayout) -> Result<TagFile, ClassicError> {
     let (header, engine) = ClassicHeader::parse(bytes).ok_or(ClassicError::NotClassic)?;
+    // Point the layout at the widths this engine actually uses before anything
+    // reads a field through it.
+    adjust_layout_for_engine(&mut layout, engine);
     let body = &bytes[64..];
     let root = read_classic_body(body, &layout, engine)?;
 
@@ -1161,6 +1220,88 @@ fn encode_struct_trailing(
 #[cfg(test)]
 mod tests {
     use super::classic_checksum;
+
+    /// A `LAMB` tag stores every `old_string_id` as 32 inline bytes, not the
+    /// modern 4-byte slot, so each one shifts everything after it by 28. The
+    /// layout's precomputed offsets describe the modern form, and every reader
+    /// and editor addresses fields through them — so on the Halo 2 banshee the
+    /// names came back empty and `parent node` was read out of the middle of
+    /// the name. 458 of the 1,095 Halo 2 render_models are `LAMB`.
+    ///
+    /// The two halves of the fix are both load-bearing and this checks both:
+    /// the adjusted offsets (node parents, and section indices that are in
+    /// range — 5 distinct with 17 out of range before, 35 with 0 after), and
+    /// the inline read that makes a name resolve at all.
+    ///
+    /// Ignored by default — it needs a loose Halo 2 tag tree.
+    ///
+    /// Run with:
+    ///   H2_TAGS=~/Halo/halo2_mcc/tags H2_DEFS=<definitions>/halo2_mcc \
+    ///     cargo test legacy_string_tag -- --ignored
+    #[test]
+    #[ignore = "requires a loose Halo 2 tag tree; set H2_TAGS and H2_DEFS"]
+    fn legacy_string_tag_reads_its_names_and_the_fields_after_them() {
+        let (Ok(tags), Ok(defs)) = (std::env::var("H2_TAGS"), std::env::var("H2_DEFS")) else {
+            eprintln!("skipping: set H2_TAGS and H2_DEFS");
+            return;
+        };
+        let path = std::path::PathBuf::from(tags)
+            .join("objects/vehicles/banshee/banshee.render_model");
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        // The premise: this tag is one of the legacy-string ones.
+        assert_eq!(&bytes[60..64], b"BMAL", "banshee is supposed to be a LAMB tag");
+
+        let layout = crate::TagLayout::from_json(
+            std::path::PathBuf::from(defs).join("render_model.json"),
+        )
+        .expect("render_model layout");
+        let tag = super::read_classic_tag_file(&bytes, layout).expect("decode banshee");
+        let root = tag.root();
+
+        assert_eq!(root.read_string_id("name").as_deref(), Some("banshee"));
+
+        let nodes = root.field("nodes").and_then(|f| f.as_block()).expect("nodes");
+        let first = nodes.element(0).expect("a node");
+        assert_eq!(first.read_string_id("name").as_deref(), Some("hull"));
+        assert_eq!(
+            first.read_block_index("parent node"),
+            -1,
+            "the first node is the root; reading it out of the name gives garbage"
+        );
+
+        // Every permutation's section index has to address a real section —
+        // this is what the preview draws, and it is a field after the name.
+        let sections = root
+            .field("sections")
+            .and_then(|f| f.as_block())
+            .expect("sections")
+            .len();
+        let regions = root.field("regions").and_then(|f| f.as_block()).expect("regions");
+        assert!(regions.len() > 1, "banshee has several regions");
+        let mut named = 0usize;
+        let mut checked = 0usize;
+        for ri in 0..regions.len() {
+            let region = regions.element(ri).expect("region");
+            if !region.read_string_id("name").unwrap_or_default().is_empty() {
+                named += 1;
+            }
+            let Some(perms) = region.field("permutations").and_then(|f| f.as_block()) else {
+                continue;
+            };
+            for pi in 0..perms.len() {
+                let perm = perms.element(pi).expect("permutation");
+                let index = perm.read_int_any("L1 section index").unwrap_or(-1);
+                assert!(
+                    index >= 0 && (index as usize) < sections,
+                    "region {ri} permutation {pi} names section {index} of {sections}"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(named, regions.len(), "every region is named");
+        assert!(checked > 30, "only {checked} permutations checked");
+    }
 
     #[test]
     fn checksum_matches_crc32_without_final_xor() {
