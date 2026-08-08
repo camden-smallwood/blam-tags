@@ -125,7 +125,7 @@ pub use error::TagReadError;
 pub use typed_enums::{Enum, Flags, SchemaEnum, TagInt};
 pub use file::TagFile;
 pub use io::Endian;
-pub use layout::TagLayout;
+pub use layout::{TagLayout, TagTemplateHole};
 pub use schema::{TagGroupMeta, TagSchemaError};
 pub use schema_compare::{
     compare_root_layout, field_key, FieldDiff, FieldKey, LayoutComparison, LayoutSeverity,

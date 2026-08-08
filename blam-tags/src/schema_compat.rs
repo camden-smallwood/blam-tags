@@ -200,6 +200,16 @@ enum WireClass {
     Padding,
     /// Recursed into rather than compared directly.
     Container(TagFieldType),
+    /// A `tmpl` custom: a fixed-size, unnamed stand-in for another group's
+    /// inlined body.
+    ///
+    /// Identity is the template plus the width, because both have to agree for
+    /// the bytes to mean the same thing — the same template can inherit a
+    /// different amount in two games, and that is a genuine wire difference
+    /// rather than a rename. Without this the hole was simply skipped, which is
+    /// why a comparison reported Halo 3's whole render method as absent from
+    /// Reach when in fact Reach carries the same 100 bytes unnamed.
+    Template { group_tag: u32, size: u32 },
     /// No portable interpretation — compared by exact type instead.
     Opaque(TagFieldType),
 }
@@ -289,6 +299,9 @@ impl WireClass {
             WireClass::Container(_) | WireClass::Opaque(_) | WireClass::LeafChunk(_) => {
                 type_name.to_owned()
             }
+            WireClass::Template { group_tag, size } => {
+                format!("{type_name} ({size}-byte {} template)", crate::format_group_tag(group_tag))
+            }
             _ => format!("{type_name} ({width}-byte {self:?})"),
         }
     }
@@ -328,7 +341,13 @@ fn wire_fields(structure: TagStructDefinition<'_>) -> Vec<WireField<'_>> {
     structure
         .fields()
         .filter_map(|definition| {
-            let class = WireClass::of(definition.field_type())?;
+            // Asked before `WireClass::of`, which sees only the type and would
+            // discard every `custom` as a zero-byte editor sentinel. A template
+            // hole is the one kind of custom that occupies bytes.
+            let class = match definition.template_hole() {
+                Some(hole) => WireClass::Template { group_tag: hole.group_tag, size: hole.size },
+                None => WireClass::of(definition.field_type())?,
+            };
             Some(WireField {
                 clean_name: crate::clean_field_name(definition.name()).into_owned(),
                 class,
@@ -1075,6 +1094,11 @@ impl Builder {
                     FieldVerdict::Blocked(BlockReason::ApiInteropGuid)
                 }
             }
+            // Reached only when template and width both matched, since either
+            // differing makes the classes unequal and lands in `TypeChanged`
+            // above. Equal on both counts means the same inlined body of the
+            // same size, so the bytes carry.
+            WireClass::Template { .. } => FieldVerdict::Identical,
             // Vertex buffers, classic pointers, non-cache runtime values: bytes
             // whose meaning is bound to the engine that wrote them.
             WireClass::Opaque(_) => FieldVerdict::Blocked(BlockReason::OpaqueBytes),
