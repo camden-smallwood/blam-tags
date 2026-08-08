@@ -1,0 +1,183 @@
+//! What the editing kits actually ship for a `tmpl` group, measured.
+//!
+//! A `tmpl` custom field stands in for a template group's ancestor body — for the
+//! fx groups that is `render_method_struct_definition`, 100 bytes in Reach and 64
+//! in Halo 3. `TagLayout::from_json` accounts for it as a *byte count* stored in
+//! the field's `definition` slot (`schema.rs`, `tmpl_expansion_size`), which
+//! leaves those bytes anonymous: nothing names them, `WireClass::of(Custom)`
+//! skips them when two games are compared, and a `custom` field has no field
+//! index for the render method's `options`/`parameters`/`postprocess` blocks to
+//! hang a sub-chunk from.
+//!
+//! That looks like something to fix by splicing the ancestor struct in instead.
+//! It is not — or at least not in the layout a tag is *built* with. These tests
+//! record why, so the next attempt does not repeat it:
+//!
+//! 1. A shipped Reach particle's own `blay` **also** keeps the render method as
+//!    an unnamed slot. Splicing a named `shader` struct into the JSON layout adds
+//!    a field the kit does not have, which is exactly the divergence
+//!    `NATIVE_LAYOUT_TEMPLATE_GROUPS` exists to work around in Baboon.
+//! 2. The dumped JSON does not agree with the shipped layout for `particle` in
+//!    the first place — a real H3EK particle root is 424 bytes where
+//!    `halo3_mcc/particle.json` declares 404.
+//!
+//! So making the template body addressable has to happen *beside* the built
+//! layout (as metadata the comparison and conversion layers can read), not by
+//! changing the layout itself.
+//!
+//! Self-skips without a kit. A green run on a machine with no kits proves
+//! nothing here.
+
+use std::path::PathBuf;
+
+use blam_tags::{TagFieldType, TagFile};
+
+fn kit_tags(env_var: &str, kit: &str) -> Option<PathBuf> {
+    if let Ok(path) = std::env::var(env_var) {
+        let path = PathBuf::from(path);
+        return path.is_dir().then_some(path);
+    }
+    [
+        "C:/Program Files (x86)/Steam/steamapps/common",
+        "C:/Program Files/Steam/steamapps/common",
+        "D:/SteamLibrary/steamapps/common",
+        "E:/SteamLibrary/steamapps/common",
+    ]
+    .iter()
+    .map(|root| PathBuf::from(root).join(kit).join("tags"))
+    .find(|path| path.is_dir())
+}
+
+fn definitions() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../definitions")
+}
+
+/// First tag with `extension` anywhere under `tags`, searched depth-first so the
+/// same kit always yields the same tag.
+fn find_one(tags: &PathBuf, extension: &str) -> Option<PathBuf> {
+    let mut stack = vec![tags.clone()];
+    let mut best: Option<PathBuf> = None;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let mut names: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        names.sort();
+        for path in names {
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some(extension)
+                && best.as_ref().is_none_or(|b| &path < b)
+            {
+                best = Some(path);
+            }
+        }
+    }
+    best
+}
+
+/// Halo Reach's own particle layout leaves the render method unnamed.
+///
+/// If this ever starts failing because a `shader` struct appeared, the kits
+/// changed their mind and splicing becomes the right answer after all.
+#[test]
+fn a_shipped_reach_particle_keeps_its_render_method_in_an_unnamed_slot() {
+    let Some(tags) = kit_tags("BLAM_TEST_HREK", "HREK") else {
+        eprintln!("skipping: no HREK editing kit (set BLAM_TEST_HREK to its `tags` directory)");
+        return;
+    };
+    let Some(path) = find_one(&tags, "particle") else {
+        eprintln!("skipping: HREK has no .particle tag under {}", tags.display());
+        return;
+    };
+    let tag = TagFile::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+
+    let struct_fields: Vec<String> = tag
+        .root()
+        .fields()
+        .filter(|field| field.field_type() == TagFieldType::Struct)
+        .map(|field| field.name().to_owned())
+        .collect();
+    assert!(
+        struct_fields.iter().any(|name| name.starts_with("actual shader")),
+        "{}: expected an `actual shader?` struct, got {struct_fields:?}",
+        path.display()
+    );
+    assert!(
+        !struct_fields.iter().any(|name| name == "shader"),
+        "{}: the shipped layout now names the render method `shader` — splicing \
+         it into the JSON layout would agree with the kit after all. Fields: \
+         {struct_fields:?}",
+        path.display()
+    );
+    // The bytes are there either way; only the naming differs.
+    assert_eq!(tag.root().definition().size(), 496, "{}", path.display());
+}
+
+/// Every `.particle` under `tags`, depth-first.
+fn find_all(tags: &PathBuf, extension: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![tags.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for path in entries.flatten().map(|e| e.path()) {
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some(extension) {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A kit ships one group at several layout revisions, so "the" shipped size is
+/// not a single number.
+///
+/// This started as a claim that the dumped `halo3_mcc/particle.json` was 20
+/// bytes short of what H3EK ships — one tag's root really is 424 where the JSON
+/// declares 404. Surveying the whole kit shows why that was the wrong reading:
+/// H3EK's particles carry **more than one** root size, because every tag embeds
+/// the `blay` it was authored against and the group grew over the kit's life.
+///
+/// What the dump has to satisfy, then, is that it matches one of the revisions
+/// actually in use — not all of them. Anything that changes the JSON-built size
+/// (a `tmpl` splice, say) has to keep that true, which is what this pins.
+#[test]
+fn h3ek_ships_particles_at_several_root_sizes_and_the_dump_matches_one() {
+    let Some(tags) = kit_tags("BLAM_TEST_H3EK", "H3EK") else {
+        eprintln!("skipping: no H3EK editing kit (set BLAM_TEST_H3EK to its `tags` directory)");
+        return;
+    };
+    let paths = find_all(&tags, "particle");
+    if paths.is_empty() {
+        eprintln!("skipping: H3EK has no .particle tag under {}", tags.display());
+        return;
+    }
+
+    let mut sizes: std::collections::BTreeMap<usize, usize> = Default::default();
+    let mut unreadable = 0usize;
+    for path in &paths {
+        match TagFile::read(path) {
+            Ok(tag) => *sizes.entry(tag.root().definition().size()).or_default() += 1,
+            Err(_) => unreadable += 1,
+        }
+    }
+    eprintln!(
+        "H3EK .particle: {} tags, {unreadable} unreadable, root sizes {sizes:?}",
+        paths.len()
+    );
+
+    let schema = definitions().join("halo3_mcc/particle.json");
+    let built = TagFile::new(&schema).unwrap_or_else(|e| panic!("{}: {e}", schema.display()));
+    let built_size = built.root().definition().size();
+    assert_eq!(built_size, 404, "the dumped schema changed");
+    assert!(
+        sizes.contains_key(&built_size),
+        "the dumped Halo 3 particle root is {built_size} bytes, which no shipped \
+         tag uses; H3EK ships {sizes:?}"
+    );
+    assert!(
+        sizes.len() > 1,
+        "expected H3EK to ship more than one particle layout revision, saw {sizes:?}"
+    );
+}
