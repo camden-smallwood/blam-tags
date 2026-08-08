@@ -123,7 +123,7 @@ pub use field_name::{clean_field_name, parse_field_name, FieldNameInfo};
 pub use field_path::{TagFieldPath, TagFieldPathSegment};
 pub use error::TagReadError;
 pub use typed_enums::{Enum, Flags, SchemaEnum, TagInt};
-pub use file::TagFile;
+pub use file::{TagFile, TagFileHeader};
 pub use io::Endian;
 pub use layout::{TagLayout, TagTemplateHole};
 pub use schema::{TagGroupMeta, TagSchemaError};

@@ -5,6 +5,7 @@
 //! dialog state and the bulk-conversion worker belong to the editor, not here.
 
 use crate::classic::{ClassicHeader, read_classic_tag_file};
+use crate::file::TagFileHeader;
 use crate::paths::group_tag_to_extension;
 use crate::{
     ApiInteropData, Endian, FunctionFlags, FunctionType, StringIdData, TagBlock, TagField,
@@ -1786,14 +1787,40 @@ fn convert_to_struct_path(
 /// unqualified the check rejects the entire game, and silently: the converter
 /// would simply fall back to a generated layout every time with nothing saying
 /// why.
-fn accepts_native_template(tag: &TagFile, target_game: &str) -> bool {
+/// How many of a group's shipped tags to consider before concluding the kit has
+/// no usable template for it.
+///
+/// A bound is needed because *proving there is none* is the expensive case, and
+/// it is a real case: Halo Reach ships 10,675 bitmaps and not one carries a
+/// source revision, so the search rejects every last one. Opening a file costs
+/// far more than reading its header — 10,675 opens is ~15 seconds here even at
+/// 64 bytes each — so the count, not the bytes, is what has to be capped.
+///
+/// 256 is chosen against measurement rather than taste. In every Halo Reach
+/// group that has an acceptable tag at all, the first one sits at index 1 or 2,
+/// and between 15% and 90% of the group qualifies. The cap is two orders of
+/// magnitude past where the answer has ever been found.
+///
+/// The cost of being wrong is bounded and visible: the conversion falls back to
+/// a generated layout and the report says so, which is exactly what a group with
+/// no acceptable tag already gets.
+const NATIVE_TEMPLATE_SCAN_LIMIT: usize = 256;
+
+/// Whether a candidate's header marks it as a kit-authored tag worth starting
+/// from.
+///
+/// Takes the header rather than the tag so the test can be applied to a
+/// candidate that has not been parsed — which is the whole point, since a group
+/// may ship thousands of candidates and the answer is 64 bytes in. See
+/// [`TagFileHeader::peek`].
+fn accepts_native_header(header: &TagFileHeader, target_game: &str) -> bool {
     if target_game == CAMPAIGN_EVOLVED_GAME {
         let (build_version, build_number, version) = CAMPAIGN_EVOLVED_GENERATION;
-        return tag.header.build_version == build_version
-            && tag.header.build_number == build_number
-            && tag.header.version == version;
+        return header.build_version == build_version
+            && header.build_number == build_number
+            && header.version == version;
     }
-    tag.header.version != u32::MAX
+    header.version != u32::MAX
 }
 
 fn find_native_target_template(
@@ -1812,7 +1839,7 @@ fn find_native_target_template(
         let Some(paths) = templates.by_group.get(&target_group_tag) else {
             return Ok(None);
         };
-        for path in paths {
+        for path in paths.iter().take(NATIVE_TEMPLATE_SCAN_LIMIT) {
             let Ok(mut tag) = read_tag_for_conversion(
                 path,
                 Some(target_game),
@@ -1845,7 +1872,23 @@ fn find_native_target_template(
         templates.cached.borrow_mut().insert(target_group_tag, None);
         return Ok(None);
     };
-    for path in paths {
+    for path in paths.iter().take(NATIVE_TEMPLATE_SCAN_LIMIT) {
+        // Sift on the 64-byte header first. Every candidate has to be *ruled
+        // out* somehow, and for a group the kit ships in bulk the ruled-out ones
+        // are nearly all of them: Halo Reach ships 10,675 bitmaps, 6.4 GB, and
+        // not one carries a source revision — so a scan that parsed each to read
+        // its header spent half a minute proving there was nothing to find. The
+        // full checks below still run on whatever survives; this only decides
+        // what is worth opening.
+        let Ok((header, endian)) = TagFileHeader::peek(path) else {
+            continue;
+        };
+        if endian != Endian::Le
+            || header.group_tag != target_group_tag
+            || !accepts_native_header(&header, target_game)
+        {
+            continue;
+        }
         let Ok(mut tag) = TagFile::read(path) else {
             continue;
         };
@@ -1854,7 +1897,7 @@ fn find_native_target_template(
         if tag.group().tag == target_group_tag
             && tag.classic_engine().is_none()
             && tag.endian == Endian::Le
-            && accepts_native_template(&tag, target_game)
+            && accepts_native_header(&tag.header, target_game)
             && reset_tag_to_defaults(&mut tag, engine_managed).is_ok()
         {
             let bytes = tag.write_to_bytes().map_err(|error| {
@@ -4733,6 +4776,127 @@ pub fn normalize_conversion_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Where a scratch kit for a test lives. Named by process and clock so
+    /// parallel test threads cannot collide.
+    fn scratch(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "blam_convert_{label}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// The header peek agrees with a full parse, and refuses what is not a tag.
+    ///
+    /// This is the primitive the template search sifts thousands of candidates
+    /// with, so a peek that disagreed with the parse would pick a different
+    /// template than the checks below it would accept — a silent divergence
+    /// rather than a failure.
+    #[test]
+    fn a_peeked_header_says_what_a_parsed_one_does() {
+        let root = scratch("peek");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("sample.weapon");
+        let mut tag =
+            TagFile::new(locate_definitions_root().join("halo3_mcc/weapon.json")).unwrap();
+        tag.header.build_version = 1;
+        tag.header.build_number = 2;
+        tag.header.version = 7;
+        tag.write_atomic(&path).unwrap();
+
+        let (peeked, endian) = TagFileHeader::peek(&path).expect("a written tag peeks");
+        let parsed = TagFile::read(&path).unwrap();
+        assert_eq!(endian, parsed.endian);
+        assert_eq!(peeked.group_tag, parsed.header.group_tag);
+        assert_eq!(peeked.version, parsed.header.version);
+        assert_eq!(peeked.build_version, parsed.header.build_version);
+        assert_eq!(peeked.build_number, parsed.header.build_number);
+        assert_eq!(peeked.group_tag, u32::from_be_bytes(*b"weap"));
+
+        // Not a tag at all, and too short to be one: both are ordinary things to
+        // meet when walking a kit, and neither may panic.
+        fs::write(root.join("notes.txt"), b"this is not a tag file at all ok").unwrap();
+        assert!(TagFileHeader::peek(root.join("notes.txt")).is_err());
+        fs::write(root.join("stub.weapon"), b"short").unwrap();
+        assert!(TagFileHeader::peek(root.join("stub.weapon")).is_err());
+        assert!(TagFileHeader::peek(root.join("absent.weapon")).is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The template search gives up after a bounded number of candidates.
+    ///
+    /// Both halves matter. Finding one inside the bound is the ordinary case and
+    /// proves the search still works; not finding one past the bound is the
+    /// deliberate limit, and without a test it would be indistinguishable from
+    /// the search being broken. What it buys: proving a group has *no* usable
+    /// template used to mean opening every tag in it, and Halo Reach ships
+    /// 10,675 bitmaps — 6.4 GB, none acceptable, half a minute to say so.
+    #[test]
+    fn the_native_template_search_stops_after_a_bounded_number_of_candidates() {
+        let definitions = locate_definitions_root();
+        let root = scratch("scan_limit");
+        let tags = root.join("tags/objects");
+        fs::create_dir_all(&tags).unwrap();
+
+        // Rejected: `version == u32::MAX` is what a tag with no recorded source
+        // revision carries, which is also what Baboon stamps on its own output.
+        let mut reject =
+            TagFile::new(definitions.join("haloreach_mcc/weapon.json")).unwrap();
+        apply_editing_kit_mcc_header(&mut reject, "haloreach_mcc").unwrap();
+        assert_eq!(reject.header.version, u32::MAX, "the reject must be rejected");
+        // Accepted: any recorded revision will do.
+        let mut accept =
+            TagFile::new(definitions.join("haloreach_mcc/weapon.json")).unwrap();
+        apply_editing_kit_mcc_header(&mut accept, "haloreach_mcc").unwrap();
+        accept.header.version = 3;
+
+        // Sorted order is what the search walks, so zero-padded names put the
+        // acceptable tag at an exact, chosen index.
+        let place = |index: usize, tag: &TagFile| {
+            tag.write_atomic(tags.join(format!("tag_{index:05}.weapon")))
+                .unwrap();
+        };
+        let past_the_bound = NATIVE_TEMPLATE_SCAN_LIMIT + 20;
+        for index in 0..past_the_bound {
+            place(index, &reject);
+        }
+        place(past_the_bound, &accept);
+
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let source = TagFile::new(definitions.join("halo3_mcc/weapon.json")).unwrap();
+        let analyze = |tags_root: &Path| {
+            let templates = NativeTemplateIndex::build(tags_root, &groups);
+            analyze_conversion_with_templates(
+                &source,
+                "halo3_mcc",
+                "haloreach_mcc",
+                &definitions,
+                Some(&templates),
+            )
+            .unwrap()
+            .native_layout_template
+        };
+
+        assert!(
+            analyze(&root.join("tags")).is_none(),
+            "an acceptable tag {past_the_bound} deep is past the bound and must not be found"
+        );
+
+        // Move it inside the bound and the same search finds it, so the miss
+        // above is the bound rather than the search failing outright.
+        place(1, &accept);
+        assert!(
+            analyze(&root.join("tags")).is_some(),
+            "an acceptable tag at index 1 is well inside the bound"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[derive(Clone)]
     struct LeafSeed {
