@@ -955,8 +955,26 @@ fn read_sub_chunks<R: Seek + Read>(
             }
 
             TagFieldType::PageableResource => {
-                let resource_layout = &layout.resource_layouts[field.definition as usize];
-                let resource_struct_definition = &layout.struct_layouts[resource_layout.struct_index as usize];
+                // A shipped tag can carry a pageable-resource field whose
+                // `definition` indexes past its own `resource_layouts` table.
+                // Report it instead of indexing out of bounds: a reader that
+                // panics takes the whole app down on one bad tag.
+                let resource_layout = layout
+                    .resource_layouts
+                    .get(field.definition as usize)
+                    .ok_or(TagReadError::LayoutIndexOutOfBounds {
+                        table: "resource_layouts",
+                        index: field.definition,
+                        len: layout.resource_layouts.len(),
+                    })?;
+                let resource_struct_definition = layout
+                    .struct_layouts
+                    .get(resource_layout.struct_index as usize)
+                    .ok_or(TagReadError::LayoutIndexOutOfBounds {
+                        table: "struct_layouts",
+                        index: resource_layout.struct_index,
+                        len: layout.struct_layouts.len(),
+                    })?;
 
                 let outer_header = read_chunk_header(reader, endian)?;
                 let outer_content_offset = reader.stream_position()?;

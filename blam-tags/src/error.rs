@@ -121,6 +121,19 @@ pub enum TagReadError {
         table_size: usize,
     },
 
+    /// A field's `definition` slot indexed past the end of the layout table it
+    /// names. The tag's own layout is internally inconsistent, so the field
+    /// cannot be resolved — reported rather than panicking, because a shipped tag
+    /// really does hit this and a reader must not take the process down.
+    LayoutIndexOutOfBounds {
+        /// Which layout table was indexed (e.g. `"resource_layouts"`).
+        table: &'static str,
+        /// Index the field asked for.
+        index: u32,
+        /// Number of entries the table actually has.
+        len: usize,
+    },
+
     /// Two streams of the same kind were found in one tag file.
     /// Tags carry at most one each of `want` / `info` / `assd`.
     DuplicateOptionalStream {
@@ -180,6 +193,10 @@ impl fmt::Display for TagReadError {
             Self::StringOffsetOutOfBounds { offset, table_size } => write!(
                 f,
                 "string offset {offset} is past end of string table (size {table_size})",
+            ),
+            Self::LayoutIndexOutOfBounds { table, index, len } => write!(
+                f,
+                "layout {table} has {len} entries but a field asked for index {index}",
             ),
             Self::DuplicateOptionalStream { signature } => write!(
                 f,
