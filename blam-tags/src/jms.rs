@@ -2522,16 +2522,26 @@ fn read_phmo_pills(root: &TagStruct<'_>, parents: &std::collections::HashMap<(i6
             .unwrap_or(0.0);
         let bottom = p.read_vec3("bottom");
         let top = p.read_vec3("top");
-        // TagTool pill anchor: translation = bottom + normalized(bottom - top) * radius
+        // A pill is stored as its two end centres. JMS gives it an origin and an
+        // orientation instead: the origin is the tip of the bottom cap, one
+        // radius beyond `bottom` along the axis, and the body runs from there
+        // for `height + 2 * radius`.
         let dir = bottom - top;
         let unit = dir.normalized();
         let anchor = bottom + unit * radius;
         let height = (top - bottom).length() * SCALE;
-        // Orientation from the `top - bottom` axis (TagTool's
-        // `QuaternionFromVector` with reference up = (0, 0, -1)).
+        // The consumer builds the pill along its own local +Z from that origin
+        // — both the Blender toolset and Foundry create a depth-2 cylinder,
+        // push it to z = 0..2, and scale z by `radius + height / 2`. So the
+        // rotation has to carry local +Z onto `top - bottom`. Carrying -Z onto
+        // it instead (which is what reading TagTool's `QuaternionFromVector`
+        // as a +Z alignment amounts to) points every pill backwards out of its
+        // own anchor, displacing it by its full length: the flood tank's legs
+        // and lower arm ended up below the floor and its upper arm out beside
+        // the body.
         let axis = top - bottom;
         let rot = RealQuaternion::shortest_arc(
-            RealVector3d { i: 0.0, j: 0.0, k: -1.0 },
+            RealVector3d { i: 0.0, j: 0.0, k: 1.0 },
             axis,
         );
         out.push(JmsCapsule {
@@ -2700,12 +2710,13 @@ fn read_phmo_h2_pills(root: &TagStruct<'_>, parent_map: &std::collections::HashM
         let radius = p.read_real("radius").unwrap_or(0.0);
         let bottom = p.read_vec3("bottom");
         let top = p.read_vec3("top");
-        // Same anchor/orientation math as the H3 pill reader.
+        // Same anchor/orientation math as the H3 pill reader — local +Z runs
+        // from the bottom cap's tip toward `top`.
         let dir = bottom - top;
         let anchor = bottom + dir.normalized() * radius;
         let height = (top - bottom).length() * SCALE;
         let rot = RealQuaternion::shortest_arc(
-            RealVector3d { i: 0.0, j: 0.0, k: -1.0 },
+            RealVector3d { i: 0.0, j: 0.0, k: 1.0 },
             top - bottom,
         );
         out.push(JmsCapsule {
@@ -3465,6 +3476,69 @@ mod tests {
         assert_eq!(nodes[0].translation.x, 24.0);
         assert_eq!(nodes[1].translation.x, 0.0);
         assert_eq!(nodes[2].translation.x, 80.0);
+    }
+
+    /// A pill is stored as two end centres, but JMS gives it an origin and an
+    /// orientation and leaves the consumer to build the body along its own
+    /// local +Z. So the emitted rotation has to carry +Z onto `top - bottom`:
+    /// reconstructing both ends from what we write must land back on the tag's
+    /// own `bottom` and `top`, each pushed out by one radius.
+    ///
+    /// Carrying -Z instead points every pill backwards out of its own anchor
+    /// and displaces it by its whole length — the flood tank's legs and lower
+    /// arm ended up below the floor and its upper arm out beside the body.
+    /// Across Halo 3 and Halo Reach that was 639 of 639 pills wrong, every far
+    /// tip off by exactly twice the pill's length.
+    ///
+    /// Ignored by default — it needs a loose Halo 3 tag tree.
+    ///
+    /// Run with:
+    ///   H3_TAGS=~/Halo/halo3_mcc/tags cargo test pill_runs_from -- --ignored
+    #[test]
+    #[ignore = "requires a loose Halo 3 tag tree; set H3_TAGS"]
+    fn pill_runs_from_its_anchor_toward_the_far_end() {
+        let Ok(root) = std::env::var("H3_TAGS") else {
+            eprintln!("skipping: set H3_TAGS to a loose Halo 3 tags directory");
+            return;
+        };
+        let path = std::path::PathBuf::from(root)
+            .join("objects/characters/flood_tank/flood_tank.physics_model");
+        let tag = crate::TagFile::read(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let jms = super::JmsFile::from_physics_model(&tag).expect("physics jms");
+        let block = tag
+            .root()
+            .field_path("pills")
+            .and_then(|f| f.as_block())
+            .expect("pills block");
+        assert!(!jms.capsules.is_empty(), "this model has no pills to check");
+
+        const SCALE: f32 = 100.0;
+        let up = crate::math::RealVector3d { i: 0.0, j: 0.0, k: 1.0 };
+        for (i, capsule) in jms.capsules.iter().enumerate() {
+            let element = block.element(i).expect("pill element");
+            let bottom = element.read_vec3("bottom") * SCALE;
+            let top = element.read_vec3("top") * SCALE;
+            let unit = (top - bottom).normalized();
+            let length = capsule.height + 2.0 * capsule.radius;
+            let tolerance = 0.01 * length;
+
+            let origin = capsule.translation.as_vector();
+            assert!(
+                (origin - (bottom - unit * capsule.radius)).length() < tolerance,
+                "pill '{}' starts at {origin:?}, not at the bottom cap's tip",
+                capsule.name,
+            );
+            let tip = origin + capsule.rotation.rotate(up) * length;
+            let want = top + unit * capsule.radius;
+            assert!(
+                (tip - want).length() < tolerance,
+                "pill '{}' reaches {tip:?} instead of {want:?} — off by {:.0}% of its \
+                 own length, which at ~200% is the pill pointing out of its anchor",
+                capsule.name,
+                100.0 * (tip - want).length() / length,
+            );
+        }
     }
 
     /// A collision node spells its parent link `parent node`, not `parent` —
