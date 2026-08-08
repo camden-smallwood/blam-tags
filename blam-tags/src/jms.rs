@@ -373,7 +373,10 @@ impl JmsFile {
     /// the same skeleton the animations and collision use. UE's extra
     /// `World` root (and any UE bone absent from the tag) falls back to the
     /// tag's root node. UE is left-handed (Y right); the classic pipeline is
-    /// right-handed (Y left), so positions and normals are Y-negated.
+    /// right-handed (Y left), so positions and normals are Y-negated. Texture
+    /// V is flipped for the same reason every other JMS writer here flips it:
+    /// UE and the Halo engines both run V downward from a top-left origin, and
+    /// JMS is the one format that doesn't.
     #[cfg(feature = "iostore")]
     pub fn from_ue_skeletal_mesh(
         mesh: &crate::iostore::skeletal_mesh::SkeletalMesh,
@@ -439,7 +442,7 @@ impl JmsFile {
                     tangent: None,
                     binormal: None,
                     node_sets,
-                    uvs: vec![crate::math::RealPoint2d { x: v.uv[0], y: v.uv[1] }],
+                    uvs: vec![crate::math::RealPoint2d { x: v.uv[0], y: 1.0 - v.uv[1] }],
                 }
             })
             .collect();
@@ -584,7 +587,7 @@ impl JmsFile {
                     tangent: None,
                     binormal: None,
                     node_sets,
-                    uvs: vec![crate::math::RealPoint2d { x: v.uv[0], y: v.uv[1] }],
+                    uvs: vec![crate::math::RealPoint2d { x: v.uv[0], y: 1.0 - v.uv[1] }],
                 });
             }
             for sec in &part.mesh.sections {
@@ -675,7 +678,7 @@ impl JmsFile {
                     tangent: None,
                     binormal: None,
                     node_sets: vec![(bone, 1.0)],
-                    uvs: vec![crate::math::RealPoint2d { x: v.uv[0], y: v.uv[1] }],
+                    uvs: vec![crate::math::RealPoint2d { x: v.uv[0], y: 1.0 - v.uv[1] }],
                 });
             }
             let matname = part
@@ -732,7 +735,7 @@ impl JmsFile {
                     tangent: None,
                     binormal: None,
                     node_sets: vec![(node, 1.0)],
-                    uvs: vec![crate::math::RealPoint2d { x: v.uv[0], y: v.uv[1] }],
+                    uvs: vec![crate::math::RealPoint2d { x: v.uv[0], y: 1.0 - v.uv[1] }],
                 });
             }
             for sec in &part.mesh.sections {

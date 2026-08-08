@@ -67,9 +67,9 @@ pub fn write_skeletal_mesh<W: Write>(
     let uvs = mesh
         .vertices
         .iter()
-        // The skeletal decoder exposes classic-tool UVs (V already flipped),
-        // while ActorX stores the original Unreal convention.
-        .map(|vertex| [vertex.uv[0], 1.0 - vertex.uv[1]])
+        // SkelVertex retains the raw Unreal UV convention, which is what ActorX
+        // stores (its importers flip V themselves) — same as `write_static_mesh`.
+        .map(|vertex| vertex.uv)
         .collect::<Vec<_>>();
     write_common(
         writer,
@@ -209,9 +209,12 @@ pub fn skeletal_mesh_to_jms(mesh: &SkeletalMesh, material_names: &[String]) -> J
                     )
                 })
                 .collect(),
+            // Unreal and the Halo engines both store V downward from a top-left
+            // origin; JMS is the odd one out, so every JMS writer here flips it
+            // (see `static_mesh_to_jms` and the classic `read_*_vertex` paths).
             uvs: vec![RealPoint2d {
                 x: vertex.uv[0],
-                y: vertex.uv[1],
+                y: 1.0 - vertex.uv[1],
             }],
         })
         .collect();
@@ -562,5 +565,56 @@ mod tests {
             );
             assert!(bytes.windows(10).any(|window| window == b"RAWWEIGHTS"));
         }
+    }
+
+    /// A character extracted from Campaign Evolved is one JMS built from both
+    /// converters — skeletal body plus bone-attached static armour — so the two
+    /// have to agree on which way V runs. They didn't: the skeletal side passed
+    /// Unreal's V through and the static side flipped it, leaving one JMS whose
+    /// islands sat in `[-1, 1]` for the body and `[0, 2]` for the armour.
+    #[test]
+    fn both_jms_converters_flip_v_the_same_way() {
+        let mut skeletal = sample();
+        skeletal.vertices[0].uv = [0.25, 0.75];
+        let from_skeletal = skeletal_mesh_to_jms(&skeletal, &[]);
+
+        let static_mesh = StaticMesh {
+            indices: vec![0, 1, 2],
+            vertices: (0..3)
+                .map(|index| crate::iostore::static_mesh::StaticVertex {
+                    position: [index as f32, 0.0, 0.0],
+                    normal: [0.0, 0.0, 1.0],
+                    uv: [0.25, 0.75],
+                })
+                .collect(),
+        };
+        let from_static = static_mesh_to_jms(&static_mesh, &[]);
+
+        // JMS runs V upward, so Unreal's 0.75 lands at 0.25.
+        assert_eq!(from_skeletal.vertices[0].uvs[0].y, 0.25);
+        assert_eq!(from_static.vertices[0].uvs[0].y, 0.25);
+        assert_eq!(from_skeletal.vertices[0].uvs[0].x, 0.25);
+        assert_eq!(from_static.vertices[0].uvs[0].x, 0.25);
+    }
+
+    /// ActorX is the mirror case: it keeps Unreal's convention, and there too
+    /// the two converters have to agree.
+    #[test]
+    fn both_actorx_writers_keep_unreal_v() {
+        let mut skeletal = sample();
+        skeletal.vertices[0].uv = [0.25, 0.75];
+        let mut bytes = Vec::new();
+        write_skeletal_mesh(&skeletal, &[], ActorXFormat::Pskx, &mut bytes).unwrap();
+        // VTXW0000 wedges are [i32 point index, f32 u, f32 v, ...]; the first
+        // wedge's V follows the 32-byte chunk header and its 4-byte index.
+        let at = bytes
+            .windows(8)
+            .position(|window| window == b"VTXW0000")
+            .expect("wedge chunk")
+            + 32
+            + 4;
+        let u = f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let v = f32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap());
+        assert_eq!((u, v), (0.25, 0.75));
     }
 }
