@@ -127,6 +127,20 @@ pub enum ClassicError {
     },
     /// Body had trailing bytes the layout-driven walk never consumed.
     TrailingBytes { consumed: usize, total: usize },
+    /// A block declared more element bytes than the body had left. Carries the
+    /// block's name and the header's own `count`/`element_size`, because the
+    /// product alone cannot say which of the two is wrong.
+    ShortBlock {
+        block: String,
+        count: usize,
+        elem_size: usize,
+        need: usize,
+        have: usize,
+        /// Body offset the elements were to be read from. The value that makes
+        /// this diagnosable: a plausible `count`/`elem_size` pair read a byte or
+        /// two off yields an implausible one, so the offset says where to look.
+        at: usize,
+    },
     /// A block/struct header's `count`/`element_size` pair is implausible
     /// (count*size overflows, or a nonzero count with a zero element
     /// size). Almost always a cursor desync that read garbage as a
@@ -146,6 +160,10 @@ impl std::fmt::Display for ClassicError {
             ClassicError::TrailingBytes { consumed, total } => {
                 write!(f, "layout walk consumed {consumed} of {total} body bytes")
             }
+            ClassicError::ShortBlock { block, count, elem_size, need, have, at } => write!(
+                f,
+                "block {block:?} at body offset {at} wants {count} x {elem_size} = {need} bytes but only {have} remain",
+            ),
             ClassicError::CorruptBlockHeader { count, elem_size } => {
                 write!(f, "corrupt block header: count={count} element_size={elem_size}")
             }
@@ -909,7 +927,28 @@ fn decode_block(
     let struct_index = resolve_version_variant(layout, struct_index, version);
 
     let total = checked_block_extent(count, elem_size)?;
-    let raw_data = cur.take(total, "block elements")?.to_vec();
+    // Name the block and quote the header's own numbers. A bare "need N bytes,
+    // have M" cannot be acted on: N is `count * element_size`, so the interesting
+    // question is always which of the two is wrong and for which block, and
+    // recovering that from the product alone is guesswork.
+    let elements_at = cur.pos;
+    let raw_data = cur
+        .take(total, "block elements")
+        .map_err(|error| match error {
+            ClassicError::UnexpectedEof { need, have, .. } => ClassicError::ShortBlock {
+                block: layout
+                    .get_string(layout.block_layouts[block_index as usize].name_offset)
+                    .unwrap_or("?")
+                    .to_owned(),
+                count,
+                elem_size,
+                need,
+                have,
+                at: elements_at,
+            },
+            other => other,
+        })?
+        .to_vec();
 
     let mut elements = Vec::with_capacity(count);
     for i in 0..count {
@@ -1071,11 +1110,22 @@ fn sync_fixed_counts(
                     wr_u32(raw, *off + 8, 0, endian);
                 }
             }
-            (TagFieldType::StringId, Some(TagSubChunkContent::StringId(s)))
-            | (TagFieldType::OldStringId, Some(TagSubChunkContent::OldStringId(s))) => {
+            (
+                TagFieldType::StringId | TagFieldType::OldStringId,
+                Some(TagSubChunkContent::StringId(s) | TagSubChunkContent::OldStringId(s)),
+            ) => {
                 // Inline (pad:u16, length:u16) big-endian. Sync length.
                 // (Legacy 32-byte inline old_string_id has no sub-chunk and
                 // is preserved verbatim, so it never reaches this arm.)
+                //
+                // Both field types accept either content variant on purpose.
+                // `encode_struct_trailing` already emits the bytes for either,
+                // so requiring the variant to match the field type left the
+                // inline length stale whenever a writer set a `string_id` value
+                // on an `old_string_id` field — the trailing bytes were the new
+                // string's while the length word was still the old string's, and
+                // the decoder then read the following block header off by the
+                // difference.
                 raw[*off + 2..*off + 4].copy_from_slice(&(s.len() as u16).to_be_bytes());
             }
             _ => {}
