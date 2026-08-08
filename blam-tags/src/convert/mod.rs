@@ -2123,16 +2123,60 @@ fn reset_tag_to_defaults(
     Ok(())
 }
 
+/// Is this struct an inlined render method?
+///
+/// `options`, `parameters` and `postprocess` appear together in the render
+/// method and nowhere else, which makes the trio a reliable signature where the
+/// struct's own name is not: Reach hides the whole body in an unnamed `tmpl`
+/// hole, and a shipped tag's expanded layout gives the fields no distinguishing
+/// parent to test against.
+fn is_render_method_struct(value: TagStruct<'_>) -> bool {
+    let mut options = false;
+    let mut parameters = false;
+    let mut postprocess = false;
+    for field in value.fields() {
+        match clean_field_key(field.name()).as_str() {
+            "options" => options = true,
+            "parameters" => parameters = true,
+            "postprocess" | "postprocess definition" => postprocess = true,
+            _ => {}
+        }
+    }
+    options && parameters && postprocess
+}
+
 fn reset_struct_to_defaults(
     mut value: TagStructMut<'_>,
     path: &str,
     engine_managed: Option<&SchemaFieldAliases>,
 ) -> Result<(), String> {
     let field_count = value.as_ref().fields().count();
+    // A render method's own `definition` reference survives the reset.
+    //
+    // The fx groups inline a render method into the tag, and which one it is
+    // rides on a single `rmdf` reference. A Reach particle with that reference
+    // empty crashes the mod tools, and the schema cannot protect it: Reach keeps
+    // the whole render method inside a `tmpl` hole, so no fx schema declares a
+    // `definition` field at all and neither the `*` nor the `!` annotation is
+    // available. A kit-authored template names it only because its *shipped*
+    // layout expands the hole.
+    //
+    // Recognised by shape, not by group or by name alone — `definition` is far
+    // too common to blanket-preserve, but a struct carrying `options`,
+    // `parameters` and `postprocess` together is a render method and nothing
+    // else. A source with its own `definition` still overwrites this during
+    // conversion, so it only decides what happens when none can be supplied.
+    let render_method = is_render_method_struct(value.as_ref());
     for ordinal in 0..field_count {
         let Some(mut field) = value.field_at_mut(ordinal) else {
             continue;
         };
+        if render_method
+            && field.as_ref().field_type() == TagFieldType::TagReference
+            && clean_field_key(field.as_ref().name()) == "definition"
+        {
+            continue;
+        }
         // Engine-managed fields keep whatever the kit-authored template put
         // there. Zeroing them writes a value nothing shipped: every Halo Reach
         // particle carries `version!` 2 (one carries 1, none carries 0), and a
@@ -6670,6 +6714,195 @@ mod tests {
             carried.is_empty(),
             "non-finite numbers reached the converted tag at {carried:?}"
         );
+    }
+
+    /// A converted Reach particle keeps a render-method definition even when the
+    /// source cannot supply one.
+    ///
+    /// A Reach particle with an empty `rmdf` reference crashes the mod tools, and
+    /// nothing in the Reach schema protects that field: the whole render method
+    /// lives in a `tmpl` hole, so no fx schema declares `definition` and neither the
+    /// `*` nor the `!` annotation applies. It survives because a kit-authored
+    /// template supplies it and the reset now leaves a render method's own
+    /// definition alone.
+    ///
+    /// The source's reference is deliberately cleared first. Halo 3 usually carries
+    /// the same `shaders\particle` value, which would make this pass whether or not
+    /// the fallback works — so the test removes it and checks the template still
+    /// fills the gap.
+    #[test]
+    fn a_converted_reach_particle_keeps_a_render_method_definition() {
+        let (Some(h3), Some(reach)) = (
+            kit_tags("BLAM_TEST_H3EK", "H3EK"),
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+        ) else {
+            eprintln!("skipping: needs H3EK and HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let source_index = GameTagIndex::load(&definitions, "halo3_mcc").unwrap();
+        let target_index = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let Some(&group_tag) =
+            super::chain_sweep::extension_to_group_tag(&source_index).get("particle")
+        else {
+            eprintln!("skipping: halo3_mcc declares no particle");
+            return;
+        };
+        let templates = NativeTemplateIndex::build(&reach, &target_index);
+        let found = super::chain_sweep::first_tag_by_extension(&h3);
+        let Some(path) = found.get("particle") else {
+            eprintln!("skipping: H3EK ships no .particle");
+            return;
+        };
+        let Ok(mut source) = read_tag_for_conversion(
+            path,
+            Some("halo3_mcc"),
+            Some(definitions.as_path()),
+            group_tag,
+        ) else {
+            eprintln!("skipping: {} is unreadable", path.display());
+            return;
+        };
+
+        // Clear the source's own render-method definition, so only the template
+        // can account for a value in the output.
+        let mut cleared = false;
+        let located = struct_at_path(source.root(), "actual shader?").and_then(|shader| {
+            let definition = shader.fields().position(|field| {
+                field.field_type() == TagFieldType::TagReference
+                    && clean_field_key(field.name()) == "definition"
+            })?;
+            let outer = field_ordinal_by_key(source.root(), "actual shader?")?;
+            is_render_method_struct(shader).then_some((outer, definition))
+        });
+        if let Some((outer, definition)) = located
+            && let Some(mut outer_field) = source.root_mut().field_at_mut(outer)
+            && let Some(mut shader) = outer_field.as_struct_mut()
+            && let Some(mut field) = shader.field_at_mut(definition)
+        {
+            field
+                .set(TagFieldData::TagReference(TagReferenceData {
+                    group_tag_and_name: None,
+                }))
+                .unwrap();
+            cleared = true;
+        }
+        assert!(
+            cleared,
+            "could not clear the source definition; the sample changed and this test              no longer proves the fallback"
+        );
+
+        let draft = analyze_conversion_with_templates(
+            &source,
+            "halo3_mcc",
+            "haloreach_mcc",
+            &definitions,
+            Some(&templates),
+        )
+        .expect("halo3 -> reach particle converts");
+        let shader = struct_at_path(draft.tag.root(), "actual shader?")
+            .expect("the converted particle has an `actual shader?` struct");
+        let definition = shader
+            .fields()
+            .find(|field| clean_field_key(field.name()) == "definition")
+            .and_then(|field| match field.value() {
+                Some(TagFieldData::TagReference(reference)) => reference.group_tag_and_name,
+                _ => None,
+            });
+        let (group, name) = definition
+            .expect("the converted particle kept a render-method definition reference");
+        assert_eq!(format_group_tag(group), "rmdf");
+        assert!(!name.is_empty(), "the render-method reference points at nothing");
+    }
+
+    /// What does a converted Reach particle actually hold where the render method
+    /// should be?
+    ///
+    /// A shipped Reach particle expands the render method inline inside
+    /// `actual shader?` with a `definition` reference to a render_method_definition
+    /// tag, and a particle without one crashes the mod tools. Halo 3 cannot supply
+    /// that value. Print the native template and the converted output side by side
+    /// rather than trusting an earlier note about which fields survive.
+    #[test]
+    #[ignore = "diagnostic; needs the editing kits"]
+    fn report_the_converted_reach_particle_render_method() {
+        let (Some(h3), Some(reach)) = (
+            kit_tags("BLAM_TEST_H3EK", "H3EK"),
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+        ) else {
+            eprintln!("skipping: needs H3EK and HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let source_index = GameTagIndex::load(&definitions, "halo3_mcc").unwrap();
+        let target_index = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let Some(&group_tag) =
+            super::chain_sweep::extension_to_group_tag(&source_index).get("particle")
+        else {
+            return;
+        };
+        let templates = NativeTemplateIndex::build(&reach, &target_index);
+        let dump = |label: &str, value: TagStruct<'_>| {
+            eprintln!("-- {label}");
+            for field in value.fields() {
+                if field.name().is_empty() {
+                    eprintln!("      (unnamed {:?})", field.field_type());
+                    continue;
+                }
+                let extra = match field.value() {
+                    Some(TagFieldData::TagReference(reference)) => match reference.group_tag_and_name {
+                        Some((group, name)) => format!(" -> {} {name:?}", format_group_tag(group)),
+                        None => " -> (empty)".to_owned(),
+                    },
+                    _ => String::new(),
+                };
+                eprintln!("      {:?} {:?}{extra}", field.name(), field.field_type());
+            }
+        };
+        let native = super::chain_sweep::first_tag_by_extension(&reach);
+        if let Some(path) = native.get("particle")
+            && let Ok(tag) = TagFile::read(path)
+        {
+            eprintln!("== native HREK {}", path.display());
+            if let Some(shader) = struct_at_path(tag.root(), "actual shader?") {
+                dump("native actual shader?", shader);
+            } else {
+                eprintln!("   no `actual shader?` struct at the root");
+                for field in tag.root().fields() {
+                    if field.as_struct().is_some() {
+                        eprintln!("      root struct field {:?}", field.name());
+                    }
+                }
+            }
+        }
+        let found = super::chain_sweep::first_tag_by_extension(&h3);
+        let Some(path) = found.get("particle") else { return };
+        let Ok(source) = crate::convert::read_tag_for_conversion(
+            path,
+            Some("halo3_mcc"),
+            Some(definitions.as_path()),
+            group_tag,
+        ) else {
+            return;
+        };
+        eprintln!("== converted from {}", path.display());
+        match analyze_conversion_with_templates(
+            &source,
+            "halo3_mcc",
+            "haloreach_mcc",
+            &definitions,
+            Some(&templates),
+        ) {
+            Ok(draft) => {
+                eprintln!("   template: {:?}", draft.native_layout_template);
+                if let Some(shader) = struct_at_path(draft.tag.root(), "actual shader?") {
+                    dump("converted actual shader?", shader);
+                } else {
+                    eprintln!("   converted tag has no `actual shader?` struct");
+                }
+            }
+            Err(error) => eprintln!("   refused: {error}"),
+        }
     }
 
     /// The schema's own `{former name}` marker resolves a rename.
