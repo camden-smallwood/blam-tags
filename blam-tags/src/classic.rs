@@ -1085,18 +1085,20 @@ fn sync_fixed_counts(
                 // 16-byte inline header: group(4) + ptr(4) + length(4) +
                 // tag_id(4). Payload is `group(4) + path + NUL`. Sync the
                 // group + the path length (excluding the NUL).
-                if p.len() >= 4 {
+                if p.len() > 5 {
+                    // group + path + NUL.
                     raw[*off..*off + 4].copy_from_slice(&p[0..4]);
-                    // Only rewrite the length when a path is present; a null
-                    // reference read from disk keeps its 4-byte (group-only)
-                    // payload and its original length field (H2 stores -1
-                    // there, not 0), so leave the inline word alone.
-                    if p.len() > 4 {
-                        let path_len = p.len() - 5; // minus 4 group + 1 NUL
-                        wr_u32(raw, *off + 8, path_len as u32, endian);
-                    }
+                    let path_len = p.len() - 5; // minus 4 group + 1 NUL
+                    wr_u32(raw, *off + 8, path_len as u32, endian);
+                } else if p.len() == 4 {
+                    // A null reference read from disk keeps its 4-byte
+                    // (group-only) payload and its original length field (H2
+                    // stores -1 there, not 0), so leave the inline word alone.
+                    raw[*off..*off + 4].copy_from_slice(&p[0..4]);
                 } else if *off + 12 <= raw.len() {
-                    // Empty payload: the reference was *edited* to null
+                    // Two cases reach here, and both mean "no path".
+                    //
+                    // An **empty payload**: the reference was edited to null
                     // (`TagReferenceData::to_bytes(None)` yields no bytes),
                     // unlike an originally-null ref whose decoded payload is
                     // the 4 group bytes. Neither the group nor the length was
@@ -1104,6 +1106,18 @@ fn sync_fixed_counts(
                     // would survive while no trailing path is emitted — the
                     // decoder then tries to read a phantom path and hits EOF
                     // ("need N bytes, have M"), corrupting the saved tag.
+                    //
+                    // A **5-byte payload** — group plus a bare NUL — is a
+                    // reference edited to the empty *string*, which a read can
+                    // never produce (a real path decodes to `4 + len + 1`
+                    // bytes). It used to take the path branch above, which
+                    // wrote `len = 5 - 5 = 0` while
+                    // `encode_struct_trailing` still emitted the NUL. The
+                    // decoder reads `len == 0` as "no path" and consumes
+                    // nothing, so every empty-path reference shifted the rest
+                    // of the body one byte and the next block header was read
+                    // off by one.
+                    //
                     // Write a canonical null: group = -1 and length = 0, which
                     // the decoder treats as NONE for both CE and H2.
                     raw[*off..*off + 4].copy_from_slice(&[0xFF; 4]);
@@ -1171,7 +1185,12 @@ fn encode_struct_trailing(
                     // already lives in raw_data, so only `path + NUL`
                     // (payload[4..]) is trailing on disk.
                     TagSubChunkContent::TagReference(p) => {
-                        if p.len() > 4 {
+                        // `> 5`, not `> 4`: a 5-byte payload is group + a bare
+                        // NUL, i.e. an empty path, which `sync_fixed_counts`
+                        // encodes as a canonical null. Emitting its NUL here
+                        // would put a byte on disk that the decoder does not
+                        // read, desyncing everything after it.
+                        if p.len() > 5 {
                             out.extend_from_slice(&p[4..]);
                         }
                     }
