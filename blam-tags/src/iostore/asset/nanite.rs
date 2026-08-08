@@ -110,15 +110,40 @@ pub fn low_mid_high_increment(bytes_per_value: u32, num: u32) -> [u32; 3] {
 }
 
 /// Read a (possibly bit-unaligned) `u32` from `data`, anchored at
-/// `base_addr` bytes with `bit_offset` bits beyond it. Mirrors CUE4Parse's
+/// `base_addr` bytes with `bit_offset` bits beyond it. Mirrors the engine's
 /// `ReadUnalignedDword`.
-pub fn read_unaligned_dword(data: &[u8], base_addr: usize, bit_offset: u64) -> u32 {
-    let byte_addr = base_addr as u64 + (bit_offset >> 3);
+///
+/// `bit_offset` is SIGNED and genuinely goes negative: the strip decoder reads
+/// at `(NumPrevRefVertices - 1) * 5`, which is `-5` for the first ref vertex a
+/// cluster codes. The engine leans on that — the CPU encoder pads its index
+/// buffer by a byte (`check(BitOffset > -8)`) and the GPU path lets the `int`
+/// arithmetic shift walk back one byte — because the bits it lands on are the
+/// cluster's *first* 5-bit delta, which the caller really does use. Shifting a
+/// negative offset logically instead would address far past the buffer and read
+/// zeros, silently collapsing that triangle onto a duplicate vertex.
+pub fn read_unaligned_dword(data: &[u8], base_addr: usize, bit_offset: i64) -> u32 {
+    // Arithmetic shift: `-5 >> 3 == -1`, i.e. step back a byte, and
+    // `-5 & 7 == 3` picks up the remaining bits — the engine's exact arithmetic.
+    let byte_addr = base_addr as i64 + (bit_offset >> 3);
     let aligned = byte_addr & !3;
-    let bit_offset = ((byte_addr - aligned) << 3) | (bit_offset & 7);
-    let low = read_u32(data, aligned as usize);
-    let high = read_u32(data, aligned as usize + 4);
-    bit_align_u32(high, low, bit_offset)
+    let shift = (((byte_addr - aligned) << 3) | (bit_offset & 7)) as u64;
+    let low = read_u32_at(data, aligned);
+    let high = read_u32_at(data, aligned + 4);
+    bit_align_u32(high, low, shift)
+}
+
+/// [`read_u32`] at a signed offset; wholly negative offsets read as zero.
+#[inline]
+fn read_u32_at(data: &[u8], offset: i64) -> u32 {
+    let mut b = [0u8; 4];
+    for (i, byte) in b.iter_mut().enumerate() {
+        if let Ok(at) = usize::try_from(offset + i as i64) {
+            if let Some(&x) = data.get(at) {
+                *byte = x;
+            }
+        }
+    }
+    u32::from_le_bytes(b)
 }
 
 /// Little-endian `u32` at `offset`, zero-filled past the end (Nanite readers
@@ -707,7 +732,7 @@ impl Cluster {
         let mut y: u32;
         let mut z: u32;
         let mut index_data =
-            read_unaligned_dword(data, read_base, ((num_prev_ref + !is_start) * 5) as i64 as u64);
+            read_unaligned_dword(data, read_base, ((num_prev_ref + !is_start) * 5) as i64);
 
         if is_start != 0 {
             let minus_num_ref = (is_left << 1) + is_ref;
@@ -768,7 +793,7 @@ impl Cluster {
             let found_index_data = read_unaligned_dword(
                 data,
                 read_base,
-                ((found_num_prev_ref - read_offset) * 5) as i64 as u64,
+                ((found_num_prev_ref - read_offset) * 5) as i64,
             );
             let found_index =
                 ((found_num_prev_new - 1) as u32).wrapping_sub(get_bits(found_index_data, 5, 0));
@@ -1439,5 +1464,29 @@ mod tests {
         let data = [0x78, 0x56, 0x34, 0x12, 0xF0, 0xDE, 0xBC, 0x9A];
         // bytes as one 64-bit LE value: 0x9ABCDEF012345678; >>4 = 0x9ABCDEF01234567
         assert_eq!(read_unaligned_dword(&data, 0, 4), 0x0123_4567);
+    }
+
+    /// The strip decoder reads at `-5` bits for the first ref vertex a cluster
+    /// codes, and the bits it lands on are the anchor's own 5-bit delta — not a
+    /// don't-care. Stepping back one byte must expose it in bits [5,10), which
+    /// is what `BitFieldExtractU32(IndexData, 5, 5)` then reads.
+    #[test]
+    fn unaligned_dword_reads_back_across_the_anchor() {
+        // Anchor at byte 4; the first 5-bit delta (0b10110 = 22) sits at its
+        // bit 0. Reading at -5 must place that delta at bit 5 of the result.
+        let mut data = [0u8; 12];
+        data[4] = 0b0001_0110;
+        let read = read_unaligned_dword(&data, 4, -5);
+        assert_eq!(get_bits(read, 5, 5), 22);
+        // The engine's own arithmetic, spelled out: one byte back, three bits in.
+        assert_eq!(read, u32::from_le_bytes([data[3], data[4], data[5], data[6]]) >> 3);
+    }
+
+    /// A negative offset that walks off the front of the buffer reads zero
+    /// rather than wrapping into a bogus positive address.
+    #[test]
+    fn unaligned_dword_before_the_buffer_reads_zero() {
+        let data = [0xFFu8; 8];
+        assert_eq!(read_unaligned_dword(&data, 0, -64), 0);
     }
 }
