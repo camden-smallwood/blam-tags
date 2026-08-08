@@ -59,6 +59,9 @@ pub enum JmsError {
     /// either the schema doesn't have it or the tag instance left it
     /// empty. Carries the dotted field path for diagnosis.
     MissingField(&'static str),
+    /// The tag isn't one this builder knows how to read (wrong group,
+    /// or an engine variant with no reader).
+    Unsupported(String),
     /// Io error from the JMS writer.
     Io(io::Error),
 }
@@ -67,6 +70,7 @@ impl std::fmt::Display for JmsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingField(p) => write!(f, "render_model is missing required field: {p}"),
+            Self::Unsupported(m) => write!(f, "{m}"),
             Self::Io(e) => write!(f, "JMS write failed: {e}"),
         }
     }
@@ -2049,7 +2053,7 @@ impl JmsFile {
 /// Read a 3-component field that may be declared as either
 /// `real_point_3d` or `real_vector_3d` (the classic engines differ from
 /// gen3+ on several geometry fields).
-fn read_point_or_vec(s: &TagStruct<'_>, name: &str) -> RealPoint3d {
+pub(crate) fn read_point_or_vec(s: &TagStruct<'_>, name: &str) -> RealPoint3d {
     match s.field(name).and_then(|f| f.value()) {
         Some(TagFieldData::RealPoint3d(p)) => p,
         Some(TagFieldData::RealVector3d(v)) => RealPoint3d { x: v.i, y: v.j, z: v.k },

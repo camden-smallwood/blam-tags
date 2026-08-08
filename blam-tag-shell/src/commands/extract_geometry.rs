@@ -113,10 +113,19 @@ pub fn run(
             reject_hlmt_only_args(kinds, force, "physics_model")?;
             run_physics(ctx, output, flat)
         }
+        // `particle_model` — the merged mesh Tool builds from a JMI
+        // manifest. Splits back into one JMS per listed object plus the
+        // `.jmi` that indexes them. `pmdf` is H3/Reach/H4; `PRTM` is
+        // Halo 2's unrelated (and richer — it keeps object names) tag.
+        b"pmdf" | b"PRTM" => {
+            reject_hlmt_only_args(kinds, force, "particle_model")?;
+            run_particle_model(ctx, output, flat)
+        }
         _ => anyhow::bail!(
             "extract-geometry expects `.model` (hlmt), `.render_model` (mode), \
              `.gbxmodel` (mod2, Halo CE), \
              `.collision_model`/`.model_collision_geometry` (coll), `.physics_model` (phmo), \
+             `.particle_model` (pmdf/PRTM), \
              `.scenario` (scnr), or `.scenario_structure_bsp` (sbsp) — got group `{}`.",
             std::str::from_utf8(&group).unwrap_or("?"),
         ),
@@ -485,6 +494,34 @@ fn run_physics(ctx: &mut CliContext, output: Option<&str>, flat: bool) -> Result
     let path = output_path_for(&out_root, &stem, Kind::Physics, flat, "jms");
     write_to(&path, |w| Ok(jms.write(w, game.jms_version())?))?;
     println!("{}: [physics] {}", path.display(), jms_summary(&jms));
+    Ok(())
+}
+
+/// Direct `particle_model` input → `.jmi` manifest + one JMS per
+/// object, in the layout Tool's `import particle model` reads back.
+///
+/// Halo 2's `PRTM` recovers the shipped object names from its
+/// `models[].model name` string_ids; the gen3 `pmdf` tag stores none,
+/// so names are synthesized from the tag stem and that is reported.
+fn run_particle_model(ctx: &mut CliContext, output: Option<&str>, flat: bool) -> Result<()> {
+    use blam_tags::extract::particle_model::particle_model_geometry;
+
+    let loaded = ctx.loaded("extract-geometry")?;
+    let stem = tag_stem(&loaded.path, "particle_model");
+    let out_root = output.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+
+    let summary = particle_model_geometry(&loaded.tag, &out_root, &stem, flat)
+        .context("extract particle_model geometry")?;
+
+    for e in &summary.emitted {
+        match &e.object {
+            Some(name) => println!("{}: [{name}] {}", e.path.display(), e.summary),
+            None => println!("{}: [manifest] {}", e.path.display(), e.summary),
+        }
+    }
+    for w in &summary.warnings {
+        eprintln!("warning: {w}");
+    }
     Ok(())
 }
 

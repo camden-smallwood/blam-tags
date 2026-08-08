@@ -20,11 +20,14 @@
 //!   files under `<out>/<stem>/animations/`.
 //! - [`geometry::scenario_geometry_to_dir`] — one ASS (H2/H3) or render +
 //!   collision JMS (Halo CE) per structure BSP, under `<out>/<stem>/structure/`.
+//! - [`particle_model::particle_model_to_dir`] — the `.jmi` manifest plus
+//!   one JMS per listed object, under `<out>/<stem>/`.
 
 mod error;
 
 pub mod animation;
 pub mod geometry;
+pub mod particle_model;
 
 pub use error::ExtractError;
 
