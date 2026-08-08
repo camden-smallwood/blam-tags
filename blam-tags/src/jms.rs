@@ -2298,15 +2298,28 @@ fn overlay_skeleton(nodes: &mut [JmsNode], skeleton: &[JmsNode]) {
     }
 }
 
+/// Read the node list a `physics_model` or `collision_model` carries.
+///
+/// The two groups spell the parent link differently — a physics node calls it
+/// `parent`, a collision node `parent node` — in every game from Halo 2 to
+/// Campaign Evolved. Reading only `parent` gave every collision node the
+/// missing-field default of -1, so the emitted armature was a flat pile of
+/// root bones with no hierarchy at all. Neither group stores transforms; a
+/// caller with a skeleton overlays them by name.
 fn read_phmo_nodes(root: &TagStruct<'_>) -> Result<Vec<JmsNode>, JmsError> {
     let block = root.field_path("nodes").and_then(|f| f.as_block())
         .ok_or(JmsError::MissingField("nodes"))?;
     let mut out = Vec::with_capacity(block.len());
     for i in 0..block.len() {
         let n = block.element(i).unwrap();
+        let parent = if n.field("parent").is_some() {
+            n.read_block_index("parent")
+        } else {
+            n.read_block_index("parent node")
+        };
         out.push(JmsNode {
             name: n.read_string_id("name").unwrap_or_default(),
-            parent: n.read_block_index("parent"),
+            parent,
             rotation: RealQuaternion::IDENTITY,
             translation: RealPoint3d::ZERO,
         });
@@ -3452,6 +3465,56 @@ mod tests {
         assert_eq!(nodes[0].translation.x, 24.0);
         assert_eq!(nodes[1].translation.x, 0.0);
         assert_eq!(nodes[2].translation.x, 80.0);
+    }
+
+    /// A collision node spells its parent link `parent node`, not `parent` —
+    /// reading only the physics spelling gave every collision bone the
+    /// missing-field default of -1, so the emitted armature was a flat pile of
+    /// roots. Checked against the render_model, which is where that hierarchy
+    /// really comes from: across the 1,347 Halo 3 models carrying both, this
+    /// went from 1,341 bone parents agreeing (307 armatures entirely
+    /// parentless) to 4,464 of 4,464.
+    ///
+    /// Ignored by default — it needs a loose Halo 3 tag tree.
+    ///
+    /// Run with:
+    ///   H3_TAGS=~/Halo/halo3_mcc/tags cargo test collision_armature -- --ignored
+    #[test]
+    #[ignore = "requires a loose Halo 3 tag tree; set H3_TAGS"]
+    fn collision_armature_matches_the_render_models_hierarchy() {
+        let Ok(root) = std::env::var("H3_TAGS") else {
+            eprintln!("skipping: set H3_TAGS to a loose Halo 3 tags directory");
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let open = |relative: &str| {
+            crate::TagFile::read(root.join(relative))
+                .unwrap_or_else(|e| panic!("read {relative}: {e}"))
+        };
+        let stem = "objects/characters/flood_tank/flood_tank";
+        let render = super::JmsFile::from_render_model(&open(&format!("{stem}.render_model")))
+            .expect("render jms");
+        let collision =
+            super::JmsFile::from_collision_model(&open(&format!("{stem}.collision_model")))
+                .expect("collision jms");
+
+        assert!(collision.nodes.len() > 1, "this model has no rig to check");
+        assert!(
+            collision.nodes.iter().any(|n| n.parent >= 0),
+            "every collision bone came out parentless"
+        );
+        for node in &collision.nodes {
+            let Some(source) = render.nodes.iter().find(|n| n.name == node.name) else {
+                continue;
+            };
+            let expected = (source.parent >= 0).then(|| &render.nodes[source.parent as usize].name);
+            let actual = (node.parent >= 0).then(|| &collision.nodes[node.parent as usize].name);
+            assert_eq!(
+                expected, actual,
+                "collision bone {} names the wrong parent",
+                node.name
+            );
+        }
     }
 
 
