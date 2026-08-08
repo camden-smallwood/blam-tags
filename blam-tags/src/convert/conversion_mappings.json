@@ -1,0 +1,1657 @@
+{
+  "version": 1,
+  "coverage": "all_supported_groups",
+  "covered_groups": [
+    "ai_dialogue_globals",
+    "ai_mission_dialogue",
+    "antenna",
+    "area_screen_effect",
+    "asset_depot_storage",
+    "bink",
+    "biped",
+    "bitmap",
+    "breakable_surface",
+    "cache_file_resource_gestalt",
+    "cache_file_resource_layout_table",
+    "camera_fx_settings",
+    "camera_track",
+    "cellular_automata",
+    "cellular_automata2d",
+    "character",
+    "cinematic",
+    "cinematic_scene",
+    "cloth",
+    "collision_damage",
+    "collision_model",
+    "color_table",
+    "compute_shader",
+    "crate",
+    "creature",
+    "damage_effect",
+    "damage_response_definition",
+    "decal_system",
+    "decorator_set",
+    "detail_object_collection",
+    "device",
+    "device_control",
+    "device_machine",
+    "device_terminal",
+    "dialogue",
+    "effect",
+    "effect_globals",
+    "effect_scenery",
+    "equipment",
+    "flock",
+    "fluid_dynamics",
+    "game_engine_settings_definition",
+    "giant",
+    "global_pixel_shader",
+    "global_vertex_shader",
+    "globals",
+    "hlsl_include",
+    "item",
+    "leaf_system",
+    "lens_flare",
+    "light",
+    "light_volume_system",
+    "material_effects",
+    "meter",
+    "model",
+    "model_animation_graph",
+    "muffin",
+    "multilingual_unicode_string_list",
+    "multiplayer_globals",
+    "multiplayer_variant_settings_interface_definition",
+    "new_cinematic_lighting",
+    "object",
+    "particle",
+    "particle_model",
+    "particle_physics",
+    "performance_throttles",
+    "physics_model",
+    "pixel_shader",
+    "point_physics",
+    "projectile",
+    "rasterizer_cache_file_globals",
+    "rasterizer_globals",
+    "render_method",
+    "render_method_definition",
+    "render_method_option",
+    "render_method_template",
+    "render_model",
+    "render_water_ripple",
+    "sandbox_text_value_pair_definition",
+    "scenario",
+    "scenario_lightmap",
+    "scenario_lightmap_bsp_data",
+    "scenario_required_resource",
+    "scenario_structure_bsp",
+    "scenario_structure_lighting_info",
+    "scenery",
+    "shader",
+    "shader_cortana",
+    "shader_custom",
+    "shader_decal",
+    "shader_foliage",
+    "shader_halogram",
+    "shader_light_volume",
+    "shader_particle",
+    "shader_skin",
+    "shader_terrain",
+    "shader_water",
+    "shared_cache_file_layout",
+    "shield_impact",
+    "sound",
+    "sound_classes",
+    "sound_effect_collection",
+    "sound_effect_template",
+    "sound_environment",
+    "sound_global_propagation",
+    "sound_looping",
+    "sound_mix",
+    "sound_scenery",
+    "stereo_system",
+    "structure_design",
+    "structure_seams",
+    "style",
+    "tag_dependency_list",
+    "tag_import_information",
+    "tag_template_unit_test",
+    "test_tag",
+    "text_value_pair_definition",
+    "unit",
+    "user_interface_globals_definition",
+    "user_interface_shared_globals_definition",
+    "user_interface_sounds_definition",
+    "vehicle",
+    "vertex_shader",
+    "weapon",
+    "wind"
+  ],
+  "struct_mappings": [
+    {
+      "group": "light",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc",
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_path": "",
+      "target_path": "midnight_light_parameters"
+    },
+    {
+      "group": "sound_environment",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc"
+      ],
+      "target_games": [
+        "haloreach_mcc"
+      ],
+      "source_path": "",
+      "target_path": "reverb settings"
+    },
+    {
+      "group": "shader",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_path": "render_method",
+      "target_path": "",
+      "reason": "Reach wraps a shader's body in a `render_method` struct under a 104-byte root that holds only that struct plus `material name`; Halo 4 puts the same body directly on the 68-byte `material` root. Reparenting the source's `render_method` onto the target root is what lets the bodies match at all - without it the two roots share no field name and the conversion is refused for having no compatible root structure. `sort layer*` then matches on both sides, same `global_sort_layer_enum_defintion`. Not bidirectional: down-porting, the source would be Halo 4's vestigial `shader` whose root already matches Reach's, so plain root-to-root pairs `render_method` and `material name` while a reparent would find nothing.",
+      "bidirectional": false
+    },
+    {
+      "group": "shader_terrain",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_path": "render_method",
+      "target_path": "",
+      "bidirectional": false,
+      "reason": "`shader_terrain` wraps its body in a `render_method` struct exactly as `shader` does; Halo 4's `material` puts the same body on the root. Reparenting is what makes the two roots share a field at all — `sort layer*` then matches on both sides with the same `global_sort_layer_enum_defintion`. Not bidirectional: down-porting, the source would be Halo 4's vestigial `shader_terrain`, whose root already matches Reach's."
+    },
+    {
+      "group": "shader_custom",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_path": "render_method",
+      "target_path": "",
+      "bidirectional": false,
+      "reason": "`shader_custom` wraps its body in a `render_method` struct exactly as `shader` does; Halo 4's `material` puts the same body on the root. Reparenting is what makes the two roots share a field at all — `sort layer*` then matches on both sides with the same `global_sort_layer_enum_defintion`. Not bidirectional: down-porting, the source would be Halo 4's vestigial `shader_custom`, whose root already matches Reach's."
+    },
+    {
+      "group": "shader_water",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_path": "render_method",
+      "target_path": "",
+      "bidirectional": false,
+      "reason": "`shader_water` wraps its body in a `render_method` struct exactly as `shader` does; Halo 4's `material` puts the same body on the root. Reparenting is what makes the two roots share a field at all — `sort layer*` then matches on both sides with the same `global_sort_layer_enum_defintion`. Not bidirectional: down-porting, the source would be Halo 4's vestigial `shader_water`, whose root already matches Reach's."
+    },
+    {
+      "group": "shader_halogram",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_path": "render_method",
+      "target_path": "",
+      "bidirectional": false,
+      "reason": "`shader_halogram` wraps its body in a `render_method` struct exactly as `shader` does; Halo 4's `material` puts the same body on the root. Reparenting is what makes the two roots share a field at all — `sort layer*` then matches on both sides with the same `global_sort_layer_enum_defintion`. Not bidirectional: down-porting, the source would be Halo 4's vestigial `shader_halogram`, whose root already matches Reach's."
+    },
+    {
+      "group": "shader_foliage",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_path": "render_method",
+      "target_path": "",
+      "bidirectional": false,
+      "reason": "`shader_foliage` wraps its body in a `render_method` struct exactly as `shader` does; Halo 4's `material` puts the same body on the root. Reparenting is what makes the two roots share a field at all — `sort layer*` then matches on both sides with the same `global_sort_layer_enum_defintion`. Not bidirectional: down-porting, the source would be Halo 4's vestigial `shader_foliage`, whose root already matches Reach's."
+    },
+    {
+      "group": "shader_decal",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_path": "render_method",
+      "target_path": "",
+      "bidirectional": false,
+      "reason": "`shader_decal` wraps its body in a `render_method` struct exactly as `shader` does; Halo 4's `material` puts the same body on the root. Reparenting is what makes the two roots share a field at all — `sort layer*` then matches on both sides with the same `global_sort_layer_enum_defintion`. Not bidirectional: down-porting, the source would be Halo 4's vestigial `shader_decal`, whose root already matches Reach's."
+    },
+    {
+      "group": "shader_cortana",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_path": "render_method",
+      "target_path": "",
+      "bidirectional": false,
+      "reason": "`shader_cortana` wraps its body in a `render_method` struct exactly as `shader` does; Halo 4's `material` puts the same body on the root. Reparenting is what makes the two roots share a field at all — `sort layer*` then matches on both sides with the same `global_sort_layer_enum_defintion`. Not bidirectional: down-porting, the source would be Halo 4's vestigial `shader_cortana`, whose root already matches Reach's."
+    },
+    {
+      "group": "shader_glass",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_path": "render_method",
+      "target_path": "",
+      "bidirectional": false,
+      "reason": "`shader_glass` wraps its body in `render_method` like every other member of the family; Halo 4's `material` puts it on the root."
+    },
+    {
+      "group": "shader_screen",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_path": "render_method",
+      "target_path": "",
+      "bidirectional": false,
+      "reason": "`shader_screen` wraps its body in `render_method` like every other member of the family; Halo 4's `material` puts it on the root."
+    },
+    {
+      "group": "shader_fur",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_path": "render_method",
+      "target_path": "",
+      "bidirectional": false,
+      "reason": "`shader_fur` wraps its body in `render_method` like every other member of the family; Halo 4's `material` puts it on the root."
+    },
+    {
+      "group": "shader_fur_stencil",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_path": "render_method",
+      "target_path": "",
+      "bidirectional": false,
+      "reason": "`shader_fur_stencil` wraps its body in `render_method` like every other member of the family; Halo 4's `material` puts it on the root."
+    },
+    {
+      "group": "shader_mux",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_path": "render_method",
+      "target_path": "",
+      "bidirectional": false,
+      "reason": "`shader_mux` wraps its body in `render_method` like every other member of the family; Halo 4's `material` puts it on the root."
+    }
+  ],
+  "incompatible_pairs": [
+    {
+      "group": "cui_screen",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "Reach stores editable component, overlay, binding, and expression tables; Halo 4 and H2A use string references plus a compiled logic/system representation."
+    },
+    {
+      "group": "contrail_system",
+      "source_games": [
+        "halo3_mcc"
+      ],
+      "target_games": [
+        "halo3odst_mcc"
+      ],
+      "reason": "The ODST definition exposes an invalid fixed-array layout for this pair; attempting structural conversion would index outside the declared element layout."
+    },
+    {
+      "group": "contrail_system",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc"
+      ],
+      "target_games": [
+        "haloreach_mcc"
+      ],
+      "reason": "The legacy and Reach definitions expose incompatible fixed-array layouts; attempting structural conversion would index outside the declared element layout."
+    },
+    {
+      "group": "lightmapper_globals",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "Reach quality-setting blocks were replaced by separate global and local lightmapper setting structures with no direct authored-field equivalence."
+    },
+    {
+      "group": "scenario_structure_lighting_resource",
+      "source_games": [
+        "halo3_mcc"
+      ],
+      "target_games": [
+        "halo3odst_mcc"
+      ],
+      "reason": "This engine-generated lighting resource has no portable authored root fields; its resource payload conversion is intentionally unsupported."
+    },
+    {
+      "group": "scenario_structure_lighting_resource",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc"
+      ],
+      "target_games": [
+        "haloreach_mcc"
+      ],
+      "reason": "This engine-generated lighting resource has no portable authored root fields; its resource payload conversion is intentionally unsupported."
+    },
+    {
+      "group": "sound_environment",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "Halo 3 uses authored room/reverb scalars while Halo 4 and H2A use a WWise environment name and wet-mix controls; there is no lossless semantic mapping."
+    },
+    {
+      "group": "vision_mode",
+      "source_games": [
+        "halo3odst_mcc",
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "The legacy radius, ping, color, and mask fields were replaced by Halo 4's screen, environment, biped, vehicle, and crosshair pass blocks."
+    },
+    {
+      "group": "shader",
+      "source_games": [
+        "haloce_mcc",
+        "halo2_mcc"
+      ],
+      "target_games": [
+        "halo3_mcc",
+        "halo3odst_mcc",
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "Halo 2 and earlier author a shader as a template reference plus a parameter/postprocess table (`template`, `parameters`, `postprocess definition`, `light response`, `specular type`, `lightmap type`); Halo 3 onward replaced that whole system with a render method. Measured: the two root structs share exactly one field name, `material name`, out of 16 and 2. A converted tag therefore carries a name and nothing else, and Guerilla rejects it as invalid. Reviewed: recreate the shader with the target engine's render-method system."
+    },
+    {
+      "group": "shader_template",
+      "source_games": [
+        "haloce_mcc",
+        "halo2_mcc"
+      ],
+      "target_games": [
+        "halo3_mcc",
+        "halo3odst_mcc",
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "The other half of the pre-Halo 3 shader system. Halo 3 onward have no shader_template class; its role is served by render_method_template, which is authored differently. Reviewed: no field-level mapping is meaningful."
+    },
+    {
+      "group": "bitmap",
+      "source_games": [
+        "haloce_mcc"
+      ],
+      "target_games": [
+        "halo3_mcc",
+        "halo3odst_mcc",
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "Halo 1 stores pixels big-endian in its own per-engine layout and its `bitmap_data_block` differs from every later generation's, so the blob cannot be carried straight into an MCC bitmap. Convert Halo 1 bitmaps to Halo 2 first (where the pixel blob does carry, byte for byte) and then forward. Reviewed: or re-import the source art with the target kit's tool."
+    },
+    {
+      "group": "sound",
+      "source_games": [
+        "haloce_mcc",
+        "halo2_mcc",
+        "halo3_mcc",
+        "halo3odst_mcc",
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc",
+        "haloce_evolved"
+      ],
+      "target_games": [
+        "haloce_mcc",
+        "halo2_mcc",
+        "halo3_mcc",
+        "halo3odst_mcc",
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc",
+        "haloce_evolved"
+      ],
+      "reason": "A sound tag is a header for audio that lives somewhere else. The samples sit in per-engine banks — Halo 2 appends cache data past the structured body that no field references, Halo 3 onward use sound-gestalt resources and FSB banks — so nothing a field-level conversion can reach carries the audio. Converting one produces a header pointing at a bank the target game does not have. Reviewed against the author's own account of the format: sound tags should not be converted at all; re-import the source audio with the target kit's tool."
+    },
+    {
+      "group": "bitmap",
+      "source_games": [
+        "halo2_mcc"
+      ],
+      "target_games": [
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "Reach onward removed `pixels offset` from `bitmap_data_block_def` entirely - the engine derives each bitmap's position in the shared blob from `four times log2 size` and friends instead - so a Halo 2 pixel blob carried straight there has nothing indexing it, which is what produced a bitmap whose metadata promised mipmaps with nothing behind it and crashed the Reach mod tools. Reviewed: convert to Halo 3 first, whose bitmaps do carry their pixels and already convert onward to Reach."
+    }
+  ],
+  "unusable_schemas": [
+    {
+      "group": "contrail_system",
+      "games": [
+        "halo3odst_mcc",
+        "haloreach_mcc"
+      ],
+      "reason": "The dumped definition contains an invalid fixed-array layout and panics while constructing the tag layout."
+    }
+  ],
+  "reference_drops": [
+    {
+      "group": "model",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc"
+      ],
+      "target_games": [
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_path": "lod_render_model",
+      "reason": "The target model schema removed Halo 3's separate legacy LOD render-model slot; native target model tags have no equivalent reference field."
+    },
+    {
+      "group": "particle",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc"
+      ],
+      "target_games": [
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_path": "shader",
+      "reason": "The target particle layout uses its actual shader/render-method fields and native target tags do not retain Halo 3's legacy custom shader reference."
+    }
+  ],
+  "accepted_field_drops": [
+    {
+      "group": "model_animation_graph",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "haloce_evolved"
+      ],
+      "source_path": "definitions/skeleton nodes/node joint flags",
+      "reason": "Reach stores per-node joint limits (constrained, global rotation, and the spring/ball variants) that Campaign Evolved's skeleton node block does not declare; the simulation derives joint behaviour from the skeleton instead. Reviewed: no Campaign Evolved field carries this, and the animation plays from the codec data, not from these flags."
+    },
+    {
+      "group": "model_animation_graph",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "haloce_evolved"
+      ],
+      "source_path": "definitions/skeleton nodes/additional flags",
+      "reason": "Reach's per-node info flags (base node, no-collision) have no Campaign Evolved counterpart; the two bytes are why animation_graph_node_block is 44 bytes in Reach and 40 in Campaign Evolved. Reviewed: node identity comes from the skeleton the graph is bound to."
+    },
+    {
+      "group": "model_animation_graph",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "haloce_evolved"
+      ],
+      "source_path": "definitions/animations/shared animation data/facial wrinkle events",
+      "reason": "Reach drives facial wrinkle maps from per-animation events. Campaign Evolved ships no wrinkle system and declares no such block. Reviewed: there is nothing on the target side to receive this, and its absence does not affect skeletal playback."
+    },
+    {
+      "group": "model_animation_graph",
+      "source_games": [
+        "haloce_evolved"
+      ],
+      "target_games": [
+        "haloreach_mcc"
+      ],
+      "source_path": "definitions/animations/shared animation data/authored frame rate",
+      "reason": "Campaign Evolved records the frame rate an animation was authored at so it can resample; Reach assumes 30Hz throughout and declares no such field. Reviewed: the codec data is already sampled, so the annotation is descriptive rather than load-bearing."
+    },
+    {
+      "group": "model_animation_graph",
+      "source_games": [
+        "haloce_evolved"
+      ],
+      "target_games": [
+        "haloreach_mcc"
+      ],
+      "source_path": "definitions/ik sets/ik points/ik weight source function",
+      "reason": "Campaign Evolved added a per-IK-point object function driving that point's weight, which is why animation_ik_set_item is 8 bytes there and 4 in Reach. Reviewed: Reach has no per-point weight source, so the value has nowhere to go; IK still resolves from the chain."
+    },
+    {
+      "group": "model_animation_graph",
+      "source_games": [
+        "haloce_evolved"
+      ],
+      "target_games": [
+        "haloreach_mcc"
+      ],
+      "source_path": "definitions/NEW blend screens/secondary weight source",
+      "reason": "Campaign Evolved compounds two blend-screen weight sources where Reach has one. The primary maps onto Reach's `weight source`; the secondary has no counterpart. Reviewed: dropping it leaves the primary behaviour intact, which is what Reach would have expressed anyway."
+    },
+    {
+      "group": "model_animation_graph",
+      "source_games": [
+        "haloce_evolved"
+      ],
+      "target_games": [
+        "haloreach_mcc"
+      ],
+      "source_path": "definitions/NEW blend screens/secondary weight source object function",
+      "reason": "The object function paired with the secondary weight source above, and dropped for the same reason."
+    }
+  ],
+  "field_aliases": [
+    {
+      "group": "cookie_purchase_globals",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_struct_guid": "dc383b79724b7afd27a284b487902ee2",
+      "target_struct_guid": "dc383b79724b7afd27a284b487902ee2",
+      "source": "helmet purchasable families",
+      "target": "helmet purchasable appearance families"
+    },
+    {
+      "group": "cookie_purchase_globals",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_struct_guid": "dc383b79724b7afd27a284b487902ee2",
+      "target_struct_guid": "dc383b79724b7afd27a284b487902ee2",
+      "source": "left shoulder purchasable families",
+      "target": "left shoulder purchasable appearance families"
+    },
+    {
+      "group": "cookie_purchase_globals",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_struct_guid": "dc383b79724b7afd27a284b487902ee2",
+      "target_struct_guid": "dc383b79724b7afd27a284b487902ee2",
+      "source": "right shoulder purchasable families",
+      "target": "right shoulder purchasable appearance families"
+    },
+    {
+      "group": "cookie_purchase_globals",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_struct_guid": "dc383b79724b7afd27a284b487902ee2",
+      "target_struct_guid": "dc383b79724b7afd27a284b487902ee2",
+      "source": "chest purchasable families",
+      "target": "chest purchasable appearance families"
+    },
+    {
+      "group": "cookie_purchase_globals",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_struct_guid": "dc383b79724b7afd27a284b487902ee2",
+      "target_struct_guid": "dc383b79724b7afd27a284b487902ee2",
+      "source": "visor tint purchasable families",
+      "target": "visor tint purchasable appearance families"
+    },
+    {
+      "group": "cookie_purchase_globals",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_struct_guid": "dc383b79724b7afd27a284b487902ee2",
+      "target_struct_guid": "dc383b79724b7afd27a284b487902ee2",
+      "source": "elite armor purchasable families",
+      "target": "elite armor purchasable appearance families"
+    },
+    {
+      "group": "cookie_purchase_globals",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_struct_guid": "dc383b79724b7afd27a284b487902ee2",
+      "target_struct_guid": "dc383b79724b7afd27a284b487902ee2",
+      "source": "primary emblem purchasable families",
+      "target": "primary emblem purchasable appearance families"
+    },
+    {
+      "group": "cookie_purchase_globals",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_struct_guid": "dc383b79724b7afd27a284b487902ee2",
+      "target_struct_guid": "dc383b79724b7afd27a284b487902ee2",
+      "source": "secondary emblem purchasable families",
+      "target": "secondary emblem purchasable appearance families"
+    },
+    {
+      "group": "light",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc",
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_struct_guid": "f2b91e672d48afb6250f2d90a165b6ed",
+      "target_struct_guid": "8e154bc7134600e0f6653d89a79de6e1",
+      "source": "type",
+      "target": "light type"
+    },
+    {
+      "group": "light",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc",
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_struct_guid": "f2b91e672d48afb6250f2d90a165b6ed",
+      "target_struct_guid": "8e154bc7134600e0f6653d89a79de6e1",
+      "source": "gel bitmap",
+      "target": "gobo tag path"
+    },
+    {
+      "group": "render_model",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc"
+      ],
+      "target_games": [
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_struct_guid": "411d27e578471259100c498a81d58751",
+      "target_struct_guid": "411d27e578471259100c498a81d58751",
+      "source": "coefficient",
+      "target": "spherical harmonic"
+    },
+    {
+      "group": "user_interface_sounds_definition",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc"
+      ],
+      "target_games": [
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_struct_guid": "55e8ff708543e72d04e6ba83b6e39715",
+      "target_struct_guid": "55e8ff708543e72d04e6ba83b6e39715",
+      "source": "error sound",
+      "target": "error"
+    },
+    {
+      "group": "user_interface_sounds_definition",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc"
+      ],
+      "target_games": [
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_struct_guid": "55e8ff708543e72d04e6ba83b6e39715",
+      "target_struct_guid": "55e8ff708543e72d04e6ba83b6e39715",
+      "source": "button a",
+      "target": "a button pressed"
+    },
+    {
+      "group": "user_interface_sounds_definition",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc"
+      ],
+      "target_games": [
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_struct_guid": "55e8ff708543e72d04e6ba83b6e39715",
+      "target_struct_guid": "55e8ff708543e72d04e6ba83b6e39715",
+      "source": "button b",
+      "target": "b button pressed"
+    },
+    {
+      "group": "user_interface_sounds_definition",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc"
+      ],
+      "target_games": [
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_struct_guid": "55e8ff708543e72d04e6ba83b6e39715",
+      "target_struct_guid": "55e8ff708543e72d04e6ba83b6e39715",
+      "source": "button x",
+      "target": "x button pressed"
+    },
+    {
+      "group": "user_interface_sounds_definition",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc"
+      ],
+      "target_games": [
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_struct_guid": "55e8ff708543e72d04e6ba83b6e39715",
+      "target_struct_guid": "55e8ff708543e72d04e6ba83b6e39715",
+      "source": "button y",
+      "target": "y button pressed"
+    },
+    {
+      "group": "user_interface_sounds_definition",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc"
+      ],
+      "target_games": [
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_struct_guid": "55e8ff708543e72d04e6ba83b6e39715",
+      "target_struct_guid": "55e8ff708543e72d04e6ba83b6e39715",
+      "source": "button start",
+      "target": "start button pressed"
+    },
+    {
+      "group": "user_interface_sounds_definition",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc"
+      ],
+      "target_games": [
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_struct_guid": "55e8ff708543e72d04e6ba83b6e39715",
+      "target_struct_guid": "55e8ff708543e72d04e6ba83b6e39715",
+      "source": "button back",
+      "target": "back button pressed"
+    },
+    {
+      "group": "user_interface_sounds_definition",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc"
+      ],
+      "target_games": [
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_struct_guid": "55e8ff708543e72d04e6ba83b6e39715",
+      "target_struct_guid": "55e8ff708543e72d04e6ba83b6e39715",
+      "source": "timer sound",
+      "target": "game start countdown timer tick"
+    },
+    {
+      "group": "user_interface_sounds_definition",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc"
+      ],
+      "target_games": [
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_struct_guid": "55e8ff708543e72d04e6ba83b6e39715",
+      "target_struct_guid": "55e8ff708543e72d04e6ba83b6e39715",
+      "source": "timer sound zero",
+      "target": "game start countdown timer final tick"
+    },
+    {
+      "group": "user_interface_sounds_definition",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc"
+      ],
+      "target_games": [
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_struct_guid": "55e8ff708543e72d04e6ba83b6e39715",
+      "target_struct_guid": "55e8ff708543e72d04e6ba83b6e39715",
+      "source": "alt timer sound",
+      "target": "alternate countdown timer tick"
+    },
+    {
+      "group": "user_interface_sounds_definition",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc"
+      ],
+      "target_games": [
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_struct_guid": "55e8ff708543e72d04e6ba83b6e39715",
+      "target_struct_guid": "55e8ff708543e72d04e6ba83b6e39715",
+      "source": "alt timer sound zero",
+      "target": "alternate countdown timer final tick"
+    },
+    {
+      "group": "bitmap",
+      "source_games": [
+        "haloce_mcc"
+      ],
+      "target_games": [
+        "halo2_mcc"
+      ],
+      "source": "pixel data offset",
+      "target": "pixels offset",
+      "reason": "Halo 1 names the per-bitmap offset into `processed pixel data` `pixel data offset`; Halo 2 calls the same field `pixels offset`. Both index the same shared pixel blob, so without this every converted bitmap points at offset 0 and shows one image's pixels for every entry. No struct GUID scoping: every classic struct carries an all-zero GUID, so the rule is scoped by group and games."
+    },
+    {
+      "group": "bitmap",
+      "source_games": [
+        "halo2_mcc"
+      ],
+      "target_games": [
+        "haloce_mcc"
+      ],
+      "source": "pixels offset",
+      "target": "pixel data offset",
+      "reason": "The reverse of the above, for a down-port to Halo 1."
+    },
+    {
+      "group": "shader",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "parameters",
+      "target": "material parameters",
+      "reason": "Reach's `render_method/parameters` and Halo 4's `material parameters` hold the same per-parameter rows: the element structs share 11 of the 14 fields Reach declares - `parameter name`, `parameter type`, `bitmap`, `real`, `int/bool` and six bitmap sampler fields."
+    },
+    {
+      "group": "shader",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "postprocess",
+      "target": "postprocess definition",
+      "reason": "Renamed, and marked engine-managed (`!`) on the Halo 4 side. The internals diverge, so the block is matched by name and its contents are reported field by field rather than assumed."
+    },
+    {
+      "group": "shader_terrain",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "parameters",
+      "target": "material parameters",
+      "reason": "Same rename as for `shader`: the render method's `parameters` is Halo 4's `material parameters` on the material root."
+    },
+    {
+      "group": "shader_terrain",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "postprocess",
+      "target": "postprocess definition",
+      "reason": "Same rename as for `shader`: the render method's `postprocess` is Halo 4's `postprocess definition` on the material root."
+    },
+    {
+      "group": "shader_custom",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "parameters",
+      "target": "material parameters",
+      "reason": "Same rename as for `shader`: the render method's `parameters` is Halo 4's `material parameters` on the material root."
+    },
+    {
+      "group": "shader_custom",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "postprocess",
+      "target": "postprocess definition",
+      "reason": "Same rename as for `shader`: the render method's `postprocess` is Halo 4's `postprocess definition` on the material root."
+    },
+    {
+      "group": "shader_water",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "parameters",
+      "target": "material parameters",
+      "reason": "Same rename as for `shader`: the render method's `parameters` is Halo 4's `material parameters` on the material root."
+    },
+    {
+      "group": "shader_water",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "postprocess",
+      "target": "postprocess definition",
+      "reason": "Same rename as for `shader`: the render method's `postprocess` is Halo 4's `postprocess definition` on the material root."
+    },
+    {
+      "group": "shader_halogram",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "parameters",
+      "target": "material parameters",
+      "reason": "Same rename as for `shader`: the render method's `parameters` is Halo 4's `material parameters` on the material root."
+    },
+    {
+      "group": "shader_halogram",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "postprocess",
+      "target": "postprocess definition",
+      "reason": "Same rename as for `shader`: the render method's `postprocess` is Halo 4's `postprocess definition` on the material root."
+    },
+    {
+      "group": "shader_foliage",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "parameters",
+      "target": "material parameters",
+      "reason": "Same rename as for `shader`: the render method's `parameters` is Halo 4's `material parameters` on the material root."
+    },
+    {
+      "group": "shader_foliage",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "postprocess",
+      "target": "postprocess definition",
+      "reason": "Same rename as for `shader`: the render method's `postprocess` is Halo 4's `postprocess definition` on the material root."
+    },
+    {
+      "group": "shader_decal",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "parameters",
+      "target": "material parameters",
+      "reason": "Same rename as for `shader`: the render method's `parameters` is Halo 4's `material parameters` on the material root."
+    },
+    {
+      "group": "shader_decal",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "postprocess",
+      "target": "postprocess definition",
+      "reason": "Same rename as for `shader`: the render method's `postprocess` is Halo 4's `postprocess definition` on the material root."
+    },
+    {
+      "group": "shader_cortana",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "parameters",
+      "target": "material parameters",
+      "reason": "Same rename as for `shader`: the render method's `parameters` is Halo 4's `material parameters` on the material root."
+    },
+    {
+      "group": "shader_cortana",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "postprocess",
+      "target": "postprocess definition",
+      "reason": "Same rename as for `shader`: the render method's `postprocess` is Halo 4's `postprocess definition` on the material root."
+    },
+    {
+      "group": "shader_glass",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "parameters",
+      "target": "material parameters",
+      "reason": "Same rename as the rest of the family."
+    },
+    {
+      "group": "shader_glass",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "postprocess",
+      "target": "postprocess definition",
+      "reason": "Same rename as the rest of the family."
+    },
+    {
+      "group": "shader_screen",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "parameters",
+      "target": "material parameters",
+      "reason": "Same rename as the rest of the family."
+    },
+    {
+      "group": "shader_screen",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "postprocess",
+      "target": "postprocess definition",
+      "reason": "Same rename as the rest of the family."
+    },
+    {
+      "group": "shader_fur",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "parameters",
+      "target": "material parameters",
+      "reason": "Same rename as the rest of the family."
+    },
+    {
+      "group": "shader_fur",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "postprocess",
+      "target": "postprocess definition",
+      "reason": "Same rename as the rest of the family."
+    },
+    {
+      "group": "shader_fur_stencil",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "parameters",
+      "target": "material parameters",
+      "reason": "Same rename as the rest of the family."
+    },
+    {
+      "group": "shader_fur_stencil",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "postprocess",
+      "target": "postprocess definition",
+      "reason": "Same rename as the rest of the family."
+    },
+    {
+      "group": "shader_mux",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "parameters",
+      "target": "material parameters",
+      "reason": "Same rename as the rest of the family."
+    },
+    {
+      "group": "shader_mux",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "postprocess",
+      "target": "postprocess definition",
+      "reason": "Same rename as the rest of the family."
+    }
+  ],
+  "option_aliases": [
+    {
+      "group": "bitmap",
+      "field": "bitmap curve",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc"
+      ],
+      "target_games": [
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "sRGB",
+      "target": "sRGB (gamma 2.2)"
+    },
+    {
+      "group": "bitmap",
+      "field": "curve",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc"
+      ],
+      "target_games": [
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "sRGB",
+      "target": "sRGB (gamma 2.2)"
+    },
+    {
+      "group": "effect",
+      "field": "flags",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc"
+      ],
+      "target_games": [
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "collide with media",
+      "target": "collide with water"
+    },
+    {
+      "group": "particle",
+      "field": "main flags",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc"
+      ],
+      "target_games": [
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "dies in media",
+      "target": "dies in water"
+    },
+    {
+      "group": "particle_physics",
+      "field": "flags",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc"
+      ],
+      "target_games": [
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "collide with media",
+      "target": "collide with water"
+    },
+    {
+      "group": "weapon",
+      "field": "secondary flags",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc",
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source": "magnitizes only when zoomed",
+      "target": "magnetizes only when zoomed"
+    }
+  ],
+  "group_aliases": [
+    {
+      "source": "contrail",
+      "target": "contrail_system",
+      "source_games": [
+        "haloce_mcc",
+        "halo2_mcc"
+      ],
+      "target_games": [
+        "halo3_mcc",
+        "halo3odst_mcc",
+        "haloreach_mcc"
+      ],
+      "reason": "Halo 3 renamed the contrail tag class to contrail_system when the render-method family landed; it is the same class with the same authored role. Reviewed: an H2 projectile's attachment points at a `.contrail` and the reference was dropped outright before this rule, measured on battle_rifle_bullet.projectile. Halo 4 and H2A are excluded because they removed the class rather than renaming it."
+    },
+    {
+      "source": "light_volume",
+      "target": "light_volume_system",
+      "source_games": [
+        "haloce_mcc",
+        "halo2_mcc"
+      ],
+      "target_games": [
+        "halo3_mcc",
+        "halo3odst_mcc",
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "Same rename as contrail, applied to the light-volume class. Reviewed: every profile from Halo 3 on declares light_volume_system and none declares light_volume."
+    },
+    {
+      "source": "decal",
+      "target": "decal_system",
+      "source_games": [
+        "haloce_mcc",
+        "halo2_mcc"
+      ],
+      "target_games": [
+        "halo3_mcc",
+        "halo3odst_mcc",
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "Same rename as contrail, applied to the decal class. Reviewed: every profile from Halo 3 on declares decal_system and none declares decal."
+    },
+    {
+      "source": "model_animations",
+      "target": "model_animation_graph",
+      "source_games": [
+        "haloce_mcc"
+      ],
+      "target_games": [
+        "halo2_mcc",
+        "halo3_mcc",
+        "halo3odst_mcc",
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "Halo 1 calls the animation graph class model_animations (`antr`); Halo 2 onward call it model_animation_graph (`jmad`). Reviewed: the class carries the same role — a skeleton plus animation set an object binds to — and no profile declares both names."
+    },
+    {
+      "source": "shader",
+      "target": "material",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "Halo 4 and Halo 2 Anniversary still declare a `shader` group, but they never load it: measured across the kits, HREK ships 6,873 `.shader` and 0 `.material`, while H4EK ships 0 `.shader` and 7,140 `.material` and H2AMPEK 0 and 1,917. The surviving `shader` definition is vestigial, so converting shader-to-shader produces a tag class the target never reads. `material` is the system successor."
+    },
+    {
+      "source": "shader_terrain",
+      "target": "material",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "The whole shader family is vestigial in Halo 4, not just `shader`. Counted in the kits: HREK ships 393 `.shader_terrain` and H4EK ships 0, against 7,140 `.material` — and the same holds for every other member (shader 6873/0, shader_terrain 393/0, shader_custom 85/0, shader_water 72/0, shader_halogram 328/0, shader_foliage 31/0, shader_decal 37/0), 7,819 Reach tags in total with no class Halo 4 loads. `material` is the successor for all of them."
+    },
+    {
+      "source": "shader_custom",
+      "target": "material",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "The whole shader family is vestigial in Halo 4, not just `shader`. Counted in the kits: HREK ships 85 `.shader_custom` and H4EK ships 0, against 7,140 `.material` — and the same holds for every other member (shader 6873/0, shader_terrain 393/0, shader_custom 85/0, shader_water 72/0, shader_halogram 328/0, shader_foliage 31/0, shader_decal 37/0), 7,819 Reach tags in total with no class Halo 4 loads. `material` is the successor for all of them."
+    },
+    {
+      "source": "shader_water",
+      "target": "material",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "The whole shader family is vestigial in Halo 4, not just `shader`. Counted in the kits: HREK ships 72 `.shader_water` and H4EK ships 0, against 7,140 `.material` — and the same holds for every other member (shader 6873/0, shader_terrain 393/0, shader_custom 85/0, shader_water 72/0, shader_halogram 328/0, shader_foliage 31/0, shader_decal 37/0), 7,819 Reach tags in total with no class Halo 4 loads. `material` is the successor for all of them."
+    },
+    {
+      "source": "shader_halogram",
+      "target": "material",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "The whole shader family is vestigial in Halo 4, not just `shader`. Counted in the kits: HREK ships 328 `.shader_halogram` and H4EK ships 0, against 7,140 `.material` — and the same holds for every other member (shader 6873/0, shader_terrain 393/0, shader_custom 85/0, shader_water 72/0, shader_halogram 328/0, shader_foliage 31/0, shader_decal 37/0), 7,819 Reach tags in total with no class Halo 4 loads. `material` is the successor for all of them."
+    },
+    {
+      "source": "shader_foliage",
+      "target": "material",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "The whole shader family is vestigial in Halo 4, not just `shader`. Counted in the kits: HREK ships 31 `.shader_foliage` and H4EK ships 0, against 7,140 `.material` — and the same holds for every other member (shader 6873/0, shader_terrain 393/0, shader_custom 85/0, shader_water 72/0, shader_halogram 328/0, shader_foliage 31/0, shader_decal 37/0), 7,819 Reach tags in total with no class Halo 4 loads. `material` is the successor for all of them."
+    },
+    {
+      "source": "shader_decal",
+      "target": "material",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "The whole shader family is vestigial in Halo 4, not just `shader`. Counted in the kits: HREK ships 37 `.shader_decal` and H4EK ships 0, against 7,140 `.material` — and the same holds for every other member (shader 6873/0, shader_terrain 393/0, shader_custom 85/0, shader_water 72/0, shader_halogram 328/0, shader_foliage 31/0, shader_decal 37/0), 7,819 Reach tags in total with no class Halo 4 loads. `material` is the successor for all of them."
+    },
+    {
+      "source": "shader_cortana",
+      "target": "material",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "The whole shader family is vestigial in Halo 4, not just `shader`. Counted in the kits: HREK ships 0 `.shader_cortana` and H4EK ships 0, against 7,140 `.material` — and the same holds for every other member (shader 6873/0, shader_terrain 393/0, shader_custom 85/0, shader_water 72/0, shader_halogram 328/0, shader_foliage 31/0, shader_decal 37/0), 7,819 Reach tags in total with no class Halo 4 loads. `material` is the successor for all of them."
+    },
+    {
+      "source": "shader_glass",
+      "target": "material",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "Vestigial in Halo 4 like the rest of the family. Counted across all 19 Reach shader groups: H4EK and H2AMPEK ship **zero** of every one, against 7,140 and 1,917 `.material`. HREK ships 36 `.shader_glass`."
+    },
+    {
+      "source": "shader_screen",
+      "target": "material",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "Vestigial in Halo 4 like the rest of the family. Counted across all 19 Reach shader groups: H4EK and H2AMPEK ship **zero** of every one, against 7,140 and 1,917 `.material`. HREK ships 17 `.shader_screen`."
+    },
+    {
+      "source": "shader_fur",
+      "target": "material",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "Vestigial in Halo 4 like the rest of the family. Counted across all 19 Reach shader groups: H4EK and H2AMPEK ship **zero** of every one, against 7,140 and 1,917 `.material`. HREK ships 1 `.shader_fur`."
+    },
+    {
+      "source": "shader_fur_stencil",
+      "target": "material",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "Vestigial in Halo 4 like the rest of the family. Counted across all 19 Reach shader groups: H4EK and H2AMPEK ship **zero** of every one, against 7,140 and 1,917 `.material`. HREK ships 1 `.shader_fur_stencil`."
+    },
+    {
+      "source": "shader_mux",
+      "target": "material",
+      "source_games": [
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "Vestigial in Halo 4 like the rest of the family. Counted across all 19 Reach shader groups: H4EK and H2AMPEK ship **zero** of every one, against 7,140 and 1,917 `.material`. HREK ships 1 `.shader_mux`."
+    }
+  ],
+  "payload_aliases": [
+    {
+      "group": "bitmap",
+      "source_games": [
+        "halo2_mcc"
+      ],
+      "target_games": [
+        "halo3_mcc",
+        "halo3odst_mcc"
+      ],
+      "source_definition": "processed_pixel_data_data",
+      "target_definition": "bitmap_group_pixel_data_def",
+      "reason": "Both are the bitmap's pixel payload in the tag body under the same field name, `processed pixel data`; only the data definition was renamed. Verified against the kits rather than the schema: a native H3EK bitmap keeps 699,052 bytes in `processed pixel data` and populates no pageable resource at all, despite the schema marking the field `*` and declaring interop resources. The formats line up too - Halo 2's `format_enum_2` and Halo 3's `bitmap_formats` share both index and name for dxt1 (14), dxt3 (15), dxt5 (16) and every uncompressed entry, and the enum is carried by name in any case. Halo 2's `p8` and `p8-bump` have no Halo 3 option and are reported. Scoped to Halo 3 and ODST on purpose: Reach's `bitmap_data_block_def` has no `pixels offset` field at all, so a blob carried there would have nothing indexing it - go through Halo 3, whose bitmaps already convert to Reach."
+    }
+  ]
+}

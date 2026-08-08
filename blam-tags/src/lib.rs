@@ -71,6 +71,7 @@ pub mod layout;
 pub mod schema;
 pub mod schema_compare;
 pub mod schema_compat;
+pub mod convert;
 pub mod data;
 pub mod path;
 pub mod field_path;
