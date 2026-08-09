@@ -85,7 +85,9 @@ pub mod animation;
 pub mod geometry;
 pub mod game;
 pub mod jms;
+pub mod jmi;
 pub mod ass;
+pub mod particle_model;
 pub mod extract;
 pub mod render_geometry;
 pub mod render_model;
@@ -139,6 +141,11 @@ pub use bitmap::{Bitmap, BitmapError, BitmapFormat, BitmapImage};
 pub use jms::{
     JmsBox, JmsCapsule, JmsConvex, JmsError, JmsFile, JmsHinge, JmsMarker, JmsMaterial,
     JmsNode, JmsRagdoll, JmsSphere, JmsTriangle, JmsVertex,
+};
+pub use jmi::{JmiError, JmiFile, JMI_MIN_VERSION, JMI_VERSION};
+pub use particle_model::{
+    is_particle_model_group, particle_model_meshes, read_particle_model, ParticleModelObject,
+    ParticleModelSource, ParticleObjectMesh, ParticleVertex,
 };
 pub use ass::{
     AssError, AssFile, AssInstance, AssLight, AssLightKind, AssMaterial, AssObject,

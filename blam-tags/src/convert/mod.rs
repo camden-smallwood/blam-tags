@@ -7661,65 +7661,50 @@ mod tests {
 
     /// A non-finite source number never reaches the target tag.
     ///
-    /// Halo 2 stamps junk into the `object` collision-damage slots it does not use,
-    /// and a shipped H2 projectile carries a NaN `material responses[0]/angular
-    /// noise` in a field Halo 3 also has — so the value matched and was copied
-    /// through. A NaN in a written tag is exactly the kind of thing that makes the
-    /// destination game's tools refuse to open it, which is the symptom this whole
-    /// line of work started from.
+    /// A NaN in a written tag is exactly what makes the destination game's tools
+    /// refuse to open it, so the converter refuses the value and keeps the
+    /// target's default.
+    ///
+    /// **This used to be anchored to a real Halo 2 projectile** whose
+    /// `material responses[0]/angular noise` read as NaN. It is not any more, and
+    /// the reason is worth recording: that NaN was never in the tag. Halo 2's
+    /// legacy-string engines store an `old_string_id` inline, so every field after
+    /// a name was being read 28 bytes early, and the "NaN" was the middle of some
+    /// neighbouring value. `adjust_layout_for_engine` fixed the read, and a scan
+    /// of 445 Halo 2 tags across six groups now finds **no** non-finite number
+    /// anywhere.
+    ///
+    /// So the sample is synthetic now, which is the better test regardless: it
+    /// exercises the guard rather than the corpus, needs no kit, and cannot be
+    /// invalidated by a kit-reading fix the way the last one was.
     #[test]
     fn a_nan_in_the_source_does_not_reach_the_converted_tag() {
-        let (Some(h2), Some(h3)) = (
-            kit_tags("BLAM_TEST_H2EK", "H2EK"),
-            kit_tags("BLAM_TEST_H3EK", "H3EK"),
-        ) else {
-            eprintln!("skipping: needs H2EK and H3EK");
-            return;
-        };
         let definitions = locate_definitions_root();
-        let source_index = GameTagIndex::load(&definitions, "halo2_mcc").unwrap();
-        let target_index = GameTagIndex::load(&definitions, "halo3_mcc").unwrap();
-        let Some(&group_tag) =
-            super::chain_sweep::extension_to_group_tag(&source_index).get("projectile")
-        else {
-            eprintln!("skipping: halo2_mcc declares no projectile");
-            return;
-        };
-        let templates = NativeTemplateIndex::build(&h3, &target_index);
-        let sampled = super::chain_sweep::first_tag_by_extension(&h2);
-        let Some(path) = sampled.get("projectile") else {
-            eprintln!("skipping: H2EK ships no .projectile");
-            return;
-        };
-        let Ok(source) = read_tag_for_conversion(
-            path,
-            Some("halo2_mcc"),
-            Some(definitions.as_path()),
-            group_tag,
-        ) else {
-            eprintln!("skipping: {} is unreadable", path.display());
-            return;
-        };
+        let mut source = TagFile::new(definitions.join("halo3_mcc/weapon.json")).unwrap();
+        let leaf = first_direct_leaf(&source, is_real_scalar);
+        source
+            .root_mut()
+            .field_at_mut(leaf.ordinal)
+            .unwrap()
+            .set(real_field_value(leaf.field_type, f32::NAN))
+            .unwrap();
+        // The premise, asserted rather than assumed: a NaN really is in there to
+        // be caught.
         let mut before = Vec::new();
         collect_numbers(source.root(), &mut before);
-        let bad_before = before
-            .iter()
-            .filter(|(_, value, _)| !value.is_finite())
-            .count();
         assert!(
-            bad_before > 0,
-            "{} was expected to carry a non-finite number; the sample changed and \
-             this test no longer proves anything",
-            path.display()
+            before.iter().any(|(_, value, _)| !value.is_finite()),
+            "the synthetic source should carry a NaN"
         );
+
         let draft = analyze_conversion_with_templates(
             &source,
-            "halo2_mcc",
             "halo3_mcc",
+            "haloreach_mcc",
             &definitions,
-            Some(&templates),
+            None,
         )
-        .expect("halo2 -> halo3 projectile converts");
+        .expect("halo3 -> reach weapon converts");
         let mut after = Vec::new();
         collect_numbers(draft.tag.root(), &mut after);
         let carried: Vec<&str> = after
@@ -7730,6 +7715,16 @@ mod tests {
         assert!(
             carried.is_empty(),
             "non-finite numbers reached the converted tag at {carried:?}"
+        );
+        // Refused, not silently defaulted: a value dropped without a word is the
+        // failure mode this whole check exists to avoid.
+        assert!(
+            draft
+                .report
+                .issues
+                .iter()
+                .any(|issue| issue.message.contains("not a finite number")),
+            "the refusal should be reported"
         );
     }
 

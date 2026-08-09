@@ -972,12 +972,28 @@ pub(crate) fn deserialize_field(
             }
             _ => None,
         }),
-        TagFieldType::OldStringId => sub_chunk.and_then(|c| match c {
-            TagSubChunkContent::OldStringId(payload) => {
-                Some(TagFieldData::OldStringId(StringIdData::from_bytes(payload)))
+        TagFieldType::OldStringId => {
+            // The legacy classic engines (`ambl` / `LAMB`) keep this as a
+            // 32-byte inline null-padded string in the fixed bytes and emit no
+            // sub-chunk at all, so there is nothing for the branch below to
+            // find and every name read back empty. `read_classic_tag_file`
+            // records that width on the field type, which is what says "inline"
+            // to a reader that has no engine in hand; every other layout leaves
+            // it at the modern 4-byte slot and takes the sub-chunk path.
+            if layout.field_types[field.type_index as usize].size == 32 {
+                return (offset + 32 <= raw_struct.len()).then(|| {
+                    TagFieldData::OldStringId(StringIdData {
+                        string: decode_null_padded_string(&raw_struct[offset..offset + 32]),
+                    })
+                });
             }
-            _ => None,
-        }),
+            sub_chunk.and_then(|c| match c {
+                TagSubChunkContent::OldStringId(payload) => {
+                    Some(TagFieldData::OldStringId(StringIdData::from_bytes(payload)))
+                }
+                _ => None,
+            })
+        }
         TagFieldType::TagReference => sub_chunk.and_then(|c| match c {
             TagSubChunkContent::TagReference(payload) => Some(TagFieldData::TagReference(
                 TagReferenceData::from_bytes(payload, endian),

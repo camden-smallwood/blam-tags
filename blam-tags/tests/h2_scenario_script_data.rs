@@ -462,3 +462,80 @@ fn report_scenario_conversions_across_the_chain() {
         eprintln!("{source_game} -> {target_game}: {ok} ok, {failed} failed  {first_error}");
     }
 }
+
+/// How many non-finite numbers Halo 2's kit still holds, after the legacy-string
+/// offset fix.
+///
+/// The NaN the converter guards against was found at
+/// `material responses[0]/angular noise` in a Halo 2 projectile. If the field was
+/// simply being read from the wrong offset, that NaN was never in the tag and the
+/// guard has nothing left to catch here.
+#[test]
+#[ignore = "diagnostic; needs H2EK"]
+fn report_non_finite_numbers_left_in_halo_2() {
+    let Some(h2) = kit("H2EK") else {
+        eprintln!("skipping: needs H2EK");
+        return;
+    };
+    let definitions = definitions();
+    for extension in ["projectile", "weapon", "biped", "vehicle", "crate", "effect"] {
+        let group_tag = match extension {
+            "projectile" => *b"proj",
+            "weapon" => *b"weap",
+            "biped" => *b"bipd",
+            "vehicle" => *b"vehi",
+            "crate" => *b"bloc",
+            _ => *b"effe",
+        };
+        let group_tag = u32::from_be_bytes(group_tag);
+        let mut scanned = 0usize;
+        let mut with_bad = 0usize;
+        let mut examples: Vec<String> = Vec::new();
+        for path in find(&h2, extension, 120) {
+            let Ok(tag) = blam_tags::convert::read_tag_for_conversion(
+                &path,
+                Some("halo2_mcc"),
+                Some(&definitions),
+                group_tag,
+            ) else {
+                continue;
+            };
+            scanned += 1;
+            let mut bad = Vec::new();
+            walk_reals(tag.root(), "", &mut bad);
+            if !bad.is_empty() {
+                with_bad += 1;
+                if examples.len() < 3 {
+                    examples.push(format!("{}: {:?}", path.file_name().unwrap().to_string_lossy(), &bad[..bad.len().min(2)]));
+                }
+            }
+        }
+        eprintln!(".{extension:<12} {scanned:>4} scanned, {with_bad} with non-finite values  {examples:?}");
+    }
+}
+
+/// Every non-finite real under `value`, by path.
+fn walk_reals(value: TagStruct<'_>, prefix: &str, out: &mut Vec<String>) {
+    for field in value.fields() {
+        let path = if prefix.is_empty() {
+            field.name().to_owned()
+        } else {
+            format!("{prefix}/{}", field.name())
+        };
+        if let Some(TagFieldData::Real(v)) = field.value() {
+            if !v.is_finite() {
+                out.push(path.clone());
+            }
+        }
+        if let Some(nested) = field.as_struct() {
+            walk_reals(nested, &path, out);
+        }
+        if let Some(block) = field.as_block() {
+            for index in 0..block.len() {
+                if let Some(element) = block.element(index) {
+                    walk_reals(element, &format!("{path}[{index}]"), out);
+                }
+            }
+        }
+    }
+}
