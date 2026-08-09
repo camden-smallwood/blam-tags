@@ -1865,6 +1865,23 @@ fn analyze_conversion_inner(
         (target, None)
     };
     apply_editing_kit_mcc_header(&mut target, target_game)?;
+    // From the template as the kit wrote it, not from `target`: the reset clears
+    // every block on the way to a blank starting point, so by now the count is
+    // gone. One extra read of a tag already on disk, and only when a native
+    // template was used at all.
+    let template_option_counts = target_template
+        .as_ref()
+        .and_then(|path| {
+            read_tag_for_conversion(
+                path,
+                Some(target_game),
+                Some(definitions_root),
+                target_group_tag,
+            )
+            .ok()
+        })
+        .map(|template| render_method_option_counts(&template))
+        .unwrap_or_default();
 
     let mut context = ConversionContext {
         source_groups: &source_groups,
@@ -2003,6 +2020,8 @@ fn analyze_conversion_inner(
         &mut context.report,
     )?;
     strip_cross_engine_scripts(&mut target, &mut context);
+    restore_render_method_option_slots(&mut target, &template_option_counts, &mut context);
+    apply_default_particle_material(&mut target, &mut context);
     let fail_closed_losses = validate_critical_runtime_safety(source, &context, policy)?;
     if !fail_closed_losses.is_empty() {
         context.report.issues.push(ConversionIssue {
@@ -2029,6 +2048,250 @@ fn analyze_conversion_inner(
         native_layout_template: target_template,
         route: Vec::new(),
     })
+}
+
+/// How many `options` a kit-authored template's render methods started with,
+/// keyed by the struct's field path.
+///
+/// Captured before conversion because conversion is what loses them: the block
+/// is resized to match the source, and a source with fewer options than the
+/// destination's rmdf declares leaves the target short.
+fn render_method_option_counts(tag: &TagFile) -> HashMap<String, usize> {
+    fn walk(value: TagStruct<'_>, prefix: &str, out: &mut HashMap<String, usize>) {
+        if is_render_method_struct(value) {
+            if let Some(options) = value
+                .fields()
+                .find(|field| clean_field_key(field.name()) == "options")
+                .and_then(|field| field.as_block())
+            {
+                out.insert(prefix.to_owned(), options.len());
+            }
+        }
+        for field in value.fields() {
+            if let Some(nested) = field.as_struct() {
+                let path = if prefix.is_empty() {
+                    field.name().to_owned()
+                } else {
+                    format!("{prefix}/{}", field.name())
+                };
+                walk(nested, &path, out);
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    walk(tag.root(), "", &mut out);
+    out
+}
+
+/// The value a render-method option slot carries when nothing selected it.
+///
+/// Halo's universal "no index" sentinel, and what most shipped tags use: across
+/// 400 Halo 4 particles the tenth slot holds `-1` in 240, an explicit option in
+/// the other 160. A slot the source never had an opinion about is unset, not set
+/// to the first option.
+const UNSET_RENDER_METHOD_OPTION: i16 = -1;
+
+/// Give a converted render method back the option slots its rmdf requires.
+///
+/// A render method's `options` block is one element per category of the
+/// `render_method_definition` it points at, in order — the count is fixed by the
+/// rmdf, not by the tag. Conversion resizes the block to match the source, which
+/// is wrong whenever the source is shorter than the destination needs.
+///
+/// Reach tolerates a short block and Halo 4 does not: 30 of 400 shipped Reach
+/// particles carry 9 options where their rmdf declares 10, while **all 900**
+/// shipped Halo 4 particles carry exactly 10. So a faithful conversion of one of
+/// those 30 produces a Halo 4 particle its mod tools will not open — reported as
+/// `smoke_fiery_large.particle`.
+///
+/// The template is the reference for the count rather than the rmdf tag itself:
+/// it is a real destination-game tag of the same group, so its block is already
+/// the length that game's tools expect, and reading it costs nothing where
+/// resolving and parsing an rmdf would need the target kit threaded in. Skipped
+/// when the two point at different render methods, since then the template's
+/// count says nothing about this tag's.
+fn restore_render_method_option_slots(
+    target: &mut TagFile,
+    template_counts: &HashMap<String, usize>,
+    context: &mut ConversionContext<'_>,
+) {
+    if template_counts.is_empty() {
+        return;
+    }
+    let mut padded: Vec<(String, usize, usize)> = Vec::new();
+    fn walk(
+        mut value: TagStructMut<'_>,
+        prefix: &str,
+        counts: &HashMap<String, usize>,
+        padded: &mut Vec<(String, usize, usize)>,
+    ) {
+        if is_render_method_struct(value.as_ref()) {
+            if let Some(&wanted) = counts.get(prefix) {
+                let ordinal = value
+                    .as_ref()
+                    .fields()
+                    .position(|field| clean_field_key(field.name()) == "options");
+                if let Some(ordinal) = ordinal {
+                    if let Some(mut field) = value.field_at_mut(ordinal) {
+                        if let Some(mut options) = field.as_block_mut() {
+                            let had = options.len();
+                            while options.len() < wanted {
+                                let index = options.add_element();
+                                if let Some(mut element) = options.element_mut(index) {
+                                    if let Some(mut slot) = element.field_at_mut(0) {
+                                        let _ = slot.set(TagFieldData::ShortInteger(
+                                            UNSET_RENDER_METHOD_OPTION,
+                                        ));
+                                    }
+                                }
+                            }
+                            if options.len() != had {
+                                padded.push((prefix.to_owned(), had, options.len()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let field_count = value.as_ref().fields().count();
+        for ordinal in 0..field_count {
+            let name = match value.as_ref().fields().nth(ordinal) {
+                Some(field) if field.as_struct().is_some() => field.name().to_owned(),
+                _ => continue,
+            };
+            let path = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if let Some(mut field) = value.field_at_mut(ordinal) {
+                if let Some(nested) = field.as_struct_mut() {
+                    walk(nested, &path, counts, padded);
+                }
+            }
+        }
+    }
+    walk(target.root_mut(), "", template_counts, &mut padded);
+    for (path, had, now) in padded {
+        context.report.issues.push(ConversionIssue {
+            kind: ConversionIssueKind::Warning,
+            path: format!("{path}/options"),
+            message: format!(
+                "{} declares fewer render-method options than {} requires ({had} against \
+                 {now}); the missing slots were added unset. The option block has one entry \
+                 per category of the render method definition, so a short one is a tag the \
+                 destination's tools cannot open.",
+                context.source_game, context.target_game
+            ),
+        });
+    }
+}
+
+/// The material shader a converted particle starts with, per target game.
+///
+/// Halo 4 and H2A put a `material` beside the render method; the older engines
+/// have no such thing, so a particle converted forward has nothing to fill it
+/// with and arrives with a null `mats` reference. That configuration *is*
+/// shipped -- 7 of 900 Halo 4 particles have it, all with a working render
+/// method -- so it opens, but the particle has no material to draw with.
+///
+/// `particle_base` is the plain one and the most used: 344 of those 900 pick it,
+/// ahead of `particle_palettized` at 137. It is a starting point rather than a
+/// guess at the original look, and the report says so, because which material a
+/// Reach particle *should* become is an art decision the tag does not carry.
+/// Verified present in both kits that declare the field.
+const DEFAULT_PARTICLE_MATERIAL: &[(&str, &str)] = &[
+    ("halo4_mcc", "shaders\\material_shaders\\fx\\particle_base"),
+    ("halo2amp_mcc", "shaders\\material_shaders\\fx\\particle_base"),
+];
+
+/// Whether a struct is a material: the shader reference, its parameters, and the
+/// physics material names together.
+///
+/// Shape rather than name, for the same reason the render method is: `material
+/// shader` alone is not distinctive enough to blanket-match on, and the group is
+/// not the right key when the same struct appears in several.
+fn is_material_struct(value: TagStruct<'_>) -> bool {
+    let has = |name: &str| {
+        value
+            .fields()
+            .any(|field| clean_field_key(field.name()) == name)
+    };
+    has("material shader") && has("material parameters") && has("physics material name")
+}
+
+/// Give a converted particle a material shader to draw with.
+///
+/// Only when the conversion left the reference null -- a source that supplied
+/// one keeps it, and a target game with no default in the table is untouched.
+fn apply_default_particle_material(target: &mut TagFile, context: &mut ConversionContext<'_>) {
+    let Some((_, default_path)) = DEFAULT_PARTICLE_MATERIAL
+        .iter()
+        .find(|(game, _)| *game == context.target_game)
+    else {
+        return;
+    };
+    let default_path = (*default_path).to_owned();
+    let group = parse_group_tag("mats").unwrap_or(u32::from_be_bytes(*b"mats"));
+    let mut applied = Vec::new();
+    let field_count = target.root().fields().count();
+    let mut root = target.root_mut();
+    for ordinal in 0..field_count {
+        let is_material = root
+            .as_ref()
+            .fields()
+            .nth(ordinal)
+            .and_then(|field| field.as_struct())
+            .is_some_and(is_material_struct);
+        if !is_material {
+            continue;
+        }
+        let Some(mut field) = root.field_at_mut(ordinal) else {
+            continue;
+        };
+        let name = field.as_ref().name().to_owned();
+        let Some(mut value) = field.as_struct_mut() else {
+            continue;
+        };
+        let Some(shader_ordinal) = value
+            .as_ref()
+            .fields()
+            .position(|inner| clean_field_key(inner.name()) == "material shader")
+        else {
+            continue;
+        };
+        let Some(mut shader) = value.field_at_mut(shader_ordinal) else {
+            continue;
+        };
+        let empty = match shader.as_ref().value() {
+            Some(TagFieldData::TagReference(reference)) => reference
+                .group_tag_and_name
+                .as_ref()
+                .is_none_or(|(_, path)| path.is_empty()),
+            _ => false,
+        };
+        if !empty {
+            continue;
+        }
+        if shader
+            .set(TagFieldData::TagReference(TagReferenceData {
+                group_tag_and_name: Some((group, default_path.clone())),
+            }))
+            .is_ok()
+        {
+            applied.push(name);
+        }
+    }
+    for name in applied {
+        context.report.issues.push(ConversionIssue {
+            kind: ConversionIssueKind::Warning,
+            path: format!("{name}/material shader"),
+            message: format!(
+                "{} has no material for a particle to carry across, so this one starts on                  `{default_path}` -- the plainest of {}'s particle materials and the one most of                  its own particles use. Point it somewhere else if the original wanted a                  palettized, scrolling or plasma look.",
+                context.source_game, context.target_game
+            ),
+        });
+    }
 }
 
 /// A scenario's compiled HaloScript, which never survives an engine change.
@@ -7968,6 +8231,250 @@ mod tests {
                 .any(|issue| issue.message.contains("not a finite number")),
             "the refusal should be reported"
         );
+    }
+
+    /// A short Reach render method is padded to what Halo 4's rmdf requires.
+    ///
+    /// Reported as `smoke_fiery_large.particle` converting but not opening in
+    /// Halo 4's mod tools. A render method's `options` block holds one entry per
+    /// category of the `render_method_definition` it points at, so its length is
+    /// dictated by the destination, not by the source. Reach tolerates a short
+    /// one — 30 of 400 shipped Reach particles carry 9 where their own rmdf
+    /// declares 10 — and Halo 4 does not: all 900 shipped Halo 4 particles carry
+    /// exactly 10. A faithful copy of one of those 30 is therefore a tag Halo 4
+    /// cannot open.
+    ///
+    /// The premise is asserted, not assumed: if Reach stops shipping a short one
+    /// this fails rather than passing on a tag that never needed padding.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_short_reach_render_method_is_padded_for_halo_4() {
+        let (Some(reach), Some(h4)) = (
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+        ) else {
+            eprintln!("skipping: needs HREK and H4EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = u32::from_be_bytes(*b"prt3");
+        let options_of = |tag: &TagFile| -> Option<usize> {
+            tag.root()
+                .fields()
+                .find_map(|field| field.as_struct().filter(|v| is_render_method_struct(*v)))
+                .and_then(|value| {
+                    value
+                        .fields()
+                        .find(|field| clean_field_key(field.name()) == "options")
+                        .and_then(|field| field.as_block())
+                        .map(|block| block.len())
+                })
+        };
+
+        let groups = GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h4, &groups);
+        // What Halo 4 requires, taken from its own shipped tags rather than
+        // hard-coded: the number is a property of the kit's rmdf.
+        let required = tags_with_extension(&h4, "particle")
+            .into_iter()
+            .take(20)
+            .find_map(|path| TagFile::read(&path).ok().and_then(|tag| options_of(&tag)));
+        let Some(required) = required else {
+            eprintln!("skipping: no readable H4EK particle");
+            return;
+        };
+
+        let short = tags_with_extension(&reach, "particle")
+            .into_iter()
+            .take(400)
+            .find_map(|path| {
+                let tag =
+                    read_tag_for_conversion(&path, Some("haloreach_mcc"), Some(&definitions), group_tag)
+                        .ok()?;
+                options_of(&tag)
+                    .filter(|count| *count < required)
+                    .map(|count| (path, tag, count))
+            });
+        let Some((path, source, source_options)) = short else {
+            eprintln!(
+                "skipping: no HREK particle carries fewer than {required} render-method options"
+            );
+            return;
+        };
+
+        let draft = analyze_conversion_with_templates(
+            &source,
+            "haloreach_mcc",
+            "halo4_mcc",
+            &definitions,
+            Some(&templates),
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+
+        assert_eq!(
+            options_of(&draft.tag),
+            Some(required),
+            "{}: {source_options} options in, and Halo 4 needs {required}",
+            path.display()
+        );
+        // Padding silently would hide that the source had no opinion about those
+        // slots, which is the thing an author needs to know.
+        assert!(
+            draft
+                .report
+                .issues
+                .iter()
+                .any(|issue| issue.message.contains("render-method options")),
+            "{}: the padding should be reported",
+            path.display()
+        );
+        // And a source that was already the right length is left alone.
+        let full = tags_with_extension(&reach, "particle")
+            .into_iter()
+            .take(400)
+            .find_map(|path| {
+                let tag =
+                    read_tag_for_conversion(&path, Some("haloreach_mcc"), Some(&definitions), group_tag)
+                        .ok()?;
+                options_of(&tag).filter(|count| *count == required).map(|_| tag)
+            });
+        if let Some(full) = full {
+            let draft = analyze_conversion_with_templates(
+                &full,
+                "haloreach_mcc",
+                "halo4_mcc",
+                &definitions,
+                Some(&templates),
+            )
+            .unwrap();
+            assert_eq!(options_of(&draft.tag), Some(required));
+            assert!(
+                !draft
+                    .report
+                    .issues
+                    .iter()
+                    .any(|issue| issue.message.contains("render-method options")),
+                "a full-length source needs no padding and should not be reported as padded"
+            );
+        }
+        eprintln!(
+            "{}: {source_options} -> {required} render-method options",
+            path.display()
+        );
+    }
+
+    /// A particle converted into Halo 4 arrives with a material to draw with.
+    ///
+    /// Halo 4 puts a `material` beside the render method and Reach has no such
+    /// thing, so the reference lands null. That opens — 7 of 900 shipped Halo 4
+    /// particles are the same — but the particle has no material, so the default
+    /// is a starting point the author can redirect, and it is reported as one.
+    ///
+    /// Also checks the pieces that make the default *safe*: it is only applied
+    /// where the conversion left nothing, and it names a tag the kit ships.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_particle_converted_into_halo_4_gets_a_default_material() {
+        let (Some(reach), Some(h4)) = (
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+        ) else {
+            eprintln!("skipping: needs HREK and H4EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = u32::from_be_bytes(*b"prt3");
+        let material_shader = |tag: &TagFile| -> Option<(u32, String)> {
+            tag.root()
+                .fields()
+                .find_map(|field| field.as_struct().filter(|v| is_material_struct(*v)))
+                .and_then(|value| {
+                    value
+                        .fields()
+                        .find(|inner| clean_field_key(inner.name()) == "material shader")
+                        .and_then(|inner| match inner.value() {
+                            Some(TagFieldData::TagReference(reference)) => {
+                                reference.group_tag_and_name
+                            }
+                            _ => None,
+                        })
+                })
+        };
+
+        let Some(source_path) = tags_with_extension(&reach, "particle").into_iter().next() else {
+            eprintln!("skipping: HREK ships no particle");
+            return;
+        };
+        let source =
+            read_tag_for_conversion(&source_path, Some("haloreach_mcc"), Some(&definitions), group_tag)
+                .unwrap();
+        // The premise: Reach has nothing of the sort to carry.
+        assert!(
+            material_shader(&source).is_none(),
+            "{}: Reach is not expected to declare a material",
+            source_path.display()
+        );
+
+        let groups = GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h4, &groups);
+        let draft = analyze_conversion_with_templates(
+            &source,
+            "haloreach_mcc",
+            "halo4_mcc",
+            &definitions,
+            Some(&templates),
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", source_path.display()));
+
+        let (group, path) = material_shader(&draft.tag)
+            .unwrap_or_else(|| panic!("{}: no material shader", source_path.display()));
+        assert_eq!(format_group_tag(group), "mats");
+        assert_eq!(path, r"shaders\material_shaders\fx\particle_base");
+        // A default that names a tag the kit does not ship is worse than none.
+        assert!(
+            h4.join("shaders/material_shaders/fx/particle_base.material_shader").is_file(),
+            "the default names a tag H4EK does not ship"
+        );
+        assert!(
+            draft
+                .report
+                .issues
+                .iter()
+                .any(|issue| issue.message.contains("particle_base")),
+            "the default should be reported as a starting point"
+        );
+
+        // Untouched where the source already answered: converting a Halo 4
+        // particle to H2A must keep its own material rather than overwrite it.
+        let Some(h4_source) = tags_with_extension(&h4, "particle").into_iter().find_map(|path| {
+            let tag = TagFile::read(&path).ok()?;
+            let (_, name) = material_shader(&tag)?;
+            (!name.is_empty() && !name.contains("particle_base")).then_some((path, tag, name))
+        }) else {
+            eprintln!("note: no H4EK particle with a non-default material to check against");
+            return;
+        };
+        let (h4_path, h4_tag, original) = h4_source;
+        if let Some(h2a) = kit_tags("BLAM_TEST_H2AMPEK", "H2AMPEK") {
+            let groups = GameTagIndex::load(&definitions, "halo2amp_mcc").unwrap();
+            let templates = NativeTemplateIndex::build(&h2a, &groups);
+            let draft = analyze_conversion_with_templates(
+                &h4_tag,
+                "halo4_mcc",
+                "halo2amp_mcc",
+                &definitions,
+                Some(&templates),
+            )
+            .unwrap_or_else(|error| panic!("{}: {error}", h4_path.display()));
+            assert_eq!(
+                material_shader(&draft.tag).map(|(_, name)| name),
+                Some(original),
+                "{}: a source that supplied a material must keep it",
+                h4_path.display()
+            );
+        }
     }
 
     /// A converted Reach particle keeps a render-method definition even when the

@@ -601,3 +601,765 @@ fn report_how_many_h3_lights_are_refused_for_audited_loss() {
         );
     }
 }
+
+/// Where Halo 4's first usable particle template sits in the scanned order.
+///
+/// `find_native_target_template` walks a group's tags sorted by path and takes
+/// the first whose header carries a source revision, stopping after
+/// `NATIVE_TEMPLATE_SCAN_LIMIT`. If Halo 4's particles are sparse in that order
+/// the cap is the difference between a native layout and a generated one.
+#[test]
+#[ignore = "diagnostic; needs H4EK"]
+fn report_where_halo_4_particle_templates_sit() {
+    let Some(h4) = kit("H4EK") else {
+        eprintln!("skipping: needs H4EK");
+        return;
+    };
+    for extension in ["particle", "effect", "material"] {
+        let paths = find(&h4, extension, usize::MAX);
+        let mut accepted_at = Vec::new();
+        for (index, path) in paths.iter().enumerate() {
+            let Ok((header, endian)) = blam_tags::TagFileHeader::peek(path) else {
+                continue;
+            };
+            if endian == blam_tags::Endian::Le && header.version != u32::MAX {
+                accepted_at.push(index);
+            }
+        }
+        eprintln!(
+            ".{extension:<10} {} shipped, {} acceptable; first at {:?}, within first 256: {}",
+            paths.len(),
+            accepted_at.len(),
+            accepted_at.first(),
+            accepted_at.iter().filter(|i| **i < 256).count()
+        );
+    }
+}
+
+/// A converted Reach particle beside a native Halo 4 one.
+///
+/// Reported as `smoke_fiery_large.particle` converting but not opening in Halo
+/// 4's mod tools. Structure first: root size, field list, and the render method,
+/// because a tag the tools refuse to open is usually one whose layout they
+/// cannot walk.
+#[test]
+#[ignore = "diagnostic; needs HREK and H4EK"]
+fn report_a_converted_reach_particle_beside_a_native_halo_4_one() {
+    let (Some(reach), Some(h4)) = (kit("HREK"), kit("H4EK")) else {
+        eprintln!("skipping: needs HREK and H4EK");
+        return;
+    };
+    let definitions = definitions();
+    let group_tag = u32::from_be_bytes(*b"prt3");
+
+    let source_path = find(&reach, "particle", usize::MAX)
+        .into_iter()
+        .find(|p| p.to_string_lossy().contains("fiery_smoke"))
+        .or_else(|| find(&reach, "particle", 1).into_iter().next());
+    let Some(source_path) = source_path else {
+        eprintln!("skipping: no HREK particle");
+        return;
+    };
+    let source = blam_tags::convert::read_tag_for_conversion(
+        &source_path,
+        Some("haloreach_mcc"),
+        Some(&definitions),
+        group_tag,
+    )
+    .unwrap();
+    eprintln!("source: {}", source_path.display());
+
+    let groups = blam_tags::convert::GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+    let templates = blam_tags::convert::NativeTemplateIndex::build(&h4, &groups);
+    let draft = match blam_tags::convert::analyze_conversion_with_templates(
+        &source,
+        "haloreach_mcc",
+        "halo4_mcc",
+        &definitions,
+        Some(&templates),
+    ) {
+        Ok(draft) => draft,
+        Err(error) => {
+            eprintln!("REFUSED: {error}");
+            return;
+        }
+    };
+    eprintln!(
+        "template used: {:?}",
+        draft.native_layout_template.as_ref().map(|p| p.display().to_string())
+    );
+
+    let native_path = find(&h4, "particle", 1).into_iter().next().unwrap();
+    let native = TagFile::read(&native_path).unwrap();
+    eprintln!("native:  {}", native_path.display());
+
+    let describe = |label: &str, tag: &TagFile| {
+        eprintln!("--- {label} ---");
+        eprintln!("  root size {} bytes", tag.root().definition().size());
+        eprintln!(
+            "  header build_version={} build_number={} version={:#x} group_version={}",
+            tag.header.build_version,
+            tag.header.build_number,
+            tag.header.version,
+            tag.header.group_version
+        );
+        for field in tag.root().fields() {
+            let kind = format!("{:?}", field.field_type());
+            if !matches!(
+                field.field_type(),
+                TagFieldType::Block | TagFieldType::TagReference | TagFieldType::Struct
+            ) {
+                continue;
+            }
+            let extra = match field.field_type() {
+                TagFieldType::Block => field
+                    .as_block()
+                    .map(|b| format!(" [{} element(s)]", b.len()))
+                    .unwrap_or_default(),
+                TagFieldType::TagReference => match field.value() {
+                    Some(TagFieldData::TagReference(r)) => match &r.group_tag_and_name {
+                        Some((g, n)) => format!(" -> {} {:?}", blam_tags::format_group_tag(*g), n),
+                        None => " -> (null)".to_owned(),
+                    },
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            };
+            eprintln!("  {:<38} {:<14}{extra}", field.name(), kind);
+        }
+    };
+    describe("converted", &draft.tag);
+    describe("native H4", &native);
+
+    // Does it survive its own write/read cycle?
+    match draft.tag.write_to_bytes() {
+        Ok(bytes) => match TagFile::read_from_bytes(&bytes) {
+            Ok(_) => eprintln!("
+roundtrip: OK ({} bytes)", bytes.len()),
+            Err(error) => eprintln!("
+roundtrip: REOPEN FAILED: {error}"),
+        },
+        Err(error) => eprintln!("
+roundtrip: WRITE FAILED: {error}"),
+    }
+    for issue in &draft.report.issues {
+        eprintln!("  issue {:?} {} - {}", issue.kind, issue.path, issue.message);
+    }
+}
+
+/// Inside the two template-backed structs of a particle: converted vs native.
+#[test]
+#[ignore = "diagnostic; needs HREK and H4EK"]
+fn report_inside_a_converted_halo_4_particle_shader_structs() {
+    let (Some(reach), Some(h4)) = (kit("HREK"), kit("H4EK")) else {
+        eprintln!("skipping: needs HREK and H4EK");
+        return;
+    };
+    let definitions = definitions();
+    let group_tag = u32::from_be_bytes(*b"prt3");
+    let source_path = find(&reach, "particle", usize::MAX)
+        .into_iter()
+        .find(|p| p.to_string_lossy().contains("fiery_smoke"))
+        .unwrap();
+    let source = blam_tags::convert::read_tag_for_conversion(
+        &source_path,
+        Some("haloreach_mcc"),
+        Some(&definitions),
+        group_tag,
+    )
+    .unwrap();
+    let groups = blam_tags::convert::GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+    let templates = blam_tags::convert::NativeTemplateIndex::build(&h4, &groups);
+    let draft = blam_tags::convert::analyze_conversion_with_templates(
+        &source,
+        "haloreach_mcc",
+        "halo4_mcc",
+        &definitions,
+        Some(&templates),
+    )
+    .unwrap();
+    let native_path = draft.native_layout_template.clone().unwrap();
+    let native = TagFile::read(&native_path).unwrap();
+
+    let dump = |label: &str, tag: &TagFile, which: &str| {
+        let Some(field) = tag
+            .root()
+            .fields()
+            .find(|f| f.name().eq_ignore_ascii_case(which))
+        else {
+            eprintln!("{label}/{which}: absent");
+            return;
+        };
+        let Some(value) = field.as_struct() else {
+            eprintln!("{label}/{which}: not a struct");
+            return;
+        };
+        eprintln!("{label}/{which}: {} bytes", value.definition().size());
+        for inner in value.fields() {
+            let extra = match inner.value() {
+                Some(TagFieldData::TagReference(r)) => match &r.group_tag_and_name {
+                    Some((g, n)) if !n.is_empty() => {
+                        format!("-> {} {:?}", blam_tags::format_group_tag(*g), n)
+                    }
+                    Some((g, _)) => format!("-> {} (EMPTY PATH)", blam_tags::format_group_tag(*g)),
+                    None => "-> (null)".to_owned(),
+                },
+                _ => String::new(),
+            };
+            let blocks = inner
+                .as_block()
+                .map(|b| format!("[{}]", b.len()))
+                .unwrap_or_default();
+            eprintln!(
+                "    {:<34} {:<14} {blocks} {extra}",
+                inner.name(),
+                format!("{:?}", inner.field_type())
+            );
+        }
+    };
+    for which in ["actual material?", "actual shader?"] {
+        dump("CONVERTED", &draft.tag, which);
+        dump("NATIVE   ", &native, which);
+        eprintln!();
+    }
+    // And what Reach had to offer in the first place.
+    dump("SOURCE(reach)", &source, "actual shader?");
+}
+
+/// What Halo 4's own particles put in the two template-backed structs.
+///
+/// Two candidate causes for the mod tools refusing a converted one: a null
+/// `material shader`, and a render method whose `options` count disagrees with
+/// what its `rmdf` declares. Both are measured here rather than guessed, because
+/// the fix differs completely.
+#[test]
+#[ignore = "diagnostic; needs H4EK"]
+fn report_what_halo_4_particles_put_in_their_material_and_shader() {
+    let Some(h4) = kit("H4EK") else {
+        eprintln!("skipping: needs H4EK");
+        return;
+    };
+    let mut shaders: BTreeMap<String, usize> = BTreeMap::new();
+    let mut option_counts: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut param_counts: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut rmdfs: BTreeMap<String, usize> = BTreeMap::new();
+    let mut null_shader = 0usize;
+    let mut scanned = 0usize;
+    // By rmdf, what option counts occur -- if the rmdf fixes the count, a
+    // converted tag carrying a different one is indexing past what it declares.
+    let mut by_rmdf: BTreeMap<String, BTreeMap<usize, usize>> = BTreeMap::new();
+
+    for path in find(&h4, "particle", 900) {
+        let Ok(tag) = TagFile::read(&path) else { continue };
+        scanned += 1;
+        let get = |name: &str| tag.root().fields().find(|f| f.name().eq_ignore_ascii_case(name));
+        if let Some(value) = get("actual material?").and_then(|f| f.as_struct()) {
+            for inner in value.fields() {
+                match (inner.name(), inner.value()) {
+                    ("material shader", Some(TagFieldData::TagReference(r))) => {
+                        match &r.group_tag_and_name {
+                            Some((_, n)) if !n.is_empty() => {
+                                *shaders.entry(n.clone()).or_default() += 1;
+                            }
+                            _ => null_shader += 1,
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(value) = get("actual shader?").and_then(|f| f.as_struct()) {
+            let mut rmdf = String::new();
+            let mut options = 0usize;
+            let mut params = 0usize;
+            for inner in value.fields() {
+                if inner.name() == "definition" {
+                    if let Some(TagFieldData::TagReference(r)) = inner.value() {
+                        if let Some((_, n)) = &r.group_tag_and_name {
+                            rmdf = n.clone();
+                        }
+                    }
+                }
+                if inner.name() == "options" {
+                    options = inner.as_block().map(|b| b.len()).unwrap_or(0);
+                }
+                if inner.name() == "parameters" {
+                    params = inner.as_block().map(|b| b.len()).unwrap_or(0);
+                }
+            }
+            *option_counts.entry(options).or_default() += 1;
+            *param_counts.entry(params).or_default() += 1;
+            *rmdfs.entry(rmdf.clone()).or_default() += 1;
+            *by_rmdf.entry(rmdf).or_default().entry(options).or_default() += 1;
+        }
+    }
+    eprintln!("scanned {scanned} H4EK particles");
+    eprintln!("
+material shader: {null_shader} null, {} distinct non-null", shaders.len());
+    let mut top: Vec<_> = shaders.iter().collect();
+    top.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+    for (name, count) in top.iter().take(6) {
+        eprintln!("    {count:>5}  {name}");
+    }
+    eprintln!("
+render method rmdf:");
+    let mut top: Vec<_> = rmdfs.iter().collect();
+    top.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+    for (name, count) in top.iter().take(6) {
+        eprintln!("    {count:>5}  {name:?}");
+    }
+    eprintln!("
+options count distribution: {option_counts:?}");
+    eprintln!("parameters count distribution: {param_counts:?}");
+    eprintln!("
+options count per rmdf (does the rmdf fix it?):");
+    for (rmdf, counts) in by_rmdf.iter().take(6) {
+        eprintln!("    {rmdf:?} -> {counts:?}");
+    }
+}
+
+/// The option categories `shaders\particle` declares in Reach and in Halo 4.
+///
+/// A render method's `options` block is one element per category, in order, so
+/// the count is fixed by the rmdf and the *meaning* of slot N is whatever
+/// category N is. Whether Reach's nine can be copied into Halo 4's ten depends
+/// entirely on whether the names line up.
+#[test]
+#[ignore = "diagnostic; needs HREK and H4EK"]
+fn report_particle_rmdf_categories_on_both_sides() {
+    let mut listing: Vec<(String, Vec<String>)> = Vec::new();
+    for (label, kit_name, game) in [
+        ("reach", "HREK", "haloreach_mcc"),
+        ("halo4", "H4EK", "halo4_mcc"),
+    ] {
+        let Some(root) = kit(kit_name) else {
+            eprintln!("skipping: needs {kit_name}");
+            return;
+        };
+        let path = root.join("shaders/particle.render_method_definition");
+        if !path.is_file() {
+            eprintln!("{label}: no {}", path.display());
+            continue;
+        }
+        let _ = game;
+        let tag = TagFile::read(&path).unwrap();
+        let mut names = Vec::new();
+        if let Some(block) = tag
+            .root()
+            .fields()
+            .find(|f| f.name().eq_ignore_ascii_case("categories"))
+            .and_then(|f| f.as_block())
+        {
+            for index in 0..block.len() {
+                let Some(element) = block.element(index) else { continue };
+                let name = element
+                    .fields()
+                    .find(|f| f.name().to_ascii_lowercase().contains("name"))
+                    .and_then(|f| match f.value() {
+                        Some(TagFieldData::StringId(s)) => Some(s.string.clone()),
+                        Some(TagFieldData::OldStringId(s)) => Some(s.string.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "?".to_owned());
+                let options = element
+                    .fields()
+                    .find(|f| f.name().eq_ignore_ascii_case("options"))
+                    .and_then(|f| f.as_block())
+                    .map(|b| b.len())
+                    .unwrap_or(0);
+                names.push(format!("{name} ({options} opt)"));
+            }
+        }
+        eprintln!("{label}: {} categories", names.len());
+        for (index, name) in names.iter().enumerate() {
+            eprintln!("   [{index}] {name}");
+        }
+        listing.push((label.to_owned(), names));
+    }
+    if listing.len() == 2 {
+        let (a, b) = (&listing[0].1, &listing[1].1);
+        let common = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
+        eprintln!("
+identical prefix: {common} of {} / {}", a.len(), b.len());
+    }
+}
+
+/// Where the tenth render-method option goes between Reach and Halo 4.
+#[test]
+#[ignore = "diagnostic; needs HREK and H4EK"]
+fn report_where_the_tenth_particle_option_goes() {
+    let (Some(reach), Some(h4)) = (kit("HREK"), kit("H4EK")) else {
+        eprintln!("skipping: needs HREK and H4EK");
+        return;
+    };
+    let definitions = definitions();
+    let group_tag = u32::from_be_bytes(*b"prt3");
+
+    let counts = |tag: &TagFile, which: &str, block: &str| -> usize {
+        tag.root()
+            .fields()
+            .find(|f| f.name().eq_ignore_ascii_case(which))
+            .and_then(|f| f.as_struct())
+            .and_then(|v| {
+                v.fields()
+                    .find(|f| f.name().eq_ignore_ascii_case(block))
+                    .and_then(|f| f.as_block())
+                    .map(|b| b.len())
+            })
+            .unwrap_or(0)
+    };
+    // What Reach's own particles carry.
+    let mut reach_options: BTreeMap<usize, usize> = BTreeMap::new();
+    for path in find(&reach, "particle", 400) {
+        let Ok(tag) = blam_tags::convert::read_tag_for_conversion(
+            &path,
+            Some("haloreach_mcc"),
+            Some(&definitions),
+            group_tag,
+        ) else {
+            continue;
+        };
+        *reach_options
+            .entry(counts(&tag, "actual shader?", "options"))
+            .or_default() += 1;
+    }
+    eprintln!("HREK particle options counts: {reach_options:?}");
+
+    // The declared max on each side: a block that cannot hold ten is the
+    // simplest explanation for arriving with nine.
+    for (game, name) in [("haloreach_mcc", "reach"), ("halo4_mcc", "halo4")] {
+        let Ok(tag) = TagFile::new(definitions.join(game).join("particle.json")) else {
+            eprintln!("{name}: schema will not build");
+            continue;
+        };
+        if let Some(value) = tag
+            .root()
+            .fields()
+            .find(|f| f.name().eq_ignore_ascii_case("actual shader?"))
+            .and_then(|f| f.as_struct())
+        {
+            for inner in value.fields() {
+                if let Some(block) = inner.as_block() {
+                    eprintln!(
+                        "{name} schema: {:<24} max_count {}",
+                        inner.name(),
+                        block.definition().max_count()
+                    );
+                }
+            }
+        }
+    }
+
+    // And the specific tag, end to end.
+    let source_path = find(&reach, "particle", usize::MAX)
+        .into_iter()
+        .find(|p| p.to_string_lossy().contains("fiery_smoke"))
+        .unwrap();
+    let source = blam_tags::convert::read_tag_for_conversion(
+        &source_path,
+        Some("haloreach_mcc"),
+        Some(&definitions),
+        group_tag,
+    )
+    .unwrap();
+    let groups = blam_tags::convert::GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+    let templates = blam_tags::convert::NativeTemplateIndex::build(&h4, &groups);
+    let draft = blam_tags::convert::analyze_conversion_with_templates(
+        &source,
+        "haloreach_mcc",
+        "halo4_mcc",
+        &definitions,
+        Some(&templates),
+    )
+    .unwrap();
+    eprintln!(
+        "
+smoke_fiery_large: source options={} params={} -> converted options={} params={}",
+        counts(&source, "actual shader?", "options"),
+        counts(&source, "actual shader?", "parameters"),
+        counts(&draft.tag, "actual shader?", "options"),
+        counts(&draft.tag, "actual shader?", "parameters"),
+    );
+    for issue in &draft.report.issues {
+        eprintln!("  {:?} {} - {}", issue.kind, issue.path, issue.message);
+    }
+}
+
+/// What the tenth category's options are, and what H4 particles pick for it.
+#[test]
+#[ignore = "diagnostic; needs H4EK"]
+fn report_the_tenth_particle_option_category() {
+    let Some(h4) = kit("H4EK") else {
+        eprintln!("skipping: needs H4EK");
+        return;
+    };
+    let rmdf = TagFile::read(h4.join("shaders/particle.render_method_definition")).unwrap();
+    let block = rmdf
+        .root()
+        .fields()
+        .find(|f| f.name().eq_ignore_ascii_case("categories"))
+        .and_then(|f| f.as_block())
+        .unwrap();
+    let element = block.element(9).unwrap();
+    for inner in element.fields() {
+        if inner.name().eq_ignore_ascii_case("options") {
+            if let Some(options) = inner.as_block() {
+                for index in 0..options.len() {
+                    let name = options
+                        .element(index)
+                        .and_then(|o| {
+                            o.fields().find_map(|f| match f.value() {
+                                Some(TagFieldData::StringId(s)) => Some(s.string.clone()),
+                                Some(TagFieldData::OldStringId(s)) => Some(s.string.clone()),
+                                _ => None,
+                            })
+                        })
+                        .unwrap_or_default();
+                    eprintln!("  self_illumination option [{index}] = {name:?}");
+                }
+            }
+        }
+    }
+    // What the shipped tags actually select in each slot.
+    let mut slot9: BTreeMap<i64, usize> = BTreeMap::new();
+    let mut shape = String::new();
+    for path in find(&h4, "particle", 400) {
+        let Ok(tag) = TagFile::read(&path) else { continue };
+        let Some(options) = tag
+            .root()
+            .fields()
+            .find(|f| f.name().eq_ignore_ascii_case("actual shader?"))
+            .and_then(|f| f.as_struct())
+            .and_then(|v| {
+                v.fields()
+                    .find(|f| f.name().eq_ignore_ascii_case("options"))
+                    .and_then(|f| f.as_block())
+            })
+        else {
+            continue;
+        };
+        if shape.is_empty() {
+            if let Some(first) = options.element(0) {
+                shape = first
+                    .fields()
+                    .map(|f| format!("{} {:?}", f.name(), f.field_type()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+            }
+        }
+        if let Some(element) = options.element(9) {
+            if let Some(value) = element.fields().next().and_then(|f| f.value()) {
+                let n = match value {
+                    TagFieldData::ShortInteger(v) => v as i64,
+                    TagFieldData::ShortEnum { value, .. } => value as i64,
+                    TagFieldData::ShortBlockIndex(v) => v as i64,
+                    other => {
+                        eprintln!("  slot 9 holds {other:?}");
+                        continue;
+                    }
+                };
+                *slot9.entry(n).or_default() += 1;
+            }
+        }
+    }
+    eprintln!("  option element shape: {shape}");
+    eprintln!("  slot 9 values across shipped H4 particles: {slot9:?}");
+}
+
+/// Every converted Reach fx tag carries the option count Halo 4 requires.
+#[test]
+#[ignore = "diagnostic; needs HREK and H4EK"]
+fn report_reach_to_halo_4_fx_option_counts() {
+    let (Some(reach), Some(h4)) = (kit("HREK"), kit("H4EK")) else {
+        eprintln!("skipping: needs HREK and H4EK");
+        return;
+    };
+    let definitions = definitions();
+    let groups = blam_tags::convert::GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+    let templates = blam_tags::convert::NativeTemplateIndex::build(&h4, &groups);
+    let options_of = |tag: &TagFile| -> Option<usize> {
+        tag.root()
+            .fields()
+            .find_map(|f| f.as_struct().filter(|v| {
+                v.fields().any(|i| i.name().eq_ignore_ascii_case("options"))
+                    && v.fields().any(|i| i.name().eq_ignore_ascii_case("parameters"))
+                    && v.fields().any(|i| i.name().eq_ignore_ascii_case("postprocess"))
+            }))
+            .and_then(|v| {
+                v.fields()
+                    .find(|i| i.name().eq_ignore_ascii_case("options"))
+                    .and_then(|i| i.as_block())
+                    .map(|b| b.len())
+            })
+    };
+    for (extension, fourcc) in [("particle", *b"prt3"), ("beam_system", *b"beam"), ("decal_system", *b"decs"), ("light_volume_system", *b"ligh")] {
+        let group_tag = u32::from_be_bytes(fourcc);
+        let mut short_source = 0usize;
+        let mut short_output = 0usize;
+        let mut converted = 0usize;
+        let mut refused = 0usize;
+        let mut null_material = 0usize;
+        for path in find(&reach, extension, 250) {
+            let Ok(source) = blam_tags::convert::read_tag_for_conversion(
+                &path, Some("haloreach_mcc"), Some(&definitions), group_tag) else { continue };
+            let src_options = options_of(&source);
+            match blam_tags::convert::analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "halo4_mcc", &definitions, Some(&templates)) {
+                Ok(draft) => {
+                    converted += 1;
+                    let out = options_of(&draft.tag);
+                    if src_options.is_some_and(|n| n < 10) { short_source += 1; }
+                    if out.is_some_and(|n| n < 10) { short_output += 1; }
+                    let material_null = draft.tag.root().fields()
+                        .find(|f| f.name().eq_ignore_ascii_case("actual material?"))
+                        .and_then(|f| f.as_struct())
+                        .map(|v| v.fields().any(|i| {
+                            i.name().eq_ignore_ascii_case("material shader")
+                                && matches!(i.value(), Some(TagFieldData::TagReference(r))
+                                    if r.group_tag_and_name.as_ref().is_none_or(|(_, n)| n.is_empty()))
+                        }))
+                        .unwrap_or(false);
+                    if material_null { null_material += 1; }
+                }
+                Err(_) => refused += 1,
+            }
+        }
+        eprintln!(
+            ".{extension:<22} {converted} converted, {refused} refused; sources short of 10:              {short_source}, OUTPUTS STILL SHORT: {short_output}; null material shader: {null_material}"
+        );
+    }
+}
+
+/// The seven shipped Halo 4 particles with no material shader: what else do they
+/// have? If their render method is populated, a converted particle matches a
+/// configuration the game ships, and the null material is a look to reconnect
+/// rather than a broken tag.
+#[test]
+#[ignore = "diagnostic; needs H4EK"]
+fn report_shipped_halo_4_particles_with_no_material_shader() {
+    let Some(h4) = kit("H4EK") else {
+        eprintln!("skipping: needs H4EK");
+        return;
+    };
+    let mut found = 0usize;
+    for path in find(&h4, "particle", 900) {
+        let Ok(tag) = TagFile::read(&path) else { continue };
+        let material = tag.root().fields()
+            .find(|f| f.name().eq_ignore_ascii_case("actual material?"))
+            .and_then(|f| f.as_struct());
+        let null_shader = material.map(|v| v.fields().any(|i| {
+            i.name().eq_ignore_ascii_case("material shader")
+                && matches!(i.value(), Some(TagFieldData::TagReference(r))
+                    if r.group_tag_and_name.as_ref().is_none_or(|(_, n)| n.is_empty()))
+        })).unwrap_or(false);
+        if !null_shader { continue; }
+        found += 1;
+        let shader = tag.root().fields()
+            .find(|f| f.name().eq_ignore_ascii_case("actual shader?"))
+            .and_then(|f| f.as_struct());
+        let (rmdf, options, params) = shader.map(|v| {
+            let rmdf = v.fields().find(|i| i.name() == "definition")
+                .and_then(|i| match i.value() {
+                    Some(TagFieldData::TagReference(r)) =>
+                        r.group_tag_and_name.map(|(_, n)| n),
+                    _ => None })
+                .unwrap_or_default();
+            let o = v.fields().find(|i| i.name() == "options").and_then(|i| i.as_block()).map(|b| b.len()).unwrap_or(0);
+            let p = v.fields().find(|i| i.name() == "parameters").and_then(|i| i.as_block()).map(|b| b.len()).unwrap_or(0);
+            (rmdf, o, p)
+        }).unwrap_or_default();
+        eprintln!(
+            "  {}
+      render method: rmdf={rmdf:?} options={options} parameters={params}",
+            path.strip_prefix(&h4).unwrap_or(&path).display()
+        );
+    }
+    eprintln!("{found} shipped H4 particle(s) ship with no material shader");
+}
+
+/// Any *other* block whose length Halo 4 fixes, that a converted tag gets wrong.
+///
+/// The options bug was one instance of a class: a block whose length is dictated
+/// by the destination rather than by the source. This finds every block that is
+/// constant across the shipped corpus and checks converted output against it, so
+/// a second instance shows up as data rather than as another bug report.
+#[test]
+#[ignore = "diagnostic; needs HREK and H4EK"]
+fn report_blocks_halo_4_fixes_that_conversion_gets_wrong() {
+    let (Some(reach), Some(h4)) = (kit("HREK"), kit("H4EK")) else {
+        eprintln!("skipping: needs HREK and H4EK");
+        return;
+    };
+    let definitions = definitions();
+    let group_tag = u32::from_be_bytes(*b"prt3");
+
+    fn block_lengths(tag: &TagFile) -> BTreeMap<String, usize> {
+        fn walk(value: TagStruct<'_>, prefix: &str, out: &mut BTreeMap<String, usize>) {
+            for field in value.fields() {
+                let path = if prefix.is_empty() {
+                    field.name().to_owned()
+                } else {
+                    format!("{prefix}/{}", field.name())
+                };
+                if let Some(block) = field.as_block() {
+                    out.insert(path.clone(), block.len());
+                }
+                if let Some(nested) = field.as_struct() {
+                    walk(nested, &path, out);
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(tag.root(), "", &mut out);
+        out
+    }
+
+    // Which top-level block lengths never vary in the shipped corpus.
+    let mut seen: BTreeMap<String, std::collections::BTreeSet<usize>> = BTreeMap::new();
+    let mut shipped = 0usize;
+    for path in find(&h4, "particle", 600) {
+        let Ok(tag) = TagFile::read(&path) else { continue };
+        shipped += 1;
+        for (name, len) in block_lengths(&tag) {
+            seen.entry(name).or_default().insert(len);
+        }
+    }
+    let fixed: BTreeMap<String, usize> = seen
+        .iter()
+        .filter(|(_, lens)| lens.len() == 1)
+        .map(|(name, lens)| (name.clone(), *lens.iter().next().unwrap()))
+        .collect();
+    eprintln!("across {shipped} shipped H4 particles, {} block(s) never vary:", fixed.len());
+    for (name, len) in &fixed {
+        eprintln!("    {name} = {len}");
+    }
+
+    // Now: do converted particles honour every one of them?
+    let groups = blam_tags::convert::GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+    let templates = blam_tags::convert::NativeTemplateIndex::build(&h4, &groups);
+    let mut violations: BTreeMap<String, usize> = BTreeMap::new();
+    let mut checked = 0usize;
+    for path in find(&reach, "particle", 250) {
+        let Ok(source) = blam_tags::convert::read_tag_for_conversion(
+            &path, Some("haloreach_mcc"), Some(&definitions), group_tag) else { continue };
+        let Ok(draft) = blam_tags::convert::analyze_conversion_with_templates(
+            &source, "haloreach_mcc", "halo4_mcc", &definitions, Some(&templates)) else { continue };
+        checked += 1;
+        for (name, len) in block_lengths(&draft.tag) {
+            if let Some(&wanted) = fixed.get(&name) {
+                if len != wanted {
+                    *violations.entry(format!("{name} (want {wanted}, got {len})")).or_default() += 1;
+                }
+            }
+        }
+    }
+    eprintln!("
+{checked} converted particles checked against those invariants");
+    if violations.is_empty() {
+        eprintln!("    no violations");
+    } else {
+        for (what, count) in &violations {
+            eprintln!("    {count:>4} x {what}");
+        }
+    }
+}
