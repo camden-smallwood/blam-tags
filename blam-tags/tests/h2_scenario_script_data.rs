@@ -8,11 +8,24 @@ use std::path::{Path, PathBuf};
 
 use blam_tags::{TagFieldData, TagFieldType, TagFile, TagStruct};
 
+/// An editing kit's `tags` directory, via `BLAM_TEST_<KIT>` or a Steam library.
+///
+/// Same convention as the other kit-gated suites: a machine with no kits skips
+/// rather than fails, and a machine with kits somewhere unusual can say where.
 fn kit(name: &str) -> Option<PathBuf> {
-    let path = PathBuf::from("D:/SteamLibrary/steamapps/common")
-        .join(name)
-        .join("tags");
-    path.is_dir().then_some(path)
+    if let Ok(path) = std::env::var(format!("BLAM_TEST_{name}")) {
+        let path = PathBuf::from(path);
+        return path.is_dir().then_some(path);
+    }
+    [
+        "D:/SteamLibrary/steamapps/common",
+        "C:/Program Files (x86)/Steam/steamapps/common",
+        "C:/Program Files/Steam/steamapps/common",
+        "E:/SteamLibrary/steamapps/common",
+    ]
+    .iter()
+    .map(|root| PathBuf::from(root).join(name).join("tags"))
+    .find(|path| path.is_dir())
 }
 
 fn definitions() -> PathBuf {
