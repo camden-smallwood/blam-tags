@@ -1363,3 +1363,258 @@ fn report_blocks_halo_4_fixes_that_conversion_gets_wrong() {
         }
     }
 }
+
+/// Is Halo 4's `tracer_system` the same tag as Reach's `contrail_system`?
+#[test]
+#[ignore = "diagnostic; needs the definitions"]
+fn report_contrail_against_tracer() {
+    let definitions = definitions();
+    let describe = |game: &str, group: &str| -> Option<(usize, Vec<String>)> {
+        let tag = TagFile::new(definitions.join(game).join(format!("{group}.json"))).ok()?;
+        let fields = tag
+            .root()
+            .fields()
+            .map(|f| format!("{} :{:?}", f.name(), f.field_type()))
+            .collect::<Vec<_>>();
+        Some((tag.root().definition().size(), fields))
+    };
+    let mut sets: Vec<(String, usize, Vec<String>)> = Vec::new();
+    // The dumped Reach/ODST contrail schema panics on build (the `unusable_schemas`
+    // case), so schemas are probed behind a catch and real kit tags carry the rest:
+    // a shipped tag has its own layout and needs no dump at all.
+    for (game, group) in [
+        ("halo3_mcc", "contrail_system"),
+        ("haloreach_mcc", "contrail_system"),
+        ("haloreach_mcc", "beam_system"),
+        ("halo4_mcc", "tracer_system"),
+    ] {
+        let probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| describe(game, group)));
+        match probe {
+            Ok(Some((size, fields))) => {
+                eprintln!("{game}/{group} SCHEMA: {size} bytes, {} fields", fields.len());
+                sets.push((format!("{game}/{group}"), size, fields));
+            }
+            Ok(None) => eprintln!("{game}/{group} SCHEMA: will not build"),
+            Err(_) => eprintln!("{game}/{group} SCHEMA: PANICS on build"),
+        }
+    }
+    // Now the same, from tags the kits actually ship.
+    sets.clear();
+    for (kit_name, group, extension) in [
+        ("HREK", "contrail_system", "contrail_system"),
+        ("HREK", "beam_system", "beam_system"),
+        ("H4EK", "tracer_system", "tracer_system"),
+    ] {
+        let Some(root) = kit(kit_name) else { continue };
+        let Some(path) = find(&root, extension, 1).into_iter().next() else {
+            eprintln!("{kit_name}/{group}: none shipped");
+            continue;
+        };
+        let Ok(tag) = TagFile::read(&path) else {
+            eprintln!("{kit_name}/{group}: unreadable");
+            continue;
+        };
+        let fields: Vec<String> = tag
+            .root()
+            .fields()
+            .map(|f| format!("{} :{:?}", f.name(), f.field_type()))
+            .collect();
+        eprintln!(
+            "{kit_name}/{group} SHIPPED: {} bytes, {} fields",
+            tag.root().definition().size(),
+            fields.len()
+        );
+        sets.push((format!("{kit_name}/{group}"), 0, fields));
+    }
+    // Overlap of every source against the Halo 4 target.
+    if let Some((target_label, _, target)) = sets.last().cloned() {
+        let target_names: std::collections::BTreeSet<&String> = target.iter().collect();
+        for (label, _, fields) in &sets[..sets.len().saturating_sub(1)] {
+            let names: std::collections::BTreeSet<&String> = fields.iter().collect();
+            let shared: Vec<_> = names.intersection(&target_names).collect();
+            eprintln!(
+                "
+{label} vs {target_label}: {} of {} source fields match exactly",
+                shared.len(),
+                fields.len()
+            );
+            let missing: Vec<&&String> = names.difference(&target_names).collect();
+            eprintln!("  source-only ({}): {:?}", missing.len(), &missing[..missing.len().min(12)]);
+            let extra: Vec<&&String> = target_names.difference(&names).collect();
+            eprintln!("  target-only ({}): {:?}", extra.len(), &extra[..extra.len().min(12)]);
+        }
+    }
+}
+
+/// A Reach contrail entry beside a Halo 4 tracer entry.
+#[test]
+#[ignore = "diagnostic; needs HREK and H4EK"]
+fn report_contrail_entry_against_tracer_entry() {
+    let (Some(reach), Some(h4)) = (kit("HREK"), kit("H4EK")) else {
+        eprintln!("skipping: needs HREK and H4EK");
+        return;
+    };
+    let element_fields = |path: &Path, block_name: &str| -> Option<Vec<String>> {
+        let tag = TagFile::read(path).ok()?;
+        let block = tag
+            .root()
+            .fields()
+            .find(|f| f.name().eq_ignore_ascii_case(block_name))?
+            .as_block()?;
+        let element = block.element(0)?;
+        Some(
+            element
+                .fields()
+                .map(|f| format!("{}:{:?}", f.name(), f.field_type()))
+                .collect(),
+        )
+    };
+    // Take the first shipped tag whose block actually has an element.
+    let pick = |root: &Path, extension: &str, block_name: &str| -> Option<(PathBuf, Vec<String>)> {
+        find(root, extension, 60)
+            .into_iter()
+            .find_map(|path| element_fields(&path, block_name).map(|f| (path, f)))
+    };
+    let Some((contrail_path, contrail)) = pick(&reach, "contrail_system", "contrails") else {
+        eprintln!("no HREK contrail with entries");
+        return;
+    };
+    let Some((tracer_path, tracer)) = pick(&h4, "tracer_system", "tracers") else {
+        eprintln!("no H4EK tracer with entries");
+        return;
+    };
+    eprintln!("contrail entry ({}): {} fields", contrail_path.file_name().unwrap().to_string_lossy(), contrail.len());
+    eprintln!("tracer entry   ({}): {} fields", tracer_path.file_name().unwrap().to_string_lossy(), tracer.len());
+    let a: std::collections::BTreeSet<&String> = contrail.iter().collect();
+    let b: std::collections::BTreeSet<&String> = tracer.iter().collect();
+    let shared: Vec<_> = a.intersection(&b).collect();
+    eprintln!("
+shared, name and type ({} of {} / {}):", shared.len(), contrail.len(), tracer.len());
+    for name in &shared {
+        eprintln!("    {name}");
+    }
+    let only_a: Vec<_> = a.difference(&b).collect();
+    eprintln!("
+contrail-only ({}):", only_a.len());
+    for name in only_a.iter().take(20) {
+        eprintln!("    {name}");
+    }
+    let only_b: Vec<_> = b.difference(&a).collect();
+    eprintln!("
+tracer-only ({}):", only_b.len());
+    for name in only_b.iter().take(20) {
+        eprintln!("    {name}");
+    }
+}
+
+/// Does a Reach contrail_system actually reach Halo 4 as a tracer_system?
+#[test]
+#[ignore = "diagnostic; needs HREK and H4EK"]
+fn report_contrail_to_tracer_conversions() {
+    let (Some(reach), Some(h4)) = (kit("HREK"), kit("H4EK")) else {
+        eprintln!("skipping: needs HREK and H4EK");
+        return;
+    };
+    let definitions = definitions();
+    let group_tag = u32::from_be_bytes(*b"cntl");
+    let groups = blam_tags::convert::GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+    let templates = blam_tags::convert::NativeTemplateIndex::build(&h4, &groups);
+    let (mut ok, mut failed) = (0usize, 0usize);
+    let mut first_error = String::new();
+    let mut carried = (0usize, 0usize);
+    for path in find(&reach, "contrail_system", 60) {
+        let Ok(source) = blam_tags::convert::read_tag_for_conversion(
+            &path, Some("haloreach_mcc"), Some(&definitions), group_tag) else { continue };
+        let src_entries = source.root().fields()
+            .find(|f| f.name().eq_ignore_ascii_case("contrails"))
+            .and_then(|f| f.as_block()).map(|b| b.len()).unwrap_or(0);
+        match blam_tags::convert::analyze_conversion_with_templates(
+            &source, "haloreach_mcc", "halo4_mcc", &definitions, Some(&templates)) {
+            Ok(draft) => {
+                ok += 1;
+                let out_entries = draft.tag.root().fields()
+                    .find(|f| f.name().eq_ignore_ascii_case("tracers"))
+                    .and_then(|f| f.as_block()).map(|b| b.len()).unwrap_or(0);
+                carried.0 += src_entries;
+                carried.1 += out_entries;
+                if ok == 1 {
+                    eprintln!(
+                        "first: {} -> {} (.{}), {src_entries} contrail(s) -> {out_entries} tracer(s)",
+                        path.file_name().unwrap().to_string_lossy(),
+                        draft.target_group_name,
+                        draft.target_extension
+                    );
+                    eprintln!("  exact={} semantic={} defaulted={} unsupported={}",
+                        draft.report.copied_exact, draft.report.converted_semantic,
+                        draft.report.defaulted_target, draft.report.unsupported_source);
+                }
+            }
+            Err(error) => {
+                failed += 1;
+                if first_error.is_empty() { first_error = error; }
+            }
+        }
+    }
+    eprintln!("
+contrail_system -> halo4: {ok} converted, {failed} failed");
+    eprintln!("entries: {} in -> {} out", carried.0, carried.1);
+    if !first_error.is_empty() { eprintln!("first error: {first_error}"); }
+}
+
+/// What Halo 4 tracers draw with, and what a converted one is left holding.
+#[test]
+#[ignore = "diagnostic; needs HREK and H4EK"]
+fn report_tracer_entry_materials() {
+    let (Some(reach), Some(h4)) = (kit("HREK"), kit("H4EK")) else {
+        eprintln!("skipping: needs HREK and H4EK");
+        return;
+    };
+    let definitions = definitions();
+    let shaders_in = |tag: &TagFile| -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(block) = tag.root().fields()
+            .find(|f| f.name().eq_ignore_ascii_case("tracers"))
+            .and_then(|f| f.as_block())
+        {
+            for index in 0..block.len() {
+                let Some(element) = block.element(index) else { continue };
+                if let Some(material) = element.fields()
+                    .find(|f| f.name().eq_ignore_ascii_case("actual material?"))
+                    .and_then(|f| f.as_struct())
+                {
+                    let name = material.fields()
+                        .find(|i| i.name().eq_ignore_ascii_case("material shader"))
+                        .and_then(|i| match i.value() {
+                            Some(TagFieldData::TagReference(r)) =>
+                                r.group_tag_and_name.map(|(_, n)| n),
+                            _ => None })
+                        .unwrap_or_default();
+                    out.push(if name.is_empty() { "(null)".to_owned() } else { name });
+                }
+            }
+        }
+        out
+    };
+    let mut shipped: BTreeMap<String, usize> = BTreeMap::new();
+    for path in find(&h4, "tracer_system", 200) {
+        let Ok(tag) = TagFile::read(&path) else { continue };
+        for name in shaders_in(&tag) { *shipped.entry(name).or_default() += 1; }
+    }
+    let mut top: Vec<_> = shipped.iter().collect();
+    top.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+    eprintln!("shipped H4 tracer entry materials:");
+    for (name, count) in top.iter().take(8) { eprintln!("    {count:>5}  {name}"); }
+
+    let groups = blam_tags::convert::GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+    let templates = blam_tags::convert::NativeTemplateIndex::build(&h4, &groups);
+    let mut converted: BTreeMap<String, usize> = BTreeMap::new();
+    for path in find(&reach, "contrail_system", 60) {
+        let Ok(source) = blam_tags::convert::read_tag_for_conversion(
+            &path, Some("haloreach_mcc"), Some(&definitions), u32::from_be_bytes(*b"cntl")) else { continue };
+        let Ok(draft) = blam_tags::convert::analyze_conversion_with_templates(
+            &source, "haloreach_mcc", "halo4_mcc", &definitions, Some(&templates)) else { continue };
+        for name in shaders_in(&draft.tag) { *converted.entry(name).or_default() += 1; }
+    }
+    eprintln!("
+converted tracer entry materials: {converted:?}");
+}

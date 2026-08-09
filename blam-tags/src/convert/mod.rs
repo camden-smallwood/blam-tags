@@ -2021,7 +2021,7 @@ fn analyze_conversion_inner(
     )?;
     strip_cross_engine_scripts(&mut target, &mut context);
     restore_render_method_option_slots(&mut target, &template_option_counts, &mut context);
-    apply_default_particle_material(&mut target, &mut context);
+    apply_default_material(&mut target, &mut context);
     let fail_closed_losses = validate_critical_runtime_safety(source, &context, policy)?;
     if !fail_closed_losses.is_empty() {
         context.report.issues.push(ConversionIssue {
@@ -2200,9 +2200,27 @@ fn restore_render_method_option_slots(
 /// guess at the original look, and the report says so, because which material a
 /// Reach particle *should* become is an art decision the tag does not carry.
 /// Verified present in both kits that declare the field.
-const DEFAULT_PARTICLE_MATERIAL: &[(&str, &str)] = &[
-    ("halo4_mcc", "shaders\\material_shaders\\fx\\particle_base"),
-    ("halo2amp_mcc", "shaders\\material_shaders\\fx\\particle_base"),
+/// The material a converted fx tag starts with, by target game and *source*
+/// group.
+///
+/// Halo 4 puts a `material` where the older engines put a render method, so a tag
+/// converted forward has nothing to fill it with and arrives holding a null
+/// `mats` reference. For a particle that is survivable — 7 of 900 shipped Halo 4
+/// particles are the same, all with a working render method — but a tracer has no
+/// render method at all, and **none** of the 316 shipped tracer entries has a null
+/// material. There the tag has simply nothing to draw with.
+///
+/// Each default is the plain member of its family: `particle_base` leads Halo 4's
+/// own particles at 344 of 900, and `tracer_base` is the unadorned tracer (124
+/// entries, behind `tracer_palettized` at 146 only because palettized is a look
+/// rather than a baseline). A starting point, not a guess at the original — which
+/// material a Reach effect *should* become is an art decision the tag does not
+/// carry, and the report says so. Both verified present in both kits.
+const DEFAULT_MATERIALS: &[(&str, &str, &str)] = &[
+    ("halo4_mcc", "particle", r"shaders\material_shaders\fx\particle_base"),
+    ("halo2amp_mcc", "particle", r"shaders\material_shaders\fx\particle_base"),
+    ("halo4_mcc", "contrail_system", r"shaders\material_shaders\fx\tracer_base"),
+    ("halo2amp_mcc", "contrail_system", r"shaders\material_shaders\fx\tracer_base"),
 ];
 
 /// Whether a struct is a material: the shader reference, its parameters, and the
@@ -2220,78 +2238,101 @@ fn is_material_struct(value: TagStruct<'_>) -> bool {
     has("material shader") && has("material parameters") && has("physics material name")
 }
 
-/// Give a converted particle a material shader to draw with.
+/// Give a converted fx tag a material to draw with.
 ///
-/// Only when the conversion left the reference null -- a source that supplied
-/// one keeps it, and a target game with no default in the table is untouched.
-fn apply_default_particle_material(target: &mut TagFile, context: &mut ConversionContext<'_>) {
-    let Some((_, default_path)) = DEFAULT_PARTICLE_MATERIAL
-        .iter()
-        .find(|(game, _)| *game == context.target_game)
-    else {
+/// Only where the conversion left the reference empty: a source that supplied one
+/// keeps it, and a target game or group with no entry in the table is untouched.
+///
+/// Descends into block elements as well as nested structs, because that is where
+/// the material usually is — a particle keeps one at the root, but a tracer keeps
+/// one per entry in the `tracers` block, and only handling the root would have
+/// fixed the case that was already survivable while leaving the one that is not.
+fn apply_default_material(target: &mut TagFile, context: &mut ConversionContext<'_>) {
+    let Some((_, _, default_path)) = DEFAULT_MATERIALS.iter().find(|(game, group, _)| {
+        *game == context.target_game && context.group_name.eq_ignore_ascii_case(group)
+    }) else {
         return;
     };
     let default_path = (*default_path).to_owned();
     let group = parse_group_tag("mats").unwrap_or(u32::from_be_bytes(*b"mats"));
-    let mut applied = Vec::new();
-    let field_count = target.root().fields().count();
-    let mut root = target.root_mut();
-    for ordinal in 0..field_count {
-        let is_material = root
-            .as_ref()
-            .fields()
-            .nth(ordinal)
-            .and_then(|field| field.as_struct())
-            .is_some_and(is_material_struct);
-        if !is_material {
-            continue;
-        }
-        let Some(mut field) = root.field_at_mut(ordinal) else {
-            continue;
-        };
-        let name = field.as_ref().name().to_owned();
-        let Some(mut value) = field.as_struct_mut() else {
-            continue;
-        };
-        let Some(shader_ordinal) = value
-            .as_ref()
-            .fields()
-            .position(|inner| clean_field_key(inner.name()) == "material shader")
-        else {
-            continue;
-        };
-        let Some(mut shader) = value.field_at_mut(shader_ordinal) else {
-            continue;
-        };
-        let empty = match shader.as_ref().value() {
-            Some(TagFieldData::TagReference(reference)) => reference
-                .group_tag_and_name
+
+    fn walk(
+        mut value: TagStructMut<'_>,
+        default_path: &str,
+        group: u32,
+        applied: &mut usize,
+    ) {
+        if is_material_struct(value.as_ref()) {
+            let shader_ordinal = value
                 .as_ref()
-                .is_none_or(|(_, path)| path.is_empty()),
-            _ => false,
-        };
-        if !empty {
-            continue;
+                .fields()
+                .position(|field| clean_field_key(field.name()) == "material shader");
+            if let Some(ordinal) = shader_ordinal {
+                if let Some(mut shader) = value.field_at_mut(ordinal) {
+                    let empty = match shader.as_ref().value() {
+                        Some(TagFieldData::TagReference(reference)) => reference
+                            .group_tag_and_name
+                            .as_ref()
+                            .is_none_or(|(_, path)| path.is_empty()),
+                        _ => false,
+                    };
+                    if empty
+                        && shader
+                            .set(TagFieldData::TagReference(TagReferenceData {
+                                group_tag_and_name: Some((group, default_path.to_owned())),
+                            }))
+                            .is_ok()
+                    {
+                        *applied += 1;
+                    }
+                }
+            }
         }
-        if shader
-            .set(TagFieldData::TagReference(TagReferenceData {
-                group_tag_and_name: Some((group, default_path.clone())),
-            }))
-            .is_ok()
-        {
-            applied.push(name);
+        let field_count = value.as_ref().fields().count();
+        for ordinal in 0..field_count {
+            let kind = match value.as_ref().fields().nth(ordinal) {
+                Some(field) => field.field_type(),
+                None => continue,
+            };
+            match kind {
+                TagFieldType::Struct => {
+                    if let Some(mut field) = value.field_at_mut(ordinal) {
+                        if let Some(nested) = field.as_struct_mut() {
+                            walk(nested, default_path, group, applied);
+                        }
+                    }
+                }
+                TagFieldType::Block => {
+                    if let Some(mut field) = value.field_at_mut(ordinal) {
+                        if let Some(mut block) = field.as_block_mut() {
+                            for index in 0..block.len() {
+                                if let Some(element) = block.element_mut(index) {
+                                    walk(element, default_path, group, applied);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
-    for name in applied {
-        context.report.issues.push(ConversionIssue {
-            kind: ConversionIssueKind::Warning,
-            path: format!("{name}/material shader"),
-            message: format!(
-                "{} has no material for a particle to carry across, so this one starts on                  `{default_path}` -- the plainest of {}'s particle materials and the one most of                  its own particles use. Point it somewhere else if the original wanted a                  palettized, scrolling or plasma look.",
-                context.source_game, context.target_game
-            ),
-        });
+
+    let mut applied = 0usize;
+    walk(target.root_mut(), &default_path, group, &mut applied);
+    if applied == 0 {
+        return;
     }
+    context.report.issues.push(ConversionIssue {
+        kind: ConversionIssueKind::Warning,
+        path: context.group_name.to_owned(),
+        message: format!(
+            "{} has no material for {} to carry across, so {applied} started on \
+             `{default_path}` — the plain member of {}'s family for this group. Point them \
+             somewhere else if the original wanted a palettized, scrolling or plasma look.",
+            context.source_game, context.group_name, context.target_game
+        ),
+    });
 }
 
 /// A scenario's compiled HaloScript, which never survives an engine change.
@@ -8475,6 +8516,131 @@ mod tests {
                 h4_path.display()
             );
         }
+    }
+
+    /// A Reach contrail_system arrives in Halo 4 as a tracer_system.
+    ///
+    /// Halo 4 renamed the class. The catalog used to say it *removed* it, which
+    /// is why this converted to nothing; measurement says otherwise. H3EK ships
+    /// 67 contrail_systems and HREK 88 with no tracer_system between them, H4EK
+    /// ships 253 tracer_systems and none of the other, and the entry structs
+    /// share 21 of the contrail's 37 fields by name and type.
+    ///
+    /// Asserts the substance moved, not just that a file came out: the entries
+    /// are all present, and one of the shared profile fields really carries.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_reach_contrail_system_becomes_a_halo_4_tracer_system() {
+        let (Some(reach), Some(h4)) = (
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+        ) else {
+            eprintln!("skipping: needs HREK and H4EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = u32::from_be_bytes(*b"cntl");
+        let entries = |tag: &TagFile, name: &str| -> usize {
+            tag.root()
+                .fields()
+                .find(|field| clean_field_key(field.name()) == name)
+                .and_then(|field| field.as_block())
+                .map(|block| block.len())
+                .unwrap_or(0)
+        };
+
+        let picked = tags_with_extension(&reach, "contrail_system")
+            .into_iter()
+            .take(40)
+            .find_map(|path| {
+                let tag = read_tag_for_conversion(
+                    &path,
+                    Some("haloreach_mcc"),
+                    Some(&definitions),
+                    group_tag,
+                )
+                .ok()?;
+                (entries(&tag, "contrails") > 0).then_some((path, tag))
+            });
+        let Some((path, source)) = picked else {
+            eprintln!("skipping: no HREK contrail_system with entries");
+            return;
+        };
+        let source_entries = entries(&source, "contrails");
+
+        let groups = GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h4, &groups);
+        let draft = analyze_conversion_with_templates(
+            &source,
+            "haloreach_mcc",
+            "halo4_mcc",
+            &definitions,
+            Some(&templates),
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+
+        assert_eq!(draft.target_group_name, "tracer_system");
+        assert_eq!(draft.target_extension, "tracer_system");
+        // The block is renamed, so every entry has to arrive under the new name
+        // or the tag is an empty shell that still counts as a conversion.
+        assert_eq!(
+            entries(&draft.tag, "tracers"),
+            source_entries,
+            "{}: {source_entries} contrail(s) in",
+            path.display()
+        );
+        // Halo 4 tracers have no render method, only a material, and none of the
+        // 316 shipped entries leaves it null — so a converted one must not.
+        let materials: Vec<String> = draft
+            .tag
+            .root()
+            .fields()
+            .find(|field| clean_field_key(field.name()) == "tracers")
+            .and_then(|field| field.as_block())
+            .map(|block| {
+                (0..block.len())
+                    .filter_map(|index| block.element(index))
+                    .filter_map(|element| {
+                        element
+                            .fields()
+                            .find(|f| clean_field_key(f.name()) == "actual material?")
+                            .and_then(|f| f.as_struct())
+                    })
+                    .filter_map(|material| {
+                        material
+                            .fields()
+                            .find(|f| clean_field_key(f.name()) == "material shader")
+                            .and_then(|f| match f.value() {
+                                Some(TagFieldData::TagReference(reference)) => {
+                                    reference.group_tag_and_name.map(|(_, name)| name)
+                                }
+                                _ => None,
+                            })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(materials.len(), source_entries, "{}", path.display());
+        assert!(
+            materials.iter().all(|name| !name.is_empty()),
+            "{}: a tracer with no material has nothing to draw with",
+            path.display()
+        );
+        // The result writes and reopens as a Halo 4 tag.
+        let bytes = draft.tag.write_to_bytes().unwrap();
+        let reopened = TagFile::read_from_bytes(&bytes).unwrap();
+        assert_eq!(
+            format_group_tag(reopened.header.group_tag),
+            "trac",
+            "{}",
+            path.display()
+        );
+        eprintln!(
+            "{}: {source_entries} contrail(s) -> {} tracer(s)",
+            path.display(),
+            entries(&draft.tag, "tracers")
+        );
     }
 
     /// A converted Reach particle keeps a render-method definition even when the

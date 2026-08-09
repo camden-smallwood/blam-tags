@@ -1325,6 +1325,38 @@
       "source": "postprocess",
       "target": "postprocess definition",
       "reason": "Same rename as the rest of the family."
+    },
+    {
+      "group": "contrail_system",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc",
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_struct_guid": null,
+      "target_struct_guid": null,
+      "source": "contrails",
+      "target": "tracers"
+    },
+    {
+      "group": "contrail_system",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc",
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_struct_guid": null,
+      "target_struct_guid": null,
+      "source": "contrail name",
+      "target": "tracer name"
     }
   ],
   "option_aliases": [
@@ -1432,7 +1464,7 @@
         "halo3odst_mcc",
         "haloreach_mcc"
       ],
-      "reason": "Halo 3 renamed the contrail tag class to contrail_system when the render-method family landed; it is the same class with the same authored role. Reviewed: an H2 projectile's attachment points at a `.contrail` and the reference was dropped outright before this rule, measured on battle_rifle_bullet.projectile. Halo 4 and H2A are excluded because they removed the class rather than renaming it."
+      "reason": "Halo 3 renamed the contrail tag class to contrail_system when the render-method family landed; it is the same class with the same authored role. Reviewed: an H2 projectile's attachment points at a `.contrail` and the reference was dropped outright before this rule, measured on battle_rifle_bullet.projectile. Halo 4 and H2A are excluded here because they renamed it again, to tracer_system -- see that rule. A Halo 2 contrail reaches Halo 4 by routing through Halo 3, one rename at a time."
     },
     {
       "source": "light_volume",
@@ -1637,6 +1669,20 @@
         "halo2amp_mcc"
       ],
       "reason": "Vestigial in Halo 4 like the rest of the family. Counted across all 19 Reach shader groups: H4EK and H2AMPEK ship **zero** of every one, against 7,140 and 1,917 `.material`. HREK ships 1 `.shader_mux`."
+    },
+    {
+      "source": "contrail_system",
+      "target": "tracer_system",
+      "source_games": [
+        "halo3_mcc",
+        "halo3odst_mcc",
+        "haloreach_mcc"
+      ],
+      "target_games": [
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "reason": "Halo 4 renamed contrail_system to tracer_system. Measured rather than assumed, because the catalog previously recorded the opposite: H3EK ships 67 contrail_systems and HREK 88 with no tracer_system between them, while H4EK ships 253 tracer_systems and none of the other. Both roots are a thin wrapper around one block of entries (`contrails`, `tracers`), and the entry structs share 21 of the contrail's 37 fields by name *and* type -- the whole substance of the effect: profile color, alpha, size, lifespan, rotation, rotation rate, offset, palette, shape, black point, intensity and self acceleration, plus uv scrolling and tiling, both fade pairs, appearance flags and sort bias. What differs is the known Halo 4 drift: `actual shader?` becomes `actual material?`, the entry's name field is renamed, and Halo 4 adds length, offset, density and angle fades while dropping emission rate and the per-entry lod distances. Those are reported per field, which is what a rename with feature drift should look like."
     }
   ],
   "payload_aliases": [
