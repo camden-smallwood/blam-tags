@@ -193,6 +193,98 @@ pub fn conversion_targets_for(source_game: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// The engine generations in order, as the tag formats actually descend.
+///
+/// This is the order the reviewed rules were authored along: every mapping in the
+/// catalog names an adjacent pair or a set of them, because that is where one
+/// engine's designers were looking at the previous one's tags. A route between
+/// distant profiles therefore walks this list rather than jumping, which is what
+/// makes each hop a conversion somebody has checked.
+///
+/// Campaign Evolved is deliberately absent. It is not a generation — it is a UE5
+/// remake whose schemas descend from Reach's, so it hangs off Reach and pairs
+/// with nothing else (see [`conversion_pair_supported`]). Routing *through* it
+/// would mean passing a tag through a game that has no such tag class.
+pub const CONVERSION_CHAIN: &[&str] = &[
+    "haloce_mcc",
+    "halo2_mcc",
+    "halo3_mcc",
+    "halo3odst_mcc",
+    "haloreach_mcc",
+    "halo4_mcc",
+    "halo2amp_mcc",
+];
+
+/// Routes from `source_game` to `target_game`, shortest first.
+///
+/// The first entry is always the direct pair, when it is allowed at all — a
+/// caller tries these in order and stops at the first that carries the tag, so
+/// routing never happens to a conversion that worked. Later entries add one
+/// intermediate at a time, taken from [`CONVERSION_CHAIN`] *between* the two
+/// endpoints: converting Halo 2 to Reach may pass through Halo 3 and ODST, but
+/// never out to Halo 4 and back.
+///
+/// Campaign Evolved has exactly one partner, so it never routes: a Halo 3 tag
+/// cannot reach it via Reach, because the reviewed relationship is between
+/// Reach's schemas and its own, not between anything else's.
+pub fn conversion_routes(source_game: &str, target_game: &str) -> Vec<Vec<String>> {
+    let mut routes = Vec::new();
+    if conversion_pair_supported(source_game, target_game) {
+        routes.push(vec![source_game.to_owned(), target_game.to_owned()]);
+    }
+    if source_game == CAMPAIGN_EVOLVED_GAME || target_game == CAMPAIGN_EVOLVED_GAME {
+        return routes;
+    }
+    let position = |game: &str| CONVERSION_CHAIN.iter().position(|entry| *entry == game);
+    let (Some(from), Some(to)) = (position(source_game), position(target_game)) else {
+        return routes;
+    };
+    // Only the profiles strictly between the endpoints, in travel order. A route
+    // that doubled back would be transcoding through a generation the tag has no
+    // business visiting.
+    let between: Vec<&str> = if from < to {
+        CONVERSION_CHAIN[from + 1..to].to_vec()
+    } else {
+        CONVERSION_CHAIN[to + 1..from].iter().rev().copied().collect()
+    };
+    // Shortest first: one intermediate, then two, and so on. Subsets keep their
+    // travel order, so a route is always a walk along the chain.
+    for count in 1..=between.len() {
+        for stops in subsequences(&between, count) {
+            let mut route = vec![source_game.to_owned()];
+            route.extend(stops.iter().map(|game| (*game).to_string()));
+            route.push(target_game.to_owned());
+            // Every hop still has to be a pair the converter will attempt.
+            if route
+                .windows(2)
+                .all(|hop| conversion_pair_supported(&hop[0], &hop[1]))
+            {
+                routes.push(route);
+            }
+        }
+    }
+    routes
+}
+
+/// Order-preserving subsequences of `items` of exactly `count` elements.
+fn subsequences<'a>(items: &[&'a str], count: usize) -> Vec<Vec<&'a str>> {
+    if count == 0 {
+        return vec![Vec::new()];
+    }
+    let mut out = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        if items.len() - index < count {
+            break;
+        }
+        for mut rest in subsequences(&items[index + 1..], count - 1) {
+            let mut one = vec![*item];
+            one.append(&mut rest);
+            out.push(one);
+        }
+    }
+    out
+}
+
 /// Why a pair is refused, in a sentence that says what to do instead.
 fn unsupported_pair_message(source_game: &str, target_game: &str) -> String {
     if source_game == target_game {
@@ -318,6 +410,14 @@ pub struct TagConversionDraft {
     pub target_group_name: String,
     pub target_extension: String,
     pub native_layout_template: Option<PathBuf>,
+    /// Every profile the tag passed through, source first and destination last,
+    /// when the direct pair could not carry it. Empty for a direct conversion.
+    ///
+    /// Worth carrying rather than reporting and forgetting: a routed conversion
+    /// has been through two or more engines' worth of loss, and a reader deciding
+    /// whether to trust the result needs to know that before they look at the
+    /// numbers.
+    pub route: Vec<String>,
 }
 
 pub struct CompanionTagDraft {
@@ -1319,6 +1419,164 @@ struct TargetFieldInfo {
     field_type: TagFieldType,
 }
 
+/// Where each hop of a route gets its kit-authored layout templates.
+///
+/// A route's intermediate profiles need templates too — the hop into Halo 3 is a
+/// conversion into Halo 3 like any other, and starting it from a kit tag is what
+/// makes its output the shape Halo 3 actually ships. A profile with no entry
+/// still converts, from a schema-built tag, so a missing intermediate kit costs
+/// fidelity rather than the whole route. Classic profiles are the exception and
+/// say so: one cannot be built from a schema at all.
+pub trait TemplateSource {
+    fn templates_for(&self, game: &str) -> Option<&NativeTemplateIndex>;
+}
+
+impl TemplateSource for () {
+    fn templates_for(&self, _game: &str) -> Option<&NativeTemplateIndex> {
+        None
+    }
+}
+
+impl TemplateSource for HashMap<String, NativeTemplateIndex> {
+    fn templates_for(&self, game: &str) -> Option<&NativeTemplateIndex> {
+        self.get(game)
+    }
+}
+
+/// Convert `source` into `target_game`, routing through intermediate engines when
+/// the direct pair cannot carry it.
+///
+/// Tries the direct conversion first and returns it untouched when it works, so
+/// nothing that converts today starts taking a detour. Only on refusal does it
+/// walk [`conversion_routes`], shortest first, hop by hop.
+///
+/// A hop hands the next one *serialized bytes*, not the draft's in-memory tag.
+/// That is deliberate and it is the difference between this and a shortcut: the
+/// intermediate is exactly the file the user would have got by saving into that
+/// game and importing from it, so a draft that would not survive a save fails
+/// here instead of two hops later. Nothing is written to disk, so there is no
+/// intermediate file to clean up and no half-finished tag left in a kit if a
+/// later hop fails.
+///
+/// Every hop's issues are kept, tagged with the hop that raised them. A routed
+/// conversion loses more than a direct one and the report has to show where.
+pub fn analyze_conversion_routed(
+    source: &TagFile,
+    source_game: &str,
+    target_game: &str,
+    definitions_root: &Path,
+    templates: &dyn TemplateSource,
+) -> Result<TagConversionDraft, String> {
+    let routes = conversion_routes(source_game, target_game);
+    if routes.is_empty() {
+        return Err(unsupported_pair_message(source_game, target_game));
+    }
+    let mut refusals = Vec::new();
+    for route in &routes {
+        match run_conversion_route(source, route, definitions_root, templates) {
+            Ok(draft) => return Ok(draft),
+            Err(error) => refusals.push(format!("{}: {error}", route.join(" \u{2192} "))),
+        }
+    }
+    // Every route refused. The direct one's reason is the one that answers the
+    // user's question, so it leads; the rest say what else was tried, because
+    // "no route works" and "we did not look" are different answers.
+    Err(format!(
+        "Could not convert {source_game} to {target_game}. Tried {} route(s):\n  {}",
+        refusals.len(),
+        refusals.join("\n  ")
+    ))
+}
+
+/// Run one route end to end, or fail saying which hop broke.
+fn run_conversion_route(
+    source: &TagFile,
+    route: &[String],
+    definitions_root: &Path,
+    templates: &dyn TemplateSource,
+) -> Result<TagConversionDraft, String> {
+    let mut carried: Option<TagFile> = None;
+    let mut earlier_issues: Vec<ConversionIssue> = Vec::new();
+    for (index, hop) in route.windows(2).enumerate() {
+        let (from, to) = (hop[0].as_str(), hop[1].as_str());
+        let input = carried.as_ref().unwrap_or(source);
+        let mut draft = analyze_conversion_with_templates(
+            input,
+            from,
+            to,
+            definitions_root,
+            templates.templates_for(to),
+        )
+        .map_err(|error| format!("{from} \u{2192} {to} failed: {error}"))?;
+
+        let final_hop = index + 2 == route.len();
+        if final_hop {
+            // The route's loss, oldest first, ahead of this hop's own.
+            earlier_issues.append(&mut draft.report.issues);
+            draft.report.issues = earlier_issues;
+            draft.route = if route.len() > 2 {
+                route.to_vec()
+            } else {
+                Vec::new()
+            };
+            return Ok(draft);
+        }
+
+        // A companion tag synthesized mid-route has nowhere reviewed to go: the
+        // rules that would carry it onward are written for the group it was
+        // extracted from, not for a tag that only exists because of an earlier
+        // hop. Refusing the route beats inventing a path for it, and the next
+        // route may not need one.
+        if !draft.companion_tags.is_empty() {
+            return Err(format!(
+                "{from} \u{2192} {to} produced {} companion tag(s), which cannot be carried \
+                 through a further conversion",
+                draft.companion_tags.len()
+            ));
+        }
+        for issue in draft.report.issues.drain(..) {
+            earlier_issues.push(ConversionIssue {
+                kind: issue.kind,
+                path: issue.path,
+                message: format!("[{from} \u{2192} {to}] {}", issue.message),
+            });
+        }
+        // Serialize and reparse, so the next hop reads what a saved tag would be.
+        let bytes = draft
+            .tag
+            .write_to_bytes()
+            .map_err(|error| format!("{from} \u{2192} {to} produced an unwritable tag: {error}"))?;
+        carried = Some(reparse_intermediate(&bytes, to, definitions_root).map_err(|error| {
+            format!("{from} \u{2192} {to} produced a tag that will not reopen: {error}")
+        })?);
+    }
+    Err("A conversion route needs at least two profiles".to_owned())
+}
+
+/// Reparse a hop's output from its own bytes.
+///
+/// Classic containers take the JSON-layout path for the same reason
+/// [`read_tag_for_conversion`] does: they carry no embedded layout, so
+/// `read_from_bytes` cannot parse them and fails in a way that points anywhere
+/// but at the reader.
+fn reparse_intermediate(
+    bytes: &[u8],
+    game: &str,
+    definitions_root: &Path,
+) -> Result<TagFile, String> {
+    if ClassicHeader::parse(bytes).is_some() {
+        let (header, _) = ClassicHeader::parse(bytes).expect("checked above");
+        let group_tag = u32::from_be_bytes(header.group_tag);
+        let group_name =
+            group_tag_to_extension(group_tag).ok_or("unknown group for classic intermediate")?;
+        let definition = definitions_root.join(game).join(format!("{group_name}.json"));
+        let layout = TagLayout::from_json(&definition)
+            .map_err(|error| format!("failed to load {}: {error}", definition.display()))?;
+        return read_classic_tag_file(bytes, layout).map_err(|error| error.to_string());
+    }
+    TagFile::read_from_bytes(bytes).map_err(|error| error.to_string())
+}
+
 pub fn analyze_conversion(
     source: &TagFile,
     source_game: &str,
@@ -1601,6 +1859,7 @@ pub fn analyze_conversion_with_templates(
         target_group_name,
         target_extension,
         native_layout_template: target_template,
+        route: Vec::new(),
     })
 }
 
@@ -4790,6 +5049,248 @@ mod tests {
         ))
     }
 
+    /// Routes are shortest first, walk the chain, and never double back.
+    #[test]
+    fn routes_walk_the_generation_chain_shortest_first() {
+        let routes = conversion_routes("halo2_mcc", "haloreach_mcc");
+        assert_eq!(
+            routes[0],
+            vec!["halo2_mcc", "haloreach_mcc"],
+            "the direct pair is always tried first, so a working conversion never detours"
+        );
+        assert_eq!(
+            routes[1],
+            vec!["halo2_mcc", "halo3_mcc", "haloreach_mcc"],
+            "one intermediate before two"
+        );
+        // Every route is a walk along the chain in travel order, and stays
+        // between the endpoints.
+        let index = |game: &str| CONVERSION_CHAIN.iter().position(|e| *e == game).unwrap();
+        for route in &routes {
+            let positions: Vec<usize> = route.iter().map(|game| index(game)).collect();
+            assert!(
+                positions.windows(2).all(|pair| pair[0] < pair[1]),
+                "{route:?} doubles back"
+            );
+            assert!(
+                positions.iter().all(|p| *p >= index("halo2_mcc") && *p <= index("haloreach_mcc")),
+                "{route:?} leaves the span between its endpoints"
+            );
+        }
+
+        // Backwards routes travel backwards.
+        let down = conversion_routes("halo4_mcc", "halo2_mcc");
+        assert_eq!(down[0], vec!["halo4_mcc", "halo2_mcc"]);
+        assert!(
+            down.iter().any(|route| route
+                == &vec![
+                    "halo4_mcc".to_owned(),
+                    "haloreach_mcc".to_owned(),
+                    "halo3_mcc".to_owned(),
+                    "halo2_mcc".to_owned()
+                ]),
+            "{down:?}"
+        );
+
+        // Adjacent profiles have nothing to route through.
+        assert_eq!(
+            conversion_routes("halo3_mcc", "halo3odst_mcc"),
+            vec![vec!["halo3_mcc", "halo3odst_mcc"]]
+        );
+
+        // Campaign Evolved has exactly one partner and is never a waypoint.
+        assert_eq!(
+            conversion_routes(CAMPAIGN_EVOLVED_GAME, CAMPAIGN_EVOLVED_PARENT),
+            vec![vec![CAMPAIGN_EVOLVED_GAME, CAMPAIGN_EVOLVED_PARENT]]
+        );
+        assert!(
+            conversion_routes("halo3_mcc", CAMPAIGN_EVOLVED_GAME).is_empty(),
+            "Halo 3 must not reach Campaign Evolved by way of Reach"
+        );
+        assert!(
+            conversion_routes("haloce_mcc", "halo2amp_mcc")
+                .iter()
+                .all(|route| !route.iter().any(|game| game == CAMPAIGN_EVOLVED_GAME))
+        );
+    }
+
+    /// A bitmap Halo 2 cannot hand to Reach directly arrives by way of Halo 3.
+    ///
+    /// This is the case the routing exists for, and it is a real refusal rather
+    /// than a contrived one: Reach's bitmap block has no `pixels offset` field at
+    /// all, so pixel data carried straight there has nothing indexing it, and the
+    /// catalog refuses the pair by name. Halo 3's does, and Halo 3 to Reach works
+    /// — so the tag gets there in two hops.
+    #[test]
+    fn a_halo_2_bitmap_reaches_reach_through_halo_3() {
+        let definitions = locate_definitions_root();
+        let source = TagFile::new(definitions.join("halo2_mcc/bitmap.json")).unwrap();
+
+        let direct = analyze_conversion_with_templates(
+            &source,
+            "halo2_mcc",
+            "haloreach_mcc",
+            &definitions,
+            None,
+        );
+        let Err(refusal) = direct else {
+            panic!("the direct pair should be refused by the catalog");
+        };
+        assert!(
+            refusal.to_ascii_lowercase().contains("halo 3")
+                || refusal.to_ascii_lowercase().contains("halo3"),
+            "the refusal should already name the way round: {refusal}"
+        );
+
+        let routed = analyze_conversion_routed(
+            &source,
+            "halo2_mcc",
+            "haloreach_mcc",
+            &definitions,
+            &(),
+        )
+        .expect("routing through Halo 3 carries it");
+        assert_eq!(
+            routed.route,
+            vec!["halo2_mcc", "halo3_mcc", "haloreach_mcc"],
+            "and it records how it got there"
+        );
+        assert_eq!(routed.target_extension, "bitmap");
+        // The tag that comes out is a real Reach tag: it writes, and it reopens.
+        let bytes = routed.tag.write_to_bytes().unwrap();
+        let reopened = TagFile::read_from_bytes(&bytes).unwrap();
+        assert_eq!(reopened.header.group_tag, u32::from_be_bytes(*b"bitm"));
+    }
+
+    /// The same route, with a real Halo 2 bitmap and real kit templates.
+    ///
+    /// The schema-built version above proves the routing *machinery*; this proves
+    /// the thing the user asked for. It needs real tags because a `TagFile::new`
+    /// Halo 2 bitmap is an MCC container wearing Halo 2's schema, not a classic
+    /// container — so it never exercises the classic read path, and it carries no
+    /// pixels, which are the whole reason this pair is refused.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_real_halo_2_bitmap_carries_its_pixels_to_reach_through_halo_3() {
+        let (Some(h2), Some(h3), Some(reach)) = (
+            kit_tags("BLAM_TEST_H2EK", "H2EK"),
+            kit_tags("BLAM_TEST_H3EK", "H3EK"),
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+        ) else {
+            eprintln!("skipping: needs H2EK, H3EK and HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = u32::from_be_bytes(*b"bitm");
+
+        // A bitmap with pixels in it, so "did the payload survive?" is a question
+        // with an answer. Bounded scan: the first few stock bitmaps will do.
+        let source = tags_with_extension(&h2, "bitmap")
+            .into_iter()
+            .take(40)
+            .find_map(|path| {
+                let tag =
+                    read_tag_for_conversion(&path, Some("halo2_mcc"), Some(&definitions), group_tag)
+                        .ok()?;
+                (blob_bytes(&tag) > 0).then_some((path, tag))
+            });
+        let Some((source_path, source)) = source else {
+            eprintln!("skipping: no H2EK bitmap with pixel data in the first 40");
+            return;
+        };
+        let source_pixels = blob_bytes(&source);
+
+        let mut templates: HashMap<String, NativeTemplateIndex> = HashMap::new();
+        for (game, root) in [("halo3_mcc", &h3), ("haloreach_mcc", &reach)] {
+            let groups = GameTagIndex::load(&definitions, game).unwrap();
+            templates.insert(game.to_owned(), NativeTemplateIndex::build(root, &groups));
+        }
+
+        let draft = analyze_conversion_routed(
+            &source,
+            "halo2_mcc",
+            "haloreach_mcc",
+            &definitions,
+            &templates,
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", source_path.display()));
+
+        assert_eq!(draft.route, vec!["halo2_mcc", "halo3_mcc", "haloreach_mcc"]);
+        // The point of the detour: the pixels are still there at the far end.
+        let landed = blob_bytes(&draft.tag);
+        assert!(
+            landed > 0,
+            "{}: {source_pixels} bytes of pixel data went in and none came out",
+            source_path.display()
+        );
+        // And the result is a tag Reach's tools can open at all.
+        let bytes = draft.tag.write_to_bytes().unwrap();
+        let reopened = TagFile::read_from_bytes(&bytes).unwrap();
+        assert_eq!(reopened.header.group_tag, group_tag);
+        // Attribute any change in payload size to the hop that caused it, rather
+        // than reporting a number with no owner. The Halo 2 to Halo 3 blob carry
+        // is reviewed; a change appearing only at the second hop would not be.
+        let midpoint = analyze_conversion_with_templates(
+            &source,
+            "halo2_mcc",
+            "halo3_mcc",
+            &definitions,
+            templates.templates_for("halo3_mcc"),
+        )
+        .map(|hop| blob_bytes(&hop.tag))
+        .unwrap_or(0);
+        eprintln!(
+            "{} : {source_pixels} -> {midpoint} (halo3) -> {landed} (reach) bytes of pixel data",
+            source_path.display()
+        );
+        assert_eq!(
+            midpoint, landed,
+            "the Halo 3 to Reach hop changed the payload size; only the classic              blob carry into Halo 3 is reviewed for that"
+        );
+    }
+
+    /// A direct conversion is left exactly as it was — no route, no detour.
+    #[test]
+    fn a_direct_conversion_is_not_routed() {
+        let definitions = locate_definitions_root();
+        let source = TagFile::new(definitions.join("halo3_mcc/weapon.json")).unwrap();
+        let draft = analyze_conversion_routed(
+            &source,
+            "halo3_mcc",
+            "haloreach_mcc",
+            &definitions,
+            &(),
+        )
+        .unwrap();
+        assert!(
+            draft.route.is_empty(),
+            "a pair that works directly must not report a route: {:?}",
+            draft.route
+        );
+    }
+
+    /// When no route works, the error says what was tried rather than just "no".
+    #[test]
+    fn an_unroutable_pair_reports_every_route_it_tried() {
+        let definitions = locate_definitions_root();
+        let source = TagFile::new(definitions.join("halo3_mcc/weapon.json")).unwrap();
+        // Campaign Evolved pairs only with Reach, so this has no route at all.
+        let Err(error) = analyze_conversion_routed(
+            &source,
+            "halo3_mcc",
+            CAMPAIGN_EVOLVED_GAME,
+            &definitions,
+            &(),
+        ) else {
+            panic!("Halo 3 cannot reach Campaign Evolved");
+        };
+        assert!(
+            error.contains(CAMPAIGN_EVOLVED_PARENT),
+            "the refusal should say what to do instead: {error}"
+        );
+    }
+
     /// The header peek agrees with a full parse, and refuses what is not a tag.
     ///
     /// This is the primitive the template search sifts thousands of candidates
@@ -7839,6 +8340,35 @@ mod tests {
 
         // Too short to be a header at all is refused rather than padded.
         assert!(retarget_function_bytes(&[0u8; 20], false, true).is_none());
+    }
+
+    /// Total bytes across every `data` blob in a tag.
+    ///
+    /// A bitmap's pixels live in one of these, so this is "is the image still
+    /// here?" reduced to a number that survives the field being renamed between
+    /// engines.
+    pub fn blob_bytes(tag: &TagFile) -> usize {
+        fn walk(value: TagStruct<'_>, total: &mut usize) {
+            for field in value.fields() {
+                match field.value() {
+                    Some(TagFieldData::Data(bytes)) => *total += bytes.len(),
+                    _ => {}
+                }
+                if let Some(nested) = field.as_struct() {
+                    walk(nested, total);
+                }
+                if let Some(block) = field.as_block() {
+                    for index in 0..block.len() {
+                        if let Some(element) = block.element(index) {
+                            walk(element, total);
+                        }
+                    }
+                }
+            }
+        }
+        let mut total = 0;
+        walk(tag.root(), &mut total);
+        total
     }
 
     /// An editing kit's `tags` directory, via `env_var` or the Steam library
