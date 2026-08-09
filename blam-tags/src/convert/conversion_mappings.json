@@ -1653,5 +1653,30 @@
       "target_definition": "bitmap_group_pixel_data_def",
       "reason": "Both are the bitmap's pixel payload in the tag body under the same field name, `processed pixel data`; only the data definition was renamed. Verified against the kits rather than the schema: a native H3EK bitmap keeps 699,052 bytes in `processed pixel data` and populates no pageable resource at all, despite the schema marking the field `*` and declaring interop resources. The formats line up too - Halo 2's `format_enum_2` and Halo 3's `bitmap_formats` share both index and name for dxt1 (14), dxt3 (15), dxt5 (16) and every uncompressed entry, and the enum is carried by name in any case. Halo 2's `p8` and `p8-bump` have no Halo 3 option and are reported. Scoped to Halo 3 and ODST on purpose: Reach's `bitmap_data_block_def` has no `pixels offset` field at all, so a blob carried there would have nothing indexing it - go through Halo 3, whose bitmaps already convert to Reach."
     }
+  ],
+  "accepted_payload_drops": [
+    {
+      "group": "scenario",
+      "source_games": [
+        "haloce_mcc",
+        "halo2_mcc",
+        "halo3_mcc",
+        "halo3odst_mcc",
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "target_games": [
+        "haloce_mcc",
+        "halo2_mcc",
+        "halo3_mcc",
+        "halo3odst_mcc",
+        "haloreach_mcc",
+        "halo4_mcc",
+        "halo2amp_mcc"
+      ],
+      "source_path": "editor scenario data",
+      "reason": "Sapien's own editor bookkeeping for the scenario, not gameplay data. Every profile declares it under the same field name and a different data definition (`editor_scenario_data_data` in Halo CE, `_data_3` in Halo 2's version-3 struct, `editor_scenario_data_definition` in Halo 3), so the opaque copy path has no identity to pair them on and refused the whole scenario over it. Measured: Halo CE ships it populated and Halo 2 ships it empty in every scenario its kit carries, which is what a per-editor scratch blob looks like. Reviewed as safe to drop -- one game's editor state means nothing to another's editor, and the scenario's actual contents live in the blocks around it."
+    }
   ]
 }

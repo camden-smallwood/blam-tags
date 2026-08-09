@@ -560,6 +560,17 @@ struct ConversionMappingCatalog {
     /// Evolved does not carry.
     #[serde(default)]
     accepted_field_drops: Vec<ReferenceDropRule>,
+    /// Inline `data` blobs both profiles declare but neither can hand to the
+    /// other, reviewed and accepted as lost.
+    ///
+    /// Distinct from `accepted_field_drops`, which is for fields the target does
+    /// not declare *at all*. Here both sides have the field and the blob still
+    /// cannot cross, because the opaque copy path pairs on the data definition's
+    /// name and the two disagree. Keeping the two apart is what lets each be
+    /// checked for the invariant that actually applies to it — an accepted field
+    /// drop must be absent on the far side, and one of these must be present.
+    #[serde(default)]
+    accepted_payload_drops: Vec<ReferenceDropRule>,
     #[serde(default)]
     field_aliases: Vec<FieldAliasRule>,
     #[serde(default)]
@@ -833,6 +844,20 @@ impl ConversionMappingCatalog {
                 ));
             }
         }
+        for (index, rule) in catalog.accepted_payload_drops.iter().enumerate() {
+            validate_game_scopes(
+                "accepted_payload_drops",
+                index,
+                &rule.group,
+                &rule.source_games,
+                &rule.target_games,
+            )?;
+            if clean_field_key(&rule.source_path).is_empty() || rule.reason.trim().is_empty() {
+                return Err(format!(
+                    "conversion_mappings.json accepted_payload_drops[{index}] has an empty path or reason"
+                ));
+            }
+        }
         for (index, rule) in catalog.option_aliases.iter().enumerate() {
             validate_mapping_rule_scope(
                 "option_aliases",
@@ -1039,6 +1064,31 @@ impl ConversionMappingCatalog {
             .iter()
             .find_map(matches)
             .or_else(|| self.reference_drops.iter().find_map(matches))
+    }
+
+    /// Why an inline `data` blob is reviewed as safe to lose.
+    ///
+    /// Only consulted by the payload check. A blob the target declares but
+    /// cannot be handed is a different situation from a field it does not have,
+    /// and answering both from one list would mean neither could be validated.
+    fn accepted_payload_drop_reason<'a>(
+        &'a self,
+        group: &str,
+        source_game: &str,
+        target_game: &str,
+        source_path: &str,
+    ) -> Option<&'a str> {
+        self.accepted_payload_drops.iter().find_map(|rule| {
+            if !rule.group.eq_ignore_ascii_case(group)
+                || !game_scope_matches(&rule.source_games, source_game)
+                || !game_scope_matches(&rule.target_games, target_game)
+            {
+                return None;
+            }
+            let covered = crate::TagFieldPath::parse(&clean_field_key(&rule.source_path));
+            let reported = crate::TagFieldPath::parse(&clean_field_key(source_path));
+            covered.is_ancestor_of(&reported).then_some(rule.reason.as_str())
+        })
     }
 }
 
@@ -1847,6 +1897,7 @@ pub fn analyze_conversion_with_templates(
         &mapping_catalog,
         &mut context.report,
     )?;
+    strip_cross_engine_scripts(&mut target, &mut context);
     validate_critical_runtime_safety(source, &context)?;
 
     let target_extension = group_tag_to_extension(target_group_tag)
@@ -1861,6 +1912,108 @@ pub fn analyze_conversion_with_templates(
         native_layout_template: target_template,
         route: Vec::new(),
     })
+}
+
+/// A scenario's compiled HaloScript, which never survives an engine change.
+///
+/// The string table, the syntax datums that index into it, and the script and
+/// global declarations that index those. All or nothing: they are one artefact
+/// spread across five fields.
+const COMPILED_SCRIPT_FIELDS: &[&str] = &[
+    "script string data",
+    "script syntax data",
+    "hs syntax datums",
+    "scripts",
+    "globals",
+];
+
+/// Empty a converted scenario's compiled scripts, and say why.
+///
+/// A compiled script node stores an *index* into its own game's function table,
+/// and those tables are renumbered at every engine boundary. Measured against
+/// Baboon's own per-game script documentation: Halo 2 declares 887 functions and
+/// Halo 3 1,377; the two agree position-for-position for the first 20 entries and
+/// then diverge, and of the 628 names both games have, **608 sit at a different
+/// index**. Even the closest pair, Halo 3 and ODST, moves 1,113 of 1,293.
+///
+/// So carrying the bytecode across is not a lossy copy, it is a wrong one: the
+/// scenario would load and then call whatever function now occupies each slot.
+/// That is worse than arriving with no scripts, because it looks like it worked.
+///
+/// The `.hsc` **source** is a different matter and is deliberately left alone —
+/// it is text, it carries fine, and 47 of the 68 scenarios Halo 2's kit ships
+/// bring it along. Recompiling from it in the destination game's tools is the
+/// route that produces correct bytecode, and the warning says so.
+fn strip_cross_engine_scripts(target: &mut TagFile, context: &mut ConversionContext<'_>) {
+    if !context.group_name.eq_ignore_ascii_case("scenario")
+        || context.source_game == context.target_game
+    {
+        return;
+    }
+    let mut emptied = Vec::new();
+    {
+        let mut root = target.root_mut();
+        let ordinals: Vec<(usize, String)> = root
+            .as_ref()
+            .fields()
+            .enumerate()
+            .filter(|(_, field)| {
+                let key = clean_field_key(field.name());
+                COMPILED_SCRIPT_FIELDS.iter().any(|name| key == *name)
+            })
+            .map(|(ordinal, field)| (ordinal, field.name().to_owned()))
+            .collect();
+        for (ordinal, name) in ordinals {
+            let Some(mut field) = root.field_at_mut(ordinal) else {
+                continue;
+            };
+            if let Some(mut block) = field.as_block_mut() {
+                if block.len() > 0 {
+                    block.clear();
+                    emptied.push(name);
+                }
+                continue;
+            }
+            let filled = matches!(field.as_ref().value(), Some(TagFieldData::Data(bytes)) if !bytes.is_empty());
+            if filled && field.set(TagFieldData::Data(Vec::new())).is_ok() {
+                emptied.push(name);
+            }
+        }
+    }
+    // The payload check must stop treating the string table as lost data: it was
+    // not dropped for want of a home, it was removed on purpose.
+    context
+        .payloads_left_behind
+        .retain(|path| !COMPILED_SCRIPT_FIELDS.iter().any(|name| path == name));
+    if emptied.is_empty() {
+        return;
+    }
+    let sources = target
+        .root()
+        .fields()
+        .find(|field| clean_field_key(field.name()) == "source files")
+        .and_then(|field| field.as_block())
+        .map(|block| block.len())
+        .unwrap_or(0);
+    let advice = if sources > 0 {
+        format!(
+            "The {sources} .hsc source file(s) came across with the tag \u{2014} recompile them \
+             with {}'s tools to get working scripts.",
+            context.target_game
+        )
+    } else {
+        "This scenario carried no .hsc source, so the scripts have to be reauthored.".to_owned()
+    };
+    context.report.issues.push(ConversionIssue {
+        kind: ConversionIssueKind::Warning,
+        path: emptied.join(", "),
+        message: format!(
+            "Compiled scripts were cleared rather than carried. A script node indexes its own \
+             game's function table, and {} renumbers {}'s \u{2014} the two tables diverge within \
+             the first two dozen entries, so carried bytecode would call the wrong functions. {advice}",
+            context.target_game, context.source_game
+        ),
+    });
 }
 
 fn validate_critical_runtime_safety(
@@ -1905,6 +2058,15 @@ fn validate_critical_runtime_safety(
                     path,
                 )
                 .is_none()
+                && context
+                    .mapping_catalog
+                    .accepted_payload_drop_reason(
+                        context.group_name,
+                        context.source_game,
+                        context.target_game,
+                        path,
+                    )
+                    .is_none()
         })
         .collect();
     if !unreviewed_payloads.is_empty() {
@@ -5247,6 +5409,196 @@ mod tests {
         assert_eq!(
             midpoint, landed,
             "the Halo 3 to Reach hop changed the payload size; only the classic              blob carry into Halo 3 is reviewed for that"
+        );
+    }
+
+    /// A Halo 2 scenario converts, and arrives with no compiled scripts but with
+    /// its script *source* intact.
+    ///
+    /// This is the case the user hit: the conversion refused outright because the
+    /// string table is a `data` blob Halo 3 declares under a different data
+    /// definition, and a blob that cannot cross fails the whole tag rather than
+    /// being written empty. The blob genuinely cannot cross, but refusing the
+    /// scenario over it was the wrong answer — and carrying it would have been a
+    /// worse one, because the syntax datums that index it renumber between
+    /// engines.
+    ///
+    /// Three things are asserted together on purpose. Emptied scripts without the
+    /// source surviving would be data loss; emptied strings with the datums still
+    /// present would be datums indexing nothing; and either without the warning
+    /// would be a silent change to what the scenario does.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_halo_2_scenario_converts_without_its_compiled_scripts() {
+        let (Some(h2), Some(h3)) = (
+            kit_tags("BLAM_TEST_H2EK", "H2EK"),
+            kit_tags("BLAM_TEST_H3EK", "H3EK"),
+        ) else {
+            eprintln!("skipping: needs H2EK and H3EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = u32::from_be_bytes(*b"scnr");
+        let block_len = |tag: &TagFile, name: &str| -> usize {
+            tag.root()
+                .fields()
+                .find(|field| clean_field_key(field.name()) == name)
+                .and_then(|field| field.as_block())
+                .map(|block| block.len())
+                .unwrap_or(0)
+        };
+
+        // A scenario that actually has scripts *and* their source, so every
+        // assertion below has something to bite on.
+        let picked = tags_with_extension(&h2, "scenario")
+            .into_iter()
+            .take(40)
+            .find_map(|path| {
+                let tag =
+                    read_tag_for_conversion(&path, Some("halo2_mcc"), Some(&definitions), group_tag)
+                        .ok()?;
+                let datums = block_len(&tag, "hs syntax datums");
+                let sources = block_len(&tag, "source files");
+                (datums > 0 && sources > 0).then_some((path, tag, datums, sources))
+            });
+        let Some((path, source, source_datums, source_files)) = picked else {
+            eprintln!("skipping: no H2EK scenario with both compiled scripts and .hsc source");
+            return;
+        };
+
+        let groups = GameTagIndex::load(&definitions, "halo3_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h3, &groups);
+        let draft = analyze_conversion_with_templates(
+            &source,
+            "halo2_mcc",
+            "halo3_mcc",
+            &definitions,
+            Some(&templates),
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+
+        // Nothing compiled came across, and nothing came across half.
+        for field in ["hs syntax datums", "scripts", "globals"] {
+            assert_eq!(
+                block_len(&draft.tag, field),
+                0,
+                "{}: {field} still carries Halo 2 bytecode",
+                path.display()
+            );
+        }
+        let strings = draft
+            .tag
+            .root()
+            .fields()
+            .find(|field| clean_field_key(field.name()) == "script string data")
+            .and_then(|field| field.value())
+            .and_then(|value| match value {
+                TagFieldData::Data(bytes) => Some(bytes.len()),
+                _ => None,
+            })
+            .unwrap_or(0);
+        assert_eq!(strings, 0, "{}: the string table survived", path.display());
+
+        // The source text did come across — that is what makes the scripts
+        // recoverable rather than lost.
+        assert_eq!(
+            block_len(&draft.tag, "source files"),
+            source_files,
+            "{}: the .hsc source did not carry",
+            path.display()
+        );
+
+        // And it says so, naming the source as the way back.
+        let warning = draft
+            .report
+            .issues
+            .iter()
+            .find(|issue| issue.message.contains("Compiled scripts were cleared"))
+            .unwrap_or_else(|| panic!("{}: no warning raised", path.display()));
+        assert_eq!(warning.kind, ConversionIssueKind::Warning);
+        assert!(warning.message.contains(".hsc"), "{}", warning.message);
+
+        // The result is a Halo 3 tag that writes and reopens.
+        let bytes = draft.tag.write_to_bytes().unwrap();
+        let reopened = TagFile::read_from_bytes(&bytes).unwrap();
+        assert_eq!(reopened.header.group_tag, group_tag);
+        eprintln!(
+            "{}: {source_datums} datums dropped, {source_files} source file(s) kept",
+            path.display()
+        );
+    }
+
+    /// A Halo CE scenario reaches Halo 2, editor blob and all.
+    ///
+    /// The same failure shape as the reported one, on a different blob: Sapien's
+    /// `editor scenario data` is declared under a different data definition in
+    /// every profile, so the opaque copy path refused the whole scenario over a
+    /// scratch buffer. Reviewed as a drop rather than aliased, because one game's
+    /// editor state means nothing to another's.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_halo_ce_scenario_reaches_halo_2_despite_its_editor_blob() {
+        let (Some(h1), Some(h2)) = (
+            kit_tags("BLAM_TEST_HCEEK", "HCEEK"),
+            kit_tags("BLAM_TEST_H2EK", "H2EK"),
+        ) else {
+            eprintln!("skipping: needs HCEEK and H2EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = u32::from_be_bytes(*b"scnr");
+        // A scenario that actually carries the blob, so the drop is exercised
+        // rather than trivially satisfied by an empty field.
+        let picked = tags_with_extension(&h1, "scenario")
+            .into_iter()
+            .take(30)
+            .find_map(|path| {
+                let tag =
+                    read_tag_for_conversion(&path, Some("haloce_mcc"), Some(&definitions), group_tag)
+                        .ok()?;
+                let filled = tag.root().fields().any(|field| {
+                    clean_field_key(field.name()) == "editor scenario data"
+                        && matches!(field.value(), Some(TagFieldData::Data(bytes)) if !bytes.is_empty())
+                });
+                filled.then_some((path, tag))
+            });
+        let Some((path, source)) = picked else {
+            eprintln!("skipping: no HCEEK scenario carries editor scenario data");
+            return;
+        };
+
+        let groups = GameTagIndex::load(&definitions, "halo2_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h2, &groups);
+        let draft = analyze_conversion_with_templates(
+            &source,
+            "haloce_mcc",
+            "halo2_mcc",
+            &definitions,
+            Some(&templates),
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        // A classic target has to come from a kit tag; if that stopped working
+        // this would silently fall back and the assertion says so.
+        assert!(
+            draft.native_layout_template.is_some(),
+            "{}: a Halo 2 target needs a kit-authored template",
+            path.display()
+        );
+        assert!(draft.tag.classic_engine().is_some(), "{}", path.display());
+    }
+
+    /// A same-game conversion leaves the scripts alone.
+    ///
+    /// The whole justification is that function tables renumber *between*
+    /// engines, so a rule that fired within one would be destroying data for no
+    /// reason. Cheap to assert and it pins the scope.
+    #[test]
+    fn scripts_are_only_stripped_when_the_engine_changes() {
+        assert!(
+            !conversion_pair_supported("halo3_mcc", "halo3_mcc"),
+            "a same-game pair is refused before any of this is reached, which is              what makes the guard in strip_cross_engine_scripts a belt-and-braces              check rather than the only thing standing between a scenario and its              own scripts"
         );
     }
 
@@ -9124,6 +9476,43 @@ mod tests {
                     rule.group,
                     rule.source_path,
                 );
+            }
+        }
+    }
+
+    /// An accepted *payload* drop must name a blob both sides really declare.
+    ///
+    /// The mirror image of the check above, and the reason the two sections are
+    /// separate. If the target does not declare the field, the loss is an
+    /// ordinary field drop and belongs in `accepted_field_drops` where the
+    /// absence is verified; if it does, the blob is being dropped despite having
+    /// somewhere to go, and that is the claim this section makes. A rule in the
+    /// wrong list would be checked against the wrong invariant and pass.
+    #[test]
+    fn every_accepted_payload_drop_names_a_blob_both_sides_declare() {
+        let catalog = ConversionMappingCatalog::load().unwrap();
+        let definitions = locate_definitions_root();
+        for rule in &catalog.accepted_payload_drops {
+            for (role, games) in [
+                ("source", &rule.source_games),
+                ("target", &rule.target_games),
+            ] {
+                for game in games {
+                    let path = definitions.join(game).join(format!("{}.json", rule.group));
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let tag = TagFile::new(&path)
+                        .unwrap_or_else(|error| panic!("build {game}/{}: {error}", rule.group));
+                    assert!(
+                        schema_path_resolves(tag.definitions().root_struct(), &rule.source_path),
+                        "{game}/{} ({role}) does not declare `{}` \u{2014} that is an ordinary \
+                         field drop, so the rule belongs in accepted_field_drops where its \
+                         absence gets checked",
+                        rule.group,
+                        rule.source_path,
+                    );
+                }
             }
         }
     }
