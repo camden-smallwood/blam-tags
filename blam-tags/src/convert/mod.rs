@@ -380,6 +380,28 @@ pub struct ConversionIssue {
     pub message: String,
 }
 
+/// Whether a conversion may write a tag that loses audited data.
+///
+/// Some groups were audited field by field for one engine step, and for those a
+/// dropped field is a defect rather than a fact of life. The default refuses
+/// them, because an unattended run has nobody to ask.
+///
+/// It is still the user's call. Somebody who has been shown exactly which fields
+/// go missing and wants the tag anyway is not making a mistake — a Halo 3 light
+/// without Reach's `percent spherical` is still most of a light. What must not
+/// happen is the loss going unmentioned, which is why [`Accept`] records it on
+/// the report rather than simply allowing it through.
+///
+/// [`Accept`]: LossPolicy::Accept
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LossPolicy {
+    /// Refuse to write a tag that would lose audited data.
+    #[default]
+    FailClosed,
+    /// Write it, and record what was lost on the report.
+    Accept,
+}
+
 #[derive(Default)]
 pub struct TagConversionReport {
     pub copied_exact: usize,
@@ -400,6 +422,13 @@ pub struct TagConversionReport {
     /// destination has no home for by design. It is also the count a user acts
     /// on — each one is something to reconnect by hand.
     pub dropped_references: usize,
+    /// Field paths that would have refused this conversion under
+    /// [`LossPolicy::FailClosed`], populated only under [`LossPolicy::Accept`].
+    ///
+    /// Machine-readable on purpose. A caller offering the user the choice has to
+    /// tell "held back for audited loss" apart from "failed" without matching on
+    /// the text of an error message, and has to be able to list what goes.
+    pub fail_closed_losses: Vec<String>,
     pub issues: Vec<ConversionIssue>,
 }
 
@@ -1517,13 +1546,37 @@ pub fn analyze_conversion_routed(
     definitions_root: &Path,
     templates: &dyn TemplateSource,
 ) -> Result<TagConversionDraft, String> {
+    analyze_conversion_routed_with_policy(
+        source,
+        source_game,
+        target_game,
+        definitions_root,
+        templates,
+        LossPolicy::default(),
+    )
+}
+
+/// [`analyze_conversion_routed`] under an explicit loss policy.
+///
+/// The policy applies to every hop. A route exists to get a tag somewhere the
+/// direct pair could not take it, and accepting a loss on the last hop while
+/// refusing one on the first would mean the answer depended on which engine the
+/// field happened to go missing in.
+pub fn analyze_conversion_routed_with_policy(
+    source: &TagFile,
+    source_game: &str,
+    target_game: &str,
+    definitions_root: &Path,
+    templates: &dyn TemplateSource,
+    policy: LossPolicy,
+) -> Result<TagConversionDraft, String> {
     let routes = conversion_routes(source_game, target_game);
     if routes.is_empty() {
         return Err(unsupported_pair_message(source_game, target_game));
     }
     let mut refusals = Vec::new();
     for route in &routes {
-        match run_conversion_route(source, route, definitions_root, templates) {
+        match run_conversion_route(source, route, definitions_root, templates, policy) {
             Ok(draft) => return Ok(draft),
             Err(error) => refusals.push(format!("{}: {error}", route.join(" \u{2192} "))),
         }
@@ -1544,18 +1597,24 @@ fn run_conversion_route(
     route: &[String],
     definitions_root: &Path,
     templates: &dyn TemplateSource,
+    policy: LossPolicy,
 ) -> Result<TagConversionDraft, String> {
     let mut carried: Option<TagFile> = None;
     let mut earlier_issues: Vec<ConversionIssue> = Vec::new();
+    // A loss on an intermediate hop is still a loss from the tag, so the final
+    // draft has to name it. Without this, routing would hide exactly what the
+    // direct conversion refuses over.
+    let mut earlier_losses: Vec<String> = Vec::new();
     for (index, hop) in route.windows(2).enumerate() {
         let (from, to) = (hop[0].as_str(), hop[1].as_str());
         let input = carried.as_ref().unwrap_or(source);
-        let mut draft = analyze_conversion_with_templates(
+        let mut draft = analyze_conversion_with_policy(
             input,
             from,
             to,
             definitions_root,
             templates.templates_for(to),
+            policy,
         )
         .map_err(|error| format!("{from} \u{2192} {to} failed: {error}"))?;
 
@@ -1564,6 +1623,8 @@ fn run_conversion_route(
             // The route's loss, oldest first, ahead of this hop's own.
             earlier_issues.append(&mut draft.report.issues);
             draft.report.issues = earlier_issues;
+            earlier_losses.append(&mut draft.report.fail_closed_losses);
+            draft.report.fail_closed_losses = earlier_losses;
             draft.route = if route.len() > 2 {
                 route.to_vec()
             } else {
@@ -1583,6 +1644,9 @@ fn run_conversion_route(
                  through a further conversion",
                 draft.companion_tags.len()
             ));
+        }
+        for hop_loss in draft.report.fail_closed_losses.drain(..) {
+            earlier_losses.push(format!("[{from} \u{2192} {to}] {hop_loss}"));
         }
         for issue in draft.report.issues.drain(..) {
             earlier_issues.push(ConversionIssue {
@@ -1646,12 +1710,53 @@ pub fn analyze_conversion(
     )
 }
 
+/// [`analyze_conversion_with_templates`] under an explicit loss policy.
+///
+/// The plain form fails closed, which is right for anything unattended. This one
+/// exists for a caller that has shown the user what would be lost and been told
+/// to go ahead.
+pub fn analyze_conversion_with_policy(
+    source: &TagFile,
+    source_game: &str,
+    target_game: &str,
+    definitions_root: &Path,
+    native_templates: Option<&NativeTemplateIndex>,
+    policy: LossPolicy,
+) -> Result<TagConversionDraft, String> {
+    analyze_conversion_inner(
+        source,
+        source_game,
+        target_game,
+        definitions_root,
+        native_templates,
+        policy,
+    )
+}
+
 pub fn analyze_conversion_with_templates(
     source: &TagFile,
     source_game: &str,
     target_game: &str,
     definitions_root: &Path,
     native_templates: Option<&NativeTemplateIndex>,
+) -> Result<TagConversionDraft, String> {
+    analyze_conversion_inner(
+        source,
+        source_game,
+        target_game,
+        definitions_root,
+        native_templates,
+        LossPolicy::default(),
+    )
+}
+
+fn analyze_conversion_inner(
+    source: &TagFile,
+    source_game: &str,
+    target_game: &str,
+    definitions_root: &Path,
+    native_templates: Option<&NativeTemplateIndex>,
+    policy: LossPolicy,
 ) -> Result<TagConversionDraft, String> {
     // A classic source is fine in either byte order — reading is endian-aware and
     // Halo CE bodies are big-endian by design. A big-endian *MCC* tag is not: it
@@ -1898,7 +2003,19 @@ pub fn analyze_conversion_with_templates(
         &mut context.report,
     )?;
     strip_cross_engine_scripts(&mut target, &mut context);
-    validate_critical_runtime_safety(source, &context)?;
+    let fail_closed_losses = validate_critical_runtime_safety(source, &context, policy)?;
+    if !fail_closed_losses.is_empty() {
+        context.report.issues.push(ConversionIssue {
+            kind: ConversionIssueKind::Warning,
+            path: fail_closed_losses.join(", "),
+            message: format!(
+                "Imported with {} audited field(s) lost, because that was asked for.                  {} has no counterpart for them.",
+                fail_closed_losses.len(),
+                context.target_game
+            ),
+        });
+    }
+    context.report.fail_closed_losses = fail_closed_losses;
 
     let target_extension = group_tag_to_extension(target_group_tag)
         .unwrap_or(&target_group_name)
@@ -2016,10 +2133,15 @@ fn strip_cross_engine_scripts(target: &mut TagFile, context: &mut ConversionCont
     });
 }
 
+/// Refuse, or record, a conversion that loses audited data.
+///
+/// Returns the lost field paths when `policy` lets them through, so the caller
+/// can put them on the report; an empty list means nothing was at stake.
 fn validate_critical_runtime_safety(
     source: &TagFile,
     context: &ConversionContext<'_>,
-) -> Result<(), String> {
+    policy: LossPolicy,
+) -> Result<Vec<String>, String> {
     // Not "does the source have resources?" but "did any resource fail to
     // cross?". The old question refused every animation graph, because an
     // animation graph's payload *is* a pageable resource — it is why a loose
@@ -2131,19 +2253,24 @@ fn validate_critical_runtime_safety(
                 .any(|group| context.group_name.eq_ignore_ascii_case(group))))
         && !critical_issues.is_empty()
     {
-        let examples = critical_issues
+        let lost: Vec<String> = critical_issues
             .iter()
-            .take(4)
-            .map(|issue| issue.path.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(format!(
-            "{} conversion would lose {} meaningful runtime or authored field(s) ({examples}); the tag was not written",
-            context.group_name,
-            critical_issues.len()
-        ));
+            .map(|issue| issue.path.clone())
+            .collect();
+        let examples = lost.iter().take(4).cloned().collect::<Vec<_>>().join(", ");
+        if policy == LossPolicy::FailClosed {
+            return Err(format!(
+                "{} conversion would lose {} meaningful runtime or authored field(s) ({examples}); the tag was not written",
+                context.group_name,
+                lost.len()
+            ));
+        }
+        // Allowed through, but never quietly. The caller asked for this tag
+        // knowing the cost, and the report is where that cost stays on record —
+        // both as prose for a reader and as a list for whatever writes it.
+        return Ok(lost);
     }
-    Ok(())
+    Ok(Vec::new())
 }
 
 
@@ -5600,6 +5727,121 @@ mod tests {
             !conversion_pair_supported("halo3_mcc", "halo3_mcc"),
             "a same-game pair is refused before any of this is reached, which is              what makes the guard in strip_cross_engine_scripts a belt-and-braces              check rather than the only thing standing between a scenario and its              own scripts"
         );
+    }
+
+    /// The audited-loss refusal can be overruled, and says what it cost.
+    ///
+    /// The case the user hit: a Halo 3 light loses `percent spherical` going to
+    /// Reach, which is a real loss and not a reason the tag is worthless. The
+    /// default still refuses, because an unattended run has nobody to ask; asked
+    /// to accept, it converts and records exactly what went.
+    ///
+    /// Self-skips without the kits — a schema-built light has no authored values
+    /// to lose, so only a real one exercises this.
+    #[test]
+    fn an_audited_loss_refuses_by_default_and_converts_when_accepted() {
+        let (Some(h3), Some(reach)) = (
+            kit_tags("BLAM_TEST_H3EK", "H3EK"),
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+        ) else {
+            eprintln!("skipping: needs H3EK and HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = u32::from_be_bytes(*b"ligh");
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+
+        // A light the default policy actually refuses. Bounded, but wide enough
+        // to actually reach one: measured across 400 H3EK lights, 69 are refused
+        // and the first sits at index 95 — a scan of 60 found none and skipped,
+        // which is the failure mode a bound this arbitrary invites.
+        let refused = tags_with_extension(&h3, "light")
+            .into_iter()
+            .take(200)
+            .find_map(|path| {
+                let tag =
+                    read_tag_for_conversion(&path, Some("halo3_mcc"), Some(&definitions), group_tag)
+                        .ok()?;
+                analyze_conversion_with_templates(
+                    &tag,
+                    "halo3_mcc",
+                    "haloreach_mcc",
+                    &definitions,
+                    Some(&templates),
+                )
+                .err()
+                .map(|error| (path, tag, error))
+            });
+        let Some((path, source, refusal)) = refused else {
+            eprintln!("skipping: no H3EK light in the first 60 is refused for audited loss");
+            return;
+        };
+        assert!(
+            refusal.contains("was not written"),
+            "{}: refused for some other reason: {refusal}",
+            path.display()
+        );
+
+        let draft = analyze_conversion_with_policy(
+            &source,
+            "halo3_mcc",
+            "haloreach_mcc",
+            &definitions,
+            Some(&templates),
+            LossPolicy::Accept,
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+
+        // Allowed through, and the cost is on the record in both forms: a list
+        // the caller can show, and prose a reader will see.
+        assert!(
+            !draft.report.fail_closed_losses.is_empty(),
+            "{}: accepted without recording what was lost",
+            path.display()
+        );
+        assert!(
+            draft
+                .report
+                .issues
+                .iter()
+                .any(|issue| issue.message.contains("audited field(s) lost")),
+            "{}: no warning on the report",
+            path.display()
+        );
+        // And it is a tag, not a husk.
+        let bytes = draft.tag.write_to_bytes().unwrap();
+        assert_eq!(
+            TagFile::read_from_bytes(&bytes).unwrap().header.group_tag,
+            group_tag
+        );
+        eprintln!(
+            "{}: accepted losing {:?}",
+            path.display(),
+            draft.report.fail_closed_losses
+        );
+    }
+
+    /// Accepting a loss changes nothing for a conversion that had none.
+    #[test]
+    fn accepting_loss_does_not_change_a_clean_conversion() {
+        let definitions = locate_definitions_root();
+        let source = TagFile::new(definitions.join("halo3_mcc/weapon.json")).unwrap();
+        for policy in [LossPolicy::FailClosed, LossPolicy::Accept] {
+            let draft = analyze_conversion_with_policy(
+                &source,
+                "halo3_mcc",
+                "haloreach_mcc",
+                &definitions,
+                None,
+                policy,
+            )
+            .unwrap();
+            assert!(
+                draft.report.fail_closed_losses.is_empty(),
+                "{policy:?} invented a loss that was not there"
+            );
+        }
     }
 
     /// A direct conversion is left exactly as it was — no route, no detour.

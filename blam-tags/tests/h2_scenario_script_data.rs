@@ -552,3 +552,52 @@ fn walk_reals(value: TagStruct<'_>, prefix: &str, out: &mut Vec<String>) {
         }
     }
 }
+
+/// How common the audited-loss refusal actually is, and where.
+#[test]
+#[ignore = "diagnostic; needs H3EK and HREK"]
+fn report_how_many_h3_lights_are_refused_for_audited_loss() {
+    let (Some(h3), Some(reach)) = (kit("H3EK"), kit("HREK")) else {
+        eprintln!("skipping: needs H3EK and HREK");
+        return;
+    };
+    let definitions = definitions();
+    let groups = blam_tags::convert::GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+    let templates = blam_tags::convert::NativeTemplateIndex::build(&reach, &groups);
+    for (extension, fourcc) in [("light", *b"ligh"), ("effect", *b"effe")] {
+        let group_tag = u32::from_be_bytes(fourcc);
+        let paths = find(&h3, extension, 400);
+        let (mut ok, mut refused, mut other) = (0usize, 0usize, 0usize);
+        let mut first: Option<(usize, String)> = None;
+        for (index, path) in paths.iter().enumerate() {
+            let Ok(tag) = blam_tags::convert::read_tag_for_conversion(
+                path,
+                Some("halo3_mcc"),
+                Some(&definitions),
+                group_tag,
+            ) else {
+                continue;
+            };
+            match blam_tags::convert::analyze_conversion_with_templates(
+                &tag,
+                "halo3_mcc",
+                "haloreach_mcc",
+                &definitions,
+                Some(&templates),
+            ) {
+                Ok(_) => ok += 1,
+                Err(error) if error.contains("was not written") => {
+                    refused += 1;
+                    if first.is_none() {
+                        first = Some((index, path.display().to_string()));
+                    }
+                }
+                Err(_) => other += 1,
+            }
+        }
+        eprintln!(
+            ".{extension:<8} {} scanned: {ok} ok, {refused} refused for audited loss, {other} other; first refusal {first:?}",
+            paths.len()
+        );
+    }
+}
