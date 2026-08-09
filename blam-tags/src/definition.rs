@@ -138,6 +138,17 @@ impl<'a> TagFieldDefinition<'a> {
         self.layout.fields[self.field_index].field_type
     }
 
+    /// If this field is a `tmpl` custom, which template fills it and how wide.
+    ///
+    /// A caller that sees `Some` is looking at an anonymous byte range standing
+    /// in for another group's inlined body, not at a zero-byte editor sentinel —
+    /// the two are both `custom` and cannot otherwise be told apart. Always
+    /// `None` for a layout that came from a tag's own `blay`, which does not
+    /// record the provenance; see [`TagLayout::tmpl_holes`].
+    pub fn template_hole(&self) -> Option<crate::layout::TagTemplateHole> {
+        self.layout.template_hole(self.field_index).copied()
+    }
+
     /// Byte offset of this field's raw data within its containing
     /// struct. Set after layout read; zero for padding.
     pub fn offset(&self) -> u32 {

@@ -127,6 +127,20 @@ pub enum ClassicError {
     },
     /// Body had trailing bytes the layout-driven walk never consumed.
     TrailingBytes { consumed: usize, total: usize },
+    /// A block declared more element bytes than the body had left. Carries the
+    /// block's name and the header's own `count`/`element_size`, because the
+    /// product alone cannot say which of the two is wrong.
+    ShortBlock {
+        block: String,
+        count: usize,
+        elem_size: usize,
+        need: usize,
+        have: usize,
+        /// Body offset the elements were to be read from. The value that makes
+        /// this diagnosable: a plausible `count`/`elem_size` pair read a byte or
+        /// two off yields an implausible one, so the offset says where to look.
+        at: usize,
+    },
     /// A block/struct header's `count`/`element_size` pair is implausible
     /// (count*size overflows, or a nonzero count with a zero element
     /// size). Almost always a cursor desync that read garbage as a
@@ -146,6 +160,10 @@ impl std::fmt::Display for ClassicError {
             ClassicError::TrailingBytes { consumed, total } => {
                 write!(f, "layout walk consumed {consumed} of {total} body bytes")
             }
+            ClassicError::ShortBlock { block, count, elem_size, need, have, at } => write!(
+                f,
+                "block {block:?} at body offset {at} wants {count} x {elem_size} = {need} bytes but only {have} remain",
+            ),
             ClassicError::CorruptBlockHeader { count, elem_size } => {
                 write!(f, "corrupt block header: count={count} element_size={elem_size}")
             }
@@ -968,7 +986,28 @@ fn decode_block(
     let struct_index = resolve_version_variant(layout, struct_index, version);
 
     let total = checked_block_extent(count, elem_size)?;
-    let raw_data = cur.take(total, "block elements")?.to_vec();
+    // Name the block and quote the header's own numbers. A bare "need N bytes,
+    // have M" cannot be acted on: N is `count * element_size`, so the interesting
+    // question is always which of the two is wrong and for which block, and
+    // recovering that from the product alone is guesswork.
+    let elements_at = cur.pos;
+    let raw_data = cur
+        .take(total, "block elements")
+        .map_err(|error| match error {
+            ClassicError::UnexpectedEof { need, have, .. } => ClassicError::ShortBlock {
+                block: layout
+                    .get_string(layout.block_layouts[block_index as usize].name_offset)
+                    .unwrap_or("?")
+                    .to_owned(),
+                count,
+                elem_size,
+                need,
+                have,
+                at: elements_at,
+            },
+            other => other,
+        })?
+        .to_vec();
 
     let mut elements = Vec::with_capacity(count);
     for i in 0..count {
@@ -1105,18 +1144,20 @@ fn sync_fixed_counts(
                 // 16-byte inline header: group(4) + ptr(4) + length(4) +
                 // tag_id(4). Payload is `group(4) + path + NUL`. Sync the
                 // group + the path length (excluding the NUL).
-                if p.len() >= 4 {
+                if p.len() > 5 {
+                    // group + path + NUL.
                     raw[*off..*off + 4].copy_from_slice(&p[0..4]);
-                    // Only rewrite the length when a path is present; a null
-                    // reference read from disk keeps its 4-byte (group-only)
-                    // payload and its original length field (H2 stores -1
-                    // there, not 0), so leave the inline word alone.
-                    if p.len() > 4 {
-                        let path_len = p.len() - 5; // minus 4 group + 1 NUL
-                        wr_u32(raw, *off + 8, path_len as u32, endian);
-                    }
+                    let path_len = p.len() - 5; // minus 4 group + 1 NUL
+                    wr_u32(raw, *off + 8, path_len as u32, endian);
+                } else if p.len() == 4 {
+                    // A null reference read from disk keeps its 4-byte
+                    // (group-only) payload and its original length field (H2
+                    // stores -1 there, not 0), so leave the inline word alone.
+                    raw[*off..*off + 4].copy_from_slice(&p[0..4]);
                 } else if *off + 12 <= raw.len() {
-                    // Empty payload: the reference was *edited* to null
+                    // Two cases reach here, and both mean "no path".
+                    //
+                    // An **empty payload**: the reference was edited to null
                     // (`TagReferenceData::to_bytes(None)` yields no bytes),
                     // unlike an originally-null ref whose decoded payload is
                     // the 4 group bytes. Neither the group nor the length was
@@ -1124,17 +1165,40 @@ fn sync_fixed_counts(
                     // would survive while no trailing path is emitted — the
                     // decoder then tries to read a phantom path and hits EOF
                     // ("need N bytes, have M"), corrupting the saved tag.
+                    //
+                    // A **5-byte payload** — group plus a bare NUL — is a
+                    // reference edited to the empty *string*, which a read can
+                    // never produce (a real path decodes to `4 + len + 1`
+                    // bytes). It used to take the path branch above, which
+                    // wrote `len = 5 - 5 = 0` while
+                    // `encode_struct_trailing` still emitted the NUL. The
+                    // decoder reads `len == 0` as "no path" and consumes
+                    // nothing, so every empty-path reference shifted the rest
+                    // of the body one byte and the next block header was read
+                    // off by one.
+                    //
                     // Write a canonical null: group = -1 and length = 0, which
                     // the decoder treats as NONE for both CE and H2.
                     raw[*off..*off + 4].copy_from_slice(&[0xFF; 4]);
                     wr_u32(raw, *off + 8, 0, endian);
                 }
             }
-            (TagFieldType::StringId, Some(TagSubChunkContent::StringId(s)))
-            | (TagFieldType::OldStringId, Some(TagSubChunkContent::OldStringId(s))) => {
+            (
+                TagFieldType::StringId | TagFieldType::OldStringId,
+                Some(TagSubChunkContent::StringId(s) | TagSubChunkContent::OldStringId(s)),
+            ) => {
                 // Inline (pad:u16, length:u16) big-endian. Sync length.
                 // (Legacy 32-byte inline old_string_id has no sub-chunk and
                 // is preserved verbatim, so it never reaches this arm.)
+                //
+                // Both field types accept either content variant on purpose.
+                // `encode_struct_trailing` already emits the bytes for either,
+                // so requiring the variant to match the field type left the
+                // inline length stale whenever a writer set a `string_id` value
+                // on an `old_string_id` field — the trailing bytes were the new
+                // string's while the length word was still the old string's, and
+                // the decoder then read the following block header off by the
+                // difference.
                 raw[*off + 2..*off + 4].copy_from_slice(&(s.len() as u16).to_be_bytes());
             }
             _ => {}
@@ -1180,7 +1244,12 @@ fn encode_struct_trailing(
                     // already lives in raw_data, so only `path + NUL`
                     // (payload[4..]) is trailing on disk.
                     TagSubChunkContent::TagReference(p) => {
-                        if p.len() > 4 {
+                        // `> 5`, not `> 4`: a 5-byte payload is group + a bare
+                        // NUL, i.e. an empty path, which `sync_fixed_counts`
+                        // encodes as a canonical null. Emitting its NUL here
+                        // would put a byte on disk that the decoder does not
+                        // read, desyncing everything after it.
+                        if p.len() > 5 {
                             out.extend_from_slice(&p[4..]);
                         }
                     }

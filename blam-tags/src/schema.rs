@@ -43,6 +43,7 @@ use crate::fields::TagFieldType;
 use crate::layout::{
     TagArrayLayout, TagBlockLayout, TagFieldLayout, TagFieldTypeLayout, TagInteropLayout,
     TagLayout, TagLayoutHeader, TagResourceLayout, TagStringList, TagStructLayout,
+    TagTemplateHole,
 };
 
 /// Schema-import failures from [`TagLayout::from_json`]. Distinct
@@ -761,12 +762,20 @@ fn build_layout_from_schema(
         struct_layouts,
         struct_tags,
         struct_version_table,
+        tmpl_holes: Vec::new(),
     };
 
     // Compute struct sizes + field offsets. First pass with tmpl
     // customs stored at 0 (no expansion) — matches how H3 schemas lay
     // out (common shader fields are inlined directly in the struct
     // field that follows the tmpl).
+    //
+    // Every `tmpl` custom is recorded, including the ones that expand to
+    // nothing: the point of `tmpl_holes` is *which template* a hole belongs
+    // to, and a dead template like `ssfx` still answers that question. Only
+    // the non-zero ones go on to have their size patched into the field's
+    // `definition` slot below, because only those change the arithmetic.
+    let mut tmpl_holes: Vec<TagTemplateHole> = Vec::new();
     let tmpl_expansions: Vec<(usize, u32)> = {
         let mut out = Vec::new();
         let mut global_field_idx = 0usize;
@@ -776,6 +785,16 @@ fn build_layout_from_schema(
                     && field.group_tag.as_deref() == Some("tmpl")
                     && let Some(target) = field.definition.as_str() {
                         let exp = tmpl_expansion_size(defs_dir, target);
+                        // A template whose tag is unparseable is not recorded
+                        // rather than recorded as zero: an unknown identity and
+                        // a known-empty one are different claims.
+                        if let Ok(group_tag) = parse_group_tag(target) {
+                            tmpl_holes.push(TagTemplateHole {
+                                field_index: global_field_idx as u32,
+                                group_tag,
+                                size: exp,
+                            });
+                        }
                         if exp > 0 {
                             out.push((global_field_idx, exp));
                         }
@@ -785,6 +804,10 @@ fn build_layout_from_schema(
         }
         out
     };
+    // `binary_search_by_key` in `template_hole` needs this ordering; the walk
+    // above produces it, and sorting says so rather than relying on it.
+    tmpl_holes.sort_by_key(|hole| hole.field_index);
+    result.tmpl_holes = tmpl_holes;
 
     for i in 0..result.struct_layouts.len() {
         result.compute_struct_layout(i);

@@ -243,9 +243,48 @@ pub struct TagLayout {
     /// Empty for MCC layouts. The classic decoder reads a block/struct
     /// header's version field and resolves the matching FieldSet variant.
     pub struct_version_table: Vec<Option<Vec<u32>>>,
+    /// Which template group each `tmpl` custom field stands in for.
+    ///
+    /// A `custom` field tagged `tmpl` is a fixed-size *hole* in a struct: the
+    /// bytes of another group's render method, inlined without a field list.
+    /// Halo 3 spells that method out by name; Reach onward hide the same ~100
+    /// bytes behind the hole. The size already reaches
+    /// [`TagFieldLayout::definition`] because the layout arithmetic needs it —
+    /// what it does not say is *which* template those bytes belong to, and
+    /// without that a comparison can only skip them and a converter can only
+    /// guess whether two holes hold the same thing.
+    ///
+    /// Sparse and sorted by `field_index`, in the manner of [`Self::struct_tags`].
+    /// **Empty for a layout parsed from a tag's own `blay`**: a shipped layout
+    /// records the hole but not its provenance, so this is populated only by
+    /// [`TagLayout::from_json`], which can read the template name out of the
+    /// schema. Deliberately additive — it changes no size, field list or offset,
+    /// so a tag still builds byte-for-byte the way the kits write it.
+    pub tmpl_holes: Vec<TagTemplateHole>,
+}
+
+/// One `tmpl` custom hole: where it sits, what template fills it, how wide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TagTemplateHole {
+    /// Index into [`TagLayout::fields`].
+    pub field_index: u32,
+    /// Group tag of the template the hole resolves to (e.g. `?rmp`).
+    pub group_tag: u32,
+    /// Bytes the hole occupies — the template's inherited root-struct chain.
+    /// Zero for a template that resolves to nothing, which is still worth
+    /// recording: the hole has an identity even when it has no width.
+    pub size: u32,
 }
 
 impl TagLayout {
+    /// The template hole at `field_index`, if that field is one.
+    pub fn template_hole(&self, field_index: usize) -> Option<&TagTemplateHole> {
+        self.tmpl_holes
+            .binary_search_by_key(&(field_index as u32), |hole| hole.field_index)
+            .ok()
+            .map(|position| &self.tmpl_holes[position])
+    }
+
     /// Resolve a `name_offset` into the UTF-8 string at that position
     /// in [`Self::string_data`] (the stored data is null-terminated).
     /// Returns `None` for an out-of-range offset.
@@ -776,6 +815,9 @@ impl TagLayout {
             interop_layouts,
             // MCC tags carry no classic inline-struct headers.
             struct_tags: Vec::new(),
+            // A shipped `blay` records the hole but never says which template
+            // it stands in for, so there is nothing honest to put here.
+            tmpl_holes: Vec::new(),
             // MCC tags are single-version (no on-disk FieldSet selection).
             struct_version_table: Vec::new(),
         };

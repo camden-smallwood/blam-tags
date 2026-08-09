@@ -95,6 +95,42 @@ impl TagFileHeader {
         })
     }
 
+    /// Read only the 64-byte header of a tag file on disk, and the byte order
+    /// it is written in.
+    ///
+    /// For a caller choosing *between* many tag files rather than opening one.
+    /// Everything the choice usually turns on — group, generation, byte order —
+    /// is in these 64 bytes, and parsing the rest of the file to reach them is
+    /// what makes such a scan cost the size of the corpus instead of the size of
+    /// the question. Measured: sifting Halo Reach's 10,675 shipped bitmaps by
+    /// full parse reads 6.4 GB and takes ~29 seconds; by header, 683 KB.
+    ///
+    /// Fails on anything without a `BLAM` signature, which includes every
+    /// classic (Halo CE / Halo 2) tag — those carry their signature elsewhere
+    /// and have no MCC header to read.
+    pub fn peek<P: AsRef<Path>>(path: P) -> Result<(Self, Endian), TagReadError> {
+        let mut file = std::fs::File::open(path.as_ref())?;
+        let mut bytes = [0u8; 64];
+        file.read_exact(&mut bytes)?;
+        // The signature is stored big-endian, so the bytes on disk spell `BLAM`
+        // in a big-endian file and `MALB` in a little-endian one. That is the
+        // same discrimination `TagFile::read` makes, and the only one available
+        // before any field has been interpreted.
+        let endian = match &bytes[60..64] {
+            b"MALB" => Endian::Le,
+            b"BLAM" => Endian::Be,
+            got => {
+                return Err(TagReadError::BadChunkSignature {
+                    offset: 60,
+                    expected: *b"BLAM",
+                    got: [got[0], got[1], got[2], got[3]],
+                });
+            }
+        };
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(&bytes[..]));
+        Ok((Self::read(&mut reader, endian)?, endian))
+    }
+
     /// Write this header. Mirrors `TagFileHeader::read`: fixed 64-byte
     /// layout with `pad[36] + build_version + build_number + version +
     /// group_tag + group_version + checksum + signature`.
