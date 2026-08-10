@@ -4371,7 +4371,11 @@ mod rename_experiment {
         let utocs = utocs_under(&root);
         assert!(!utocs.is_empty(), "no pakchunk .utoc found under {root}");
 
-        let mut imported: HashSet<String> = HashSet::new();
+        // Referrer count plus one example referrer's pak, per imported package.
+        // Counts rather than lists, because the corpus has 122k packages and
+        // keeping every edge would cost far more than the question is worth.
+        let mut imported: std::collections::HashMap<String, (usize, String)> =
+            std::collections::HashMap::new();
         let mut tags: Vec<(String, String)> = Vec::new();
         for utoc in &utocs {
             let Ok(archive) = IoStoreArchive::open(utoc) else {
@@ -4393,7 +4397,10 @@ mod rename_experiment {
                     continue;
                 };
                 for import in &header.imported_package_names {
-                    imported.insert(import.to_ascii_lowercase());
+                    let slot = imported
+                        .entry(import.to_ascii_lowercase())
+                        .or_insert((0, label.clone()));
+                    slot.0 += 1;
                 }
                 if lower.contains("/content/tags/") {
                     tags.push((label.clone(), header.package_name()));
@@ -4403,27 +4410,72 @@ mod rename_experiment {
 
         let mut by_pak: std::collections::BTreeMap<&str, Vec<&str>> =
             std::collections::BTreeMap::new();
+        // Exactly one referrer is what experiments B and C need: with more than
+        // one, a partial failure cannot be told from a partial success.
+        let mut single: Vec<(&str, &str, &str)> = Vec::new();
         for (label, name) in &tags {
-            if !imported.contains(&name.to_ascii_lowercase()) {
-                by_pak.entry(label).or_default().push(name);
+            match imported.get(&name.to_ascii_lowercase()) {
+                None => by_pak.entry(label).or_default().push(name),
+                Some((1, referrer)) => single.push((label, name, referrer)),
+                Some(_) => {}
             }
         }
         let free: usize = by_pak.values().map(Vec::len).sum();
+        let gb_of = |label: &str| {
+            std::fs::metadata(
+                std::path::Path::new(&root)
+                    .join(label)
+                    .with_extension("ucas"),
+            )
+            .map(|meta| meta.len() as f64 / 1024.0 / 1024.0 / 1024.0)
+            .unwrap_or(0.0)
+        };
 
-        println!("\ntag packages            {}", tags.len());
-        println!("with no importer at all {free}\n");
+        println!("\ntag packages               {}", tags.len());
+        println!("with no importer at all    {free}");
+        println!("with exactly one importer  {}\n", single.len());
         for (label, names) in &by_pak {
-            let size = std::path::Path::new(&root)
-                .join(label)
-                .with_extension("ucas");
-            let gb = std::fs::metadata(&size)
-                .map(|meta| meta.len() as f64 / 1024.0 / 1024.0 / 1024.0)
-                .unwrap_or(0.0);
             println!(
-                "{label:<28} {:>5} candidates  {gb:>6.2} GB ucas  e.g. {}",
+                "{label:<28} {:>5} unimported  {:>6.2} GB ucas  e.g. {}",
                 names.len(),
+                gb_of(label),
                 names[0]
             );
+        }
+
+        // Sorted so the cheapest pak to restore comes first, and same-pak
+        // referrers before cross-pak ones -- B is the experiment to run before
+        // C, because B failing makes C moot.
+        println!("\nsingle-importer candidates, cheapest pak first:");
+        single.sort_by(|a, b| {
+            // Same pak before cross-pak, then cheapest to restore first. The
+            // tuple compares a label against a label; comparing the package
+            // name against it instead silently sorts by nothing at all.
+            (a.0 != a.2).cmp(&(b.0 != b.2)).then(
+                gb_of(a.0)
+                    .partial_cmp(&gb_of(b.0))
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+        });
+        // Both kinds, cheapest of each, rather than the cheapest overall: the
+        // two are different experiments and the cost of running them differs by
+        // two orders of magnitude, so the choice is the caller's to make.
+        for (scope, cross) in [
+            ("B, referrer in the same pak", false),
+            ("C, referrer elsewhere", true),
+        ] {
+            println!("\n  experiment {scope}:");
+            let mut shown = 0;
+            for (label, name, referrer) in single.iter().filter(|(l, _, r)| (l != r) == cross) {
+                println!("  {:>6.2} GB  {label:<26} {name}", gb_of(label));
+                shown += 1;
+                if shown == 5 {
+                    break;
+                }
+            }
+            if shown == 0 {
+                println!("  (none)");
+            }
         }
         assert!(!tags.is_empty(), "no tag package was found under CE_PAKS");
     }
