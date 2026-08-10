@@ -304,17 +304,27 @@ fn unsupported_pair_message(source_game: &str, target_game: &str) -> String {
 
 const CONVERSION_MAPPING_CATALOG: &str = include_str!("conversion_mappings.json");
 
-/// These groups contain layout features which `TagFile::new` cannot currently
-/// reconstruct closely enough for the native editing kits. Start from an
-/// editing-kit-authored target tag so its embedded layout tables stay native.
-#[cfg(test)]
-const NATIVE_LAYOUT_TEMPLATE_GROUPS: &[&str] = &["particle", "model", "biped"];
 
 #[cfg(test)]
-fn requires_native_layout_template(group_name: &str) -> bool {
-    NATIVE_LAYOUT_TEMPLATE_GROUPS
-        .iter()
-        .any(|group| group_name.eq_ignore_ascii_case(group))
+
+/// Whether this target needs a tag from its editing kit to start from.
+///
+/// Derived rather than listed, by asking the same question
+/// [`build_target_from_definitions`] answers, so the two cannot drift apart. The
+/// old hardcoded trio - particle, model, biped - was a per-group approximation of
+/// a per-*target* fact: Halo 4's `decal_system` keeps a material in a named struct
+/// and builds from its schema, while Halo 3's expands a render method inline and
+/// cannot. Measured over the definitions, `model` and `biped` declare no template
+/// hole at all.
+#[cfg(test)]
+fn target_needs_kit_template(definitions_root: &Path, target_game: &str, group_name: &str) -> bool {
+    if CLASSIC_CONVERSION_GAMES.contains(&target_game) {
+        return true;
+    }
+    let schema = definitions_root
+        .join(target_game)
+        .join(format!("{group_name}.json"));
+    schema.is_file() && build_target_from_definitions(&schema).is_none()
 }
 
 /// Stamp a freshly-created MCC tag with the file-header generation expected by
@@ -1911,28 +1921,41 @@ fn analyze_conversion_inner(
             ));
         }
     }
-    let (mut target, target_template) = if let Some((template, template_path)) = native_target {
-        (template, Some(template_path))
-    } else if CLASSIC_CONVERSION_GAMES.contains(&target_game) {
+    // A tag built from the target game's own definitions, which is where a
+    // conversion should start: the fields are then filled from the source and
+    // nothing else is carried. `None` when the definitions cannot produce one —
+    // a classic container, or a schema that does not survive construction.
+    let from_definitions = if CLASSIC_CONVERSION_GAMES.contains(&target_game) {
         // `TagFile::new` can only build an MCC container: it hard-codes
         // `TagContainer::Mcc` and `Endian::Le`, there is no `ClassicHeader`
         // writer, and Halo 2's root block header is never synthesized. So a
         // classic target has to start from a tag the kit authored.
-        return Err(format!(
-            "Converting to {target_game} needs a {target_group_name} tag from its \
-             editing kit to start from, because a classic tag cannot be built \
-             from a schema alone. Configure the {target_game} kit and make sure \
-             it ships at least one {target_group_name}."
-        ));
+        None
+    } else if std::env::var_os("BLAM_PREFER_KIT_TEMPLATE").is_some() {
+        // Comparison switch, not a feature: it puts the old order back so the
+        // two starting points can be diffed on one machine.
+        None
     } else {
-        let mut target = TagFile::new(&schema_path).map_err(|error| {
-            format!(
-                "Could not create target tag from {}: {error}",
+        build_target_from_definitions(&schema_path)
+    };
+    let (mut target, target_template) = match (from_definitions, native_target) {
+        (Some(target), _) => (target, None),
+        (None, Some((template, template_path))) => (template, Some(template_path)),
+        (None, None) if CLASSIC_CONVERSION_GAMES.contains(&target_game) => {
+            return Err(format!(
+                "Converting to {target_game} needs a {target_group_name} tag from its \
+                 editing kit to start from, because a classic tag cannot be built \
+                 from a schema alone. Configure the {target_game} kit and make sure \
+                 it ships at least one {target_group_name}."
+            ));
+        }
+        (None, None) => {
+            return Err(format!(
+                "Could not build a {target_group_name} for {target_game} from \
+                 {}, and the kit has none to start from either.",
                 schema_path.display()
-            )
-        })?;
-        initialize_block_index_defaults(target.root_mut());
-        (target, None)
+            ));
+        }
     };
     apply_editing_kit_mcc_header(&mut target, target_game)?;
     // From the template as the kit wrote it, not from `target`: the reset clears
@@ -2514,6 +2537,52 @@ fn report_materials_without_a_shader(target: &TagFile, context: &mut ConversionC
             context.target_game
         ),
     });
+}
+
+/// Build an empty target tag from the game's own definitions.
+///
+/// This is where a conversion starts. Reading the source and filling a tag built
+/// from the target's schema is both what a user expects an importer to do and
+/// what makes the result clean: nothing arrives in the tag except what came from
+/// the source or what the schema says the field defaults to. Starting from a tag
+/// the kit happened to ship means inheriting whichever revision and whichever
+/// leftover values that tag had, and it means a user with an empty editing kit
+/// gets nothing at all — which is the case that made this the default.
+///
+/// `None` rather than an error when the definitions cannot produce a usable tag,
+/// because the caller has a second option. Three cases, and each is decided by
+/// asking rather than by consulting a list:
+///
+/// - **A classic container**, which has no writer at all. The caller checks that.
+/// - **A schema that will not build.** Reach's `contrail_system` *panics* in
+///   `layout.rs` with an out-of-range layout index, so the panic is caught rather
+///   than predicted and a schema that starts or stops building needs no list
+///   maintained anywhere.
+/// - **A schema with a `tmpl` hole of non-zero width.** This is the one that
+///   cannot be worked around, and it is why the kit-template path is kept rather
+///   than deleted. A `tmpl` custom field stands in for another group's inlined
+///   render method: the definitions know how many bytes it occupies and nothing
+///   about what is in it, so the `options`, `parameters` and `postprocess` blocks
+///   inside it have no field list and no field index, and a tag built from the
+///   schema cannot hold them. Converting an H3 particle into Reach from a
+///   schema-built tag loses 18 authored `options` entries and is refused — which
+///   is the guard working, since a Reach particle with no render-method
+///   definition is what crashed the mod tools in the first place.
+///
+/// A zero-width hole is not a reason to fall back: the template it names resolves
+/// to nothing, so there is nothing the schema is failing to describe.
+fn build_target_from_definitions(schema_path: &Path) -> Option<TagFile> {
+    std::panic::catch_unwind(|| {
+        let layout = crate::layout::TagLayout::from_json(schema_path).ok()?;
+        if layout.tmpl_holes.iter().any(|hole| hole.size > 0) {
+            return None;
+        }
+        let mut target = TagFile::new(schema_path).ok()?;
+        initialize_block_index_defaults(target.root_mut());
+        Some(target)
+    })
+    .ok()
+    .flatten()
 }
 
 /// A parameter, as the name it answers to plus every value it carries.
@@ -7021,19 +7090,19 @@ mod tests {
         // Rejected: `version == u32::MAX` is what a tag with no recorded source
         // revision carries, which is also what Baboon stamps on its own output.
         let mut reject =
-            TagFile::new(definitions.join("haloreach_mcc/weapon.json")).unwrap();
+            TagFile::new(definitions.join("haloreach_mcc/particle.json")).unwrap();
         apply_editing_kit_mcc_header(&mut reject, "haloreach_mcc").unwrap();
         assert_eq!(reject.header.version, u32::MAX, "the reject must be rejected");
         // Accepted: any recorded revision will do.
         let mut accept =
-            TagFile::new(definitions.join("haloreach_mcc/weapon.json")).unwrap();
+            TagFile::new(definitions.join("haloreach_mcc/particle.json")).unwrap();
         apply_editing_kit_mcc_header(&mut accept, "haloreach_mcc").unwrap();
         accept.header.version = 3;
 
         // Sorted order is what the search walks, so zero-padded names put the
         // acceptable tag at an exact, chosen index.
         let place = |index: usize, tag: &TagFile| {
-            tag.write_atomic(tags.join(format!("tag_{index:05}.weapon")))
+            tag.write_atomic(tags.join(format!("tag_{index:05}.particle")))
                 .unwrap();
         };
         let past_the_bound = NATIVE_TEMPLATE_SCAN_LIMIT + 20;
@@ -7043,7 +7112,7 @@ mod tests {
         place(past_the_bound, &accept);
 
         let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
-        let source = TagFile::new(definitions.join("halo3_mcc/weapon.json")).unwrap();
+        let source = TagFile::new(definitions.join("halo3_mcc/particle.json")).unwrap();
         let analyze = |tags_root: &Path| {
             let templates = NativeTemplateIndex::build(tags_root, &groups);
             analyze_conversion_with_templates(
@@ -7053,12 +7122,15 @@ mod tests {
                 &definitions,
                 Some(&templates),
             )
-            .unwrap()
-            .native_layout_template
+            .map(|draft| draft.native_layout_template)
         };
 
+        // `particle` is a group the definitions cannot build — its render method
+        // is a `tmpl` hole — so a template past the bound is not merely "not
+        // found", it leaves the conversion with nowhere to start. Either way what
+        // is being measured is the bound.
         assert!(
-            analyze(&root.join("tags")).is_none(),
+            analyze(&root.join("tags")).is_err(),
             "an acceptable tag {past_the_bound} deep is past the bound and must not be found"
         );
 
@@ -7066,7 +7138,7 @@ mod tests {
         // above is the bound rather than the search failing outright.
         place(1, &accept);
         assert!(
-            analyze(&root.join("tags")).is_some(),
+            analyze(&root.join("tags")).is_ok_and(|template| template.is_some()),
             "an acceptable tag at index 1 is well inside the bound"
         );
 
@@ -7482,11 +7554,6 @@ mod tests {
         let catalog = ConversionMappingCatalog::load().unwrap();
         let mut failures = Vec::new();
         for group in &catalog.covered_groups {
-            // Layout-sensitive output intentionally requires a native
-            // editing-kit template. Its path has dedicated tests below.
-            if requires_native_layout_template(group) {
-                continue;
-            }
             for source_game in CONVERSION_GAMES {
                 let source = match std::panic::catch_unwind(|| {
                     TagFile::new(root.join(source_game).join(format!("{group}.json")))
@@ -7505,6 +7572,12 @@ mod tests {
                 };
                 for target_game in CONVERSION_GAMES {
                     if source_game == target_game {
+                        continue;
+                    }
+                    // This sweep runs with no kits on purpose, so a target whose
+                    // schema cannot start a conversion has nothing to test here.
+                    // Its own path is covered by the template tests below.
+                    if target_needs_kit_template(&root, target_game, group) {
                         continue;
                     }
                     let analysis = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -7548,9 +7621,6 @@ mod tests {
 
         let mut failures = Vec::new();
         for group in &all_groups {
-            if requires_native_layout_template(group) {
-                continue;
-            }
             for (source_index, source_game) in CONVERSION_GAMES.iter().enumerate() {
                 if !indexes[source_index].by_name.contains_key(group) {
                     continue;
@@ -7575,6 +7645,11 @@ mod tests {
                     if source_game == target_game
                         || !indexes[target_index].by_name.contains_key(group)
                     {
+                        continue;
+                    }
+                    // Kitless sweep: a target whose schema cannot start a
+                    // conversion is covered by the template tests instead.
+                    if target_needs_kit_template(&root, target_game, group) {
                         continue;
                     }
                     if catalog.unusable_schema_reason(group, target_game).is_some() {
@@ -7715,9 +7790,9 @@ mod tests {
     }
 
     #[test]
-    fn model_and_biped_use_native_target_layout_templates() {
+    fn a_group_the_definitions_cannot_build_uses_a_native_layout_template() {
         let definitions = locate_definitions_root();
-        for group in ["model", "biped"] {
+        for group in ["particle"] {
             let tags_root = std::env::temp_dir().join(format!(
                 "baboon_{group}_template_{}_{}",
                 std::process::id(),
@@ -8477,11 +8552,10 @@ mod tests {
         // reject. Without one of those the assertions below hold vacuously.
         let mut discriminated = 0usize;
 
-        for (group, fourcc) in [
-            ("effect", "effe"),
-            ("particle", "prt3"),
-            ("decal_system", "decs"),
-        ] {
+        // `particle` only. Every other fx group now builds from Halo 4's own
+        // definitions and never consults the kit, so there is no revision to
+        // choose between - which is the point of the change, not a gap here.
+        for (group, fourcc) in [("particle", "prt3")] {
             let group_tag = crate::parse_group_tag(fourcc).expect("a group tag");
             let schema = definitions.join("halo4_mcc").join(format!("{group}.json"));
             let declared =
@@ -8559,10 +8633,10 @@ mod tests {
         };
         let definitions = locate_definitions_root();
         let groups = GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
-        let group_tag = crate::parse_group_tag("effe").expect("effe is a group tag");
-        let declared = declared_root_size(&definitions.join("halo4_mcc/effect.json")).unwrap();
+        let group_tag = crate::parse_group_tag("prt3").expect("prt3 is a group tag");
+        let declared = declared_root_size(&definitions.join("halo4_mcc/particle.json")).unwrap();
 
-        let Some(wrong) = tags_with_extension(&h4, "effect").into_iter().find(|path| {
+        let Some(wrong) = tags_with_extension(&h4, "particle").into_iter().find(|path| {
             TagFile::read(path).is_ok_and(|tag| {
                 accepts_native_header(&tag.header, "halo4_mcc")
                     && tag.root().definition().size() != declared
@@ -8574,7 +8648,7 @@ mod tests {
 
         // A kit holding exactly one effect, of the wrong revision.
         let scratch = std::env::temp_dir().join(format!(
-            "blam_wrong_revision_{}_{}",
+            "blam_wrong_revision_particle_{}_{}",
             std::process::id(),
             group_tag
         ));
@@ -8583,13 +8657,13 @@ mod tests {
         fs::copy(&wrong, scratch.join(wrong.file_name().unwrap())).unwrap();
         let templates = NativeTemplateIndex::build(&scratch, &groups);
 
-        let source_path = tags_with_extension(&reach, "effect")
+        let source_path = tags_with_extension(&reach, "particle")
             .into_iter()
             .find(|path| {
                 read_tag_for_conversion(path, Some("haloreach_mcc"), Some(&definitions), group_tag)
                     .is_ok()
             })
-            .expect("HREK ships an effect");
+            .expect("HREK ships a particle");
         let source = read_tag_for_conversion(
             &source_path,
             Some("haloreach_mcc"),
@@ -9594,6 +9668,84 @@ mod tests {
         if checked == 0 {
             eprintln!("skipping: no HREK particle in the sample names a base map");
         }
+    }
+
+    /// A target the definitions can build never touches the kit.
+    ///
+    /// The guarantee the whole importer is meant to give: read the source, build
+    /// a tag from the *target's* schema, fill its fields from what was read. A tag
+    /// the kit happened to ship is not consulted, so the result cannot inherit
+    /// that tag's layout revision or its leftovers, and a user with an empty
+    /// editing kit gets the same output as a user with a full one.
+    ///
+    /// A full kit index is passed in deliberately: the point is that having one
+    /// available changes nothing.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_target_the_definitions_can_build_never_consults_the_kit() {
+        let (Some(reach), Some(h4)) = (
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+        ) else {
+            eprintln!("skipping: needs HREK and H4EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h4, &groups);
+        let mut checked = 0usize;
+
+        for (group, fourcc) in [
+            ("effect", "effe"),
+            ("weapon", "weap"),
+            ("decal_system", "decs"),
+            ("biped", "bipd"),
+        ] {
+            let Some(group_tag) = crate::parse_group_tag(fourcc) else {
+                continue;
+            };
+            let Some(path) = tags_with_extension(&reach, group).into_iter().find(|path| {
+                read_tag_for_conversion(path, Some("haloreach_mcc"), Some(&definitions), group_tag)
+                    .is_ok()
+            }) else {
+                eprintln!("skipping {group}: HREK ships none");
+                continue;
+            };
+            let source = read_tag_for_conversion(
+                &path,
+                Some("haloreach_mcc"),
+                Some(&definitions),
+                group_tag,
+            )
+            .unwrap();
+            let Ok(draft) = analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "halo4_mcc",
+                &definitions,
+                Some(&templates),
+            ) else {
+                eprintln!("skipping {group}: did not convert");
+                continue;
+            };
+            assert!(
+                draft.native_layout_template.is_none(),
+                "{group}: started from the kit's {:?} when halo4_mcc/{group}.json can build one",
+                draft.native_layout_template
+            );
+            // And the schema's own root size, not whichever revision a kit tag had.
+            let declared =
+                declared_root_size(&definitions.join("halo4_mcc").join(format!("{group}.json")))
+                    .expect("a declared root size");
+            assert_eq!(
+                draft.tag.root().definition().size(),
+                declared,
+                "{group}: built to a different revision than the definitions declare"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no group was actually checked");
     }
 
     /// A conversion with no target kit at all still gives the material its texture.
