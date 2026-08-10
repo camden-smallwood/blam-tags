@@ -275,6 +275,51 @@ impl FIoContainerHeader {
         self.packages.0.remove(&package_id).is_some()
     }
 
+    /// Point every redirect that currently targets `from` at `to` instead.
+    ///
+    /// Returns how many moved. Without this a package could be renamed once and
+    /// never again: renaming A to B installs a redirect targeting B, and the
+    /// next rename would find B redirected-to and refuse rather than leave the
+    /// first redirect dangling. Collapsing `A → B → C` to `A → C, B → C` keeps
+    /// every name that ever pointed here resolving.
+    pub fn retarget_package_redirect(&mut self, from: FPackageId, to: FPackageId) -> usize {
+        let mut moved = 0;
+        for redirect in &mut self.package_redirects {
+            if redirect.target_package_id == from {
+                redirect.target_package_id = to;
+                moved += 1;
+            }
+        }
+        for redirect in &mut self.legacy_package_redirects {
+            if redirect.target_package_id == from {
+                redirect.target_package_id = to;
+                moved += 1;
+            }
+        }
+        for target in self.package_redirect_lookup.values_mut() {
+            if *target == from {
+                *target = to;
+            }
+        }
+        moved
+    }
+
+    /// Drop the redirect whose *source* is `source_package_id`, if any.
+    ///
+    /// Safe with respect to `redirect_name_map`: names are addressed by
+    /// `FMappedName` index and the map is serialized whole, so an orphaned name
+    /// costs bytes and nothing else. Removing it would renumber every index
+    /// after it, which is the opposite of safe.
+    pub fn remove_package_redirect(&mut self, source_package_id: FPackageId) -> bool {
+        let before = self.package_redirects.len() + self.legacy_package_redirects.len();
+        self.package_redirects
+            .retain(|redirect| redirect.source_package_id != source_package_id);
+        self.legacy_package_redirects
+            .retain(|redirect| redirect.source_package_id != source_package_id);
+        self.package_redirect_lookup.remove(&source_package_id);
+        before != self.package_redirects.len() + self.legacy_package_redirects.len()
+    }
+
     /// Whether the soft-package-reference block declares anything.
     ///
     /// Separate from [`has_soft_package_references`](Self::has_soft_package_references)
