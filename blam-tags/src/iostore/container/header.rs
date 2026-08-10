@@ -275,6 +275,18 @@ impl FIoContainerHeader {
         self.packages.0.remove(&package_id).is_some()
     }
 
+    /// Whether the soft-package-reference block declares anything.
+    ///
+    /// Separate from [`has_soft_package_references`](Self::has_soft_package_references)
+    /// because an empty block has no ordinals to desync: the refusal exists to
+    /// protect a mapping, and a mapping of nothing is not one.
+    pub fn soft_package_reference_count(&self) -> usize {
+        self.soft_package_references
+            .as_ref()
+            .map(|refs| refs.package_indices.len())
+            .unwrap_or_default()
+    }
+
     /// Whether a soft-package-reference block is present.
     ///
     /// Its `package_indices` buffer is keyed by store-entry ordinal, and the
@@ -696,5 +708,101 @@ impl Writeable for FCulturePackageMap {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod corpus {
+    use super::*;
+    use crate::iostore::IoStoreArchive;
+    use std::io::Cursor;
+    use std::path::PathBuf;
+
+    /// `EIoChunkType::ContainerHeader`.
+    const CHUNK_TYPE_CONTAINER_HEADER: u8 = 6;
+
+    /// Report whether shipped containers carry the ordinal-keyed blocks that
+    /// make adding or removing a package unsafe.
+    ///
+    /// A measurement, not an assertion about the game. It decides whether
+    /// renaming a tag in place is possible on a shipped pak at all:
+    /// `soft_package_references` and the optional segment are keyed by
+    /// store-entry ordinal, and the store is a `BTreeMap` over `FPackageId`, so
+    /// *adding* a package renumbers them exactly as removing one does.
+    ///
+    /// It matters twice over. `resolve_tag_deletion` refuses a container that
+    /// carries them, but `duplicate_tag_in_place_impl` calls `add_package` with
+    /// no such check -- so if shipped packs do carry a non-empty block, the
+    /// duplicate path that already ships is unsound against them.
+    ///
+    ///   CE_PAKS=/path/to/Meteorite/Content/Paks \
+    ///     cargo test --features iostore container::header::corpus -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires a Campaign Evolved install; set CE_PAKS"]
+    fn report_ordinal_keyed_blocks_in_shipped_containers() {
+        let Ok(root) = std::env::var("CE_PAKS") else {
+            panic!("set CE_PAKS to the game's Content/Paks");
+        };
+        let mut utocs: Vec<PathBuf> = std::fs::read_dir(&root)
+            .expect("read paks dir")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|x| x.eq_ignore_ascii_case("utoc")))
+            .filter(|path| !path.file_name().is_some_and(|n| n.eq_ignore_ascii_case("global.utoc")))
+            .collect();
+        utocs.sort();
+
+        let (mut headers, mut soft, mut optional, mut locked) = (0usize, 0usize, 0usize, 0usize);
+        for utoc in &utocs {
+            let name = utoc.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            let Ok(archive) = IoStoreArchive::open(utoc) else {
+                println!("{name:<44} could not be opened");
+                continue;
+            };
+            let mut found = false;
+            for index in 0..archive.chunk_count() as u32 {
+                let Ok(id) = archive.chunk_id(index) else { continue };
+                if id.chunk_type() != CHUNK_TYPE_CONTAINER_HEADER {
+                    continue;
+                }
+                found = true;
+                headers += 1;
+                let Ok(bytes) = archive.read_chunk(index) else {
+                    println!("{name:<44} header chunk unreadable");
+                    continue;
+                };
+                match FIoContainerHeader::deserialize(&mut Cursor::new(&bytes[..]), None) {
+                    Ok(header) => {
+                        let refs = header.soft_package_reference_count();
+                        let segment = header.optional_segment_package_ids.len();
+                        soft += usize::from(refs > 0);
+                        optional += usize::from(segment > 0);
+                        locked += usize::from(refs > 0 || segment > 0);
+                        println!(
+                            "{name:<44} version {:?}  packages {}  soft refs {refs}  optional {segment}",
+                            header.version,
+                            header.package_ids().len(),
+                        );
+                    }
+                    Err(error) => println!("{name:<44} header did not parse: {error}"),
+                }
+            }
+            if !found {
+                println!("{name:<44} carries no container header");
+            }
+        }
+
+        println!("\ncontainer headers read      {headers}");
+        println!("with soft package refs      {soft}");
+        println!("with an optional segment    {optional}");
+        println!("ordinal-locked              {locked}");
+        if locked > 0 {
+            println!(
+                "\nIn-place rename is refused on those containers -- and the in-place duplicate\n\
+                 path that already ships does NOT check for this before calling add_package."
+            );
+        } else {
+            println!("\nNo container is ordinal-locked; in-place add and remove are both open.");
+        }
+        assert!(headers > 0, "no container header was found under CE_PAKS");
     }
 }
