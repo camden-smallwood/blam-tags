@@ -4377,6 +4377,7 @@ mod rename_experiment {
         let mut imported: std::collections::HashMap<String, (usize, String)> =
             std::collections::HashMap::new();
         let mut tags: Vec<(String, String)> = Vec::new();
+        let mut assets: Vec<(String, String)> = Vec::new();
         for utoc in &utocs {
             let Ok(archive) = IoStoreArchive::open(utoc) else {
                 continue;
@@ -4404,6 +4405,14 @@ mod rename_experiment {
                 }
                 if lower.contains("/content/tags/") {
                     tags.push((label.clone(), header.package_name()));
+                } else {
+                    // Everything that is not a tag: meshes, textures, materials,
+                    // Wwise events. These are what the *runtime* dereferences
+                    // through the import path, which a tag wrapper may never do
+                    // -- Campaign Evolved reads tag data through its own layer
+                    // and reaches the cooked asset directly. A rename experiment
+                    // on a tag can therefore pass while proving nothing.
+                    assets.push((label.clone(), header.package_name()));
                 }
             }
         }
@@ -4477,6 +4486,38 @@ mod rename_experiment {
                 println!("  (none)");
             }
         }
+        // Non-tag assets with exactly one referrer, in the cheapest paks. These
+        // are the only subjects that can actually falsify the redirect question:
+        // a mesh or texture that a single material or level imports is on the
+        // runtime's import path, so withholding the redirect has to break
+        // something visible. A test that cannot break anything cannot prove
+        // anything either.
+        let mut single_assets: Vec<(&str, &str, &str)> = assets
+            .iter()
+            .filter_map(
+                |(label, name)| match imported.get(&name.to_ascii_lowercase()) {
+                    Some((1, referrer)) => Some((label.as_str(), name.as_str(), referrer.as_str())),
+                    _ => None,
+                },
+            )
+            .collect();
+        single_assets.sort_by(|a, b| {
+            gb_of(a.0)
+                .partial_cmp(&gb_of(b.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        println!(
+            "\nnon-tag packages {}, of which {} have exactly one importer",
+            assets.len(),
+            single_assets.len()
+        );
+        println!("cheapest paks first:");
+        for (label, name, referrer) in single_assets.iter().take(20) {
+            println!(
+                "  {:>6.2} GB  {label:<26} {name}\n              imported by {referrer}",
+                gb_of(label)
+            );
+        }
         assert!(!tags.is_empty(), "no tag package was found under CE_PAKS");
     }
 
@@ -4508,6 +4549,11 @@ mod rename_experiment {
     fn move_one_package_in_a_copied_install() {
         let root = std::env::var("CE_RENAME_EXPERIMENT")
             .expect("set CE_RENAME_EXPERIMENT to a COPY of the game's Content/Paks");
+        // The negative control, and the only thing that makes a positive result
+        // mean anything. If the referrer still resolves with no redirect
+        // installed, then whatever kept it working was never the redirect, and
+        // a passing run with one proves nothing about it.
+        let redirect = std::env::var("CE_RENAME_REDIRECT").as_deref() != Ok("0");
         // The other gated tests read; this one writes. Pointing it at the
         // install every other test measures would corrupt the baseline every
         // later answer is compared against.
@@ -4611,6 +4657,14 @@ mod rename_experiment {
         println!("to          {destination}");
         println!("old id      0x{:016X}", old_id.0);
         println!("new id      0x{:016X}", new_id.0);
+        println!(
+            "redirect    {}",
+            if redirect {
+                "installed"
+            } else {
+                "NONE - negative control"
+            }
+        );
         println!("referrers   {}", referrers_of_target.len());
         for (referrer, label) in &referrers_of_target {
             let elsewhere = if label
@@ -4636,7 +4690,7 @@ mod rename_experiment {
                 replacement_export_bundle: None,
                 replacement_bulk_data: None,
                 minimum_appended_index: None,
-                redirect: true,
+                redirect,
             },
         )
         .expect("the rename itself");
