@@ -468,6 +468,10 @@ pub struct GameTagIndex {
 pub struct NativeTemplateIndex {
     by_group: HashMap<u32, Vec<PathBuf>>,
     cached: RefCell<HashMap<u32, Option<(Vec<u8>, PathBuf)>>>,
+    /// What each `.material_shader` in the kit declares its inputs to be, keyed
+    /// by the tag path a material names. A folder run converts hundreds of
+    /// particles that between them name a handful of shaders.
+    material_parameters: RefCell<HashMap<String, Vec<DeclaredParameter>>>,
 }
 
 impl NativeTemplateIndex {
@@ -2088,6 +2092,9 @@ fn analyze_conversion_inner(
     strip_cross_engine_scripts(&mut target, &mut context);
     restore_render_method_option_slots(&mut target, &template_option_counts, &mut context);
     apply_default_material(&mut target, &mut context);
+    // After the default, because the material it names is what decides which
+    // inputs there are to seed.
+    seed_material_parameters(&mut target, &mut context);
     let fail_closed_losses = validate_critical_runtime_safety(source, &context, policy)?;
     if !fail_closed_losses.is_empty() {
         context.report.issues.push(ConversionIssue {
@@ -2399,6 +2406,345 @@ fn apply_default_material(target: &mut TagFile, context: &mut ConversionContext<
             context.source_game, context.group_name, context.target_game
         ),
     });
+}
+
+/// A parameter, as the name it answers to plus every value it carries.
+type ParameterFields = (String, Vec<(String, TagFieldData)>);
+
+/// What a material shader calls one of its inputs, and what kind it is.
+///
+/// Only the identity, not the values: a `TagFieldData` cannot be cloned, and the
+/// values a seeded parameter should carry come from the source anyway.
+#[derive(Clone)]
+struct DeclaredParameter {
+    name: String,
+    parameter_type: Option<(i32, Option<String>)>,
+}
+
+/// A parameter name with the punctuation taken out.
+///
+/// The two blocks name the same input differently — `base_map` against
+/// `basemap`, `depth_fade_range` against `depthfaderange`, `alpha_map` against
+/// `alphamap`. Measured across the 1,986 H4EK particles that fill both blocks,
+/// squashing is what lines them up; nothing subtler was needed.
+fn squashed_parameter_name(name: &str) -> String {
+    name.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// Every element of `block_name`, as its parameter name plus its field values.
+fn parameter_elements(value: TagStruct<'_>, block_name: &str) -> Vec<ParameterFields> {
+    let Some(block) = value
+        .fields()
+        .find(|field| clean_field_key(field.name()) == block_name)
+        .and_then(|field| field.as_block())
+    else {
+        return Vec::new();
+    };
+    (0..block.len())
+        .filter_map(|index| block.element(index))
+        .filter_map(|element| {
+            let mut fields = Vec::new();
+            let mut name = None;
+            for field in element.fields() {
+                let Some(data) = field.value() else { continue };
+                let key = clean_field_key(field.name());
+                if key == "parameter name"
+                    && let TagFieldData::StringId(value) | TagFieldData::OldStringId(value) = &data
+                {
+                    name = Some(value.string.clone());
+                }
+                fields.push((key, data));
+            }
+            name.map(|name| (name, fields))
+        })
+        .collect()
+}
+
+/// What the kit's own `.material_shader` says its inputs are called.
+///
+/// Read from the target kit rather than derived, because the answer is per
+/// material shader: `particle_base` declares 16 parameters and `tracer_base`
+/// exactly one. Cached, since a folder run converts hundreds of particles that
+/// all name the same handful of shaders.
+fn material_shader_parameters(
+    templates: &NativeTemplateIndex,
+    tag_path: &str,
+    target_game: &str,
+    definitions_root: &Path,
+) -> Vec<DeclaredParameter> {
+    if let Some(cached) = templates.material_parameters.borrow().get(tag_path) {
+        return cached.clone();
+    }
+    let group = parse_group_tag("mats").unwrap_or(u32::from_be_bytes(*b"mats"));
+    let wanted =
+        format!("{}.material_shader", tag_path.replace('\\', "/")).to_ascii_lowercase();
+    let found: Vec<DeclaredParameter> = templates
+        .by_group
+        .get(&group)
+        .into_iter()
+        .flatten()
+        .find(|path| {
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+                .ends_with(&wanted)
+        })
+        .and_then(|path| {
+            read_tag_for_conversion(path, Some(target_game), Some(definitions_root), group).ok()
+        })
+        .map(|tag| {
+            parameter_elements(tag.root(), "material parameters")
+                .into_iter()
+                .map(|(name, fields)| DeclaredParameter {
+                    name,
+                    parameter_type: fields.into_iter().find_map(|(key, data)| match data {
+                        TagFieldData::LongEnum { value, name } if key == "parameter type" => {
+                            Some((value, name))
+                        }
+                        _ => None,
+                    }),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    templates
+        .material_parameters
+        .borrow_mut()
+        .insert(tag_path.to_owned(), found.clone());
+    found
+}
+
+/// Give a converted fx tag's material the inputs its own render method carries.
+///
+/// Halo 4 keeps two parameter blocks side by side: the legacy render method's,
+/// under `actual shader?`, and the material's, under `actual material?`. Both are
+/// populated in shipped content — 3,429 of H4EK's 3,916 particles fill the
+/// material block — and only the material one feeds the material shader the tag
+/// actually draws with. A conversion carries the render method faithfully and, up
+/// to now, left the material block empty, so a ported particle named a material
+/// shader and gave it nothing: the texture sat in the deprecated half and the
+/// visible half fell back to the shader's own defaults.
+///
+/// Only parameters the material shader *declares* are seeded, and the element is
+/// built from that declaration so its type and sampler settings are the shader's
+/// own — with just the values overlaid from the render method. For a Reach
+/// particle on `particle_base` that is `base_map` -> `basemap`, the particle's
+/// texture, and `depth_fade_range` -> `depthfaderange`.
+///
+/// Seeding, not translating, and the report says so. Halo 4's artists re-authored
+/// these when they ported content: of the shipped pairs that share a squashed
+/// name and carry a bitmap, 2,491 agree and 796 deliberately do not. An automatic
+/// port cannot know which it is looking at, and the source's own texture is a far
+/// better starting point than none.
+fn seed_material_parameters(target: &mut TagFile, context: &mut ConversionContext<'_>) {
+    let Some(templates) = context.native_templates else {
+        return;
+    };
+
+    fn walk(
+        mut value: TagStructMut<'_>,
+        templates: &NativeTemplateIndex,
+        target_game: &str,
+        definitions_root: &Path,
+        seeded: &mut Vec<String>,
+    ) {
+        // A container that holds the material beside something carrying render
+        // method parameters. Found by shape rather than by field name, because
+        // the slot is at the root of a particle and inside a block element of a
+        // tracer, and named for its own group either way.
+        let material_ordinal = value
+            .as_ref()
+            .fields()
+            .position(|field| field.as_struct().is_some_and(is_material_struct));
+        if let Some(material_ordinal) = material_ordinal {
+            let carried: Vec<ParameterFields> = value
+                .as_ref()
+                .fields()
+                .enumerate()
+                .filter(|(ordinal, _)| *ordinal != material_ordinal)
+                .filter_map(|(_, field)| field.as_struct())
+                .map(|sibling| parameter_elements(sibling, "parameters"))
+                .find(|parameters| !parameters.is_empty())
+                .unwrap_or_default();
+            let existing = value
+                .as_ref()
+                .fields()
+                .nth(material_ordinal)
+                .and_then(|field| field.as_struct())
+                .map(|material| parameter_elements(material, "material parameters"))
+                .unwrap_or_default();
+            let shader_path = value
+                .as_ref()
+                .fields()
+                .nth(material_ordinal)
+                .and_then(|field| field.as_struct())
+                .and_then(|material| {
+                    material
+                        .fields()
+                        .find(|field| clean_field_key(field.name()) == "material shader")
+                })
+                .and_then(|field| match field.value() {
+                    Some(TagFieldData::TagReference(reference)) => {
+                        reference.group_tag_and_name.map(|(_, path)| path)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+
+            // A material the author already parameterised is left exactly as it
+            // is: this fills a blank, it does not second-guess a filled one.
+            if !carried.is_empty() && existing.is_empty() && !shader_path.is_empty() {
+                let declared =
+                    material_shader_parameters(templates, &shader_path, target_game, definitions_root);
+                let mut carried = carried;
+                let wanted: Vec<(DeclaredParameter, Vec<(String, TagFieldData)>)> = declared
+                    .into_iter()
+                    .filter_map(|declaration| {
+                        let squashed = squashed_parameter_name(&declaration.name);
+                        let position = carried
+                            .iter()
+                            .position(|(name, _)| squashed_parameter_name(name) == squashed)?;
+                        // Taken, not borrowed: the values move into the new
+                        // element, and no parameter should be seeded twice.
+                        let (_, fields) = carried.remove(position);
+                        Some((declaration, fields))
+                    })
+                    .collect();
+                if !wanted.is_empty()
+                    && let Some(mut field) = value.field_at_mut(material_ordinal)
+                    && let Some(mut material) = field.as_struct_mut()
+                {
+                    let block_ordinal = material
+                        .as_ref()
+                        .fields()
+                        .position(|field| clean_field_key(field.name()) == "material parameters");
+                    if let Some(block_ordinal) = block_ordinal
+                        && let Some(mut block_field) = material.field_at_mut(block_ordinal)
+                        && let Some(mut block) = block_field.as_block_mut()
+                    {
+                        for (declaration, fields) in wanted {
+                            let index = block.add_element();
+                            let Some(mut element) = block.element_mut(index) else {
+                                continue;
+                            };
+                            let mut source_name = String::new();
+                            for (key, data) in fields {
+                                if key == "parameter name" {
+                                    if let TagFieldData::StringId(value)
+                                    | TagFieldData::OldStringId(value) = &data
+                                    {
+                                        source_name = value.string.clone();
+                                    }
+                                    // The material shader's own spelling wins.
+                                    continue;
+                                }
+                                if key == "parameter type" {
+                                    continue;
+                                }
+                                set_named_field(&mut element, &key, data);
+                            }
+                            // Identity from the declaration, so the element
+                            // names an input the shader actually has and types
+                            // it the way the shader does.
+                            set_named_field(
+                                &mut element,
+                                "parameter name",
+                                TagFieldData::StringId(StringIdData {
+                                    string: declaration.name.clone(),
+                                }),
+                            );
+                            if let Some((value, name)) = declaration.parameter_type {
+                                set_named_field(
+                                    &mut element,
+                                    "parameter type",
+                                    TagFieldData::LongEnum { value, name },
+                                );
+                            }
+                            seeded.push(format!("{} <- {source_name}", declaration.name));
+                        }
+                    }
+                }
+            }
+        }
+
+        let field_count = value.as_ref().fields().count();
+        for ordinal in 0..field_count {
+            let kind = match value.as_ref().fields().nth(ordinal) {
+                Some(field) => field.field_type(),
+                None => continue,
+            };
+            match kind {
+                TagFieldType::Struct => {
+                    if let Some(mut field) = value.field_at_mut(ordinal)
+                        && let Some(nested) = field.as_struct_mut()
+                    {
+                        walk(nested, templates, target_game, definitions_root, seeded);
+                    }
+                }
+                TagFieldType::Block => {
+                    if let Some(mut field) = value.field_at_mut(ordinal)
+                        && let Some(mut block) = field.as_block_mut()
+                    {
+                        for index in 0..block.len() {
+                            if let Some(element) = block.element_mut(index) {
+                                walk(element, templates, target_game, definitions_root, seeded);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut seeded = Vec::new();
+    let target_game = context.target_game;
+    let definitions_root = context.definitions_root;
+    walk(
+        target.root_mut(),
+        templates,
+        target_game,
+        definitions_root,
+        &mut seeded,
+    );
+    if seeded.is_empty() {
+        return;
+    }
+    seeded.sort();
+    seeded.dedup();
+    context.report.issues.push(ConversionIssue {
+        kind: ConversionIssueKind::Warning,
+        path: context.group_name.to_owned(),
+        message: format!(
+            "Seeded the material with {} input(s) from the render method it came with ({}). \
+             Only inputs the material shader declares were filled, from the values the source \
+             already had — Halo 4's own ports often re-authored these, so check them against \
+             the look you want.",
+            seeded.len(),
+            seeded.join(", ")
+        ),
+    });
+}
+
+/// Set the field called `key`, if the element has one that will take the value.
+///
+/// A mismatch is not an error worth reporting: the two parameter blocks share
+/// most of their fields but not all, and a field the material's element does not
+/// have is one the material shader has no use for.
+fn set_named_field(element: &mut TagStructMut<'_>, key: &str, data: TagFieldData) {
+    let Some(ordinal) = element
+        .as_ref()
+        .fields()
+        .position(|field| clean_field_key(field.name()) == key)
+    else {
+        return;
+    };
+    if let Some(mut field) = element.field_at_mut(ordinal) {
+        let _ = field.set(data);
+    }
 }
 
 /// A scenario's compiled HaloScript, which never survives an engine change.
@@ -8856,6 +9202,162 @@ mod tests {
         // A class the target genuinely does not have stays unanswered rather than
         // being routed into something that merely sounds close.
         assert_eq!(landing("bitmap", "haloreach_mcc", "haloce_evolved"), None);
+    }
+
+    /// The material gets the inputs the render method came with.
+    ///
+    /// Halo 4 keeps two parameter blocks side by side and fills both in shipped
+    /// content — 3,429 of H4EK's 3,916 particles populate the material one — but
+    /// only the material block feeds the material shader the tag draws with. A
+    /// conversion used to fill the render method's block faithfully and leave
+    /// the material's empty, so a ported particle named `particle_base` and gave
+    /// it nothing: the texture sat in the deprecated half while the half that
+    /// draws fell back to the shader's defaults.
+    ///
+    /// Asserts the texture specifically, not just a count, because carrying the
+    /// scalars and dropping the bitmap would look like success and render
+    /// nothing.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_ported_particle_gives_its_material_the_texture_it_came_with() {
+        let (Some(reach), Some(h4)) = (
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+        ) else {
+            eprintln!("skipping: needs HREK and H4EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = crate::parse_group_tag("prt3").expect("prt3 is a group tag");
+        let groups = GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h4, &groups);
+
+        // The bitmap a parameter block carries, keyed by parameter name.
+        let bitmaps = |tag: &TagFile, slot: &str, block: &str| -> HashMap<String, String> {
+            tag.root()
+                .fields()
+                .find(|field| clean_field_key(field.name()) == slot)
+                .and_then(|field| field.as_struct())
+                .map(|value| parameter_elements(value, block))
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(name, fields)| {
+                    fields.into_iter().find_map(|(key, data)| match data {
+                        TagFieldData::TagReference(reference) if key == "bitmap" => reference
+                            .group_tag_and_name
+                            .map(|(_, path)| (name.clone(), path)),
+                        _ => None,
+                    })
+                })
+                .filter(|(_, path)| !path.is_empty())
+                .collect()
+        };
+
+        let mut checked = 0usize;
+        for path in tags_with_extension(&reach, "particle").into_iter().take(60) {
+            let Ok(source) =
+                read_tag_for_conversion(&path, Some("haloreach_mcc"), Some(&definitions), group_tag)
+            else {
+                continue;
+            };
+            // The premise: the source names a base map on the render method.
+            let Some(texture) = bitmaps(&source, "actual shader?", "parameters")
+                .into_iter()
+                .find(|(name, _)| squashed_parameter_name(name) == "basemap")
+                .map(|(_, path)| path)
+            else {
+                continue;
+            };
+            let Ok(draft) = analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "halo4_mcc",
+                &definitions,
+                Some(&templates),
+            ) else {
+                continue;
+            };
+            let material = bitmaps(&draft.tag, "actual material?", "material parameters");
+            assert_eq!(
+                material.get("basemap").map(String::as_str),
+                Some(texture.as_str()),
+                "{}: the material should draw with the source's own base map; it has {material:?}",
+                path.display()
+            );
+            checked += 1;
+            break;
+        }
+        if checked == 0 {
+            eprintln!("skipping: no HREK particle in the sample names a base map");
+        }
+    }
+
+    /// A material the source already parameterised is left alone.
+    ///
+    /// Seeding fills a blank. A Halo 4 tag converted to H2A arrives with its
+    /// material parameters intact, and re-seeding them from the render method
+    /// would overwrite an author's work with a guess.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn seeding_does_not_touch_a_material_that_already_has_parameters() {
+        let (Some(h4), Some(h2a)) = (
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+            kit_tags("BLAM_TEST_H2AMPEK", "H2AMPEK"),
+        ) else {
+            eprintln!("skipping: needs H4EK and H2AMPEK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = crate::parse_group_tag("prt3").expect("prt3 is a group tag");
+        let groups = GameTagIndex::load(&definitions, "halo2amp_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h2a, &groups);
+
+        let names = |tag: &TagFile| -> Vec<String> {
+            tag.root()
+                .fields()
+                .find(|field| clean_field_key(field.name()) == "actual material?")
+                .and_then(|field| field.as_struct())
+                .map(|value| parameter_elements(value, "material parameters"))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect()
+        };
+
+        let mut checked = 0usize;
+        for path in tags_with_extension(&h4, "particle").into_iter().take(200) {
+            let Ok(source) =
+                read_tag_for_conversion(&path, Some("halo4_mcc"), Some(&definitions), group_tag)
+            else {
+                continue;
+            };
+            let before = names(&source);
+            if before.is_empty() {
+                continue;
+            }
+            let Ok(draft) = analyze_conversion_with_templates(
+                &source,
+                "halo4_mcc",
+                "halo2amp_mcc",
+                &definitions,
+                Some(&templates),
+            ) else {
+                continue;
+            };
+            assert_eq!(
+                names(&draft.tag),
+                before,
+                "{}: an already-parameterised material was rewritten",
+                path.display()
+            );
+            checked += 1;
+            break;
+        }
+        if checked == 0 {
+            eprintln!("skipping: no H4EK particle in the sample carries material parameters");
+        }
     }
 
     /// A Reach contrail_system arrives in Halo 4 as a tracer_system.
