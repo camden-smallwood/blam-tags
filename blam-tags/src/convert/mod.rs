@@ -2529,6 +2529,79 @@ struct DeclaredParameter {
     parameter_type: Option<(i32, Option<String>)>,
 }
 
+/// What each material in [`DEFAULT_MATERIALS`] declares its inputs to be.
+///
+/// So that seeding works with **no editing kit at all**. Reading the kit's own
+/// `.material_shader` is more accurate and still preferred when one is there — it
+/// covers materials outside this table, and it carries each parameter's declared
+/// type — but a user whose target kit is empty was getting a material with no
+/// inputs, which is the case this exists for.
+///
+/// Measured from both kits that declare the field, which agree parameter for
+/// parameter on all four. Names only: the type is inferred from whichever value
+/// the source actually carried, since `material_shader_parameter_type_enum` is
+/// `bitmap, real, int, bool, color` and the value says which it is.
+const DEFAULT_MATERIAL_PARAMETERS: &[(&str, &[&str])] = &[
+    (
+        r"shaders\material_shaders\fx\particle_base",
+        &[
+            "newschoolframeindex",
+            "constantscreensize",
+            "lightingperparticle",
+            "lighting_per_particle_strength",
+            "lighting_bright_intensity_decrease",
+            "lighting_dim_alpha_increase",
+            "lighting_bright_alpha_decrease",
+            "lightingsmooth",
+            "lightingcontrastscale",
+            "lightingcontrastoffset",
+            "lightingstrength",
+            "spherewarpstrength",
+            "depthfadeasvcoord",
+            "basemap",
+            "depthfaderange",
+            "depthfadeinvert",
+        ],
+    ),
+    (r"shaders\material_shaders\fx\tracer_base", &["basemap"]),
+    (r"shaders\material_shaders\decals\base", &["color_map"]),
+    (
+        r"shaders\material_shaders\fx\light_volume_smooth",
+        &["centeroffset", "falloff", "depthfaderange", "depthfadeinvert"],
+    ),
+];
+
+/// The `material_shader_parameter_type_enum` index for a value of this kind.
+///
+/// Inferred rather than read when there is no kit to read it from. The enum is
+/// `bitmap, real, int, bool, color` in that order, and a parameter carrying a
+/// bitmap reference is a bitmap parameter — nothing subtler is needed, because
+/// these are the only kinds a render-method parameter can hold either.
+fn inferred_parameter_type(fields: &[(String, TagFieldData)]) -> Option<(i32, Option<String>)> {
+    for (key, data) in fields {
+        match (key.as_str(), data) {
+            ("bitmap", TagFieldData::TagReference(reference))
+                if reference
+                    .group_tag_and_name
+                    .as_ref()
+                    .is_some_and(|(_, path)| !path.is_empty()) =>
+            {
+                return Some((0, Some("bitmap".to_owned())));
+            }
+            _ => {}
+        }
+    }
+    for (key, _) in fields {
+        match key.as_str() {
+            "color" => return Some((4, Some("color".to_owned()))),
+            "real" => return Some((1, Some("real".to_owned()))),
+            "int/bool" => return Some((2, Some("int".to_owned()))),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Reviewed parameter renames, where squashing the punctuation is not enough.
 ///
 /// By *source* group, as `(group, render method name, material name)`. Mined from
@@ -2601,11 +2674,31 @@ fn parameter_elements(value: TagStruct<'_>, block_name: &str) -> Vec<ParameterFi
 /// exactly one. Cached, since a folder run converts hundreds of particles that
 /// all name the same handful of shaders.
 fn material_shader_parameters(
-    templates: &NativeTemplateIndex,
+    templates: Option<&NativeTemplateIndex>,
     tag_path: &str,
     target_game: &str,
     definitions_root: &Path,
 ) -> Vec<DeclaredParameter> {
+    // The reviewed table, for when there is no kit to ask. Not a fallback of last
+    // resort so much as the answer for the materials this converter chose itself.
+    let from_table = || -> Vec<DeclaredParameter> {
+        DEFAULT_MATERIAL_PARAMETERS
+            .iter()
+            .find(|(material, _)| material.eq_ignore_ascii_case(tag_path))
+            .map(|(_, names)| {
+                names
+                    .iter()
+                    .map(|name| DeclaredParameter {
+                        name: (*name).to_owned(),
+                        parameter_type: None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let Some(templates) = templates else {
+        return from_table();
+    };
     if let Some(cached) = templates.material_parameters.borrow().get(tag_path) {
         return cached.clone();
     }
@@ -2640,7 +2733,7 @@ fn material_shader_parameters(
                 })
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_else(from_table);
     templates
         .material_parameters
         .borrow_mut()
@@ -2675,9 +2768,10 @@ fn seed_material_parameters(
     source: &TagFile,
     context: &mut ConversionContext<'_>,
 ) {
-    let Some(templates) = context.native_templates else {
-        return;
-    };
+    // A kit is welcome but not required: without one the reviewed table answers
+    // for the materials this converter assigns itself, which is the whole of what
+    // a from-scratch conversion needs.
+    let templates = context.native_templates;
 
     // Keyed by block path — `/decals[0]`, `/tracers[1]`, or the empty string for
     // a particle's root. Struct names are left out deliberately: the two engines
@@ -2690,7 +2784,7 @@ fn seed_material_parameters(
         mut value: TagStructMut<'_>,
         path: &str,
         by_path: &mut HashMap<String, Vec<ParameterFields>>,
-        templates: &NativeTemplateIndex,
+        templates: Option<&NativeTemplateIndex>,
         target_game: &str,
         definitions_root: &Path,
         group: &str,
@@ -2773,6 +2867,10 @@ fn seed_material_parameters(
                                 continue;
                             };
                             let mut source_name = String::new();
+                            // Worked out before the values are moved out, so the
+                            // type can be inferred from what the source carried
+                            // when no kit told us what it should be.
+                            let inferred = inferred_parameter_type(&fields);
                             for (key, data) in fields {
                                 if key == "parameter name" {
                                     if let TagFieldData::StringId(value)
@@ -2798,7 +2896,9 @@ fn seed_material_parameters(
                                     string: declaration.name.clone(),
                                 }),
                             );
-                            if let Some((value, name)) = declaration.parameter_type {
+                            if let Some((value, name)) =
+                                declaration.parameter_type.clone().or(inferred)
+                            {
                                 set_named_field(
                                     &mut element,
                                     "parameter type",
@@ -9486,6 +9586,89 @@ mod tests {
                 material.get("basemap").map(String::as_str),
                 Some(texture.as_str()),
                 "{}: the material should draw with the source's own base map; it has {material:?}",
+                path.display()
+            );
+            checked += 1;
+            break;
+        }
+        if checked == 0 {
+            eprintln!("skipping: no HREK particle in the sample names a base map");
+        }
+    }
+
+    /// A conversion with no target kit at all still gives the material its texture.
+    ///
+    /// This is the case a user actually hit: an empty Halo 4 editing kit, so no
+    /// kit tag to seed from and nothing to read a material shader's inputs out
+    /// of, and the material arrived with no inputs. The reviewed table in
+    /// [`DEFAULT_MATERIAL_PARAMETERS`] answers for the materials this converter
+    /// assigns itself, and the parameter's type is inferred from the value rather
+    /// than read from the kit.
+    ///
+    /// Deliberately passes `None` for the templates: needing only the *source*
+    /// kit is the point of the test.
+    #[test]
+    fn a_conversion_with_no_target_kit_still_seeds_the_material() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else {
+            eprintln!("skipping: needs HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = crate::parse_group_tag("prt3").expect("prt3 is a group tag");
+
+        let bitmaps = |tag: &TagFile, slot: &str, block: &str| -> HashMap<String, String> {
+            tag.root()
+                .fields()
+                .find(|field| clean_field_key(field.name()) == slot)
+                .and_then(|field| field.as_struct())
+                .map(|value| parameter_elements(value, block))
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(name, fields)| {
+                    fields.into_iter().find_map(|(key, data)| match data {
+                        TagFieldData::TagReference(reference) if key == "bitmap" => reference
+                            .group_tag_and_name
+                            .map(|(_, path)| (name.clone(), path)),
+                        _ => None,
+                    })
+                })
+                .filter(|(_, path)| !path.is_empty())
+                .collect()
+        };
+
+        let mut checked = 0usize;
+        for path in tags_with_extension(&reach, "particle").into_iter().take(60) {
+            let Ok(source) =
+                read_tag_for_conversion(&path, Some("haloreach_mcc"), Some(&definitions), group_tag)
+            else {
+                continue;
+            };
+            let Some(texture) = bitmaps(&source, "actual shader?", "parameters")
+                .into_iter()
+                .find(|(name, _)| squashed_parameter_name(name) == "basemap")
+                .map(|(_, path)| path)
+            else {
+                continue;
+            };
+            let Ok(draft) = analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "halo4_mcc",
+                &definitions,
+                None,
+            ) else {
+                continue;
+            };
+            assert!(
+                draft.native_layout_template.is_none(),
+                "this test is about the no-kit path and a template was used"
+            );
+            let material = bitmaps(&draft.tag, "actual material?", "material parameters");
+            assert_eq!(
+                material.get("basemap").map(String::as_str),
+                Some(texture.as_str()),
+                "{}: with no kit the material still has to carry the source's base map; \
+                 it has {material:?}",
                 path.display()
             );
             checked += 1;
