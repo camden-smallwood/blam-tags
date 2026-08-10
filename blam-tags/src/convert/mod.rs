@@ -1479,6 +1479,71 @@ fn resolve_target_group(
     Some((tag, name.unwrap_or_else(|| group_name.to_owned())))
 }
 
+/// A game's group table, loaded once per game and kept for the rest of a walk.
+fn game_groups<'a>(
+    game: &str,
+    definitions_root: &Path,
+    cache: &'a mut HashMap<String, GameTagIndex>,
+) -> Result<&'a GameTagIndex, String> {
+    if !cache.contains_key(game) {
+        let groups = GameTagIndex::load(definitions_root, game)?;
+        cache.insert(game.to_owned(), groups);
+    }
+    Ok(&cache[game])
+}
+
+/// The group a `group_name` tag ends up as in `target_game`, following the same
+/// reviewed renames and the same routing a conversion would.
+///
+/// Public because naming a converted file is not the converter's job, but has to
+/// agree with it exactly. Deciding by canonical name alone gets it wrong in two
+/// opposite ways, and both are live: a renamed class the target does not declare
+/// looks unconvertible — `contrail_system` into Halo 4 — while one it *does*
+/// still declare gets a name that contradicts its contents, because Halo 4 keeps
+/// a vestigial `shader` group it ships no tags of and every Reach shader converts
+/// to `material`.
+///
+/// Routes are followed because a rename can take two hops. Halo 4 has no
+/// `contrail` at all, so a Halo 2 one reaches it only through Halo 3, arriving as
+/// `contrail` -> `contrail_system` -> `tracer_system`.
+///
+/// This is a prediction, and the honest limit is worth stating: the converter
+/// tries the direct pair first and routes only if that is refused, so a group
+/// that resolves directly is answered directly even where a route would have
+/// renamed it further. A caller holding a finished draft should prefer its
+/// `target_extension`, which is what actually happened rather than what was
+/// expected to.
+pub fn converted_group(
+    group_name: &str,
+    source_game: &str,
+    target_game: &str,
+    definitions_root: &Path,
+) -> Result<Option<(u32, String)>, String> {
+    let catalog = ConversionMappingCatalog::load()?;
+    let mut cache = HashMap::new();
+    for route in conversion_routes(source_game, target_game) {
+        let mut name = group_name.to_owned();
+        let mut landed = None;
+        for hop in route.windows(2) {
+            let groups = game_groups(&hop[1], definitions_root, &mut cache)?;
+            let Some((group_tag, hop_name)) =
+                resolve_target_group(&name, groups, &catalog, &hop[0], &hop[1])
+            else {
+                // This route has no answer for the class, so it is not the route
+                // the tag would take either. Try the next.
+                landed = None;
+                break;
+            };
+            name = hop_name.clone();
+            landed = Some((group_tag, hop_name));
+        }
+        if let Some(found) = landed {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
 fn parse_schema_guid(value: &str) -> Option<[u8; 16]> {
     if value.len() != 32 {
         return None;
@@ -8518,6 +8583,52 @@ mod tests {
         }
     }
 
+    /// Naming a converted file agrees with what the converter produces.
+    ///
+    /// A caller that has to name the output *before* converting — a folder run
+    /// planning where every tag lands, so it can spot two sources colliding on
+    /// one destination — cannot ask the draft. It gets the same answer here, and
+    /// this pins the three shapes that answer differs in:
+    /// a plain same-name group, a rename the target does not declare, and a
+    /// rename the target *does* still declare and never uses.
+    #[test]
+    fn the_group_a_converted_tag_lands_in_is_answerable_before_converting() {
+        let definitions = locate_definitions_root();
+        let landing = |group: &str, source: &str, target: &str| {
+            converted_group(group, source, target, &definitions)
+                .unwrap()
+                .map(|(_, name)| name)
+        };
+
+        // Unchanged classes stay put, which is most of every folder.
+        assert_eq!(
+            landing("weapon", "halo3_mcc", "haloreach_mcc").as_deref(),
+            Some("weapon")
+        );
+        // Renamed, and Halo 4 does not declare the old name — resolving by
+        // canonical name refuses this outright.
+        assert_eq!(
+            landing("contrail_system", "haloreach_mcc", "halo4_mcc").as_deref(),
+            Some("tracer_system")
+        );
+        // Renamed, and Halo 4 *does* declare the old name. This is the quiet one:
+        // canonical name resolution succeeds and gives an answer that contradicts
+        // the tag the converter builds.
+        assert_eq!(
+            landing("shader", "haloreach_mcc", "halo4_mcc").as_deref(),
+            Some("material")
+        );
+        // Two renames, one per generation, so the answer only exists along the
+        // route the converter would take.
+        assert_eq!(
+            landing("contrail", "halo2_mcc", "halo4_mcc").as_deref(),
+            Some("tracer_system")
+        );
+        // A class the target genuinely does not have stays unanswered rather than
+        // being routed into something that merely sounds close.
+        assert_eq!(landing("bitmap", "haloreach_mcc", "haloce_evolved"), None);
+    }
+
     /// A Reach contrail_system arrives in Halo 4 as a tracer_system.
     ///
     /// Halo 4 renamed the class. The catalog used to say it *removed* it, which
@@ -11207,6 +11318,89 @@ mod group_alias_regression {
         }
         if checked == 0 {
             eprintln!("skipping: no H2EK projectile attaches a contrail");
+        }
+    }
+
+    /// The rename carries the references to the class, not just the class.
+    ///
+    /// The companion to the Halo 2 case above, at the other rename: an HREK
+    /// effect points at a `.contrail_system`, and in Halo 4 that same tag is a
+    /// `tracer_system`. Renaming the tag and leaving every pointer to it behind
+    /// would be the worse half-measure of the two — the imported effect would
+    /// open and simply do nothing.
+    ///
+    /// The path is asserted unchanged as well, because that is what makes the
+    /// reference find the renamed tag: only the class four-cc moves.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_reach_reference_to_a_contrail_system_lands_on_halo_4s_tracer_system() {
+        let (Some(reach), Some(h4)) = (
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+        ) else {
+            eprintln!("skipping: needs HREK and H4EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let contrail = crate::parse_group_tag("cntl").unwrap();
+        let tracer = crate::parse_group_tag("trac").unwrap();
+        let group_tag = crate::parse_group_tag("effe").unwrap();
+        let references = |tag: &TagFile| {
+            let mut found = Vec::new();
+            collect_reference_values(tag.root(), "", &mut found);
+            found
+        };
+
+        let groups = GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h4, &groups);
+        let mut checked = 0usize;
+        for path in super::tests::tags_with_extension(&reach, "effect").into_iter().take(400) {
+            let Ok(source) = read_tag_for_conversion(
+                &path,
+                Some("haloreach_mcc"),
+                Some(definitions.as_path()),
+                group_tag,
+            ) else {
+                continue;
+            };
+            let wanted: Vec<String> = references(&source)
+                .into_iter()
+                .filter(|reference| reference.group_tag == contrail)
+                .map(|reference| reference.tag_path)
+                .collect();
+            if wanted.is_empty() {
+                continue;
+            }
+            let Ok(draft) = analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "halo4_mcc",
+                &definitions,
+                Some(&templates),
+            ) else {
+                continue;
+            };
+            let landed = references(&draft.tag);
+            for tag_path in &wanted {
+                assert!(
+                    landed.iter().any(|reference| {
+                        reference.group_tag == tracer && reference.tag_path == *tag_path
+                    }),
+                    "{}: {tag_path} should be referenced as a tracer_system, got {:?}",
+                    path.display(),
+                    landed
+                        .iter()
+                        .filter(|reference| reference.tag_path == *tag_path)
+                        .map(|reference| format_group_tag(reference.group_tag))
+                        .collect::<Vec<_>>()
+                );
+            }
+            checked += 1;
+            break;
+        }
+        if checked == 0 {
+            eprintln!("skipping: no HREK effect in the sample references a contrail_system");
         }
     }
 
