@@ -4736,6 +4736,32 @@ mod rename_experiment {
             "and no longer at the old one"
         );
 
+        // Prove the redirect is in the container before any conclusion is drawn
+        // about whether the engine honours it. A negative in-game result means
+        // two completely different things depending on this, and the cheaper
+        // explanation -- that nothing was written -- has to be eliminated first.
+        if redirect {
+            let header_index = (0..reopened.chunk_count())
+                .find(|slot| {
+                    reopened
+                        .chunk_id(*slot)
+                        .is_ok_and(|id| id.chunk_type() == CHUNK_TYPE_CONTAINER_HEADER)
+                })
+                .expect("the container has a header chunk");
+            let header = FIoContainerHeader::deserialize(
+                &mut Cursor::new(reopened.read_chunk(header_index).expect("read header")),
+                None,
+            )
+            .expect("the container header parses");
+            match header.lookup_package_redirect(old_id) {
+                Some(target) if target == new_id => {
+                    println!("redirect verified in container: old -> new")
+                }
+                Some(other) => panic!("redirect points at 0x{:016X}, not the new id", other.0),
+                None => panic!("no redirect was written for 0x{:016X}", old_id.0),
+            }
+        }
+
         println!("\nwritten. now run the copied install and load a level, then:");
         println!("  grep -i {:016x} Meteorite/Saved/Logs/*.log", old_id.0);
         println!(
