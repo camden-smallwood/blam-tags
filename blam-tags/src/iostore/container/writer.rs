@@ -4300,6 +4300,247 @@ pub fn cityhash64(s: &[u8]) -> u64 {
     )
 }
 
+/// Prepare the one experiment that decides whether renaming in place is worth
+/// shipping at all.
+///
+/// Everything else about a rename can be proved here: the TOC surgery, the
+/// tombstones, the directory index, the store entry, the rollback. What cannot
+/// be proved here is whether the *game* loads the result — nothing in a pak
+/// records how the runtime resolves a package id, and this crate has never read
+/// a container redirect back (`lookup_package_redirect` has no callers). So the
+/// answer has to come from running the game, and this is the harness that sets
+/// that up and says what to look for.
+///
+/// Runs only against a **copy** of an install, behind its own environment
+/// variable, and refuses to run against the same directory `CE_PAKS` names.
+/// Every other gated test in this crate reads paks; this one writes to them.
+#[cfg(test)]
+mod rename_experiment {
+    use super::*;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    fn utocs_under(root: &str) -> Vec<PathBuf> {
+        let mut utocs: Vec<PathBuf> = std::fs::read_dir(root)
+            .expect("read the paks directory")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("utoc"))
+            })
+            .filter(|path| {
+                !path
+                    .file_name()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("global.utoc"))
+            })
+            .collect();
+        utocs.sort();
+        utocs
+    }
+
+    fn header_of(bytes: &[u8]) -> Option<FZenPackageHeader> {
+        use crate::iostore::compat::{CE_CONTAINER_HEADER_VERSION, CE_TOC_VERSION};
+        FZenPackageHeader::deserialize(
+            &mut Cursor::new(bytes),
+            None,
+            CE_TOC_VERSION,
+            CE_CONTAINER_HEADER_VERSION,
+            None,
+        )
+        .ok()
+    }
+
+    /// Move one package inside a copied install, and print what to watch for.
+    ///
+    /// Which experiment this is depends on what you point it at.
+    ///
+    /// **A — control.** No `CE_RENAME_PACKAGE`; a tag nothing imports is chosen
+    /// for you. This isolates the container surgery from the redirect question
+    /// entirely: if the level still loads, the TOC rewrite, the tombstones and
+    /// the store re-registration are all sound. If A fails, the redirect was
+    /// never the problem and the rest of the plan is moot.
+    ///
+    /// **B and C.** Name a package that something imports. One referrer in the
+    /// same pak is B; one in a different pak is C. B passing and C failing is
+    /// the signature of per-container redirect scoping, and it is the outcome
+    /// most likely to slip past casual testing.
+    ///
+    /// The decisive observable is not "does it look right" — it is the game's
+    /// own log. `LogStreaming` names the `FPackageId` in hex when a package
+    /// import fails to resolve, so the old id printed below is what to search
+    /// `Meteorite/Saved/Logs/*.log` for after loading a level.
+    ///
+    ///   CE_RENAME_EXPERIMENT=/path/to/a/COPY/of/Content/Paks \
+    ///     cargo test --release --features iostore rename_experiment \
+    ///       -- --ignored --nocapture
+    #[test]
+    #[ignore = "writes to a copied Campaign Evolved install; set CE_RENAME_EXPERIMENT"]
+    fn move_one_package_in_a_copied_install() {
+        let root = std::env::var("CE_RENAME_EXPERIMENT")
+            .expect("set CE_RENAME_EXPERIMENT to a COPY of the game's Content/Paks");
+        // The other gated tests read; this one writes. Pointing it at the
+        // install every other test measures would corrupt the baseline every
+        // later answer is compared against.
+        if let Ok(live) = std::env::var("CE_PAKS") {
+            let same = std::fs::canonicalize(&root)
+                .ok()
+                .zip(std::fs::canonicalize(&live).ok())
+                .is_some_and(|(a, b)| a == b);
+            assert!(
+                !same,
+                "CE_RENAME_EXPERIMENT points at the same directory as CE_PAKS.\n\
+                 Copy the Paks folder first — this test rewrites a .utoc in place."
+            );
+        }
+
+        let utocs = utocs_under(&root);
+        assert!(!utocs.is_empty(), "no pakchunk .utoc found under {root}");
+
+        // One pass over every package, collecting what each one imports. Cheaper
+        // than asking "who imports X?" per candidate, and it answers that for
+        // every package at once.
+        let mut imported: HashSet<String> = HashSet::new();
+        let mut referrers_of_target: Vec<(String, String)> = Vec::new();
+        let mut tags: Vec<(usize, String)> = Vec::new();
+        let wanted = std::env::var("CE_RENAME_PACKAGE").ok();
+        let wanted_lower = wanted.as_ref().map(|name| name.to_ascii_lowercase());
+
+        for (index, utoc) in utocs.iter().enumerate() {
+            let Ok(archive) = IoStoreArchive::open(utoc) else {
+                continue;
+            };
+            let label = utoc
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            for entry in archive.entries() {
+                let lower = entry.path.to_ascii_lowercase().replace('\\', "/");
+                if !lower.ends_with(".uasset") {
+                    continue;
+                }
+                let Ok(bytes) = archive.read(&entry.path) else {
+                    continue;
+                };
+                let Some(header) = header_of(&bytes) else {
+                    continue;
+                };
+                let name = header.package_name();
+                for import in &header.imported_package_names {
+                    let import = import.to_ascii_lowercase();
+                    if wanted_lower.as_deref() == Some(import.as_str()) {
+                        referrers_of_target.push((name.clone(), label.clone()));
+                    }
+                    imported.insert(import);
+                }
+                if wanted.is_none() && lower.contains("/content/tags/") {
+                    tags.push((index, name));
+                }
+            }
+        }
+
+        let (container, package) = match wanted {
+            Some(package) => {
+                let index = utocs
+                    .iter()
+                    .position(|utoc| {
+                        IoStoreArchive::open(utoc).is_ok_and(|archive| {
+                            let id = FPackageId::from_name(&package);
+                            (0..archive.chunk_count()).any(|slot| {
+                                archive.chunk_id(slot).is_ok_and(|chunk| {
+                                    chunk.package_id() == id.0.to_le_bytes()
+                                        && chunk.chunk_type() != RETIRED_CHUNK_TYPE
+                                })
+                            })
+                        })
+                    })
+                    .expect("CE_RENAME_PACKAGE is not in any mounted container");
+                (index, package)
+            }
+            None => {
+                let free: Vec<&(usize, String)> = tags
+                    .iter()
+                    .filter(|(_, name)| !imported.contains(&name.to_ascii_lowercase()))
+                    .collect();
+                println!(
+                    "{} of {} tag packages have no importer at all",
+                    free.len(),
+                    tags.len()
+                );
+                let chosen = free
+                    .first()
+                    .expect("no tag package is free of importers; name one with CE_RENAME_PACKAGE");
+                (chosen.0, chosen.1.clone())
+            }
+        };
+
+        let (parent, leaf) = split_package_path(&package);
+        let destination = format!("{parent}/baboonmoved-{leaf}");
+        let old_id = FPackageId::from_name(&package);
+        let new_id = FPackageId::from_name(&destination);
+        let utoc = &utocs[container];
+
+        println!("\n--- experiment ---");
+        println!("container   {}", utoc.display());
+        println!("from        {package}");
+        println!("to          {destination}");
+        println!("old id      0x{:016X}", old_id.0);
+        println!("new id      0x{:016X}", new_id.0);
+        println!("referrers   {}", referrers_of_target.len());
+        for (referrer, label) in &referrers_of_target {
+            let elsewhere = if label
+                == &utoc
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            {
+                "same pak"
+            } else {
+                "OTHER PAK — this is experiment C"
+            };
+            println!("            {referrer}  [{label}, {elsewhere}]");
+        }
+
+        let archive = IoStoreArchive::open(utoc).expect("open the container to write");
+        rename_package_in_place_with(
+            &archive,
+            utoc,
+            &InPlacePackageRename {
+                old_package_path: &package,
+                new_package_path: &destination,
+                replacement_export_bundle: None,
+                replacement_bulk_data: None,
+                minimum_appended_index: None,
+                redirect: true,
+            },
+        )
+        .expect("the rename itself");
+        drop(archive);
+
+        // Reopening proves only that the write is well-formed. It says nothing
+        // about the runtime, which is the entire point of the experiment.
+        let reopened = IoStoreArchive::open(utoc).expect("reopen after the rename");
+        assert!(
+            reopened
+                .find_chunk(&make_chunk_id(new_id.0, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA))
+                .is_some(),
+            "the package is at its new id"
+        );
+        assert!(
+            reopened
+                .find_chunk(&make_chunk_id(old_id.0, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA))
+                .is_none(),
+            "and no longer at the old one"
+        );
+
+        println!("\nwritten. now run the copied install and load a level, then:");
+        println!("  grep -i {:016x} Meteorite/Saved/Logs/*.log", old_id.0);
+        println!(
+            "a hit is the runtime failing to resolve the old id — the redirect did not apply."
+        );
+        println!("no hit, and the asset renders: the redirect resolved imports.");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
