@@ -1931,16 +1931,30 @@ fn analyze_conversion_inner(
         // writer, and Halo 2's root block header is never synthesized. So a
         // classic target has to start from a tag the kit authored.
         None
-    } else if std::env::var_os("BLAM_PREFER_KIT_TEMPLATE").is_some() {
-        // Comparison switch, not a feature: it puts the old order back so the
-        // two starting points can be diffed on one machine.
-        None
     } else {
         build_target_from_definitions(&schema_path, false)
     };
+    // Which starting point wins when both are available.
+    //
+    // Building from the target's own definitions is the better design and the
+    // one this is heading for: nothing reaches the tag except what the source
+    // gave it, and the result does not depend on what a user has installed. It
+    // is not the default yet, because it is not yet proven where it counts —
+    // effects and particles built this way were reported failing to open, and
+    // crashing, in Halo 4's own tools, where kit-seeded ones opened. Until that
+    // is understood, a user with a populated kit keeps the path that works.
+    //
+    // A user with an *empty* kit gets the definitions either way, which is the
+    // case that started this: it is a fallback, not a preference.
+    let prefer_definitions = std::env::var_os("BLAM_BUILD_FROM_DEFINITIONS").is_some();
     let mut built_without_a_template_body = false;
     let (mut target, target_template) = match (from_definitions, native_target) {
-        (Some(target), _) => (target, None),
+        (Some(target), None) => (target, None),
+        (Some(target), Some(_)) if prefer_definitions => (target, None),
+        (Some(target), Some((template, template_path))) => {
+            let _ = target;
+            (template, Some(template_path))
+        }
         (None, Some((template, template_path))) => (template, Some(template_path)),
         (None, None) if CLASSIC_CONVERSION_GAMES.contains(&target_game) => {
             return Err(format!(
@@ -9705,30 +9719,22 @@ mod tests {
         }
     }
 
-    /// A target the definitions can build never touches the kit.
+    /// With no kit to lean on, a buildable target still converts.
     ///
-    /// The guarantee the whole importer is meant to give: read the source, build
-    /// a tag from the *target's* schema, fill its fields from what was read. A tag
-    /// the kit happened to ship is not consulted, so the result cannot inherit
-    /// that tag's layout revision or its leftovers, and a user with an empty
-    /// editing kit gets the same output as a user with a full one.
+    /// The empty-kit case, which is what this fallback exists for: no template
+    /// index at all, and the tag is built from the target's own definitions and
+    /// filled from the source. Preferring this even when a kit *is* available is
+    /// the intended end state and is behind `BLAM_BUILD_FROM_DEFINITIONS` until
+    /// it is proven against Halo 4's own tools.
     ///
-    /// A full kit index is passed in deliberately: the point is that having one
-    /// available changes nothing.
-    ///
-    /// Self-skips without the kits.
+    /// Self-skips without the source kit.
     #[test]
-    fn a_target_the_definitions_can_build_never_consults_the_kit() {
-        let (Some(reach), Some(h4)) = (
-            kit_tags("BLAM_TEST_HREK", "HREK"),
-            kit_tags("BLAM_TEST_H4EK", "H4EK"),
-        ) else {
-            eprintln!("skipping: needs HREK and H4EK");
+    fn with_no_kit_a_buildable_target_still_converts() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else {
+            eprintln!("skipping: needs HREK");
             return;
         };
         let definitions = locate_definitions_root();
-        let groups = GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
-        let templates = NativeTemplateIndex::build(&h4, &groups);
         let mut checked = 0usize;
 
         for (group, fourcc) in [
@@ -9759,15 +9765,14 @@ mod tests {
                 "haloreach_mcc",
                 "halo4_mcc",
                 &definitions,
-                Some(&templates),
+                None,
             ) else {
                 eprintln!("skipping {group}: did not convert");
                 continue;
             };
             assert!(
                 draft.native_layout_template.is_none(),
-                "{group}: started from the kit's {:?} when halo4_mcc/{group}.json can build one",
-                draft.native_layout_template
+                "{group}: no kit was offered, so nothing could have been started from"
             );
             // And the schema's own root size, not whichever revision a kit tag had.
             let declared =
