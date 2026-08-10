@@ -2094,7 +2094,8 @@ fn analyze_conversion_inner(
     apply_default_material(&mut target, &mut context);
     // After the default, because the material it names is what decides which
     // inputs there are to seed.
-    seed_material_parameters(&mut target, &mut context);
+    seed_material_parameters(&mut target, source, &mut context);
+    report_materials_without_a_shader(&target, &mut context);
     let fail_closed_losses = validate_critical_runtime_safety(source, &context, policy)?;
     if !fail_closed_losses.is_empty() {
         context.report.issues.push(ConversionIssue {
@@ -2289,11 +2290,37 @@ fn restore_render_method_option_slots(
 /// rather than a baseline). A starting point, not a guess at the original — which
 /// material a Reach effect *should* become is an art decision the tag does not
 /// carry, and the report says so. Both verified present in both kits.
+/// A decal and a light volume need one for a harder reason than a particle: a
+/// converted Reach `decal_system` **crashed Halo 4** the moment the decal was
+/// triggered, with `#0 is not a valid material_postprocess_block index in
+/// [#0, #0)`. Nothing indexes that block in the schema — it is the renderer,
+/// building a material's postprocess from the material shader and finding no
+/// material shader to build one from. Shipped Halo 4 content ships that block
+/// empty too, in all 466 decal slots and all 400 particle slots sampled, so an
+/// empty postprocess is normal and a *null shader* is what is not.
+///
+/// `decals\base` is the plain member again rather than the most common:
+/// `decals\normal` leads at 221 of 504 against `base`'s 119, but a normal-mapped
+/// decal wants a normal map a Reach decal has no way to supply, and `base` is the
+/// one whose name says baseline. `light_volume_smooth` needs no such judgement —
+/// it is 232 of 236.
 const DEFAULT_MATERIALS: &[(&str, &str, &str)] = &[
     ("halo4_mcc", "particle", r"shaders\material_shaders\fx\particle_base"),
     ("halo2amp_mcc", "particle", r"shaders\material_shaders\fx\particle_base"),
     ("halo4_mcc", "contrail_system", r"shaders\material_shaders\fx\tracer_base"),
     ("halo2amp_mcc", "contrail_system", r"shaders\material_shaders\fx\tracer_base"),
+    ("halo4_mcc", "decal_system", r"shaders\material_shaders\decals\base"),
+    ("halo2amp_mcc", "decal_system", r"shaders\material_shaders\decals\base"),
+    (
+        "halo4_mcc",
+        "light_volume_system",
+        r"shaders\material_shaders\fx\light_volume_smooth",
+    ),
+    (
+        "halo2amp_mcc",
+        "light_volume_system",
+        r"shaders\material_shaders\fx\light_volume_smooth",
+    ),
 ];
 
 /// Whether a struct is a material: the shader reference, its parameters, and the
@@ -2408,6 +2435,87 @@ fn apply_default_material(target: &mut TagFile, context: &mut ConversionContext<
     });
 }
 
+/// Report any material the conversion leaves with nothing to draw with.
+///
+/// A null `material shader` is not a cosmetic gap: Halo 4's renderer builds a
+/// material's postprocess from its material shader, so a material without one
+/// crashes the moment the effect plays — `#0 is not a valid
+/// material_postprocess_block index in [#0, #0)` on a converted Reach
+/// `decal_system`. [`DEFAULT_MATERIALS`] exists to stop that happening, and this
+/// exists so the next group nobody has put in that table says so in the report
+/// rather than in the game.
+///
+/// A finding, not a refusal. Halo 4 does ship a handful of particles with a null
+/// material and a working render method behind it, so this is survivable for some
+/// groups and fatal for others, and the difference is not something the tag
+/// carries.
+fn report_materials_without_a_shader(target: &TagFile, context: &mut ConversionContext<'_>) {
+    fn walk(value: TagStruct<'_>, prefix: &str, empty: &mut Vec<String>) {
+        if is_material_struct(value) {
+            let shader = value
+                .fields()
+                .find(|field| clean_field_key(field.name()) == "material shader")
+                .and_then(|field| match field.value() {
+                    Some(TagFieldData::TagReference(reference)) => reference
+                        .group_tag_and_name
+                        .map(|(_, path)| path),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if shader.is_empty() {
+                empty.push(if prefix.is_empty() {
+                    "actual material?".to_owned()
+                } else {
+                    prefix.to_owned()
+                });
+            }
+        }
+        for field in value.fields() {
+            let key = clean_field_key(field.name());
+            let name = if key.is_empty() {
+                field.type_name().to_owned()
+            } else {
+                key
+            };
+            let path = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if let Some(child) = field.as_struct() {
+                walk(child, &path, empty);
+            }
+            if let Some(block) = field.as_block() {
+                for index in 0..block.len() {
+                    if let Some(element) = block.element(index) {
+                        walk(element, &format!("{path}[{index}]"), empty);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut empty = Vec::new();
+    walk(target.root(), "", &mut empty);
+    if empty.is_empty() {
+        return;
+    }
+    let shown = empty.len().min(6);
+    context.report.issues.push(ConversionIssue {
+        kind: ConversionIssueKind::Unsupported,
+        path: empty[..shown].join(", "),
+        message: format!(
+            "{} material(s) arrived with no material shader, because {} has nothing to fill one \
+             from and this group has no reviewed default. {} builds a material's postprocess from \
+             its material shader, so an effect like this can crash when it plays rather than \
+             merely look wrong — point them at a material shader before using the tag.",
+            empty.len(),
+            context.source_game,
+            context.target_game
+        ),
+    });
+}
+
 /// A parameter, as the name it answers to plus every value it carries.
 type ParameterFields = (String, Vec<(String, TagFieldData)>);
 
@@ -2420,6 +2528,29 @@ struct DeclaredParameter {
     name: String,
     parameter_type: Option<(i32, Option<String>)>,
 }
+
+/// Reviewed parameter renames, where squashing the punctuation is not enough.
+///
+/// By *source* group, as `(group, render method name, material name)`. Mined from
+/// Halo 4's own ports rather than guessed: taking every pair of parameters in a
+/// shipped tag that name the same bitmap and disagree on their name, decals give
+/// `base_map` -> `color_map` consistently across all three material families it
+/// uses (44 on `normal`, 38 on `base`, 24 on `palette_alpha`), plus `bump_map` ->
+/// `normal_map` and `palette` -> `palette_map`. Halo 4's `impact.decal_system` is
+/// literally the ported Reach decal of the same name, and that is the rename it
+/// carries.
+///
+/// Deliberately decals only. The same mining over particles returns contradictory
+/// pairs — `alpha_map` -> `basemap` 534 times *and* `base_map` -> `alpha_map` 99
+/// times — because a particle that uses one bitmap for both slots makes every
+/// combination look like a rename. Squashing already handles the particle cases
+/// that are real, so nothing is added on the strength of evidence that cannot
+/// tell a rename from a coincidence.
+const MATERIAL_PARAMETER_ALIASES: &[(&str, &str, &str)] = &[
+    ("decal_system", "base_map", "color_map"),
+    ("decal_system", "bump_map", "normal_map"),
+    ("decal_system", "palette", "palette_map"),
+];
 
 /// A parameter name with the punctuation taken out.
 ///
@@ -2539,36 +2670,41 @@ fn material_shader_parameters(
 /// name and carry a bitmap, 2,491 agree and 796 deliberately do not. An automatic
 /// port cannot know which it is looking at, and the source's own texture is a far
 /// better starting point than none.
-fn seed_material_parameters(target: &mut TagFile, context: &mut ConversionContext<'_>) {
+fn seed_material_parameters(
+    target: &mut TagFile,
+    source: &TagFile,
+    context: &mut ConversionContext<'_>,
+) {
     let Some(templates) = context.native_templates else {
         return;
     };
 
+    // Keyed by block path — `/decals[0]`, `/tracers[1]`, or the empty string for
+    // a particle's root. Struct names are left out deliberately: the two engines
+    // disagree about them and about how many struct layers there are, while a
+    // block and its index mean the same thing on both sides.
+    let mut by_path: HashMap<String, Vec<ParameterFields>> = HashMap::new();
+    collect_render_parameters(source.root(), String::new(), &mut by_path);
+
     fn walk(
         mut value: TagStructMut<'_>,
+        path: &str,
+        by_path: &mut HashMap<String, Vec<ParameterFields>>,
         templates: &NativeTemplateIndex,
         target_game: &str,
         definitions_root: &Path,
+        group: &str,
         seeded: &mut Vec<String>,
     ) {
-        // A container that holds the material beside something carrying render
-        // method parameters. Found by shape rather than by field name, because
-        // the slot is at the root of a particle and inside a block element of a
-        // tracer, and named for its own group either way.
+        // Found by shape rather than by field name, because the slot is at the
+        // root of a particle and inside a block element of a tracer, and named
+        // for its own group either way.
         let material_ordinal = value
             .as_ref()
             .fields()
             .position(|field| field.as_struct().is_some_and(is_material_struct));
         if let Some(material_ordinal) = material_ordinal {
-            let carried: Vec<ParameterFields> = value
-                .as_ref()
-                .fields()
-                .enumerate()
-                .filter(|(ordinal, _)| *ordinal != material_ordinal)
-                .filter_map(|(_, field)| field.as_struct())
-                .map(|sibling| parameter_elements(sibling, "parameters"))
-                .find(|parameters| !parameters.is_empty())
-                .unwrap_or_default();
+            let carried: Vec<ParameterFields> = by_path.remove(path).unwrap_or_default();
             let existing = value
                 .as_ref()
                 .fields()
@@ -2604,9 +2740,15 @@ fn seed_material_parameters(target: &mut TagFile, context: &mut ConversionContex
                     .into_iter()
                     .filter_map(|declaration| {
                         let squashed = squashed_parameter_name(&declaration.name);
-                        let position = carried
-                            .iter()
-                            .position(|(name, _)| squashed_parameter_name(name) == squashed)?;
+                        let position = carried.iter().position(|(name, _)| {
+                            squashed_parameter_name(name) == squashed
+                                || MATERIAL_PARAMETER_ALIASES.iter().any(|(scope, from, to)| {
+                                    scope.eq_ignore_ascii_case(group)
+                                        && squashed_parameter_name(from)
+                                            == squashed_parameter_name(name)
+                                        && squashed_parameter_name(to) == squashed
+                                })
+                        })?;
                         // Taken, not borrowed: the values move into the new
                         // element, and no parameter should be seeded twice.
                         let (_, fields) = carried.remove(position);
@@ -2672,8 +2814,8 @@ fn seed_material_parameters(target: &mut TagFile, context: &mut ConversionContex
 
         let field_count = value.as_ref().fields().count();
         for ordinal in 0..field_count {
-            let kind = match value.as_ref().fields().nth(ordinal) {
-                Some(field) => field.field_type(),
+            let (kind, name) = match value.as_ref().fields().nth(ordinal) {
+                Some(field) => (field.field_type(), clean_field_key(field.name())),
                 None => continue,
             };
             match kind {
@@ -2681,7 +2823,17 @@ fn seed_material_parameters(target: &mut TagFile, context: &mut ConversionContex
                     if let Some(mut field) = value.field_at_mut(ordinal)
                         && let Some(nested) = field.as_struct_mut()
                     {
-                        walk(nested, templates, target_game, definitions_root, seeded);
+                        // A struct does not move the path; only a block does.
+                        walk(
+                            nested,
+                            path,
+                            by_path,
+                            templates,
+                            target_game,
+                            definitions_root,
+                            group,
+                            seeded,
+                        );
                     }
                 }
                 TagFieldType::Block => {
@@ -2690,7 +2842,17 @@ fn seed_material_parameters(target: &mut TagFile, context: &mut ConversionContex
                     {
                         for index in 0..block.len() {
                             if let Some(element) = block.element_mut(index) {
-                                walk(element, templates, target_game, definitions_root, seeded);
+                                let child = format!("{path}/{name}[{index}]");
+                                walk(
+                                    element,
+                                    &child,
+                                    by_path,
+                                    templates,
+                                    target_game,
+                                    definitions_root,
+                                    group,
+                                    seeded,
+                                );
                             }
                         }
                     }
@@ -2703,11 +2865,15 @@ fn seed_material_parameters(target: &mut TagFile, context: &mut ConversionContex
     let mut seeded = Vec::new();
     let target_game = context.target_game;
     let definitions_root = context.definitions_root;
+    let group = context.group_name;
     walk(
         target.root_mut(),
+        "",
+        &mut by_path,
         templates,
         target_game,
         definitions_root,
+        group,
         &mut seeded,
     );
     if seeded.is_empty() {
@@ -2727,6 +2893,43 @@ fn seed_material_parameters(target: &mut TagFile, context: &mut ConversionContex
             seeded.join(", ")
         ),
     });
+}
+
+/// Every render-method `parameters` block in a tag, keyed by block path.
+///
+/// Read from the *source*, because the target need not have anywhere to keep a
+/// render method at all. Halo 4's declared `decal_system` revision holds only the
+/// material in a decal entry — no `actual shader?` beside it — so a Reach decal's
+/// `base_map` has no slot to land in, and looking for it next to the material in
+/// the converted tag finds nothing. The source always has it.
+fn collect_render_parameters(
+    value: TagStruct<'_>,
+    path: String,
+    out: &mut HashMap<String, Vec<ParameterFields>>,
+) {
+    for field in value.fields() {
+        if let Some(child) = field.as_struct() {
+            let parameters = parameter_elements(child, "parameters");
+            if !parameters.is_empty() {
+                out.entry(path.clone()).or_insert(parameters);
+            }
+            collect_render_parameters(child, path.clone(), out);
+        }
+    }
+    for field in value.fields() {
+        if field.field_type() != TagFieldType::Block {
+            continue;
+        }
+        let Some(block) = field.as_block() else {
+            continue;
+        };
+        let name = clean_field_key(field.name());
+        for index in 0..block.len() {
+            if let Some(element) = block.element(index) {
+                collect_render_parameters(element, format!("{path}/{name}[{index}]"), out);
+            }
+        }
+    }
 }
 
 /// Set the field called `key`, if the element has one that will take the value.
@@ -9290,6 +9493,127 @@ mod tests {
         }
         if checked == 0 {
             eprintln!("skipping: no HREK particle in the sample names a base map");
+        }
+    }
+
+    /// No converted fx tag reaches Halo 4 with a material and no material shader.
+    ///
+    /// A converted Reach `decal_system` read fine in the mod tools and **crashed
+    /// the game** the moment the decal was triggered: `#0 is not a valid
+    /// material_postprocess_block index in [#0, #0)`. Nothing in the schema
+    /// indexes that block — it is the renderer building a material's postprocess
+    /// from its material shader and finding none, because `decal_system` had no
+    /// entry in [`DEFAULT_MATERIALS`] and Reach has no material to carry over.
+    ///
+    /// Checks every group in the table plus the texture, since a decal whose
+    /// material draws with the shader's placeholder is only half-ported. Halo 4's
+    /// own `impact.decal_system` is the ported Reach decal of that name and is
+    /// what this is measured against: `decals\base`, and the source's `base_map`
+    /// bitmap arriving as `color_map`.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_converted_fx_tag_never_arrives_with_a_material_and_no_shader() {
+        let (Some(reach), Some(h4)) = (
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+        ) else {
+            eprintln!("skipping: needs HREK and H4EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h4, &groups);
+
+        // Every material in the tag, as (shader path, parameter names).
+        fn materials(value: TagStruct<'_>, out: &mut Vec<(String, Vec<String>)>) {
+            if is_material_struct(value) {
+                let shader = value
+                    .fields()
+                    .find(|field| clean_field_key(field.name()) == "material shader")
+                    .and_then(|field| match field.value() {
+                        Some(TagFieldData::TagReference(reference)) => {
+                            reference.group_tag_and_name.map(|(_, path)| path)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let names = parameter_elements(value, "material parameters")
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect();
+                out.push((shader, names));
+            }
+            for field in value.fields() {
+                if let Some(child) = field.as_struct() {
+                    materials(child, out);
+                }
+                if let Some(block) = field.as_block() {
+                    for index in 0..block.len() {
+                        if let Some(element) = block.element(index) {
+                            materials(element, out);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (group, fourcc) in [
+            ("decal_system", "decs"),
+            ("particle", "prt3"),
+            ("light_volume_system", "ligh"),
+        ] {
+            let Some(group_tag) = crate::parse_group_tag(fourcc) else {
+                continue;
+            };
+            let mut checked = 0usize;
+            for path in tags_with_extension(&reach, group).into_iter().take(40) {
+                let Ok(source) = read_tag_for_conversion(
+                    &path,
+                    Some("haloreach_mcc"),
+                    Some(&definitions),
+                    group_tag,
+                ) else {
+                    continue;
+                };
+                let Ok(draft) = analyze_conversion_with_templates(
+                    &source,
+                    "haloreach_mcc",
+                    "halo4_mcc",
+                    &definitions,
+                    Some(&templates),
+                ) else {
+                    continue;
+                };
+                let mut found = Vec::new();
+                materials(draft.tag.root(), &mut found);
+                if found.is_empty() {
+                    continue;
+                }
+                for (shader, names) in &found {
+                    assert!(
+                        !shader.is_empty(),
+                        "{group} {}: a material arrived with no material shader, which crashes \
+                         Halo 4 when the effect plays",
+                        path.display()
+                    );
+                    // A decal's texture has to reach the material as well: the
+                    // target revision has no render method to fall back on.
+                    if group == "decal_system" {
+                        assert!(
+                            names.iter().any(|name| name == "color_map"),
+                            "{}: the decal's material has {names:?}, so it draws with \
+                             {shader}'s placeholder instead of the source's own bitmap",
+                            path.display()
+                        );
+                    }
+                }
+                checked += 1;
+                break;
+            }
+            if checked == 0 {
+                eprintln!("skipping {group}: no HREK {group} in the sample converted");
+            }
         }
     }
 
