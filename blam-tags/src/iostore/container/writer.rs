@@ -2799,6 +2799,21 @@ fn add_package_override_to_writer(
         FZenPackageHeader::deserialize(&mut std::io::Cursor::new(&over.bytes), None, CV, HV, None)
             .map_err(|_| IoStoreError::Package("rebuilt package did not parse"))?;
     let package_id = FPackageId::from_name(&header.package_name());
+    // The chunk id came from the base container's path; the store key came from
+    // the rebuilt name. If an edit moved the name, those two now disagree, and
+    // the result is a container that builds and cannot be read: the engine
+    // resolves a name to a package id and that id to a chunk id, so it would
+    // compute one nothing in the container serves.
+    //
+    // `overwrite_packages_in_place_with` has always refused this. The override
+    // path silently accepted it, which made renaming a package look like an
+    // ordinary property edit right up until the mod did nothing.
+    if id.package_id() != package_id.0.to_le_bytes() {
+        return Err(IoStoreError::Package(
+            "rebuilt package identity changed; renaming a package needs a new chunk id and a \
+             container-header entry, not an override of the old one",
+        ));
+    }
     writer.add_package(id, over.bytes.clone(), package_id, over.store.clone());
     Ok(())
 }
