@@ -4350,6 +4350,84 @@ mod rename_experiment {
         .ok()
     }
 
+    /// Which tag packages nothing imports, and which pak each one is in.
+    ///
+    /// Read-only, and gated on `CE_PAKS` like every other corpus control,
+    /// because it only reads. It exists so the experiment does not have to take
+    /// whatever candidate happens to sort first: that is in the largest pak, and
+    /// restoring a 37 GB pak to undo a one-package edit is a bad trade. Pick a
+    /// candidate in a small pak and pass it as `CE_RENAME_PACKAGE`.
+    ///
+    /// The count is also the answer to a real design question — how much of the
+    /// corpus a zero-referrer restriction would leave usable.
+    ///
+    ///   CE_PAKS=/path/to/Meteorite/Content/Paks \
+    ///     cargo test --release --features iostore rename_experiment \
+    ///       -- --ignored --nocapture report_packages
+    #[test]
+    #[ignore = "requires a Campaign Evolved install; set CE_PAKS"]
+    fn report_packages_nothing_imports() {
+        let root = std::env::var("CE_PAKS").expect("set CE_PAKS to the game's Content/Paks");
+        let utocs = utocs_under(&root);
+        assert!(!utocs.is_empty(), "no pakchunk .utoc found under {root}");
+
+        let mut imported: HashSet<String> = HashSet::new();
+        let mut tags: Vec<(String, String)> = Vec::new();
+        for utoc in &utocs {
+            let Ok(archive) = IoStoreArchive::open(utoc) else {
+                continue;
+            };
+            let label = utoc
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            for entry in archive.entries() {
+                let lower = entry.path.to_ascii_lowercase().replace('\\', "/");
+                if !lower.ends_with(".uasset") {
+                    continue;
+                }
+                let Ok(bytes) = archive.read(&entry.path) else {
+                    continue;
+                };
+                let Some(header) = header_of(&bytes) else {
+                    continue;
+                };
+                for import in &header.imported_package_names {
+                    imported.insert(import.to_ascii_lowercase());
+                }
+                if lower.contains("/content/tags/") {
+                    tags.push((label.clone(), header.package_name()));
+                }
+            }
+        }
+
+        let mut by_pak: std::collections::BTreeMap<&str, Vec<&str>> =
+            std::collections::BTreeMap::new();
+        for (label, name) in &tags {
+            if !imported.contains(&name.to_ascii_lowercase()) {
+                by_pak.entry(label).or_default().push(name);
+            }
+        }
+        let free: usize = by_pak.values().map(Vec::len).sum();
+
+        println!("\ntag packages            {}", tags.len());
+        println!("with no importer at all {free}\n");
+        for (label, names) in &by_pak {
+            let size = std::path::Path::new(&root)
+                .join(label)
+                .with_extension("ucas");
+            let gb = std::fs::metadata(&size)
+                .map(|meta| meta.len() as f64 / 1024.0 / 1024.0 / 1024.0)
+                .unwrap_or(0.0);
+            println!(
+                "{label:<28} {:>5} candidates  {gb:>6.2} GB ucas  e.g. {}",
+                names.len(),
+                names[0]
+            );
+        }
+        assert!(!tags.is_empty(), "no tag package was found under CE_PAKS");
+    }
+
     /// Move one package inside a copied install, and print what to watch for.
     ///
     /// Which experiment this is depends on what you point it at.
@@ -4402,6 +4480,7 @@ mod rename_experiment {
         let mut imported: HashSet<String> = HashSet::new();
         let mut referrers_of_target: Vec<(String, String)> = Vec::new();
         let mut tags: Vec<(usize, String)> = Vec::new();
+        let mut found: Option<(usize, String)> = None;
         let wanted = std::env::var("CE_RENAME_PACKAGE").ok();
         let wanted_lower = wanted.as_ref().map(|name| name.to_ascii_lowercase());
 
@@ -4425,6 +4504,15 @@ mod rename_experiment {
                     continue;
                 };
                 let name = header.package_name();
+                // Located during the same pass that reads it, rather than by a
+                // second search afterwards. A named package and a reported
+                // candidate then agree by construction — a separate lookup can
+                // disagree with the scan about where a package is, and the
+                // failure looks like "not in any container" when it is right
+                // there.
+                if wanted_lower.as_deref() == Some(name.to_ascii_lowercase().as_str()) {
+                    found = Some((index, name.clone()));
+                }
                 for import in &header.imported_package_names {
                     let import = import.to_ascii_lowercase();
                     if wanted_lower.as_deref() == Some(import.as_str()) {
@@ -4439,23 +4527,9 @@ mod rename_experiment {
         }
 
         let (container, package) = match wanted {
-            Some(package) => {
-                let index = utocs
-                    .iter()
-                    .position(|utoc| {
-                        IoStoreArchive::open(utoc).is_ok_and(|archive| {
-                            let id = FPackageId::from_name(&package);
-                            (0..archive.chunk_count()).any(|slot| {
-                                archive.chunk_id(slot).is_ok_and(|chunk| {
-                                    chunk.package_id() == id.0.to_le_bytes()
-                                        && chunk.chunk_type() != RETIRED_CHUNK_TYPE
-                                })
-                            })
-                        })
-                    })
-                    .expect("CE_RENAME_PACKAGE is not in any mounted container");
-                (index, package)
-            }
+            Some(package) => found.unwrap_or_else(|| {
+                panic!("no package under {root} is named {package}");
+            }),
             None => {
                 let free: Vec<&(usize, String)> = tags
                     .iter()
