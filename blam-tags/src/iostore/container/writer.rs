@@ -4518,6 +4518,30 @@ mod rename_experiment {
                 gb_of(label)
             );
         }
+        // A named slice of the corpus, for picking a subject by what it *is*
+        // rather than by how cheap its pak is. Referrer counts here are UE
+        // imports only -- a tag is also reached through Halo's own reference
+        // path, which no count in this report can see, so a zero here does not
+        // mean nothing points at it.
+        if let Ok(filter) = std::env::var("CE_RENAME_FILTER") {
+            let filter = filter.to_ascii_lowercase();
+            let mut matched: Vec<(&str, &str, usize)> = tags
+                .iter()
+                .filter(|(_, name)| name.to_ascii_lowercase().contains(&filter))
+                .map(|(label, name)| {
+                    let count = imported
+                        .get(&name.to_ascii_lowercase())
+                        .map_or(0, |(count, _)| *count);
+                    (label.as_str(), name.as_str(), count)
+                })
+                .collect();
+            matched.sort_by_key(|(_, name, _)| *name);
+            println!("\n{} tags matching {filter:?}:", matched.len());
+            for (label, name, count) in matched.iter().take(40) {
+                println!("  {count:>3} importers  {label:<26} {name}");
+            }
+        }
+
         assert!(!tags.is_empty(), "no tag package was found under CE_PAKS");
     }
 
