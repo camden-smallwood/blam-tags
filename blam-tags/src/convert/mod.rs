@@ -1878,6 +1878,7 @@ fn analyze_conversion_inner(
                 target_game,
                 Some(&target_field_aliases),
                 definitions_root,
+                &schema_path,
             )
         })
         .transpose()?
@@ -2740,12 +2741,41 @@ fn accepts_native_header(header: &TagFileHeader, target_game: &str) -> bool {
     header.version != u32::MAX
 }
 
+/// The root size `target_schema` declares, or `None` if it will not build.
+///
+/// This is what makes a template *fit* rather than merely exist. A kit ships one
+/// group at many layout revisions — every tag embeds the `blay` it was authored
+/// against — and H4EK's effects come in three: 96 bytes (480 tags), 104 (2,740)
+/// and 108 (4). Taking whichever sorts first means taking one by accident.
+///
+/// Matching the definition is the principled tie-break rather than "the most
+/// common one", because the definition is the schema the conversion maps fields
+/// *with*. A template narrower than the definition has nowhere to put fields the
+/// converter knows how to fill: measured on one Reach effect into Halo 4, the
+/// 96-byte revision carried 1,758 values and the 104-byte one 2,084.
+///
+/// Read out of the JSON rather than taken from a built `TagFile`, because
+/// *building* is the thing some groups cannot survive: Reach's
+/// `contrail_system` panics in `layout.rs`, which is the whole reason a native
+/// template is preferred there in the first place. The declared number is the
+/// same either way — it already accounts for `tmpl` expansion, so Reach's
+/// particle reads 496 from both.
+fn declared_root_size(target_schema: &Path) -> Option<usize> {
+    let bytes = fs::read(target_schema).ok()?;
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    let block = value.get("block")?.as_str()?;
+    let root = value.get("blocks")?.get(block)?.get("struct")?.as_str()?;
+    let size = value.get("structs")?.get(root)?.get("size")?.as_u64()?;
+    usize::try_from(size).ok()
+}
+
 fn find_native_target_template(
     templates: &NativeTemplateIndex,
     target_group_tag: u32,
     target_game: &str,
     engine_managed: Option<&SchemaFieldAliases>,
     definitions_root: &Path,
+    target_schema: &Path,
 ) -> Result<Option<(TagFile, PathBuf)>, String> {
     // A classic target needs a kit-authored tag to start from — `TagFile::new`
     // only builds MCC containers — but a classic tag cannot be read by
@@ -2789,6 +2819,18 @@ fn find_native_target_template(
         templates.cached.borrow_mut().insert(target_group_tag, None);
         return Ok(None);
     };
+    // Which revision to hold out for. `by_group` is sorted by path, so without
+    // this the choice is whichever tag sorts first — on one H4EK that is
+    // everything under `2011\`, and a kit missing that folder (or holding a tag
+    // sorting before it, including one a previous import wrote) silently
+    // converts against a different layout. Same editor, same tag, different
+    // machine, different output: that is the bug this exists to remove.
+    let wanted_root_size = declared_root_size(target_schema);
+    // The best of the wrong ones, kept in case the kit ships no matching
+    // revision at all. A template of the wrong revision still beats none: the
+    // fallback from here is a layout built from the schema, which no kit ever
+    // authored.
+    let mut fallback: Option<(TagFile, PathBuf)> = None;
     for path in paths.iter().take(NATIVE_TEMPLATE_SCAN_LIMIT) {
         // Sift on the 64-byte header first. Every candidate has to be *ruled
         // out* somehow, and for a group the kit ships in bulk the ruled-out ones
@@ -2817,21 +2859,40 @@ fn find_native_target_template(
             && accepts_native_header(&tag.header, target_game)
             && reset_tag_to_defaults(&mut tag, engine_managed).is_ok()
         {
-            let bytes = tag.write_to_bytes().map_err(|error| {
-                format!(
-                    "Could not cache native template {}: {error}",
-                    path.display()
-                )
-            })?;
-            templates
-                .cached
-                .borrow_mut()
-                .insert(target_group_tag, Some((bytes, path.clone())));
-            return Ok(Some((tag, path.to_path_buf())));
+            // Read after the reset, because that is the shape the conversion
+            // will actually fill.
+            let root_size = tag.root().definition().size();
+            if wanted_root_size.is_some_and(|wanted| wanted != root_size) {
+                if fallback.is_none() {
+                    fallback = Some((tag, path.to_path_buf()));
+                }
+                continue;
+            }
+            return cache_native_template(templates, target_group_tag, tag, path.clone());
         }
+    }
+    if let Some((tag, path)) = fallback {
+        return cache_native_template(templates, target_group_tag, tag, path);
     }
     templates.cached.borrow_mut().insert(target_group_tag, None);
     Ok(None)
+}
+
+/// Remember a chosen template as bytes, so the next tag of the group reuses it.
+fn cache_native_template(
+    templates: &NativeTemplateIndex,
+    target_group_tag: u32,
+    tag: TagFile,
+    path: PathBuf,
+) -> Result<Option<(TagFile, PathBuf)>, String> {
+    let bytes = tag
+        .write_to_bytes()
+        .map_err(|error| format!("Could not cache native template {}: {error}", path.display()))?;
+    templates
+        .cached
+        .borrow_mut()
+        .insert(target_group_tag, Some((bytes, path.clone())));
+    Ok(Some((tag, path)))
 }
 
 fn create_companion_tag(
@@ -2846,6 +2907,10 @@ fn create_companion_tag(
         .get(&group_name.to_ascii_lowercase())
         .copied()
         .ok_or_else(|| format!("{} has no {group_name} tag group", context.target_game))?;
+    let schema = context
+        .definitions_root
+        .join(context.target_game)
+        .join(format!("{group_name}.json"));
     let native_target = context
         .native_templates
         .map(|templates| {
@@ -2855,14 +2920,11 @@ fn create_companion_tag(
                 context.target_game,
                 Some(context.target_field_aliases),
                 context.definitions_root,
+                &schema,
             )
         })
         .transpose()?
         .flatten();
-    let schema = context
-        .definitions_root
-        .join(context.target_game)
-        .join(format!("{group_name}.json"));
     let (mut tag, native_layout_template) = if let Some((template, template_path)) = native_target {
         (template, Some(template_path))
     } else {
@@ -7732,6 +7794,173 @@ mod tests {
             result.unwrap().is_ok(),
             "native Reach contrail is unreadable"
         );
+    }
+
+    /// A conversion starts from the layout revision the definition declares.
+    ///
+    /// A kit ships one group at several layout revisions — every tag embeds the
+    /// `blay` it was authored against — and the template index is sorted by
+    /// path, so "first acceptable" means "whichever sorts first". On one H4EK
+    /// that is everything under `2011\`; a kit without that folder, or holding a
+    /// tag sorting before it (including one a previous import wrote), starts
+    /// from a different layout. That is how the same editor converting the same
+    /// tag produced a file that opened on one machine and not another.
+    ///
+    /// The declared revision is the right one to hold out for because it is the
+    /// schema the conversion maps fields *with*. Measured on one Reach effect
+    /// into Halo 4: the 96-byte revision carried 1,758 values, the 104-byte one
+    /// — which is what `halo4_mcc/effect.json` declares — carried 2,084.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_conversion_starts_from_the_layout_revision_the_definition_declares() {
+        let (Some(reach), Some(h4)) = (
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+        ) else {
+            eprintln!("skipping: needs HREK and H4EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h4, &groups);
+        // Counts the groups where the kit actually offered a wrong revision to
+        // reject. Without one of those the assertions below hold vacuously.
+        let mut discriminated = 0usize;
+
+        for (group, fourcc) in [
+            ("effect", "effe"),
+            ("particle", "prt3"),
+            ("decal_system", "decs"),
+        ] {
+            let group_tag = crate::parse_group_tag(fourcc).expect("a group tag");
+            let schema = definitions.join("halo4_mcc").join(format!("{group}.json"));
+            let declared =
+                declared_root_size(&schema).expect("halo4_mcc declares a root size for {group}");
+            let offered: HashSet<usize> = templates
+                .by_group
+                .get(&group_tag)
+                .into_iter()
+                .flatten()
+                .take(NATIVE_TEMPLATE_SCAN_LIMIT)
+                .filter_map(|path| TagFile::read(path).ok())
+                .filter(|tag| accepts_native_header(&tag.header, "halo4_mcc"))
+                .map(|tag| tag.root().definition().size())
+                .collect();
+            if offered.len() > 1 {
+                discriminated += 1;
+            }
+
+            let Some(source_path) = tags_with_extension(&reach, group).into_iter().find(|path| {
+                read_tag_for_conversion(path, Some("haloreach_mcc"), Some(&definitions), group_tag)
+                    .is_ok()
+            }) else {
+                eprintln!("skipping {group}: HREK ships none");
+                continue;
+            };
+            let source = read_tag_for_conversion(
+                &source_path,
+                Some("haloreach_mcc"),
+                Some(&definitions),
+                group_tag,
+            )
+            .unwrap();
+            let draft = analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "halo4_mcc",
+                &definitions,
+                Some(&templates),
+            )
+            .unwrap_or_else(|error| panic!("{}: {error}", source_path.display()));
+            let picked = draft
+                .native_layout_template
+                .unwrap_or_else(|| panic!("{group}: no native template was used"));
+            let size = TagFile::read(&picked).unwrap().root().definition().size();
+            assert_eq!(
+                size,
+                declared,
+                "{group}: started from {} (root {size}) when the definition declares {declared}; \
+                 the kit offered {offered:?}",
+                picked.display()
+            );
+        }
+        assert!(
+            discriminated > 0,
+            "no group offered more than one revision, so nothing was actually chosen between"
+        );
+    }
+
+    /// A template of the wrong revision still beats no template.
+    ///
+    /// Holding out for the declared revision must not turn "started from an
+    /// older kit tag" into "built the layout from the schema" — that fallback is
+    /// a layout no kit ever authored, and it is the one the editor labels
+    /// unverified.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_kit_with_only_the_wrong_revision_still_supplies_a_template() {
+        let (Some(reach), Some(h4)) = (
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+        ) else {
+            eprintln!("skipping: needs HREK and H4EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+        let group_tag = crate::parse_group_tag("effe").expect("effe is a group tag");
+        let declared = declared_root_size(&definitions.join("halo4_mcc/effect.json")).unwrap();
+
+        let Some(wrong) = tags_with_extension(&h4, "effect").into_iter().find(|path| {
+            TagFile::read(path).is_ok_and(|tag| {
+                accepts_native_header(&tag.header, "halo4_mcc")
+                    && tag.root().definition().size() != declared
+            })
+        }) else {
+            eprintln!("skipping: H4EK ships only the declared revision");
+            return;
+        };
+
+        // A kit holding exactly one effect, of the wrong revision.
+        let scratch = std::env::temp_dir().join(format!(
+            "blam_wrong_revision_{}_{}",
+            std::process::id(),
+            group_tag
+        ));
+        let _ = fs::remove_dir_all(&scratch);
+        fs::create_dir_all(&scratch).unwrap();
+        fs::copy(&wrong, scratch.join(wrong.file_name().unwrap())).unwrap();
+        let templates = NativeTemplateIndex::build(&scratch, &groups);
+
+        let source_path = tags_with_extension(&reach, "effect")
+            .into_iter()
+            .find(|path| {
+                read_tag_for_conversion(path, Some("haloreach_mcc"), Some(&definitions), group_tag)
+                    .is_ok()
+            })
+            .expect("HREK ships an effect");
+        let source = read_tag_for_conversion(
+            &source_path,
+            Some("haloreach_mcc"),
+            Some(&definitions),
+            group_tag,
+        )
+        .unwrap();
+        let draft = analyze_conversion_with_templates(
+            &source,
+            "haloreach_mcc",
+            "halo4_mcc",
+            &definitions,
+            Some(&templates),
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", source_path.display()));
+        assert!(
+            draft.native_layout_template.is_some(),
+            "the only template on offer was rejected for its revision"
+        );
+        let _ = fs::remove_dir_all(scratch);
     }
 
     #[test]
