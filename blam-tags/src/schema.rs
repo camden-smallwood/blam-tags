@@ -659,10 +659,21 @@ fn build_layout_from_schema(
             // Clean the field name to its bare display form (drop `:units`,
             // `#help`, `{alias}`, and trailing `*`/`!` markers) so the embedded
             // layout matches shipped tags rather than the verbose JSON schema.
+            // A shipped layout carries no name for a `custom` field, whatever the
+            // JSON calls it. Measured across HREK: every `custom` in a kit tag's
+            // layout is unnamed — the decorators, and the `tmpl` render-method
+            // hole alike — while the dump names them `types`, `mapping`,
+            // `shader`. An explanation is the same case with its heading text.
+            //
+            // The name is metadata on a field that carries no data, so dropping
+            // it moves nothing; what it buys is a field list the editing kits
+            // recognise as their own, which is what `cheap_particle_emitter`
+            // needed. The JSON keeps the names, so nothing is lost that a reader
+            // of the schema wanted.
             let field_name_offset = match &field.name {
-                // An explanation's name is its heading text, which a shipped
-                // layout does not carry.
-                Some(n) if !explanation => strings.intern(&clean_blay_field_name(n)),
+                Some(n) if !explanation && !matches!(ty, TagFieldType::Custom) => {
+                    strings.intern(&clean_blay_field_name(n))
+                }
                 _ => 0,
             };
 

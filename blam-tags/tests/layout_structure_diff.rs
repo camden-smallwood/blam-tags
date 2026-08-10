@@ -15,12 +15,10 @@
 //!   the difference being exactly its seven explanations. Emitting them the way
 //!   the kits do took it from **43 differences to 3**, with the root field list
 //!   now matching. Fixed in `schema.rs`.
-//! - **The kits do not store a name for a `custom` field.** The three
-//!   differences left on `cheap_particle_emitter` are all of that shape: ours
-//!   says `types` and `mapping` where the kit's says nothing. Zero-risk to align
-//!   for the same reason - a custom carries no data - but it changes what a
-//!   newly created tag shows for those fields in an editor, so it is worth doing
-//!   deliberately rather than as a footnote.
+//! - **The kits do not store a name for a `custom` field**, whatever the JSON
+//!   calls it - the decorators and the `tmpl` render-method hole alike. Dropping
+//!   ours took `cheap_particle_emitter` the rest of the way, from 3 differences
+//!   to **0**: structurally identical to the kit tag. Also fixed in `schema.rs`.
 //! - **`effect` and `decal_system` roots are byte-identical** to the kit's, so
 //!   whatever makes an effect fail is not its root shape.
 //! - **`particle` cannot be judged this way.** Ours declares 496 bytes and the
