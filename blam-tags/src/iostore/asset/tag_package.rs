@@ -118,7 +118,13 @@ pub fn is_bare_group(group: &str, usmap: &Usmap) -> bool {
     extra_properties(&group_to_class(group), usmap).is_ok_and(|extra| extra.is_empty())
 }
 
-fn extra_properties(class: &str, usmap: &Usmap) -> Result<Vec<String>> {
+/// The properties a tag class declares beyond the three every wrapper has.
+///
+/// Empty means the group is derivable: a wrapper can be built from the group
+/// alone. Non-empty is the reason it cannot, and the names are worth surfacing
+/// rather than swallowing — "cannot be derived" is a dead end, while "declares
+/// Model and Materials" tells you what a donor would have had to supply.
+pub fn extra_properties(class: &str, usmap: &Usmap) -> Result<Vec<String>> {
     const BASE: [&str; 3] = [
         "CookedAssetsReferencedByTag",
         "BinaryBlobSize",
