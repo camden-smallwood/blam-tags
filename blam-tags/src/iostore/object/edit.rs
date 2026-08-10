@@ -732,7 +732,7 @@ pub fn set_object_property(
 /// Nested on purpose: `CookedAssetsReferencedByTag` is an array of references,
 /// so a top-level-only count would report zero for exactly the properties most
 /// likely to share a slot.
-fn count_object_references(block: &PropertyBlock, package_index: i32) -> usize {
+pub fn count_object_references(block: &PropertyBlock, package_index: i32) -> usize {
     fn count_value(value: &PropValue, package_index: i32) -> usize {
         match value.unwrapped() {
             PropValue::Object(i) => usize::from(*i == package_index),
