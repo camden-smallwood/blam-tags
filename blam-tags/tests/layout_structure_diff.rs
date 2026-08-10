@@ -1,34 +1,37 @@
 //! Where a tag built from the definitions differs in *shape* from one the kit
 //! wrote, for the same game and group.
 //!
-//! Run with `--ignored`. Kept as a diagnostic rather than an assertion because
-//! it is measuring a known defect, not guarding a fixed one: the editing kits
-//! reject a tag whose field list disagrees with their own, and this says exactly
-//! where the disagreement is. What it found on HREK, which is the starting point
-//! for fixing it:
+//! Run with `--ignored`. Kept as a diagnostic rather than an assertion: it
+//! measures how close the two shapes are, and the remaining gap is real.
 //!
-//! | group | ours | the kit's |
-//! |---|---|---|
-//! | `effect` | 96B / 34 fields | identical |
-//! | `decal_system` | 60B / 12 fields | identical |
-//! | `particle` | **496B** / 32 fields | **492B** / 34 fields |
-//! | `cheap_particle_emitter` | 268B / **36** fields | 268B / **43** fields |
+//! The editing kits walk their own field list against a tag's, so a field list
+//! that disagrees is a tag they can refuse or fall over on - which is what was
+//! happening. Measured against HREK, and what it found:
 //!
-//! Two distinct defects, both in the JSON-to-layout builder rather than in the
-//! converter:
+//! - **`explanation` fields were being dropped from the built layout**, on a
+//!   stated belief that shipped tags carry none. They do carry them, as
+//!   zero-width unnamed `custom` fields. `cheap_particle_emitter` - the group
+//!   reported crashing the tools - declared 36 root fields against the kit's 43,
+//!   the difference being exactly its seven explanations. Emitting them the way
+//!   the kits do took it from **43 differences to 3**, with the root field list
+//!   now matching. Fixed in `schema.rs`.
+//! - **The kits do not store a name for a `custom` field.** The three
+//!   differences left on `cheap_particle_emitter` are all of that shape: ours
+//!   says `types` and `mapping` where the kit's says nothing. Zero-risk to align
+//!   for the same reason - a custom carries no data - but it changes what a
+//!   newly created tag shows for those fields in an editor, so it is worth doing
+//!   deliberately rather than as a footnote.
+//! - **`effect` and `decal_system` roots are byte-identical** to the kit's, so
+//!   whatever makes an effect fail is not its root shape.
+//! - **`particle` cannot be judged this way.** Ours declares 496 bytes and the
+//!   tag compared against carries 492: Reach ships that group at several layout
+//!   revisions, so this is comparing two different ones. A fair comparison has
+//!   to pick a kit tag whose root size matches the declared size first, and
+//!   until it does the particle numbers here mean nothing.
 //!
-//! 1. **Zero-width `custom` fields the dump omits.** `cheap_particle_emitter`
-//!    agrees on the root's total size and still declares seven fewer fields, the
-//!    missing ones including `custom` entries at indices 3 and 5. They occupy no
-//!    bytes, so emitting them aligns the field list without moving any data -
-//!    which is what a tool comparing field lists needs.
-//! 2. **`particle`'s root is four bytes too large.** 496 against the kit's 492,
-//!    so the `tmpl` expansion is being added where the kit does not add it.
-//!
-//! `effect` and `decal_system` roots are byte-identical, so whatever makes those
-//! fail is not here. Note the honest limit of this comparison: a freshly built
-//! tag has empty blocks, so only structs are descended into. Block element
-//! shapes are unmeasured and are the next place to look.
+//! Its other limit: a freshly built tag has empty blocks, so only structs are
+//! descended into. Block element shapes are unmeasured, and for `effect` that is
+//! where the substance lives.
 
 use blam_tags::convert::clean_field_key;
 use blam_tags::{TagFile, TagStruct};
@@ -37,7 +40,7 @@ use std::path::PathBuf;
 fn kit(name: &str) -> Option<PathBuf> {
     let path = PathBuf::from("D:/SteamLibrary/steamapps/common")
         .join(name)
-        .join("tags");
+        .join(if name == "H4EK" { "tog" } else { "tags" });
     path.is_dir().then_some(path)
 }
 
