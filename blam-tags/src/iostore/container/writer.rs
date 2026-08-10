@@ -497,6 +497,14 @@ pub struct InPlacePackageRename<'a> {
     /// saved and then moved. `None` carries the container's own bytes across
     /// with only the header rewritten.
     pub replacement_export_bundle: Option<&'a [u8]>,
+    /// Replacement payload for the package's bulk-data chunk, for the same
+    /// reason: a tag whose body was edited can be renamed in one transaction.
+    ///
+    /// Refused unless the package owns exactly one `BulkData` chunk and its
+    /// header describes exactly one bulk-data entry starting at offset zero —
+    /// otherwise "the new length" does not say which entry grew, and a wrong
+    /// `SerialSize` reads the payload off the end of the chunk.
+    pub replacement_bulk_data: Option<&'a [u8]>,
     /// How many chunks the container held before this caller ever appended to
     /// it. Every chunk of the package must sit at or past that index. Same
     /// provenance role, and the same limits, as [`InPlaceTagDeletion`].
@@ -531,6 +539,73 @@ pub fn rename_package_in_place_with(
     request: &InPlacePackageRename<'_>,
 ) -> Result<()> {
     rename_package_in_place_impl(archive, utoc_path, request, None)
+}
+
+/// Identity of a Campaign Evolved tag to move inside the container holding it.
+///
+/// A tag is a package plus a naming contract: `/Game/Tags/<path>-<group>`, where
+/// the group half names the wrapper's `Blam<Group>TagDataAsset` class. Nothing
+/// else distinguishes it, which is why this is a wrapper and not a second
+/// implementation.
+pub struct InPlaceTagRename<'a> {
+    /// The tag's package path as the container holds it, e.g.
+    /// `/Game/Tags/objects/characters/masterchief-biped`.
+    pub old_package_path: &'a str,
+    /// Where it should be. Same group; the name, the folder, or both may move.
+    pub new_package_path: &'a str,
+    /// Replacement tag body for the `.ubulk`, when the caller holds an edited
+    /// document — so renaming a dirty tag does not have to be a save followed
+    /// by a move. `None` carries the stored body across untouched.
+    pub tag_bytes: Option<&'a [u8]>,
+    /// Same provenance role, and the same limits, as [`InPlaceTagDeletion`].
+    pub minimum_appended_index: Option<u32>,
+    /// Install an old→new redirect so the old path still resolves.
+    pub redirect: bool,
+}
+
+/// Move a tag to a new path inside the exact container that holds it.
+///
+/// Everything mechanical is [`rename_package_in_place_with`]; what this adds is
+/// the one contract a tag has and a package does not. The group suffix is the
+/// wrapper export's class — `-biped` is a `BlamBipedTagDataAsset` — and the
+/// class is a script import hashed into the game's own binary, not something
+/// the package path can redefine. So renaming across groups would produce a tag
+/// the browser files under one group and the engine loads as another, and the
+/// mismatch would not surface until load. Refused here rather than repaired.
+///
+/// Renaming *within* a group is the whole operation: `-biped` to `-biped`, any
+/// name, any folder.
+pub fn rename_tag_in_place_with(
+    archive: &IoStoreArchive,
+    utoc_path: &Path,
+    request: &InPlaceTagRename<'_>,
+) -> Result<()> {
+    let old = crate::iostore::package::imports::split_tag_package(request.old_package_path)
+        .ok_or(IoStoreError::Package(
+            "the tag to rename is not at a /Game/Tags/<path>-<group> path",
+        ))?;
+    let new = crate::iostore::package::imports::split_tag_package(request.new_package_path)
+        .ok_or(IoStoreError::Package(
+            "the destination is not a /Game/Tags/<path>-<group> path",
+        ))?;
+    if !old.1.eq_ignore_ascii_case(new.1) {
+        return Err(IoStoreError::Package(
+            "a tag cannot be renamed into a different group",
+        ));
+    }
+
+    rename_package_in_place_with(
+        archive,
+        utoc_path,
+        &InPlacePackageRename {
+            old_package_path: request.old_package_path,
+            new_package_path: request.new_package_path,
+            replacement_export_bundle: None,
+            replacement_bulk_data: request.tag_bytes,
+            minimum_appended_index: request.minimum_appended_index,
+            redirect: request.redirect,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -2037,6 +2112,7 @@ fn retarget_package_identity(
     bytes: &[u8],
     old_package: &str,
     new_package: &str,
+    bulk_serial_size: Option<i64>,
 ) -> Result<Vec<u8>> {
     use crate::iostore::compat::{CE_CONTAINER_HEADER_VERSION, CE_TOC_VERSION};
 
@@ -2057,6 +2133,24 @@ fn retarget_package_identity(
     let tail = bytes[header_size..].to_vec();
 
     header.summary.name = header.name_map.store(new_package);
+
+    // The bulk chunk's length lives in the *package's* header, not in the TOC
+    // entry, so replacing the payload without this reads the old number of
+    // bytes out of the new chunk. Rewritten on the parsed header rather than
+    // byte-patched, because the header is being reserialized here anyway.
+    if let Some(size) = bulk_serial_size {
+        if header.bulk_data.len() != 1 {
+            return Err(IoStoreError::Package(
+                "a replacement body needs exactly one bulk-data map entry",
+            ));
+        }
+        if header.bulk_data[0].serial_offset != 0 {
+            return Err(IoStoreError::Package(
+                "the bulk-data entry does not start at the beginning of its chunk",
+            ));
+        }
+        header.bulk_data[0].serial_size = size;
+    }
 
     // Only the export the package is named after, and only when that name
     // actually changes. `public_export_hash` is how *other* packages address
@@ -2210,6 +2304,30 @@ fn resolve_package_rename(
         }
     }
 
+    // A replacement body must name exactly one chunk, or "the new length" does
+    // not say which one changed.
+    let replacement_bulk = match request.replacement_bulk_data {
+        Some(body) => {
+            let bulk: Vec<u32> = member_indices
+                .iter()
+                .copied()
+                .filter(|index| toc.chunk_ids[*index as usize].chunk_type() == CHUNK_TYPE_BULK_DATA)
+                .collect();
+            if bulk.len() != 1 {
+                return Err(IoStoreError::Package(
+                    "a replacement body needs the package to own exactly one bulk-data chunk",
+                ));
+            }
+            if body.len() > i64::MAX as usize {
+                return Err(IoStoreError::Package(
+                    "replacement body is too large for SerialSize",
+                ));
+            }
+            Some((bulk[0], body))
+        }
+        None => None,
+    };
+
     let indexed = toc.directory_index_size != 0;
     let mut members = Vec::new();
     let mut moved_indices = BTreeSet::new();
@@ -2220,7 +2338,12 @@ fn resolve_package_rename(
                 &bundle_bytes,
                 request.old_package_path,
                 request.new_package_path,
+                replacement_bulk.map(|(_, body)| body.len() as i64),
             )?
+        } else if let Some((bulk_index, body)) = replacement_bulk
+            && *index == bulk_index
+        {
+            body.to_vec()
         } else {
             archive.read_chunk(*index)?
         };
@@ -6124,6 +6247,7 @@ mod tests {
             old_package_path: old,
             new_package_path: new,
             replacement_export_bundle: None,
+            replacement_bulk_data: None,
             minimum_appended_index: None,
             redirect: true,
         }
@@ -6397,6 +6521,171 @@ mod tests {
                 .iter()
                 .any(|entry| entry.path == old_uasset_path),
             "and so did its path"
+        );
+        drop(reopened);
+        remove_duplicate_fixture(&utoc);
+    }
+
+    /// The group half of the leaf names the wrapper's native class, which no
+    /// package path can redefine — so this is refused rather than written and
+    /// discovered at load.
+    #[test]
+    fn a_tag_cannot_be_renamed_into_a_different_group() {
+        let (utoc, _source, source_header, _uasset, _ubulk, _bulk) =
+            duplicate_fixture("renametaggroup", true, true);
+        let tag_package = source_header.package_name();
+        let (stem, group) = tag_package.rsplit_once('-').expect("the fixture is a tag");
+        assert_ne!(group, "biped");
+        let other_group = format!("{stem}-biped");
+        let before = std::fs::read(&utoc).expect("TOC before");
+
+        let archive = IoStoreArchive::open(&utoc).expect("open");
+        let error = rename_tag_in_place_with(
+            &archive,
+            &utoc,
+            &InPlaceTagRename {
+                old_package_path: &tag_package,
+                new_package_path: &other_group,
+                tag_bytes: None,
+                minimum_appended_index: None,
+                redirect: true,
+            },
+        )
+        .expect_err("a group change is refused");
+        assert!(format!("{error}").contains("different group"), "{error}");
+        drop(archive);
+        assert_eq!(
+            std::fs::read(&utoc).expect("TOC after"),
+            before,
+            "and nothing was written"
+        );
+
+        // The same move within the group is allowed, so the refusal is about
+        // the group and not about the rename.
+        let within_group = format!("/Game/Tags/Fixture/Elsewhere/renamed-{group}");
+        let archive = IoStoreArchive::open(&utoc).expect("reopen");
+        rename_tag_in_place_with(
+            &archive,
+            &utoc,
+            &InPlaceTagRename {
+                old_package_path: &tag_package,
+                new_package_path: &within_group,
+                tag_bytes: None,
+                minimum_appended_index: None,
+                redirect: true,
+            },
+        )
+        .expect("a rename within the group is a plain move");
+        drop(archive);
+        remove_duplicate_fixture(&utoc);
+    }
+
+    /// A package outside the tag layout has no group to preserve, so the
+    /// wrapper cannot speak for it — in either direction. The general primitive
+    /// still can, which is why this refuses rather than falling back to it.
+    #[test]
+    fn a_package_outside_the_tag_layout_is_not_a_tag_rename() {
+        let (utoc, _source, source_header, _uasset, _ubulk, _bulk) =
+            duplicate_fixture("renamenontag", true, true);
+        let tag_package = source_header.package_name();
+        let archive = IoStoreArchive::open(&utoc).expect("open");
+
+        for (old, new) in [
+            ("/Game/Meshes/SM_Warthog", "/Game/Meshes/SM_Scorpion"),
+            (tag_package.as_str(), "/Game/Meshes/SM_Scorpion"),
+            ("/Game/Tags/Fixture/no-extension-here/", tag_package.as_str()),
+        ] {
+            let error = rename_tag_in_place_with(
+                &archive,
+                &utoc,
+                &InPlaceTagRename {
+                    old_package_path: old,
+                    new_package_path: new,
+                    tag_bytes: None,
+                    minimum_appended_index: None,
+                    redirect: true,
+                },
+            )
+            .expect_err("the wrapper refuses a non-tag path");
+            // Refused on the path alone, before the container is consulted.
+            assert!(format!("{error}").contains("/Game/Tags/"), "{error}");
+        }
+        drop(archive);
+        remove_duplicate_fixture(&utoc);
+    }
+
+    /// Renaming a tag whose body was edited is one transaction, not a save
+    /// followed by a move. The body's length lives in the package header, so
+    /// the two have to move together or the chunk reads short.
+    #[test]
+    fn renaming_a_tag_installs_an_edited_body_in_the_same_transaction() {
+        use crate::iostore::compat::{CE_CONTAINER_HEADER_VERSION, CE_TOC_VERSION};
+
+        let (utoc, _source, source_header, _uasset, _ubulk, old_bulk) =
+            duplicate_fixture("renametagbody", true, true);
+        let tag_package = source_header.package_name();
+        let group = tag_package.rsplit_once('-').expect("the fixture is a tag").1;
+        let new_package = format!("/Game/Tags/Fixture/edited-{group}");
+        let new_package = new_package.as_str();
+        let new_body = vec![0x5au8; old_bulk.len() + 41];
+
+        let serial_size_of = |archive: &IoStoreArchive, package: &str| -> i64 {
+            let id = FPackageId::from_name(package);
+            let index = archive
+                .find_chunk(&make_chunk_id(id.0, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA))
+                .expect("the package has an export bundle chunk");
+            let bytes = archive.read_chunk(index).expect("read the bundle");
+            let header = FZenPackageHeader::deserialize(
+                &mut Cursor::new(&bytes),
+                None,
+                CE_TOC_VERSION,
+                CE_CONTAINER_HEADER_VERSION,
+                None,
+            )
+            .expect("the bundle parses");
+            assert_eq!(header.bulk_data.len(), 1);
+            header.bulk_data[0].serial_size
+        };
+
+        let archive = IoStoreArchive::open(&utoc).expect("open");
+        let before = serial_size_of(&archive, &tag_package);
+        rename_tag_in_place_with(
+            &archive,
+            &utoc,
+            &InPlaceTagRename {
+                old_package_path: &tag_package,
+                new_package_path: new_package,
+                tag_bytes: Some(&new_body),
+                minimum_appended_index: None,
+                redirect: true,
+            },
+        )
+        .expect("rename and install the edited body");
+        drop(archive);
+
+        let reopened = IoStoreArchive::open(&utoc).expect("reopen");
+        let new_id = FPackageId::from_name(new_package);
+        let bulk = reopened
+            .find_chunk(&make_chunk_id(new_id.0, 0, CHUNK_TYPE_BULK_DATA))
+            .expect("the renamed tag has a bulk chunk");
+        assert_eq!(
+            reopened.read_chunk(bulk).expect("read the body"),
+            new_body,
+            "the edited body is what landed"
+        );
+        assert_ne!(before, new_body.len() as i64, "the length really changed");
+        assert_eq!(
+            serial_size_of(&reopened, new_package),
+            new_body.len() as i64,
+            "and the header says so"
+        );
+        // The path moved too, so this is a rename and not an overwrite.
+        let moved_leaf = format!("{}.ubulk", split_package_path(new_package).1);
+        assert!(
+            reopened
+                .entries()
+                .iter()
+                .any(|entry| entry.path.ends_with(&moved_leaf))
         );
         drop(reopened);
         remove_duplicate_fixture(&utoc);
