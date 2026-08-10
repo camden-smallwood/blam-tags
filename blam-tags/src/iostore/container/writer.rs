@@ -2230,11 +2230,17 @@ fn resolve_package_rename(
     }
 
     let old_key = old_id.0.to_le_bytes();
+    // Tombstones are skipped, for the same reason the collision check below
+    // skips them: `retire_chunk_id` rewrites only the type and pad bytes, so a
+    // retired slot keeps the package id it was retired from. A package that has
+    // been renamed away from this path before has left some here, and they are
+    // neither payload to move nor a shape to refuse -- counting them as members
+    // made every second rename fail on the member-type gate.
     let member_indices: Vec<u32> = toc
         .chunk_ids
         .iter()
         .enumerate()
-        .filter(|(_, id)| id.package_id() == old_key)
+        .filter(|(_, id)| id.package_id() == old_key && id.chunk_type() != RETIRED_CHUNK_TYPE)
         .map(|(index, _)| index as u32)
         .collect();
     if member_indices.is_empty() {
@@ -6523,6 +6529,42 @@ mod tests {
             "and so did its path"
         );
         drop(reopened);
+        remove_duplicate_fixture(&utoc);
+    }
+
+    /// A package that has been renamed before must still be renamable.
+    ///
+    /// It was not: the container header populated its localized-source set from
+    /// `package_redirects` instead of `localized_packages`, so re-parsing a
+    /// container reported every redirect's source as a localized package — and
+    /// both rename and delete refuse one of those. A rename installs a redirect,
+    /// so the second move of a package was refused, with a message about
+    /// localization that had nothing to do with what the caller had done.
+    #[test]
+    fn a_package_can_be_moved_again_after_a_round_trip_left_redirects_behind() {
+        let (utoc, _source, source_header, _old_uasset, _old_ubulk, _bulk) =
+            duplicate_fixture("renamerelocalized", true, true);
+        let home = source_header.package_name();
+        let away = "/Game/Tags/Fixture/away-empty";
+        let onward = "/Game/Tags/Fixture/onward-empty";
+
+        for (from, to) in [(home.as_str(), away), (away, home.as_str())] {
+            let archive = IoStoreArchive::open(&utoc).expect("open");
+            rename_package_in_place_with(&archive, &utoc, &rename_request(from, to))
+                .expect("the round trip itself works");
+            drop(archive);
+        }
+        // Redirects now name both paths as sources; neither is localized.
+        let reopened = IoStoreArchive::open(&utoc).expect("reopen");
+        let header = container_header_of(&reopened);
+        assert!(!header.is_localized_source(FPackageId::from_name(&home)));
+        assert!(!header.is_localized_source(FPackageId::from_name(away)));
+        drop(reopened);
+
+        let archive = IoStoreArchive::open(&utoc).expect("reopen");
+        rename_package_in_place_with(&archive, &utoc, &rename_request(&home, onward))
+            .expect("and the package can still be moved on");
+        drop(archive);
         remove_duplicate_fixture(&utoc);
     }
 

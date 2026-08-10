@@ -83,8 +83,13 @@ impl FIoContainerHeader {
             new.localized_packages = s.de()?;
             new.package_redirects = s.de()?;
 
-            // Populate Source Package IDs of localized packages from the list we just read
-            new.localized_source_package_ids = new.package_redirects.iter().map(|x| x.source_package_id).collect();
+            // Populate Source Package IDs of localized packages from the list we just read.
+            // From `localized_packages`, not `package_redirects`: the two are different lists
+            // that happen to share a field name, so reading the wrong one compiles and then
+            // reports every redirect's source as a localized package. Renaming installs
+            // redirects, and both rename and delete refuse a localized source -- so a package
+            // that was renamed once became one this crate would not move or retire again.
+            new.localized_source_package_ids = new.localized_packages.iter().map(|x| x.source_package_id).collect();
 
             // Populate package redirects lookup from the package redirect list
             new.package_redirect_lookup.reserve(new.package_redirects.len());
