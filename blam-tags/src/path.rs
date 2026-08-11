@@ -642,11 +642,19 @@ mod tests {
         let tag = read_classic_tag_file(&bytes, layout).unwrap();
         let root = tag.root();
 
-        // The color struct's `.field("Mapping")` is the custom leaf (ambiguity).
         let color = root.field("color").and_then(|f| f.as_struct()).unwrap();
+        // `color` used to hold two fields named `Mapping` -- the struct, and a
+        // `custom` leaf ahead of it -- and this test reached the struct through
+        // that ambiguity. The ambiguity was Baboon's own: a kit-authored layout
+        // names no `custom` at all, and once we stopped naming them too the
+        // duplicate here went away. The leaf is still present, unnamed.
+        //
+        // Real duplicates are common and unaffected -- 709 of 28,195 H2 tags
+        // carry one -- so the disambiguation this used to gate now runs against
+        // one of those, in `positional_path_resolves_a_real_duplicate_h2_contrail`.
         assert!(
-            color.field("Mapping").and_then(|f| f.as_struct()).is_none(),
-            "first 'Mapping' should be the non-struct custom leaf"
+            color.fields_all().any(|f| f.name().is_empty()),
+            "the custom leaf should still be there, just unnamed"
         );
         // Capture the struct Mapping's ordinal and resolve positionally.
         let map_ord = color
@@ -684,5 +692,54 @@ mod tests {
         // …and combined with a (correct) positional ordinal.
         let path = format!("color#{color_ord}/Mapping#{map_ord}/Function Type:[0,1]");
         assert!(root.field_path(&path).is_some(), "positional + markup path {path} failed");
+    }
+
+    /// An ordinal reaches a field a name alone cannot.
+    ///
+    /// This is what positional paths exist for, gated on a duplicate the tag
+    /// really has rather than one Baboon created by naming a `custom`: an H2
+    /// contrail declares `bitmap` twice at its root, and 709 of the kit's 28,195
+    /// tags carry a duplicate somewhere.
+    #[test]
+    fn positional_path_resolves_a_real_duplicate_h2_contrail() {
+        use crate::classic::read_classic_tag_file;
+        use crate::layout::TagLayout;
+        let tag_path = "/Users/camden/Halo/halo2_mcc/tags/effects/objects/weapons/rifle/sniper_rifle/sniper.contrail";
+        let def = "../definitions/halo2_mcc/contrail.json";
+        if !std::path::Path::new(tag_path).exists() || !std::path::Path::new(def).exists() {
+            eprintln!("skipping: H2 contrail/definition not present");
+            return;
+        }
+        let bytes = std::fs::read(tag_path).unwrap();
+        let layout = TagLayout::from_json(def).unwrap();
+        let tag = read_classic_tag_file(&bytes, layout).unwrap();
+        let root = tag.root();
+
+        let ordinals: Vec<usize> = root
+            .fields_all()
+            .filter(|f| f.name() == "bitmap")
+            .map(|f| f.ordinal())
+            .collect();
+        assert_eq!(
+            ordinals.len(),
+            2,
+            "this contrail should declare `bitmap` twice; got {ordinals:?}"
+        );
+
+        // A name alone can only ever reach one of them, and it is the first.
+        assert_eq!(
+            root.field("bitmap").map(|f| f.ordinal()),
+            Some(ordinals[0]),
+            "a bare name should resolve to the first match"
+        );
+
+        // Each ordinal reaches its own field -- including the one the bare name
+        // cannot, which is the whole point.
+        for &ordinal in &ordinals {
+            let field = root
+                .field_path(&format!("bitmap#{ordinal}"))
+                .unwrap_or_else(|| panic!("positional path bitmap#{ordinal} failed"));
+            assert_eq!(field.ordinal(), ordinal, "bitmap#{ordinal} resolved elsewhere");
+        }
     }
 }
