@@ -304,17 +304,27 @@ fn unsupported_pair_message(source_game: &str, target_game: &str) -> String {
 
 const CONVERSION_MAPPING_CATALOG: &str = include_str!("conversion_mappings.json");
 
-/// These groups contain layout features which `TagFile::new` cannot currently
-/// reconstruct closely enough for the native editing kits. Start from an
-/// editing-kit-authored target tag so its embedded layout tables stay native.
-#[cfg(test)]
-const NATIVE_LAYOUT_TEMPLATE_GROUPS: &[&str] = &["particle", "model", "biped"];
 
 #[cfg(test)]
-fn requires_native_layout_template(group_name: &str) -> bool {
-    NATIVE_LAYOUT_TEMPLATE_GROUPS
-        .iter()
-        .any(|group| group_name.eq_ignore_ascii_case(group))
+
+/// Whether this target needs a tag from its editing kit to start from.
+///
+/// Derived rather than listed, by asking the same question
+/// [`build_target_from_definitions`] answers, so the two cannot drift apart. The
+/// old hardcoded trio - particle, model, biped - was a per-group approximation of
+/// a per-*target* fact: Halo 4's `decal_system` keeps a material in a named struct
+/// and builds from its schema, while Halo 3's expands a render method inline and
+/// cannot. Measured over the definitions, `model` and `biped` declare no template
+/// hole at all.
+#[cfg(test)]
+fn target_needs_kit_template(definitions_root: &Path, target_game: &str, group_name: &str) -> bool {
+    if CLASSIC_CONVERSION_GAMES.contains(&target_game) {
+        return true;
+    }
+    let schema = definitions_root
+        .join(target_game)
+        .join(format!("{group_name}.json"));
+    schema.is_file() && build_target_from_definitions(&schema, false).is_none()
 }
 
 /// Stamp a freshly-created MCC tag with the file-header generation expected by
@@ -468,6 +478,10 @@ pub struct GameTagIndex {
 pub struct NativeTemplateIndex {
     by_group: HashMap<u32, Vec<PathBuf>>,
     cached: RefCell<HashMap<u32, Option<(Vec<u8>, PathBuf)>>>,
+    /// What each `.material_shader` in the kit declares its inputs to be, keyed
+    /// by the tag path a material names. A folder run converts hundreds of
+    /// particles that between them name a handful of shaders.
+    material_parameters: RefCell<HashMap<String, Vec<DeclaredParameter>>>,
 }
 
 impl NativeTemplateIndex {
@@ -1479,6 +1493,71 @@ fn resolve_target_group(
     Some((tag, name.unwrap_or_else(|| group_name.to_owned())))
 }
 
+/// A game's group table, loaded once per game and kept for the rest of a walk.
+fn game_groups<'a>(
+    game: &str,
+    definitions_root: &Path,
+    cache: &'a mut HashMap<String, GameTagIndex>,
+) -> Result<&'a GameTagIndex, String> {
+    if !cache.contains_key(game) {
+        let groups = GameTagIndex::load(definitions_root, game)?;
+        cache.insert(game.to_owned(), groups);
+    }
+    Ok(&cache[game])
+}
+
+/// The group a `group_name` tag ends up as in `target_game`, following the same
+/// reviewed renames and the same routing a conversion would.
+///
+/// Public because naming a converted file is not the converter's job, but has to
+/// agree with it exactly. Deciding by canonical name alone gets it wrong in two
+/// opposite ways, and both are live: a renamed class the target does not declare
+/// looks unconvertible — `contrail_system` into Halo 4 — while one it *does*
+/// still declare gets a name that contradicts its contents, because Halo 4 keeps
+/// a vestigial `shader` group it ships no tags of and every Reach shader converts
+/// to `material`.
+///
+/// Routes are followed because a rename can take two hops. Halo 4 has no
+/// `contrail` at all, so a Halo 2 one reaches it only through Halo 3, arriving as
+/// `contrail` -> `contrail_system` -> `tracer_system`.
+///
+/// This is a prediction, and the honest limit is worth stating: the converter
+/// tries the direct pair first and routes only if that is refused, so a group
+/// that resolves directly is answered directly even where a route would have
+/// renamed it further. A caller holding a finished draft should prefer its
+/// `target_extension`, which is what actually happened rather than what was
+/// expected to.
+pub fn converted_group(
+    group_name: &str,
+    source_game: &str,
+    target_game: &str,
+    definitions_root: &Path,
+) -> Result<Option<(u32, String)>, String> {
+    let catalog = ConversionMappingCatalog::load()?;
+    let mut cache = HashMap::new();
+    for route in conversion_routes(source_game, target_game) {
+        let mut name = group_name.to_owned();
+        let mut landed = None;
+        for hop in route.windows(2) {
+            let groups = game_groups(&hop[1], definitions_root, &mut cache)?;
+            let Some((group_tag, hop_name)) =
+                resolve_target_group(&name, groups, &catalog, &hop[0], &hop[1])
+            else {
+                // This route has no answer for the class, so it is not the route
+                // the tag would take either. Try the next.
+                landed = None;
+                break;
+            };
+            name = hop_name.clone();
+            landed = Some((group_tag, hop_name));
+        }
+        if let Some(found) = landed {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
 fn parse_schema_guid(value: &str) -> Option<[u8; 16]> {
     if value.len() != 32 {
         return None;
@@ -1813,6 +1892,7 @@ fn analyze_conversion_inner(
                 target_game,
                 Some(&target_field_aliases),
                 definitions_root,
+                &schema_path,
             )
         })
         .transpose()?
@@ -1841,28 +1921,69 @@ fn analyze_conversion_inner(
             ));
         }
     }
-    let (mut target, target_template) = if let Some((template, template_path)) = native_target {
-        (template, Some(template_path))
-    } else if CLASSIC_CONVERSION_GAMES.contains(&target_game) {
+    // A tag built from the target game's own definitions, which is where a
+    // conversion should start: the fields are then filled from the source and
+    // nothing else is carried. `None` when the definitions cannot produce one —
+    // a classic container, or a schema that does not survive construction.
+    let from_definitions = if CLASSIC_CONVERSION_GAMES.contains(&target_game) {
         // `TagFile::new` can only build an MCC container: it hard-codes
         // `TagContainer::Mcc` and `Endian::Le`, there is no `ClassicHeader`
         // writer, and Halo 2's root block header is never synthesized. So a
         // classic target has to start from a tag the kit authored.
-        return Err(format!(
-            "Converting to {target_game} needs a {target_group_name} tag from its \
-             editing kit to start from, because a classic tag cannot be built \
-             from a schema alone. Configure the {target_game} kit and make sure \
-             it ships at least one {target_group_name}."
-        ));
+        None
     } else {
-        let mut target = TagFile::new(&schema_path).map_err(|error| {
-            format!(
-                "Could not create target tag from {}: {error}",
-                schema_path.display()
-            )
-        })?;
-        initialize_block_index_defaults(target.root_mut());
-        (target, None)
+        build_target_from_definitions(&schema_path, false)
+    };
+    // Which starting point wins when both are available.
+    //
+    // Building from the target's own definitions is the better design and the
+    // one this is heading for: nothing reaches the tag except what the source
+    // gave it, and the result does not depend on what a user has installed. It
+    // is not the default yet, because it is not yet proven where it counts —
+    // effects and particles built this way were reported failing to open, and
+    // crashing, in Halo 4's own tools, where kit-seeded ones opened. Until that
+    // is understood, a user with a populated kit keeps the path that works.
+    //
+    // A user with an *empty* kit gets the definitions either way, which is the
+    // case that started this: it is a fallback, not a preference.
+    let prefer_definitions = std::env::var_os("BLAM_BUILD_FROM_DEFINITIONS").is_some();
+    let mut built_without_a_template_body = false;
+    let (mut target, target_template) = match (from_definitions, native_target) {
+        (Some(target), None) => (target, None),
+        (Some(target), Some(_)) if prefer_definitions => (target, None),
+        (Some(target), Some((template, template_path))) => {
+            let _ = target;
+            (template, Some(template_path))
+        }
+        (None, Some((template, template_path))) => (template, Some(template_path)),
+        (None, None) if CLASSIC_CONVERSION_GAMES.contains(&target_game) => {
+            return Err(format!(
+                "Converting to {target_game} needs a {target_group_name} tag from its \
+                 editing kit to start from, because a classic tag cannot be built \
+                 from a schema alone. Configure the {target_game} kit and make sure \
+                 it ships at least one {target_group_name}."
+            ));
+        }
+        // A `tmpl` group with no kit tag to borrow a template body from. Build it
+        // from the schema anyway rather than refusing outright: the tag converts,
+        // and what cannot be carried is exactly what the loss guard already
+        // measures and reports. Refusing here turned an answerable question —
+        // "this loses the render method, do you still want it?" — into 375 dead
+        // rows in a folder report, which is worse for a user with an empty kit
+        // than the honest partial result they asked for.
+        (None, None) => match build_target_from_definitions(&schema_path, true) {
+            Some(target) => {
+                built_without_a_template_body = true;
+                (target, None)
+            }
+            None => {
+                return Err(format!(
+                    "Could not build a {target_group_name} for {target_game} from \
+                     {}, and the kit has none to start from either.",
+                    schema_path.display()
+                ));
+            }
+        },
     };
     apply_editing_kit_mcc_header(&mut target, target_game)?;
     // From the template as the kit wrote it, not from `target`: the reset clears
@@ -1928,6 +2049,19 @@ fn analyze_conversion_inner(
                  The settings convert, but the meshes, collision and rigid-body data were \
                  built for a different engine's vertex formats and compression — reimport \
                  from the source art with {target_game}'s tool rather than relying on this."
+            ),
+        });
+    }
+    if built_without_a_template_body {
+        context.report.issues.push(ConversionIssue {
+            kind: ConversionIssueKind::Warning,
+            path: "target layout".to_owned(),
+            message: format!(
+                "Built {target_group_name} from {target_game}'s own definitions with no kit tag \
+                 to start from. The definitions describe this group's render method as a \
+                 fixed-size hole rather than as fields, so its options, parameters and \
+                 postprocess have nowhere to be written — a {target_group_name} anywhere in the \
+                 {target_game} kit would supply them. Everything else converts."
             ),
         });
     }
@@ -2022,6 +2156,10 @@ fn analyze_conversion_inner(
     strip_cross_engine_scripts(&mut target, &mut context);
     restore_render_method_option_slots(&mut target, &template_option_counts, &mut context);
     apply_default_material(&mut target, &mut context);
+    // After the default, because the material it names is what decides which
+    // inputs there are to seed.
+    seed_material_parameters(&mut target, source, &mut context);
+    report_materials_without_a_shader(&target, &mut context);
     let fail_closed_losses = validate_critical_runtime_safety(source, &context, policy)?;
     if !fail_closed_losses.is_empty() {
         context.report.issues.push(ConversionIssue {
@@ -2216,11 +2354,37 @@ fn restore_render_method_option_slots(
 /// rather than a baseline). A starting point, not a guess at the original — which
 /// material a Reach effect *should* become is an art decision the tag does not
 /// carry, and the report says so. Both verified present in both kits.
+/// A decal and a light volume need one for a harder reason than a particle: a
+/// converted Reach `decal_system` **crashed Halo 4** the moment the decal was
+/// triggered, with `#0 is not a valid material_postprocess_block index in
+/// [#0, #0)`. Nothing indexes that block in the schema — it is the renderer,
+/// building a material's postprocess from the material shader and finding no
+/// material shader to build one from. Shipped Halo 4 content ships that block
+/// empty too, in all 466 decal slots and all 400 particle slots sampled, so an
+/// empty postprocess is normal and a *null shader* is what is not.
+///
+/// `decals\base` is the plain member again rather than the most common:
+/// `decals\normal` leads at 221 of 504 against `base`'s 119, but a normal-mapped
+/// decal wants a normal map a Reach decal has no way to supply, and `base` is the
+/// one whose name says baseline. `light_volume_smooth` needs no such judgement —
+/// it is 232 of 236.
 const DEFAULT_MATERIALS: &[(&str, &str, &str)] = &[
     ("halo4_mcc", "particle", r"shaders\material_shaders\fx\particle_base"),
     ("halo2amp_mcc", "particle", r"shaders\material_shaders\fx\particle_base"),
     ("halo4_mcc", "contrail_system", r"shaders\material_shaders\fx\tracer_base"),
     ("halo2amp_mcc", "contrail_system", r"shaders\material_shaders\fx\tracer_base"),
+    ("halo4_mcc", "decal_system", r"shaders\material_shaders\decals\base"),
+    ("halo2amp_mcc", "decal_system", r"shaders\material_shaders\decals\base"),
+    (
+        "halo4_mcc",
+        "light_volume_system",
+        r"shaders\material_shaders\fx\light_volume_smooth",
+    ),
+    (
+        "halo2amp_mcc",
+        "light_volume_system",
+        r"shaders\material_shaders\fx\light_volume_smooth",
+    ),
 ];
 
 /// Whether a struct is a material: the shader reference, its parameters, and the
@@ -2333,6 +2497,667 @@ fn apply_default_material(target: &mut TagFile, context: &mut ConversionContext<
             context.source_game, context.group_name, context.target_game
         ),
     });
+}
+
+/// Report any material the conversion leaves with nothing to draw with.
+///
+/// A null `material shader` is not a cosmetic gap: Halo 4's renderer builds a
+/// material's postprocess from its material shader, so a material without one
+/// crashes the moment the effect plays — `#0 is not a valid
+/// material_postprocess_block index in [#0, #0)` on a converted Reach
+/// `decal_system`. [`DEFAULT_MATERIALS`] exists to stop that happening, and this
+/// exists so the next group nobody has put in that table says so in the report
+/// rather than in the game.
+///
+/// A finding, not a refusal. Halo 4 does ship a handful of particles with a null
+/// material and a working render method behind it, so this is survivable for some
+/// groups and fatal for others, and the difference is not something the tag
+/// carries.
+fn report_materials_without_a_shader(target: &TagFile, context: &mut ConversionContext<'_>) {
+    fn walk(value: TagStruct<'_>, prefix: &str, empty: &mut Vec<String>) {
+        if is_material_struct(value) {
+            let shader = value
+                .fields()
+                .find(|field| clean_field_key(field.name()) == "material shader")
+                .and_then(|field| match field.value() {
+                    Some(TagFieldData::TagReference(reference)) => reference
+                        .group_tag_and_name
+                        .map(|(_, path)| path),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if shader.is_empty() {
+                empty.push(if prefix.is_empty() {
+                    "actual material?".to_owned()
+                } else {
+                    prefix.to_owned()
+                });
+            }
+        }
+        for field in value.fields() {
+            let key = clean_field_key(field.name());
+            let name = if key.is_empty() {
+                field.type_name().to_owned()
+            } else {
+                key
+            };
+            let path = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if let Some(child) = field.as_struct() {
+                walk(child, &path, empty);
+            }
+            if let Some(block) = field.as_block() {
+                for index in 0..block.len() {
+                    if let Some(element) = block.element(index) {
+                        walk(element, &format!("{path}[{index}]"), empty);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut empty = Vec::new();
+    walk(target.root(), "", &mut empty);
+    if empty.is_empty() {
+        return;
+    }
+    let shown = empty.len().min(6);
+    context.report.issues.push(ConversionIssue {
+        kind: ConversionIssueKind::Unsupported,
+        path: empty[..shown].join(", "),
+        message: format!(
+            "{} material(s) arrived with no material shader, because {} has nothing to fill one \
+             from and this group has no reviewed default. {} builds a material's postprocess from \
+             its material shader, so an effect like this can crash when it plays rather than \
+             merely look wrong — point them at a material shader before using the tag.",
+            empty.len(),
+            context.source_game,
+            context.target_game
+        ),
+    });
+}
+
+/// Build an empty target tag from the game's own definitions.
+///
+/// This is where a conversion starts. Reading the source and filling a tag built
+/// from the target's schema is both what a user expects an importer to do and
+/// what makes the result clean: nothing arrives in the tag except what came from
+/// the source or what the schema says the field defaults to. Starting from a tag
+/// the kit happened to ship means inheriting whichever revision and whichever
+/// leftover values that tag had, and it means a user with an empty editing kit
+/// gets nothing at all — which is the case that made this the default.
+///
+/// `None` rather than an error when the definitions cannot produce a usable tag,
+/// because the caller has a second option. Three cases, and each is decided by
+/// asking rather than by consulting a list:
+///
+/// - **A classic container**, which has no writer at all. The caller checks that.
+/// - **A schema that will not build.** Reach's `contrail_system` *panics* in
+///   `layout.rs` with an out-of-range layout index, so the panic is caught rather
+///   than predicted and a schema that starts or stops building needs no list
+///   maintained anywhere.
+/// - **A schema with a `tmpl` hole of non-zero width.** This is the one that
+///   cannot be worked around, and it is why the kit-template path is kept rather
+///   than deleted. A `tmpl` custom field stands in for another group's inlined
+///   render method: the definitions know how many bytes it occupies and nothing
+///   about what is in it, so the `options`, `parameters` and `postprocess` blocks
+///   inside it have no field list and no field index, and a tag built from the
+///   schema cannot hold them. Converting an H3 particle into Reach from a
+///   schema-built tag loses 18 authored `options` entries and is refused — which
+///   is the guard working, since a Reach particle with no render-method
+///   definition is what crashed the mod tools in the first place.
+///
+/// A zero-width hole is not a reason to fall back: the template it names resolves
+/// to nothing, so there is nothing the schema is failing to describe.
+fn build_target_from_definitions(schema_path: &Path, allow_template_hole: bool) -> Option<TagFile> {
+    std::panic::catch_unwind(|| {
+        let layout = crate::layout::TagLayout::from_json(schema_path).ok()?;
+        if !allow_template_hole && layout.tmpl_holes.iter().any(|hole| hole.size > 0) {
+            return None;
+        }
+        let mut target = TagFile::new(schema_path).ok()?;
+        initialize_block_index_defaults(target.root_mut());
+        Some(target)
+    })
+    .ok()
+    .flatten()
+}
+
+/// A parameter, as the name it answers to plus every value it carries.
+type ParameterFields = (String, Vec<(String, TagFieldData)>);
+
+/// What a material shader calls one of its inputs, and what kind it is.
+///
+/// Only the identity, not the values: a `TagFieldData` cannot be cloned, and the
+/// values a seeded parameter should carry come from the source anyway.
+#[derive(Clone)]
+struct DeclaredParameter {
+    name: String,
+    parameter_type: Option<(i32, Option<String>)>,
+}
+
+/// What each material in [`DEFAULT_MATERIALS`] declares its inputs to be.
+///
+/// So that seeding works with **no editing kit at all**. Reading the kit's own
+/// `.material_shader` is more accurate and still preferred when one is there — it
+/// covers materials outside this table, and it carries each parameter's declared
+/// type — but a user whose target kit is empty was getting a material with no
+/// inputs, which is the case this exists for.
+///
+/// Measured from both kits that declare the field, which agree parameter for
+/// parameter on all four. Names only: the type is inferred from whichever value
+/// the source actually carried, since `material_shader_parameter_type_enum` is
+/// `bitmap, real, int, bool, color` and the value says which it is.
+const DEFAULT_MATERIAL_PARAMETERS: &[(&str, &[&str])] = &[
+    (
+        r"shaders\material_shaders\fx\particle_base",
+        &[
+            "newschoolframeindex",
+            "constantscreensize",
+            "lightingperparticle",
+            "lighting_per_particle_strength",
+            "lighting_bright_intensity_decrease",
+            "lighting_dim_alpha_increase",
+            "lighting_bright_alpha_decrease",
+            "lightingsmooth",
+            "lightingcontrastscale",
+            "lightingcontrastoffset",
+            "lightingstrength",
+            "spherewarpstrength",
+            "depthfadeasvcoord",
+            "basemap",
+            "depthfaderange",
+            "depthfadeinvert",
+        ],
+    ),
+    (r"shaders\material_shaders\fx\tracer_base", &["basemap"]),
+    (r"shaders\material_shaders\decals\base", &["color_map"]),
+    (
+        r"shaders\material_shaders\fx\light_volume_smooth",
+        &["centeroffset", "falloff", "depthfaderange", "depthfadeinvert"],
+    ),
+];
+
+/// The `material_shader_parameter_type_enum` index for a value of this kind.
+///
+/// Inferred rather than read when there is no kit to read it from. The enum is
+/// `bitmap, real, int, bool, color` in that order, and a parameter carrying a
+/// bitmap reference is a bitmap parameter — nothing subtler is needed, because
+/// these are the only kinds a render-method parameter can hold either.
+fn inferred_parameter_type(fields: &[(String, TagFieldData)]) -> Option<(i32, Option<String>)> {
+    for (key, data) in fields {
+        match (key.as_str(), data) {
+            ("bitmap", TagFieldData::TagReference(reference))
+                if reference
+                    .group_tag_and_name
+                    .as_ref()
+                    .is_some_and(|(_, path)| !path.is_empty()) =>
+            {
+                return Some((0, Some("bitmap".to_owned())));
+            }
+            _ => {}
+        }
+    }
+    for (key, _) in fields {
+        match key.as_str() {
+            "color" => return Some((4, Some("color".to_owned()))),
+            "real" => return Some((1, Some("real".to_owned()))),
+            "int/bool" => return Some((2, Some("int".to_owned()))),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Reviewed parameter renames, where squashing the punctuation is not enough.
+///
+/// By *source* group, as `(group, render method name, material name)`. Mined from
+/// Halo 4's own ports rather than guessed: taking every pair of parameters in a
+/// shipped tag that name the same bitmap and disagree on their name, decals give
+/// `base_map` -> `color_map` consistently across all three material families it
+/// uses (44 on `normal`, 38 on `base`, 24 on `palette_alpha`), plus `bump_map` ->
+/// `normal_map` and `palette` -> `palette_map`. Halo 4's `impact.decal_system` is
+/// literally the ported Reach decal of the same name, and that is the rename it
+/// carries.
+///
+/// Deliberately decals only. The same mining over particles returns contradictory
+/// pairs — `alpha_map` -> `basemap` 534 times *and* `base_map` -> `alpha_map` 99
+/// times — because a particle that uses one bitmap for both slots makes every
+/// combination look like a rename. Squashing already handles the particle cases
+/// that are real, so nothing is added on the strength of evidence that cannot
+/// tell a rename from a coincidence.
+const MATERIAL_PARAMETER_ALIASES: &[(&str, &str, &str)] = &[
+    ("decal_system", "base_map", "color_map"),
+    ("decal_system", "bump_map", "normal_map"),
+    ("decal_system", "palette", "palette_map"),
+];
+
+/// A parameter name with the punctuation taken out.
+///
+/// The two blocks name the same input differently — `base_map` against
+/// `basemap`, `depth_fade_range` against `depthfaderange`, `alpha_map` against
+/// `alphamap`. Measured across the 1,986 H4EK particles that fill both blocks,
+/// squashing is what lines them up; nothing subtler was needed.
+fn squashed_parameter_name(name: &str) -> String {
+    name.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// Every element of `block_name`, as its parameter name plus its field values.
+fn parameter_elements(value: TagStruct<'_>, block_name: &str) -> Vec<ParameterFields> {
+    let Some(block) = value
+        .fields()
+        .find(|field| clean_field_key(field.name()) == block_name)
+        .and_then(|field| field.as_block())
+    else {
+        return Vec::new();
+    };
+    (0..block.len())
+        .filter_map(|index| block.element(index))
+        .filter_map(|element| {
+            let mut fields = Vec::new();
+            let mut name = None;
+            for field in element.fields() {
+                let Some(data) = field.value() else { continue };
+                let key = clean_field_key(field.name());
+                if key == "parameter name"
+                    && let TagFieldData::StringId(value) | TagFieldData::OldStringId(value) = &data
+                {
+                    name = Some(value.string.clone());
+                }
+                fields.push((key, data));
+            }
+            name.map(|name| (name, fields))
+        })
+        .collect()
+}
+
+/// What the kit's own `.material_shader` says its inputs are called.
+///
+/// Read from the target kit rather than derived, because the answer is per
+/// material shader: `particle_base` declares 16 parameters and `tracer_base`
+/// exactly one. Cached, since a folder run converts hundreds of particles that
+/// all name the same handful of shaders.
+fn material_shader_parameters(
+    templates: Option<&NativeTemplateIndex>,
+    tag_path: &str,
+    target_game: &str,
+    definitions_root: &Path,
+) -> Vec<DeclaredParameter> {
+    // The reviewed table, for when there is no kit to ask. Not a fallback of last
+    // resort so much as the answer for the materials this converter chose itself.
+    let from_table = || -> Vec<DeclaredParameter> {
+        DEFAULT_MATERIAL_PARAMETERS
+            .iter()
+            .find(|(material, _)| material.eq_ignore_ascii_case(tag_path))
+            .map(|(_, names)| {
+                names
+                    .iter()
+                    .map(|name| DeclaredParameter {
+                        name: (*name).to_owned(),
+                        parameter_type: None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let Some(templates) = templates else {
+        return from_table();
+    };
+    if let Some(cached) = templates.material_parameters.borrow().get(tag_path) {
+        return cached.clone();
+    }
+    let group = parse_group_tag("mats").unwrap_or(u32::from_be_bytes(*b"mats"));
+    let wanted =
+        format!("{}.material_shader", tag_path.replace('\\', "/")).to_ascii_lowercase();
+    let found: Vec<DeclaredParameter> = templates
+        .by_group
+        .get(&group)
+        .into_iter()
+        .flatten()
+        .find(|path| {
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+                .ends_with(&wanted)
+        })
+        .and_then(|path| {
+            read_tag_for_conversion(path, Some(target_game), Some(definitions_root), group).ok()
+        })
+        .map(|tag| {
+            parameter_elements(tag.root(), "material parameters")
+                .into_iter()
+                .map(|(name, fields)| DeclaredParameter {
+                    name,
+                    parameter_type: fields.into_iter().find_map(|(key, data)| match data {
+                        TagFieldData::LongEnum { value, name } if key == "parameter type" => {
+                            Some((value, name))
+                        }
+                        _ => None,
+                    }),
+                })
+                .collect()
+        })
+        .unwrap_or_else(from_table);
+    templates
+        .material_parameters
+        .borrow_mut()
+        .insert(tag_path.to_owned(), found.clone());
+    found
+}
+
+/// Give a converted fx tag's material the inputs its own render method carries.
+///
+/// Halo 4 keeps two parameter blocks side by side: the legacy render method's,
+/// under `actual shader?`, and the material's, under `actual material?`. Both are
+/// populated in shipped content — 3,429 of H4EK's 3,916 particles fill the
+/// material block — and only the material one feeds the material shader the tag
+/// actually draws with. A conversion carries the render method faithfully and, up
+/// to now, left the material block empty, so a ported particle named a material
+/// shader and gave it nothing: the texture sat in the deprecated half and the
+/// visible half fell back to the shader's own defaults.
+///
+/// Only parameters the material shader *declares* are seeded, and the element is
+/// built from that declaration so its type and sampler settings are the shader's
+/// own — with just the values overlaid from the render method. For a Reach
+/// particle on `particle_base` that is `base_map` -> `basemap`, the particle's
+/// texture, and `depth_fade_range` -> `depthfaderange`.
+///
+/// Seeding, not translating, and the report says so. Halo 4's artists re-authored
+/// these when they ported content: of the shipped pairs that share a squashed
+/// name and carry a bitmap, 2,491 agree and 796 deliberately do not. An automatic
+/// port cannot know which it is looking at, and the source's own texture is a far
+/// better starting point than none.
+fn seed_material_parameters(
+    target: &mut TagFile,
+    source: &TagFile,
+    context: &mut ConversionContext<'_>,
+) {
+    // A kit is welcome but not required: without one the reviewed table answers
+    // for the materials this converter assigns itself, which is the whole of what
+    // a from-scratch conversion needs.
+    let templates = context.native_templates;
+
+    // Keyed by block path — `/decals[0]`, `/tracers[1]`, or the empty string for
+    // a particle's root. Struct names are left out deliberately: the two engines
+    // disagree about them and about how many struct layers there are, while a
+    // block and its index mean the same thing on both sides.
+    let mut by_path: HashMap<String, Vec<ParameterFields>> = HashMap::new();
+    collect_render_parameters(source.root(), String::new(), &mut by_path);
+
+    fn walk(
+        mut value: TagStructMut<'_>,
+        path: &str,
+        by_path: &mut HashMap<String, Vec<ParameterFields>>,
+        templates: Option<&NativeTemplateIndex>,
+        target_game: &str,
+        definitions_root: &Path,
+        group: &str,
+        seeded: &mut Vec<String>,
+    ) {
+        // Found by shape rather than by field name, because the slot is at the
+        // root of a particle and inside a block element of a tracer, and named
+        // for its own group either way.
+        let material_ordinal = value
+            .as_ref()
+            .fields()
+            .position(|field| field.as_struct().is_some_and(is_material_struct));
+        if let Some(material_ordinal) = material_ordinal {
+            let carried: Vec<ParameterFields> = by_path.remove(path).unwrap_or_default();
+            let existing = value
+                .as_ref()
+                .fields()
+                .nth(material_ordinal)
+                .and_then(|field| field.as_struct())
+                .map(|material| parameter_elements(material, "material parameters"))
+                .unwrap_or_default();
+            let shader_path = value
+                .as_ref()
+                .fields()
+                .nth(material_ordinal)
+                .and_then(|field| field.as_struct())
+                .and_then(|material| {
+                    material
+                        .fields()
+                        .find(|field| clean_field_key(field.name()) == "material shader")
+                })
+                .and_then(|field| match field.value() {
+                    Some(TagFieldData::TagReference(reference)) => {
+                        reference.group_tag_and_name.map(|(_, path)| path)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+
+            // A material the author already parameterised is left exactly as it
+            // is: this fills a blank, it does not second-guess a filled one.
+            if !carried.is_empty() && existing.is_empty() && !shader_path.is_empty() {
+                let declared =
+                    material_shader_parameters(templates, &shader_path, target_game, definitions_root);
+                let mut carried = carried;
+                let wanted: Vec<(DeclaredParameter, Vec<(String, TagFieldData)>)> = declared
+                    .into_iter()
+                    .filter_map(|declaration| {
+                        let squashed = squashed_parameter_name(&declaration.name);
+                        let position = carried.iter().position(|(name, _)| {
+                            squashed_parameter_name(name) == squashed
+                                || MATERIAL_PARAMETER_ALIASES.iter().any(|(scope, from, to)| {
+                                    scope.eq_ignore_ascii_case(group)
+                                        && squashed_parameter_name(from)
+                                            == squashed_parameter_name(name)
+                                        && squashed_parameter_name(to) == squashed
+                                })
+                        })?;
+                        // Taken, not borrowed: the values move into the new
+                        // element, and no parameter should be seeded twice.
+                        let (_, fields) = carried.remove(position);
+                        Some((declaration, fields))
+                    })
+                    .collect();
+                if !wanted.is_empty()
+                    && let Some(mut field) = value.field_at_mut(material_ordinal)
+                    && let Some(mut material) = field.as_struct_mut()
+                {
+                    let block_ordinal = material
+                        .as_ref()
+                        .fields()
+                        .position(|field| clean_field_key(field.name()) == "material parameters");
+                    if let Some(block_ordinal) = block_ordinal
+                        && let Some(mut block_field) = material.field_at_mut(block_ordinal)
+                        && let Some(mut block) = block_field.as_block_mut()
+                    {
+                        for (declaration, fields) in wanted {
+                            let index = block.add_element();
+                            let Some(mut element) = block.element_mut(index) else {
+                                continue;
+                            };
+                            let mut source_name = String::new();
+                            // Worked out before the values are moved out, so the
+                            // type can be inferred from what the source carried
+                            // when no kit told us what it should be.
+                            let inferred = inferred_parameter_type(&fields);
+                            for (key, data) in fields {
+                                if key == "parameter name" {
+                                    if let TagFieldData::StringId(value)
+                                    | TagFieldData::OldStringId(value) = &data
+                                    {
+                                        source_name = value.string.clone();
+                                    }
+                                    // The material shader's own spelling wins.
+                                    continue;
+                                }
+                                if key == "parameter type" {
+                                    continue;
+                                }
+                                set_named_field(&mut element, &key, data);
+                            }
+                            // Identity from the declaration, so the element
+                            // names an input the shader actually has and types
+                            // it the way the shader does.
+                            set_named_field(
+                                &mut element,
+                                "parameter name",
+                                TagFieldData::StringId(StringIdData {
+                                    string: declaration.name.clone(),
+                                }),
+                            );
+                            if let Some((value, name)) =
+                                declaration.parameter_type.clone().or(inferred)
+                            {
+                                set_named_field(
+                                    &mut element,
+                                    "parameter type",
+                                    TagFieldData::LongEnum { value, name },
+                                );
+                            }
+                            seeded.push(format!("{} <- {source_name}", declaration.name));
+                        }
+                    }
+                }
+            }
+        }
+
+        let field_count = value.as_ref().fields().count();
+        for ordinal in 0..field_count {
+            let (kind, name) = match value.as_ref().fields().nth(ordinal) {
+                Some(field) => (field.field_type(), clean_field_key(field.name())),
+                None => continue,
+            };
+            match kind {
+                TagFieldType::Struct => {
+                    if let Some(mut field) = value.field_at_mut(ordinal)
+                        && let Some(nested) = field.as_struct_mut()
+                    {
+                        // A struct does not move the path; only a block does.
+                        walk(
+                            nested,
+                            path,
+                            by_path,
+                            templates,
+                            target_game,
+                            definitions_root,
+                            group,
+                            seeded,
+                        );
+                    }
+                }
+                TagFieldType::Block => {
+                    if let Some(mut field) = value.field_at_mut(ordinal)
+                        && let Some(mut block) = field.as_block_mut()
+                    {
+                        for index in 0..block.len() {
+                            if let Some(element) = block.element_mut(index) {
+                                let child = format!("{path}/{name}[{index}]");
+                                walk(
+                                    element,
+                                    &child,
+                                    by_path,
+                                    templates,
+                                    target_game,
+                                    definitions_root,
+                                    group,
+                                    seeded,
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut seeded = Vec::new();
+    let target_game = context.target_game;
+    let definitions_root = context.definitions_root;
+    let group = context.group_name;
+    walk(
+        target.root_mut(),
+        "",
+        &mut by_path,
+        templates,
+        target_game,
+        definitions_root,
+        group,
+        &mut seeded,
+    );
+    if seeded.is_empty() {
+        return;
+    }
+    seeded.sort();
+    seeded.dedup();
+    context.report.issues.push(ConversionIssue {
+        kind: ConversionIssueKind::Warning,
+        path: context.group_name.to_owned(),
+        message: format!(
+            "Seeded the material with {} input(s) from the render method it came with ({}). \
+             Only inputs the material shader declares were filled, from the values the source \
+             already had — Halo 4's own ports often re-authored these, so check them against \
+             the look you want.",
+            seeded.len(),
+            seeded.join(", ")
+        ),
+    });
+}
+
+/// Every render-method `parameters` block in a tag, keyed by block path.
+///
+/// Read from the *source*, because the target need not have anywhere to keep a
+/// render method at all. Halo 4's declared `decal_system` revision holds only the
+/// material in a decal entry — no `actual shader?` beside it — so a Reach decal's
+/// `base_map` has no slot to land in, and looking for it next to the material in
+/// the converted tag finds nothing. The source always has it.
+fn collect_render_parameters(
+    value: TagStruct<'_>,
+    path: String,
+    out: &mut HashMap<String, Vec<ParameterFields>>,
+) {
+    for field in value.fields() {
+        if let Some(child) = field.as_struct() {
+            let parameters = parameter_elements(child, "parameters");
+            if !parameters.is_empty() {
+                out.entry(path.clone()).or_insert(parameters);
+            }
+            collect_render_parameters(child, path.clone(), out);
+        }
+    }
+    for field in value.fields() {
+        if field.field_type() != TagFieldType::Block {
+            continue;
+        }
+        let Some(block) = field.as_block() else {
+            continue;
+        };
+        let name = clean_field_key(field.name());
+        for index in 0..block.len() {
+            if let Some(element) = block.element(index) {
+                collect_render_parameters(element, format!("{path}/{name}[{index}]"), out);
+            }
+        }
+    }
+}
+
+/// Set the field called `key`, if the element has one that will take the value.
+///
+/// A mismatch is not an error worth reporting: the two parameter blocks share
+/// most of their fields but not all, and a field the material's element does not
+/// have is one the material shader has no use for.
+fn set_named_field(element: &mut TagStructMut<'_>, key: &str, data: TagFieldData) {
+    let Some(ordinal) = element
+        .as_ref()
+        .fields()
+        .position(|field| clean_field_key(field.name()) == key)
+    else {
+        return;
+    };
+    if let Some(mut field) = element.field_at_mut(ordinal) {
+        let _ = field.set(data);
+    }
 }
 
 /// A scenario's compiled HaloScript, which never survives an engine change.
@@ -2675,12 +3500,41 @@ fn accepts_native_header(header: &TagFileHeader, target_game: &str) -> bool {
     header.version != u32::MAX
 }
 
+/// The root size `target_schema` declares, or `None` if it will not build.
+///
+/// This is what makes a template *fit* rather than merely exist. A kit ships one
+/// group at many layout revisions — every tag embeds the `blay` it was authored
+/// against — and H4EK's effects come in three: 96 bytes (480 tags), 104 (2,740)
+/// and 108 (4). Taking whichever sorts first means taking one by accident.
+///
+/// Matching the definition is the principled tie-break rather than "the most
+/// common one", because the definition is the schema the conversion maps fields
+/// *with*. A template narrower than the definition has nowhere to put fields the
+/// converter knows how to fill: measured on one Reach effect into Halo 4, the
+/// 96-byte revision carried 1,758 values and the 104-byte one 2,084.
+///
+/// Read out of the JSON rather than taken from a built `TagFile`, because
+/// *building* is the thing some groups cannot survive: Reach's
+/// `contrail_system` panics in `layout.rs`, which is the whole reason a native
+/// template is preferred there in the first place. The declared number is the
+/// same either way — it already accounts for `tmpl` expansion, so Reach's
+/// particle reads 496 from both.
+fn declared_root_size(target_schema: &Path) -> Option<usize> {
+    let bytes = fs::read(target_schema).ok()?;
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    let block = value.get("block")?.as_str()?;
+    let root = value.get("blocks")?.get(block)?.get("struct")?.as_str()?;
+    let size = value.get("structs")?.get(root)?.get("size")?.as_u64()?;
+    usize::try_from(size).ok()
+}
+
 fn find_native_target_template(
     templates: &NativeTemplateIndex,
     target_group_tag: u32,
     target_game: &str,
     engine_managed: Option<&SchemaFieldAliases>,
     definitions_root: &Path,
+    target_schema: &Path,
 ) -> Result<Option<(TagFile, PathBuf)>, String> {
     // A classic target needs a kit-authored tag to start from — `TagFile::new`
     // only builds MCC containers — but a classic tag cannot be read by
@@ -2724,6 +3578,18 @@ fn find_native_target_template(
         templates.cached.borrow_mut().insert(target_group_tag, None);
         return Ok(None);
     };
+    // Which revision to hold out for. `by_group` is sorted by path, so without
+    // this the choice is whichever tag sorts first — on one H4EK that is
+    // everything under `2011\`, and a kit missing that folder (or holding a tag
+    // sorting before it, including one a previous import wrote) silently
+    // converts against a different layout. Same editor, same tag, different
+    // machine, different output: that is the bug this exists to remove.
+    let wanted_root_size = declared_root_size(target_schema);
+    // The best of the wrong ones, kept in case the kit ships no matching
+    // revision at all. A template of the wrong revision still beats none: the
+    // fallback from here is a layout built from the schema, which no kit ever
+    // authored.
+    let mut fallback: Option<(TagFile, PathBuf)> = None;
     for path in paths.iter().take(NATIVE_TEMPLATE_SCAN_LIMIT) {
         // Sift on the 64-byte header first. Every candidate has to be *ruled
         // out* somehow, and for a group the kit ships in bulk the ruled-out ones
@@ -2752,21 +3618,40 @@ fn find_native_target_template(
             && accepts_native_header(&tag.header, target_game)
             && reset_tag_to_defaults(&mut tag, engine_managed).is_ok()
         {
-            let bytes = tag.write_to_bytes().map_err(|error| {
-                format!(
-                    "Could not cache native template {}: {error}",
-                    path.display()
-                )
-            })?;
-            templates
-                .cached
-                .borrow_mut()
-                .insert(target_group_tag, Some((bytes, path.clone())));
-            return Ok(Some((tag, path.to_path_buf())));
+            // Read after the reset, because that is the shape the conversion
+            // will actually fill.
+            let root_size = tag.root().definition().size();
+            if wanted_root_size.is_some_and(|wanted| wanted != root_size) {
+                if fallback.is_none() {
+                    fallback = Some((tag, path.to_path_buf()));
+                }
+                continue;
+            }
+            return cache_native_template(templates, target_group_tag, tag, path.clone());
         }
+    }
+    if let Some((tag, path)) = fallback {
+        return cache_native_template(templates, target_group_tag, tag, path);
     }
     templates.cached.borrow_mut().insert(target_group_tag, None);
     Ok(None)
+}
+
+/// Remember a chosen template as bytes, so the next tag of the group reuses it.
+fn cache_native_template(
+    templates: &NativeTemplateIndex,
+    target_group_tag: u32,
+    tag: TagFile,
+    path: PathBuf,
+) -> Result<Option<(TagFile, PathBuf)>, String> {
+    let bytes = tag
+        .write_to_bytes()
+        .map_err(|error| format!("Could not cache native template {}: {error}", path.display()))?;
+    templates
+        .cached
+        .borrow_mut()
+        .insert(target_group_tag, Some((bytes, path.clone())));
+    Ok(Some((tag, path)))
 }
 
 fn create_companion_tag(
@@ -2781,6 +3666,10 @@ fn create_companion_tag(
         .get(&group_name.to_ascii_lowercase())
         .copied()
         .ok_or_else(|| format!("{} has no {group_name} tag group", context.target_game))?;
+    let schema = context
+        .definitions_root
+        .join(context.target_game)
+        .join(format!("{group_name}.json"));
     let native_target = context
         .native_templates
         .map(|templates| {
@@ -2790,14 +3679,11 @@ fn create_companion_tag(
                 context.target_game,
                 Some(context.target_field_aliases),
                 context.definitions_root,
+                &schema,
             )
         })
         .transpose()?
         .flatten();
-    let schema = context
-        .definitions_root
-        .join(context.target_game)
-        .join(format!("{group_name}.json"));
     let (mut tag, native_layout_template) = if let Some((template, template_path)) = native_target {
         (template, Some(template_path))
     } else {
@@ -6245,19 +7131,19 @@ mod tests {
         // Rejected: `version == u32::MAX` is what a tag with no recorded source
         // revision carries, which is also what Baboon stamps on its own output.
         let mut reject =
-            TagFile::new(definitions.join("haloreach_mcc/weapon.json")).unwrap();
+            TagFile::new(definitions.join("haloreach_mcc/particle.json")).unwrap();
         apply_editing_kit_mcc_header(&mut reject, "haloreach_mcc").unwrap();
         assert_eq!(reject.header.version, u32::MAX, "the reject must be rejected");
         // Accepted: any recorded revision will do.
         let mut accept =
-            TagFile::new(definitions.join("haloreach_mcc/weapon.json")).unwrap();
+            TagFile::new(definitions.join("haloreach_mcc/particle.json")).unwrap();
         apply_editing_kit_mcc_header(&mut accept, "haloreach_mcc").unwrap();
         accept.header.version = 3;
 
         // Sorted order is what the search walks, so zero-padded names put the
         // acceptable tag at an exact, chosen index.
         let place = |index: usize, tag: &TagFile| {
-            tag.write_atomic(tags.join(format!("tag_{index:05}.weapon")))
+            tag.write_atomic(tags.join(format!("tag_{index:05}.particle")))
                 .unwrap();
         };
         let past_the_bound = NATIVE_TEMPLATE_SCAN_LIMIT + 20;
@@ -6267,7 +7153,7 @@ mod tests {
         place(past_the_bound, &accept);
 
         let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
-        let source = TagFile::new(definitions.join("halo3_mcc/weapon.json")).unwrap();
+        let source = TagFile::new(definitions.join("halo3_mcc/particle.json")).unwrap();
         let analyze = |tags_root: &Path| {
             let templates = NativeTemplateIndex::build(tags_root, &groups);
             analyze_conversion_with_templates(
@@ -6277,12 +7163,11 @@ mod tests {
                 &definitions,
                 Some(&templates),
             )
-            .unwrap()
-            .native_layout_template
+            .map(|draft| draft.native_layout_template)
         };
 
         assert!(
-            analyze(&root.join("tags")).is_none(),
+            analyze(&root.join("tags")).is_ok_and(|template| template.is_none()),
             "an acceptable tag {past_the_bound} deep is past the bound and must not be found"
         );
 
@@ -6290,7 +7175,7 @@ mod tests {
         // above is the bound rather than the search failing outright.
         place(1, &accept);
         assert!(
-            analyze(&root.join("tags")).is_some(),
+            analyze(&root.join("tags")).is_ok_and(|template| template.is_some()),
             "an acceptable tag at index 1 is well inside the bound"
         );
 
@@ -6706,11 +7591,6 @@ mod tests {
         let catalog = ConversionMappingCatalog::load().unwrap();
         let mut failures = Vec::new();
         for group in &catalog.covered_groups {
-            // Layout-sensitive output intentionally requires a native
-            // editing-kit template. Its path has dedicated tests below.
-            if requires_native_layout_template(group) {
-                continue;
-            }
             for source_game in CONVERSION_GAMES {
                 let source = match std::panic::catch_unwind(|| {
                     TagFile::new(root.join(source_game).join(format!("{group}.json")))
@@ -6729,6 +7609,12 @@ mod tests {
                 };
                 for target_game in CONVERSION_GAMES {
                     if source_game == target_game {
+                        continue;
+                    }
+                    // This sweep runs with no kits on purpose, so a target whose
+                    // schema cannot start a conversion has nothing to test here.
+                    // Its own path is covered by the template tests below.
+                    if target_needs_kit_template(&root, target_game, group) {
                         continue;
                     }
                     let analysis = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -6772,9 +7658,6 @@ mod tests {
 
         let mut failures = Vec::new();
         for group in &all_groups {
-            if requires_native_layout_template(group) {
-                continue;
-            }
             for (source_index, source_game) in CONVERSION_GAMES.iter().enumerate() {
                 if !indexes[source_index].by_name.contains_key(group) {
                     continue;
@@ -6799,6 +7682,11 @@ mod tests {
                     if source_game == target_game
                         || !indexes[target_index].by_name.contains_key(group)
                     {
+                        continue;
+                    }
+                    // Kitless sweep: a target whose schema cannot start a
+                    // conversion is covered by the template tests instead.
+                    if target_needs_kit_template(&root, target_game, group) {
                         continue;
                     }
                     if catalog.unusable_schema_reason(group, target_game).is_some() {
@@ -6939,9 +7827,9 @@ mod tests {
     }
 
     #[test]
-    fn model_and_biped_use_native_target_layout_templates() {
+    fn a_group_the_definitions_cannot_build_uses_a_native_layout_template() {
         let definitions = locate_definitions_root();
-        for group in ["model", "biped"] {
+        for group in ["particle"] {
             let tags_root = std::env::temp_dir().join(format!(
                 "baboon_{group}_template_{}_{}",
                 std::process::id(),
@@ -7667,6 +8555,175 @@ mod tests {
             result.unwrap().is_ok(),
             "native Reach contrail is unreadable"
         );
+    }
+
+    /// A conversion starts from the layout revision the definition declares.
+    ///
+    /// A kit ships one group at several layout revisions — every tag embeds the
+    /// `blay` it was authored against — and the template index is sorted by
+    /// path, so "first acceptable" means "whichever sorts first". On one H4EK
+    /// that is everything under `2011\`; a kit without that folder, or holding a
+    /// tag sorting before it (including one a previous import wrote), starts
+    /// from a different layout. That is how the same editor converting the same
+    /// tag produced a file that opened on one machine and not another.
+    ///
+    /// The declared revision is the right one to hold out for because it is the
+    /// schema the conversion maps fields *with*. Measured on one Reach effect
+    /// into Halo 4: the 96-byte revision carried 1,758 values, the 104-byte one
+    /// — which is what `halo4_mcc/effect.json` declares — carried 2,084.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_conversion_starts_from_the_layout_revision_the_definition_declares() {
+        let (Some(reach), Some(h4)) = (
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+        ) else {
+            eprintln!("skipping: needs HREK and H4EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h4, &groups);
+        // Counts the groups where the kit actually offered a wrong revision to
+        // reject. Without one of those the assertions below hold vacuously.
+        let mut discriminated = 0usize;
+
+        // `particle` only. Every other fx group now builds from Halo 4's own
+        // definitions and never consults the kit, so there is no revision to
+        // choose between - which is the point of the change, not a gap here.
+        for (group, fourcc) in [("particle", "prt3")] {
+            let group_tag = crate::parse_group_tag(fourcc).expect("a group tag");
+            let schema = definitions.join("halo4_mcc").join(format!("{group}.json"));
+            let declared =
+                declared_root_size(&schema).expect("halo4_mcc declares a root size for {group}");
+            let offered: HashSet<usize> = templates
+                .by_group
+                .get(&group_tag)
+                .into_iter()
+                .flatten()
+                .take(NATIVE_TEMPLATE_SCAN_LIMIT)
+                .filter_map(|path| TagFile::read(path).ok())
+                .filter(|tag| accepts_native_header(&tag.header, "halo4_mcc"))
+                .map(|tag| tag.root().definition().size())
+                .collect();
+            if offered.is_empty() {
+                eprintln!("skipping {group}: H4EK offers no acceptable template");
+                continue;
+            }
+            if offered.len() > 1 {
+                discriminated += 1;
+            }
+
+            let Some(source_path) = tags_with_extension(&reach, group).into_iter().find(|path| {
+                read_tag_for_conversion(path, Some("haloreach_mcc"), Some(&definitions), group_tag)
+                    .is_ok()
+            }) else {
+                eprintln!("skipping {group}: HREK ships none");
+                continue;
+            };
+            let source = read_tag_for_conversion(
+                &source_path,
+                Some("haloreach_mcc"),
+                Some(&definitions),
+                group_tag,
+            )
+            .unwrap();
+            let draft = analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "halo4_mcc",
+                &definitions,
+                Some(&templates),
+            )
+            .unwrap_or_else(|error| panic!("{}: {error}", source_path.display()));
+            let picked = draft
+                .native_layout_template
+                .unwrap_or_else(|| panic!("{group}: no native template was used"));
+            let size = TagFile::read(&picked).unwrap().root().definition().size();
+            assert_eq!(
+                size,
+                declared,
+                "{group}: started from {} (root {size}) when the definition declares {declared}; \
+                 the kit offered {offered:?}",
+                picked.display()
+            );
+        }
+        if discriminated == 0 {
+            eprintln!("skipping: no group offered more than one revision to choose between");
+        }
+    }
+
+    /// A template of the wrong revision still beats no template.
+    ///
+    /// Holding out for the declared revision must not turn "started from an
+    /// older kit tag" into "built the layout from the schema" — that fallback is
+    /// a layout no kit ever authored, and it is the one the editor labels
+    /// unverified.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_kit_with_only_the_wrong_revision_still_supplies_a_template() {
+        let (Some(reach), Some(h4)) = (
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+        ) else {
+            eprintln!("skipping: needs HREK and H4EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+        let group_tag = crate::parse_group_tag("prt3").expect("prt3 is a group tag");
+        let declared = declared_root_size(&definitions.join("halo4_mcc/particle.json")).unwrap();
+
+        let Some(wrong) = tags_with_extension(&h4, "particle").into_iter().find(|path| {
+            TagFile::read(path).is_ok_and(|tag| {
+                accepts_native_header(&tag.header, "halo4_mcc")
+                    && tag.root().definition().size() != declared
+            })
+        }) else {
+            eprintln!("skipping: H4EK ships only the declared revision");
+            return;
+        };
+
+        // A kit holding exactly one effect, of the wrong revision.
+        let scratch = std::env::temp_dir().join(format!(
+            "blam_wrong_revision_particle_{}_{}",
+            std::process::id(),
+            group_tag
+        ));
+        let _ = fs::remove_dir_all(&scratch);
+        fs::create_dir_all(&scratch).unwrap();
+        fs::copy(&wrong, scratch.join(wrong.file_name().unwrap())).unwrap();
+        let templates = NativeTemplateIndex::build(&scratch, &groups);
+
+        let source_path = tags_with_extension(&reach, "particle")
+            .into_iter()
+            .find(|path| {
+                read_tag_for_conversion(path, Some("haloreach_mcc"), Some(&definitions), group_tag)
+                    .is_ok()
+            })
+            .expect("HREK ships a particle");
+        let source = read_tag_for_conversion(
+            &source_path,
+            Some("haloreach_mcc"),
+            Some(&definitions),
+            group_tag,
+        )
+        .unwrap();
+        let draft = analyze_conversion_with_templates(
+            &source,
+            "haloreach_mcc",
+            "halo4_mcc",
+            &definitions,
+            Some(&templates),
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", source_path.display()));
+        assert!(
+            draft.native_layout_template.is_some(),
+            "the only template on offer was rejected for its revision"
+        );
+        let _ = fs::remove_dir_all(scratch);
     }
 
     #[test]
@@ -8448,6 +9505,15 @@ mod tests {
             eprintln!("skipping: HREK ships no particle");
             return;
         };
+        // An installed-but-empty kit is a real state - a user clearing theirs to
+        // test an empty-kit import - and it is not this test's subject.
+        if !h4
+            .join("shaders/material_shaders/fx/particle_base.material_shader")
+            .is_file()
+        {
+            eprintln!("skipping: H4EK ships no material shaders");
+            return;
+        }
         let source =
             read_tag_for_conversion(&source_path, Some("haloreach_mcc"), Some(&definitions), group_tag)
                 .unwrap();
@@ -8515,6 +9581,481 @@ mod tests {
                 "{}: a source that supplied a material must keep it",
                 h4_path.display()
             );
+        }
+    }
+
+    /// Naming a converted file agrees with what the converter produces.
+    ///
+    /// A caller that has to name the output *before* converting — a folder run
+    /// planning where every tag lands, so it can spot two sources colliding on
+    /// one destination — cannot ask the draft. It gets the same answer here, and
+    /// this pins the three shapes that answer differs in:
+    /// a plain same-name group, a rename the target does not declare, and a
+    /// rename the target *does* still declare and never uses.
+    #[test]
+    fn the_group_a_converted_tag_lands_in_is_answerable_before_converting() {
+        let definitions = locate_definitions_root();
+        let landing = |group: &str, source: &str, target: &str| {
+            converted_group(group, source, target, &definitions)
+                .unwrap()
+                .map(|(_, name)| name)
+        };
+
+        // Unchanged classes stay put, which is most of every folder.
+        assert_eq!(
+            landing("weapon", "halo3_mcc", "haloreach_mcc").as_deref(),
+            Some("weapon")
+        );
+        // Renamed, and Halo 4 does not declare the old name — resolving by
+        // canonical name refuses this outright.
+        assert_eq!(
+            landing("contrail_system", "haloreach_mcc", "halo4_mcc").as_deref(),
+            Some("tracer_system")
+        );
+        // Renamed, and Halo 4 *does* declare the old name. This is the quiet one:
+        // canonical name resolution succeeds and gives an answer that contradicts
+        // the tag the converter builds.
+        assert_eq!(
+            landing("shader", "haloreach_mcc", "halo4_mcc").as_deref(),
+            Some("material")
+        );
+        // Two renames, one per generation, so the answer only exists along the
+        // route the converter would take.
+        assert_eq!(
+            landing("contrail", "halo2_mcc", "halo4_mcc").as_deref(),
+            Some("tracer_system")
+        );
+        // A class the target genuinely does not have stays unanswered rather than
+        // being routed into something that merely sounds close.
+        assert_eq!(landing("bitmap", "haloreach_mcc", "haloce_evolved"), None);
+    }
+
+    /// The material gets the inputs the render method came with.
+    ///
+    /// Halo 4 keeps two parameter blocks side by side and fills both in shipped
+    /// content — 3,429 of H4EK's 3,916 particles populate the material one — but
+    /// only the material block feeds the material shader the tag draws with. A
+    /// conversion used to fill the render method's block faithfully and leave
+    /// the material's empty, so a ported particle named `particle_base` and gave
+    /// it nothing: the texture sat in the deprecated half while the half that
+    /// draws fell back to the shader's defaults.
+    ///
+    /// Asserts the texture specifically, not just a count, because carrying the
+    /// scalars and dropping the bitmap would look like success and render
+    /// nothing.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_ported_particle_gives_its_material_the_texture_it_came_with() {
+        let (Some(reach), Some(h4)) = (
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+        ) else {
+            eprintln!("skipping: needs HREK and H4EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = crate::parse_group_tag("prt3").expect("prt3 is a group tag");
+        let groups = GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h4, &groups);
+
+        // The bitmap a parameter block carries, keyed by parameter name.
+        let bitmaps = |tag: &TagFile, slot: &str, block: &str| -> HashMap<String, String> {
+            tag.root()
+                .fields()
+                .find(|field| clean_field_key(field.name()) == slot)
+                .and_then(|field| field.as_struct())
+                .map(|value| parameter_elements(value, block))
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(name, fields)| {
+                    fields.into_iter().find_map(|(key, data)| match data {
+                        TagFieldData::TagReference(reference) if key == "bitmap" => reference
+                            .group_tag_and_name
+                            .map(|(_, path)| (name.clone(), path)),
+                        _ => None,
+                    })
+                })
+                .filter(|(_, path)| !path.is_empty())
+                .collect()
+        };
+
+        let mut checked = 0usize;
+        for path in tags_with_extension(&reach, "particle").into_iter().take(60) {
+            let Ok(source) =
+                read_tag_for_conversion(&path, Some("haloreach_mcc"), Some(&definitions), group_tag)
+            else {
+                continue;
+            };
+            // The premise: the source names a base map on the render method.
+            let Some(texture) = bitmaps(&source, "actual shader?", "parameters")
+                .into_iter()
+                .find(|(name, _)| squashed_parameter_name(name) == "basemap")
+                .map(|(_, path)| path)
+            else {
+                continue;
+            };
+            let Ok(draft) = analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "halo4_mcc",
+                &definitions,
+                Some(&templates),
+            ) else {
+                continue;
+            };
+            let material = bitmaps(&draft.tag, "actual material?", "material parameters");
+            assert_eq!(
+                material.get("basemap").map(String::as_str),
+                Some(texture.as_str()),
+                "{}: the material should draw with the source's own base map; it has {material:?}",
+                path.display()
+            );
+            checked += 1;
+            break;
+        }
+        if checked == 0 {
+            eprintln!("skipping: no HREK particle in the sample names a base map");
+        }
+    }
+
+    /// With no kit to lean on, a buildable target still converts.
+    ///
+    /// The empty-kit case, which is what this fallback exists for: no template
+    /// index at all, and the tag is built from the target's own definitions and
+    /// filled from the source. Preferring this even when a kit *is* available is
+    /// the intended end state and is behind `BLAM_BUILD_FROM_DEFINITIONS` until
+    /// it is proven against Halo 4's own tools.
+    ///
+    /// Self-skips without the source kit.
+    #[test]
+    fn with_no_kit_a_buildable_target_still_converts() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else {
+            eprintln!("skipping: needs HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let mut checked = 0usize;
+
+        for (group, fourcc) in [
+            ("effect", "effe"),
+            ("weapon", "weap"),
+            ("decal_system", "decs"),
+            ("biped", "bipd"),
+        ] {
+            let Some(group_tag) = crate::parse_group_tag(fourcc) else {
+                continue;
+            };
+            let Some(path) = tags_with_extension(&reach, group).into_iter().find(|path| {
+                read_tag_for_conversion(path, Some("haloreach_mcc"), Some(&definitions), group_tag)
+                    .is_ok()
+            }) else {
+                eprintln!("skipping {group}: HREK ships none");
+                continue;
+            };
+            let source = read_tag_for_conversion(
+                &path,
+                Some("haloreach_mcc"),
+                Some(&definitions),
+                group_tag,
+            )
+            .unwrap();
+            let Ok(draft) = analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "halo4_mcc",
+                &definitions,
+                None,
+            ) else {
+                eprintln!("skipping {group}: did not convert");
+                continue;
+            };
+            assert!(
+                draft.native_layout_template.is_none(),
+                "{group}: no kit was offered, so nothing could have been started from"
+            );
+            // And the schema's own root size, not whichever revision a kit tag had.
+            let declared =
+                declared_root_size(&definitions.join("halo4_mcc").join(format!("{group}.json")))
+                    .expect("a declared root size");
+            assert_eq!(
+                draft.tag.root().definition().size(),
+                declared,
+                "{group}: built to a different revision than the definitions declare"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no group was actually checked");
+    }
+
+    /// A conversion with no target kit at all still gives the material its texture.
+    ///
+    /// This is the case a user actually hit: an empty Halo 4 editing kit, so no
+    /// kit tag to seed from and nothing to read a material shader's inputs out
+    /// of, and the material arrived with no inputs. The reviewed table in
+    /// [`DEFAULT_MATERIAL_PARAMETERS`] answers for the materials this converter
+    /// assigns itself, and the parameter's type is inferred from the value rather
+    /// than read from the kit.
+    ///
+    /// Deliberately passes `None` for the templates: needing only the *source*
+    /// kit is the point of the test.
+    #[test]
+    fn a_conversion_with_no_target_kit_still_seeds_the_material() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else {
+            eprintln!("skipping: needs HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = crate::parse_group_tag("prt3").expect("prt3 is a group tag");
+
+        let bitmaps = |tag: &TagFile, slot: &str, block: &str| -> HashMap<String, String> {
+            tag.root()
+                .fields()
+                .find(|field| clean_field_key(field.name()) == slot)
+                .and_then(|field| field.as_struct())
+                .map(|value| parameter_elements(value, block))
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(name, fields)| {
+                    fields.into_iter().find_map(|(key, data)| match data {
+                        TagFieldData::TagReference(reference) if key == "bitmap" => reference
+                            .group_tag_and_name
+                            .map(|(_, path)| (name.clone(), path)),
+                        _ => None,
+                    })
+                })
+                .filter(|(_, path)| !path.is_empty())
+                .collect()
+        };
+
+        let mut checked = 0usize;
+        for path in tags_with_extension(&reach, "particle").into_iter().take(60) {
+            let Ok(source) =
+                read_tag_for_conversion(&path, Some("haloreach_mcc"), Some(&definitions), group_tag)
+            else {
+                continue;
+            };
+            let Some(texture) = bitmaps(&source, "actual shader?", "parameters")
+                .into_iter()
+                .find(|(name, _)| squashed_parameter_name(name) == "basemap")
+                .map(|(_, path)| path)
+            else {
+                continue;
+            };
+            let Ok(draft) = analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "halo4_mcc",
+                &definitions,
+                None,
+            ) else {
+                continue;
+            };
+            assert!(
+                draft.native_layout_template.is_none(),
+                "this test is about the no-kit path and a template was used"
+            );
+            let material = bitmaps(&draft.tag, "actual material?", "material parameters");
+            assert_eq!(
+                material.get("basemap").map(String::as_str),
+                Some(texture.as_str()),
+                "{}: with no kit the material still has to carry the source's base map; \
+                 it has {material:?}",
+                path.display()
+            );
+            checked += 1;
+            break;
+        }
+        if checked == 0 {
+            eprintln!("skipping: no HREK particle in the sample names a base map");
+        }
+    }
+
+    /// No converted fx tag reaches Halo 4 with a material and no material shader.
+    ///
+    /// A converted Reach `decal_system` read fine in the mod tools and **crashed
+    /// the game** the moment the decal was triggered: `#0 is not a valid
+    /// material_postprocess_block index in [#0, #0)`. Nothing in the schema
+    /// indexes that block — it is the renderer building a material's postprocess
+    /// from its material shader and finding none, because `decal_system` had no
+    /// entry in [`DEFAULT_MATERIALS`] and Reach has no material to carry over.
+    ///
+    /// Checks every group in the table plus the texture, since a decal whose
+    /// material draws with the shader's placeholder is only half-ported. Halo 4's
+    /// own `impact.decal_system` is the ported Reach decal of that name and is
+    /// what this is measured against: `decals\base`, and the source's `base_map`
+    /// bitmap arriving as `color_map`.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_converted_fx_tag_never_arrives_with_a_material_and_no_shader() {
+        let (Some(reach), Some(h4)) = (
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+        ) else {
+            eprintln!("skipping: needs HREK and H4EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h4, &groups);
+
+        // Every material in the tag, as (shader path, parameter names).
+        fn materials(value: TagStruct<'_>, out: &mut Vec<(String, Vec<String>)>) {
+            if is_material_struct(value) {
+                let shader = value
+                    .fields()
+                    .find(|field| clean_field_key(field.name()) == "material shader")
+                    .and_then(|field| match field.value() {
+                        Some(TagFieldData::TagReference(reference)) => {
+                            reference.group_tag_and_name.map(|(_, path)| path)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let names = parameter_elements(value, "material parameters")
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect();
+                out.push((shader, names));
+            }
+            for field in value.fields() {
+                if let Some(child) = field.as_struct() {
+                    materials(child, out);
+                }
+                if let Some(block) = field.as_block() {
+                    for index in 0..block.len() {
+                        if let Some(element) = block.element(index) {
+                            materials(element, out);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (group, fourcc) in [
+            ("decal_system", "decs"),
+            ("particle", "prt3"),
+            ("light_volume_system", "ligh"),
+        ] {
+            let Some(group_tag) = crate::parse_group_tag(fourcc) else {
+                continue;
+            };
+            let mut checked = 0usize;
+            for path in tags_with_extension(&reach, group).into_iter().take(40) {
+                let Ok(source) = read_tag_for_conversion(
+                    &path,
+                    Some("haloreach_mcc"),
+                    Some(&definitions),
+                    group_tag,
+                ) else {
+                    continue;
+                };
+                let Ok(draft) = analyze_conversion_with_templates(
+                    &source,
+                    "haloreach_mcc",
+                    "halo4_mcc",
+                    &definitions,
+                    Some(&templates),
+                ) else {
+                    continue;
+                };
+                let mut found = Vec::new();
+                materials(draft.tag.root(), &mut found);
+                if found.is_empty() {
+                    continue;
+                }
+                for (shader, names) in &found {
+                    assert!(
+                        !shader.is_empty(),
+                        "{group} {}: a material arrived with no material shader, which crashes \
+                         Halo 4 when the effect plays",
+                        path.display()
+                    );
+                    // A decal's texture has to reach the material as well: the
+                    // target revision has no render method to fall back on.
+                    if group == "decal_system" {
+                        assert!(
+                            names.iter().any(|name| name == "color_map"),
+                            "{}: the decal's material has {names:?}, so it draws with \
+                             {shader}'s placeholder instead of the source's own bitmap",
+                            path.display()
+                        );
+                    }
+                }
+                checked += 1;
+                break;
+            }
+            if checked == 0 {
+                eprintln!("skipping {group}: no HREK {group} in the sample converted");
+            }
+        }
+    }
+
+    /// A material the source already parameterised is left alone.
+    ///
+    /// Seeding fills a blank. A Halo 4 tag converted to H2A arrives with its
+    /// material parameters intact, and re-seeding them from the render method
+    /// would overwrite an author's work with a guess.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn seeding_does_not_touch_a_material_that_already_has_parameters() {
+        let (Some(h4), Some(h2a)) = (
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+            kit_tags("BLAM_TEST_H2AMPEK", "H2AMPEK"),
+        ) else {
+            eprintln!("skipping: needs H4EK and H2AMPEK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = crate::parse_group_tag("prt3").expect("prt3 is a group tag");
+        let groups = GameTagIndex::load(&definitions, "halo2amp_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h2a, &groups);
+
+        let names = |tag: &TagFile| -> Vec<String> {
+            tag.root()
+                .fields()
+                .find(|field| clean_field_key(field.name()) == "actual material?")
+                .and_then(|field| field.as_struct())
+                .map(|value| parameter_elements(value, "material parameters"))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect()
+        };
+
+        let mut checked = 0usize;
+        for path in tags_with_extension(&h4, "particle").into_iter().take(200) {
+            let Ok(source) =
+                read_tag_for_conversion(&path, Some("halo4_mcc"), Some(&definitions), group_tag)
+            else {
+                continue;
+            };
+            let before = names(&source);
+            if before.is_empty() {
+                continue;
+            }
+            let Ok(draft) = analyze_conversion_with_templates(
+                &source,
+                "halo4_mcc",
+                "halo2amp_mcc",
+                &definitions,
+                Some(&templates),
+            ) else {
+                continue;
+            };
+            assert_eq!(
+                names(&draft.tag),
+                before,
+                "{}: an already-parameterised material was rewritten",
+                path.display()
+            );
+            checked += 1;
+            break;
+        }
+        if checked == 0 {
+            eprintln!("skipping: no H4EK particle in the sample carries material parameters");
         }
     }
 
@@ -11207,6 +12748,89 @@ mod group_alias_regression {
         }
         if checked == 0 {
             eprintln!("skipping: no H2EK projectile attaches a contrail");
+        }
+    }
+
+    /// The rename carries the references to the class, not just the class.
+    ///
+    /// The companion to the Halo 2 case above, at the other rename: an HREK
+    /// effect points at a `.contrail_system`, and in Halo 4 that same tag is a
+    /// `tracer_system`. Renaming the tag and leaving every pointer to it behind
+    /// would be the worse half-measure of the two — the imported effect would
+    /// open and simply do nothing.
+    ///
+    /// The path is asserted unchanged as well, because that is what makes the
+    /// reference find the renamed tag: only the class four-cc moves.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_reach_reference_to_a_contrail_system_lands_on_halo_4s_tracer_system() {
+        let (Some(reach), Some(h4)) = (
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+        ) else {
+            eprintln!("skipping: needs HREK and H4EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let contrail = crate::parse_group_tag("cntl").unwrap();
+        let tracer = crate::parse_group_tag("trac").unwrap();
+        let group_tag = crate::parse_group_tag("effe").unwrap();
+        let references = |tag: &TagFile| {
+            let mut found = Vec::new();
+            collect_reference_values(tag.root(), "", &mut found);
+            found
+        };
+
+        let groups = GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h4, &groups);
+        let mut checked = 0usize;
+        for path in super::tests::tags_with_extension(&reach, "effect").into_iter().take(400) {
+            let Ok(source) = read_tag_for_conversion(
+                &path,
+                Some("haloreach_mcc"),
+                Some(definitions.as_path()),
+                group_tag,
+            ) else {
+                continue;
+            };
+            let wanted: Vec<String> = references(&source)
+                .into_iter()
+                .filter(|reference| reference.group_tag == contrail)
+                .map(|reference| reference.tag_path)
+                .collect();
+            if wanted.is_empty() {
+                continue;
+            }
+            let Ok(draft) = analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "halo4_mcc",
+                &definitions,
+                Some(&templates),
+            ) else {
+                continue;
+            };
+            let landed = references(&draft.tag);
+            for tag_path in &wanted {
+                assert!(
+                    landed.iter().any(|reference| {
+                        reference.group_tag == tracer && reference.tag_path == *tag_path
+                    }),
+                    "{}: {tag_path} should be referenced as a tracer_system, got {:?}",
+                    path.display(),
+                    landed
+                        .iter()
+                        .filter(|reference| reference.tag_path == *tag_path)
+                        .map(|reference| format_group_tag(reference.group_tag))
+                        .collect::<Vec<_>>()
+                );
+            }
+            checked += 1;
+            break;
+        }
+        if checked == 0 {
+            eprintln!("skipping: no HREK effect in the sample references a contrail_system");
         }
     }
 

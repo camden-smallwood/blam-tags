@@ -443,7 +443,88 @@ pub enum PropValue {
     Raw(Vec<u8>),
 }
 
+impl PropValue {
+    /// Visit every [`FName`] this value carries, recursively — see
+    /// [`PropertyBlock::visit_names_mut`].
+    ///
+    /// The match is exhaustive on purpose. A missed name is invisible: the file
+    /// still round-trips, because the index is what is written, and the damage
+    /// only appears later when someone edits the stale field and forks a name.
+    /// Listing the name-free variants explicitly makes a new one a compile
+    /// error instead.
+    pub fn visit_names_mut(&mut self, f: &mut dyn FnMut(&mut FName)) {
+        match self {
+            PropValue::Name(name) => f(name),
+            PropValue::SoftObject(path) => {
+                f(&mut path.package);
+                f(&mut path.asset);
+            }
+            PropValue::Array(values) | PropValue::Set(values) => {
+                for value in values {
+                    value.visit_names_mut(f);
+                }
+            }
+            PropValue::Map(pairs) => {
+                for (key, value) in pairs {
+                    key.visit_names_mut(f);
+                    value.visit_names_mut(f);
+                }
+            }
+            PropValue::WithRemovals { removals, inner } => {
+                if let Some(removals) = removals {
+                    for value in removals {
+                        value.visit_names_mut(f);
+                    }
+                }
+                inner.visit_names_mut(f);
+            }
+            PropValue::Struct(block) => block.visit_names_mut(f),
+            PropValue::HandWritten(value) => value.visit_names_mut(f),
+            PropValue::Delegate { function, .. } => f(function),
+            PropValue::MulticastDelegate(bindings) => {
+                for (_, function) in bindings {
+                    f(function);
+                }
+            }
+            PropValue::FieldPath { path, .. } => {
+                for segment in path {
+                    f(segment);
+                }
+            }
+            // No name map reference. `Native` is listed here on evidence: every
+            // `NativeStruct` variant is numeric, and the module names no `FName`
+            // at all.
+            PropValue::Bool(_)
+            | PropValue::Int(_)
+            | PropValue::Float(_)
+            | PropValue::Str(_)
+            | PropValue::Object(_)
+            | PropValue::Native(_)
+            | PropValue::Unset
+            | PropValue::Raw(_) => {}
+        }
+    }
+}
+
 impl PropertyBlock {
+    /// Visit every [`FName`] reachable from this block, in place.
+    ///
+    /// An `FName` serializes as its index and number, so renaming a name-map
+    /// entry already retargets every reference to it on disk. What it does *not*
+    /// do is update the resolved `text` a decoded value carries — and a stale
+    /// one is not merely cosmetic, because interning is by string: editing that
+    /// field afterwards would fork a fresh entry rather than follow the rename.
+    /// This is how a caller refreshes them.
+    ///
+    /// Property *names* are not visited. A cooked block is
+    /// [`BlockLayout::Unversioned`], so its names come from the class's schema
+    /// rather than from the package's name map.
+    pub fn visit_names_mut(&mut self, f: &mut dyn FnMut(&mut FName)) {
+        for entry in &mut self.entries {
+            entry.value.visit_names_mut(f);
+        }
+    }
+
     /// Equality by *value*, for the round-trip contract
     /// `decode(encode(decode(x))) == decode(x)`.
     ///
@@ -690,6 +771,135 @@ impl SoftObjectPath {
     pub fn is_empty(&self) -> bool {
         self.package.as_str().is_empty() && self.asset.as_str().is_empty()
     }
+}
+
+#[cfg(test)]
+mod visit_names_tests {
+    use super::*;
+    use crate::iostore::object::hand_written::{HandWritten, LocatorFragment};
+
+    fn block(values: Vec<PropValue>) -> PropertyBlock {
+        PropertyBlock {
+            entries: values
+                .into_iter()
+                .enumerate()
+                .map(|(i, value)| PropertyEntry {
+                    name: format!("Field{i}").into(),
+                    value,
+                    slot: None,
+                })
+                .collect(),
+            layout: BlockLayout::Unversioned {
+                schema_len: 0,
+                leading_empty: 0,
+            },
+        }
+    }
+
+    fn name(text: &str) -> FName {
+        FName::new(0, 0, text)
+    }
+
+    fn seen(block: &mut PropertyBlock) -> Vec<String> {
+        let mut found = Vec::new();
+        block.visit_names_mut(&mut |name| found.push(name.to_string()));
+        found.sort();
+        found
+    }
+
+    /// Every nesting shape a name can hide behind, in one block. A variant that
+    /// stops being visited is invisible on disk — the index is what is written —
+    /// and only shows up later as a forked name-map entry.
+    #[test]
+    fn every_nested_shape_is_reached() {
+        let mut subject = block(vec![
+            PropValue::Name(name("Direct")),
+            PropValue::SoftObject(SoftObjectPath {
+                package: name("SoftPackage"),
+                asset: name("SoftAsset"),
+                sub_path: FStr::from("sub"),
+            }),
+            PropValue::Array(vec![PropValue::Name(name("InArray"))]),
+            PropValue::Set(vec![PropValue::Name(name("InSet"))]),
+            PropValue::Map(vec![(
+                PropValue::Name(name("MapKey")),
+                PropValue::Name(name("MapValue")),
+            )]),
+            PropValue::WithRemovals {
+                removals: Some(vec![PropValue::Name(name("Removed"))]),
+                inner: Box::new(PropValue::Name(name("Kept"))),
+            },
+            PropValue::Struct(block(vec![PropValue::Name(name("InStruct"))])),
+            PropValue::Delegate {
+                object: 0,
+                function: name("DelegateFn"),
+            },
+            PropValue::MulticastDelegate(vec![(0, name("MulticastFn"))]),
+            PropValue::FieldPath {
+                path: vec![name("PathSegment")],
+                owner: 0,
+            },
+            PropValue::HandWritten(HandWritten::LocatorFragment(LocatorFragment {
+                fragment_type: name("FragmentType"),
+                payload: Some(block(vec![PropValue::Name(name("InFragment"))])),
+            })),
+        ]);
+
+        assert_eq!(
+            seen(&mut subject),
+            [
+                "DelegateFn",
+                "Direct",
+                "FragmentType",
+                "InArray",
+                "InFragment",
+                "InSet",
+                "InStruct",
+                "Kept",
+                "MapKey",
+                "MapValue",
+                "MulticastFn",
+                "PathSegment",
+                "Removed",
+                "SoftAsset",
+                "SoftPackage",
+            ]
+        );
+    }
+
+    /// The visitor mutates in place, which is the whole reason it exists: a
+    /// rename retargets the index on disk but leaves the resolved text stale,
+    /// and interning is by string.
+    #[test]
+    fn the_visitor_can_rewrite_the_resolved_text() {
+        let mut subject = block(vec![
+            PropValue::Name(FName::new(4, 0, "Warthog")),
+            PropValue::Array(vec![PropValue::Name(FName::new(4, 3, "Warthog_2"))]),
+            PropValue::Name(FName::new(9, 0, "Untouched")),
+        ]);
+
+        subject.visit_names_mut(&mut |name| {
+            if name.index == 4 {
+                let text = if name.number != 0 {
+                    format!("Scorpion_{}", name.number - 1)
+                } else {
+                    "Scorpion".to_owned()
+                };
+                *name = FName::new(name.index, name.number, text);
+            }
+        });
+
+        assert_eq!(seen(&mut subject), ["Scorpion", "Scorpion_2", "Untouched"]);
+    }
+
+    /// Property names come from the class schema, not the package name map, so
+    /// renaming a name-map entry must not touch them.
+    #[test]
+    fn property_names_are_not_name_map_references() {
+        let mut subject = block(vec![PropValue::Int(1)]);
+        assert!(seen(&mut subject).is_empty());
+    }
+
 }
 
 #[cfg(test)]

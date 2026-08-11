@@ -631,35 +631,63 @@ fn build_layout_from_schema(
             let info = field_type_info(&field.ty)
                 .ok_or_else(|| TagSchemaError::UnknownFieldType(field.ty.clone()))?;
 
-            // Strip explanation fields entirely — shipped MCC tags carry none in
-            // their embedded layout (the documentation text lives only in the
-            // JSON schema, not in tag files).
-            if matches!(info.ty, TagFieldType::Explanation) {
-                continue;
-            }
+            // An `explanation` is the schema's documentation text, and a shipped
+            // layout does not carry the text — but it *does* carry the field.
+            //
+            // This used to drop them entirely, on the belief that tags carry none
+            // at all. Measured against HREK, that is wrong: the kits keep a
+            // zero-width, unnamed `custom` field at each explanation's position,
+            // so `cheap_particle_emitter`'s root has 43 fields where dropping
+            // them gave 36 — the seven explanations in its schema. The bytes were
+            // right either way, because these occupy none; what diverged was the
+            // field *list*, and an editing kit walking its own field list against
+            // a tag's is entitled to refuse the tag or fall over on it.
+            //
+            // So they are emitted the way the kits write them: `custom`, size 0,
+            // no name. Keeping them as `explanation` would align the count and
+            // still disagree on the type.
+            let explanation = matches!(info.ty, TagFieldType::Explanation);
+            let (canonical, ty, size) = if explanation {
+                ("custom", TagFieldType::Custom, 0)
+            } else {
+                (info.canonical, info.ty, info.size)
+            };
 
-            let type_index = intern_field_type(
-                info.canonical,
-                info.size,
-                info.needs_sub_chunk,
-                &mut strings,
-            );
+            let type_index =
+                intern_field_type(canonical, size, info.needs_sub_chunk, &mut strings);
 
             // Clean the field name to its bare display form (drop `:units`,
             // `#help`, `{alias}`, and trailing `*`/`!` markers) so the embedded
             // layout matches shipped tags rather than the verbose JSON schema.
+            // A shipped layout carries no name for a `custom` field, whatever the
+            // JSON calls it. Measured across HREK: every `custom` in a kit tag's
+            // layout is unnamed — the decorators, and the `tmpl` render-method
+            // hole alike — while the dump names them `types`, `mapping`,
+            // `shader`. An explanation is the same case with its heading text.
+            //
+            // The name is metadata on a field that carries no data, so dropping
+            // it moves nothing; what it buys is a field list the editing kits
+            // recognise as their own, which is what `cheap_particle_emitter`
+            // needed. The JSON keeps the names, so nothing is lost that a reader
+            // of the schema wanted.
             let field_name_offset = match &field.name {
-                Some(n) => strings.intern(&clean_blay_field_name(n)),
-                None => 0,
+                Some(n) if !explanation && !matches!(ty, TagFieldType::Custom) => {
+                    strings.intern(&clean_blay_field_name(n))
+                }
+                _ => 0,
             };
 
-            let definition = resolve_field_definition(field, info.ty, &schema)?;
+            let definition = if explanation {
+                0
+            } else {
+                resolve_field_definition(field, info.ty, &schema)?
+            };
 
             fields.push(TagFieldLayout {
                 name_offset: field_name_offset,
                 type_index,
                 definition,
-                field_type: info.ty,
+                field_type: ty,
                 offset: 0, // computed later by compute_struct_layout
             });
         }

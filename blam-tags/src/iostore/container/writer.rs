@@ -480,6 +480,144 @@ pub fn delete_tag_in_place_with(
     delete_tag_in_place_impl(archive, utoc_path, request, None)
 }
 
+/// A package to move to a new path inside the container that already holds it.
+///
+/// Deliberately general over packages rather than shaped like a tag. A tag is
+/// exactly a `.uasset` and a `.ubulk`; an arbitrary cooked package can own
+/// several bulk chunks, and its identity lives in an export that may not be the
+/// first one. Both are handled here, and the tag case is just the two-chunk one.
+pub struct InPlacePackageRename<'a> {
+    /// The package as the container currently holds it,
+    /// e.g. `/Game/Vehicles/Warthog/SM_Warthog`.
+    pub old_package_path: &'a str,
+    /// Where it should be. May differ in folder, in leaf, or in both.
+    pub new_package_path: &'a str,
+    /// Replacement export-bundle bytes, when the caller has a rebuilt package —
+    /// so an edited document can be renamed in one transaction rather than
+    /// saved and then moved. `None` carries the container's own bytes across
+    /// with only the header rewritten.
+    pub replacement_export_bundle: Option<&'a [u8]>,
+    /// Replacement payload for the package's bulk-data chunk, for the same
+    /// reason: a tag whose body was edited can be renamed in one transaction.
+    ///
+    /// Refused unless the package owns exactly one `BulkData` chunk and its
+    /// header describes exactly one bulk-data entry starting at offset zero —
+    /// otherwise "the new length" does not say which entry grew, and a wrong
+    /// `SerialSize` reads the payload off the end of the chunk.
+    pub replacement_bulk_data: Option<&'a [u8]>,
+    /// How many chunks the container held before this caller ever appended to
+    /// it. Every chunk of the package must sit at or past that index. Same
+    /// provenance role, and the same limits, as [`InPlaceTagDeletion`].
+    pub minimum_appended_index: Option<u32>,
+    /// Install an old→new package redirect, so a name that pointed at the old
+    /// path still resolves. Off for a move that should leave nothing behind.
+    pub redirect: bool,
+}
+
+/// Move a package to a new path inside the exact container that holds it.
+///
+/// One transaction. Composing the existing duplicate and delete would not
+/// merely perform worse — it does not work: `validate_delete_result` asserts the
+/// chunk count is unchanged, which is false once the duplicate half has run;
+/// delete-then-duplicate is impossible because the delete retires the very
+/// `.uasset` the duplicate clones; and `resolve_tag_deletion` refuses to delete
+/// anything a redirect points at, which the rename's own redirect creates.
+///
+/// A rename is not a metadata edit. `FPackageId` is a hash of the package path,
+/// and every chunk id derives from it, so moving the path moves every chunk id
+/// with it. What actually happens is: the package's chunks are re-emitted under
+/// the new id, the old ones are retired as tombstones, the directory index is
+/// rebuilt around the new paths, and the container header's store entry moves.
+///
+/// The `.ucas` is appended to and never truncated; the old payload stays behind
+/// as dead space. The `.utoc` is replaced atomically and restored if anything
+/// fails. A perfect-hash table in the target is **dropped** — see
+/// [`plan_toc_append`].
+pub fn rename_package_in_place_with(
+    archive: &IoStoreArchive,
+    utoc_path: &Path,
+    request: &InPlacePackageRename<'_>,
+) -> Result<()> {
+    rename_package_in_place_impl(archive, utoc_path, request, None)
+}
+
+/// Identity of a Campaign Evolved tag to move inside the container holding it.
+///
+/// A tag is a package plus a naming contract: `/Game/Tags/<path>-<group>`, where
+/// the group half names the wrapper's `Blam<Group>TagDataAsset` class. Nothing
+/// else distinguishes it, which is why this is a wrapper and not a second
+/// implementation.
+pub struct InPlaceTagRename<'a> {
+    /// The tag's package path as the container holds it, e.g.
+    /// `/Game/Tags/objects/characters/masterchief-biped`.
+    pub old_package_path: &'a str,
+    /// Where it should be. Same group; the name, the folder, or both may move.
+    pub new_package_path: &'a str,
+    /// Replacement tag body for the `.ubulk`, when the caller holds an edited
+    /// document — so renaming a dirty tag does not have to be a save followed
+    /// by a move. `None` carries the stored body across untouched.
+    pub tag_bytes: Option<&'a [u8]>,
+    /// Same provenance role, and the same limits, as [`InPlaceTagDeletion`].
+    pub minimum_appended_index: Option<u32>,
+    /// Install an old→new redirect so the old path still resolves.
+    pub redirect: bool,
+}
+
+/// Move a tag to a new path inside the exact container that holds it.
+///
+/// Everything mechanical is [`rename_package_in_place_with`]; what this adds is
+/// the one contract a tag has and a package does not. The group suffix is the
+/// wrapper export's class — `-biped` is a `BlamBipedTagDataAsset` — and the
+/// class is a script import hashed into the game's own binary, not something
+/// the package path can redefine. So renaming across groups would produce a tag
+/// the browser files under one group and the engine loads as another, and the
+/// mismatch would not surface until load. Refused here rather than repaired.
+///
+/// Renaming *within* a group is the whole operation: `-biped` to `-biped`, any
+/// name, any folder.
+pub fn rename_tag_in_place_with(
+    archive: &IoStoreArchive,
+    utoc_path: &Path,
+    request: &InPlaceTagRename<'_>,
+) -> Result<()> {
+    let old = crate::iostore::package::imports::split_tag_package(request.old_package_path)
+        .ok_or(IoStoreError::Package(
+            "the tag to rename is not at a /Game/Tags/<path>-<group> path",
+        ))?;
+    let new = crate::iostore::package::imports::split_tag_package(request.new_package_path)
+        .ok_or(IoStoreError::Package(
+            "the destination is not a /Game/Tags/<path>-<group> path",
+        ))?;
+    if !old.1.eq_ignore_ascii_case(new.1) {
+        return Err(IoStoreError::Package(
+            "a tag cannot be renamed into a different group",
+        ));
+    }
+
+    rename_package_in_place_with(
+        archive,
+        utoc_path,
+        &InPlacePackageRename {
+            old_package_path: request.old_package_path,
+            new_package_path: request.new_package_path,
+            replacement_export_bundle: None,
+            replacement_bulk_data: request.tag_bytes,
+            minimum_appended_index: request.minimum_appended_index,
+            redirect: request.redirect,
+        },
+    )
+}
+
+#[cfg(test)]
+fn rename_package_in_place_with_failure_for_test(
+    archive: &IoStoreArchive,
+    utoc_path: &Path,
+    request: &InPlacePackageRename<'_>,
+    failure: DuplicateFailurePoint,
+) -> Result<()> {
+    rename_package_in_place_impl(archive, utoc_path, request, Some(failure))
+}
+
 /// Where to abort an in-place operation, so the rollback ladder can be tested at
 /// every step. Shared by duplication and deletion — they run the same ladder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1880,6 +2018,697 @@ fn delete_tag_in_place_impl(
     Ok(())
 }
 
+/// Move a chunk id to a different package, preserving everything else in it.
+///
+/// Byte substitution rather than [`make_chunk_id`] on purpose. The id's 16-bit
+/// index field is written little-endian there, while `FIoChunkId`'s own doc says
+/// it is stored byte-swapped — and every call site passes index 0, where the two
+/// encodings coincide, so nothing has ever read it back and the question is
+/// unresolved. Copying the bytes sidesteps it entirely, and preserves the pad
+/// byte that `retire_chunk_id` repurposes.
+fn retarget_chunk_id(old: FIoChunkId, new_package_id: FPackageId) -> FIoChunkId {
+    let mut bytes = old.0;
+    bytes[..8].copy_from_slice(&new_package_id.0.to_le_bytes());
+    FIoChunkId(bytes)
+}
+
+/// The leaf of a `/Game/...` package path, and everything before it.
+fn split_package_path(path: &str) -> (&str, &str) {
+    match path.rsplit_once('/') {
+        Some((parent, leaf)) => (parent, leaf),
+        None => ("", path),
+    }
+}
+
+/// Rewrite one member's container path for the move.
+///
+/// The path is taken from the directory index and edited, never synthesized:
+/// `chunk_type_extension` has no `.umap` arm while `world` treats `.umap` as a
+/// first-class package extension, so building a path from the package name and a
+/// chunk type would quietly rename a level's `.umap` to `.uasset`. The extension
+/// — including a compound one like `.m.ubulk` — is carried through untouched.
+fn rename_entry_path(
+    entry_path: &str,
+    old_package: &str,
+    new_package: &str,
+) -> Result<String> {
+    let (old_parent, old_leaf) = split_package_path(old_package);
+    let (new_parent, new_leaf) = split_package_path(new_package);
+    let normalized = entry_path.replace('\\', "/");
+    let (dir, file) = match normalized.rsplit_once('/') {
+        Some((dir, file)) => (dir.to_owned(), file.to_owned()),
+        None => (String::new(), normalized.clone()),
+    };
+    if !file.len().checked_sub(old_leaf.len()).is_some_and(|_| {
+        file.get(..old_leaf.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(old_leaf))
+            && file[old_leaf.len()..].starts_with('.')
+    }) {
+        return Err(IoStoreError::Package(
+            "a chunk of the package to rename is at an unexpected path",
+        ));
+    }
+    let file = format!("{new_leaf}{}", &file[old_leaf.len()..]);
+
+    if old_parent.eq_ignore_ascii_case(new_parent) {
+        return Ok(if dir.is_empty() {
+            file
+        } else {
+            format!("{dir}/{file}")
+        });
+    }
+    // A folder move. The container's mount prefix (`Meteorite/Content/`) is not
+    // derivable from the package path, so match on the tail the two share and
+    // replace only that, keeping the container's own spelling of the prefix.
+    let old_tail = old_parent.trim_start_matches('/');
+    let old_tail = old_tail.strip_prefix("Game/").unwrap_or(old_tail);
+    let new_tail = new_parent.trim_start_matches('/');
+    let new_tail = new_tail.strip_prefix("Game/").unwrap_or(new_tail);
+    let Some(cut) = dir.len().checked_sub(old_tail.len()) else {
+        return Err(IoStoreError::Package(
+            "the package to rename is not under the folder its path names",
+        ));
+    };
+    if !dir[cut..].eq_ignore_ascii_case(old_tail) {
+        return Err(IoStoreError::Package(
+            "the package to rename is not under the folder its path names",
+        ));
+    }
+    let dir = format!("{}{new_tail}", &dir[..cut]);
+    Ok(if dir.is_empty() {
+        file
+    } else {
+        format!("{dir}/{file}")
+    })
+}
+
+/// Rewrite a package's own header so it says what it is now called.
+///
+/// Splices rather than going through `write_package`: the export payloads are
+/// carried across untouched, and rebuilding them would require decoding every
+/// export of a package this crate may not have a schema for. Export offsets are
+/// relative to the end of the header, so a header that changes size is fine.
+fn retarget_package_identity(
+    bytes: &[u8],
+    old_package: &str,
+    new_package: &str,
+    bulk_serial_size: Option<i64>,
+) -> Result<Vec<u8>> {
+    use crate::iostore::compat::{CE_CONTAINER_HEADER_VERSION, CE_TOC_VERSION};
+
+    let mut header = FZenPackageHeader::deserialize(
+        &mut Cursor::new(bytes),
+        None,
+        CE_TOC_VERSION,
+        CE_CONTAINER_HEADER_VERSION,
+        None,
+    )
+    .map_err(|_| IoStoreError::Package("the package to rename did not parse"))?;
+    let header_size = header.summary.header_size as usize;
+    if header_size > bytes.len() {
+        return Err(IoStoreError::Package(
+            "the package to rename has a header longer than its bytes",
+        ));
+    }
+    let tail = bytes[header_size..].to_vec();
+
+    header.summary.name = header.name_map.store(new_package);
+
+    // The bulk chunk's length lives in the *package's* header, not in the TOC
+    // entry, so replacing the payload without this reads the old number of
+    // bytes out of the new chunk. Rewritten on the parsed header rather than
+    // byte-patched, because the header is being reserialized here anyway.
+    if let Some(size) = bulk_serial_size {
+        if header.bulk_data.len() != 1 {
+            return Err(IoStoreError::Package(
+                "a replacement body needs exactly one bulk-data map entry",
+            ));
+        }
+        if header.bulk_data[0].serial_offset != 0 {
+            return Err(IoStoreError::Package(
+                "the bulk-data entry does not start at the beginning of its chunk",
+            ));
+        }
+        header.bulk_data[0].serial_size = size;
+    }
+
+    // Only the export the package is named after, and only when that name
+    // actually changes. `public_export_hash` is how *other* packages address
+    // this export, so a folder move — which leaves the object name alone — must
+    // not touch it.
+    let (_, old_leaf) = split_package_path(old_package);
+    let (_, new_leaf) = split_package_path(new_package);
+    if !old_leaf.eq_ignore_ascii_case(new_leaf) {
+        let matches: Vec<usize> = header
+            .export_map
+            .iter()
+            .enumerate()
+            .filter(|(_, export)| export.outer_index.is_null())
+            .filter(|(_, export)| {
+                header
+                    .name_map
+                    .try_get(export.object_name)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(old_leaf))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        // Exactly one, or none. Several exports sharing the package's name is a
+        // shape this cannot reason about, and guessing which one is the asset
+        // would rename the wrong object; leaving them all is recoverable.
+        if matches.len() == 1 {
+            let index = matches[0];
+            header.export_map[index].object_name = header.name_map.store(new_leaf);
+            header.export_map[index].public_export_hash =
+                crate::iostore::package::imports::public_export_hash(new_leaf);
+        }
+    }
+
+    let mut store = StoreEntry::default();
+    let mut serialized = Cursor::new(Vec::new());
+    header
+        .serialize(&mut serialized, &mut store, CE_CONTAINER_HEADER_VERSION)
+        .map_err(|_| IoStoreError::Package("failed to serialize the renamed package"))?;
+    let mut package = serialized.into_inner();
+    package.extend_from_slice(&tail);
+    Ok(package)
+}
+
+struct RenamedMember {
+    old_index: u32,
+    new_id: FIoChunkId,
+    bytes: Vec<u8>,
+    new_path: Option<String>,
+}
+
+struct ResolvedPackageRename {
+    new_package_id: FPackageId,
+    members: Vec<RenamedMember>,
+    surviving_entries: Vec<Entry>,
+    header_index: u32,
+    header_bytes: Vec<u8>,
+    expected_package_ids: BTreeSet<FPackageId>,
+}
+
+/// Establish what a rename would move, and prove it is safe, before anything is
+/// written.
+fn resolve_package_rename(
+    archive: &IoStoreArchive,
+    toc: &ParsedToc,
+    request: &InPlacePackageRename<'_>,
+) -> Result<ResolvedPackageRename> {
+    if request.old_package_path.is_empty() || request.new_package_path.is_empty() {
+        return Err(IoStoreError::Package("rename package path is empty"));
+    }
+    let old_id = FPackageId::from_name(request.old_package_path);
+    let new_id = FPackageId::from_name(request.new_package_path);
+    // `FPackageId::from_name` lowercases, so a case-only rename produces the
+    // same id — and the addition would collide with its own tombstone.
+    if old_id == new_id {
+        return Err(IoStoreError::Package(
+            "the new package path hashes to the same id as the old one",
+        ));
+    }
+
+    let old_key = old_id.0.to_le_bytes();
+    // Tombstones are skipped, for the same reason the collision check below
+    // skips them: `retire_chunk_id` rewrites only the type and pad bytes, so a
+    // retired slot keeps the package id it was retired from. A package that has
+    // been renamed away from this path before has left some here, and they are
+    // neither payload to move nor a shape to refuse -- counting them as members
+    // made every second rename fail on the member-type gate.
+    let member_indices: Vec<u32> = toc
+        .chunk_ids
+        .iter()
+        .enumerate()
+        .filter(|(_, id)| id.package_id() == old_key && id.chunk_type() != RETIRED_CHUNK_TYPE)
+        .map(|(index, _)| index as u32)
+        .collect();
+    if member_indices.is_empty() {
+        return Err(IoStoreError::Package(
+            "the package to rename is not in this container",
+        ));
+    }
+    if let Some(minimum) = request.minimum_appended_index
+        && member_indices.iter().any(|index| *index < minimum)
+    {
+        return Err(IoStoreError::Package(
+            "the package to rename predates this container's appended chunks",
+        ));
+    }
+
+    let bundles: Vec<u32> = member_indices
+        .iter()
+        .copied()
+        .filter(|index| toc.chunk_ids[*index as usize].chunk_type() == CHUNK_TYPE_EXPORT_BUNDLE_DATA)
+        .collect();
+    if bundles.len() != 1 {
+        return Err(IoStoreError::Package(
+            "the package to rename does not have exactly one export bundle chunk",
+        ));
+    }
+    let bundle_index = bundles[0];
+    for index in &member_indices {
+        let kind = toc.chunk_ids[*index as usize].chunk_type();
+        // Anything else sharing the identity is a shape this cannot move, and
+        // moving only part of a package is worse than refusing.
+        if *index != bundle_index
+            && !matches!(
+                kind,
+                CHUNK_TYPE_BULK_DATA
+                    | crate::iostore::CHUNK_TYPE_OPTIONAL_BULK_DATA
+                    | crate::iostore::CHUNK_TYPE_MEMORY_MAPPED_BULK_DATA
+            )
+        {
+            return Err(IoStoreError::Package(
+                "the package to rename owns a chunk of an unexpected type",
+            ));
+        }
+    }
+
+    // Prove the bundle really holds the package the caller named.
+    let bundle_bytes = match request.replacement_export_bundle {
+        Some(bytes) => bytes.to_vec(),
+        None => archive.read_chunk(bundle_index)?,
+    };
+    {
+        use crate::iostore::compat::{CE_CONTAINER_HEADER_VERSION, CE_TOC_VERSION};
+        let header = FZenPackageHeader::deserialize(
+            &mut Cursor::new(&bundle_bytes),
+            None,
+            CE_TOC_VERSION,
+            CE_CONTAINER_HEADER_VERSION,
+            None,
+        )
+        .map_err(|_| IoStoreError::Package("the package to rename did not parse"))?;
+        if !header
+            .package_name()
+            .eq_ignore_ascii_case(request.old_package_path)
+        {
+            return Err(IoStoreError::Package(
+                "the package to rename names a different package",
+            ));
+        }
+    }
+
+    // A replacement body must name exactly one chunk, or "the new length" does
+    // not say which one changed.
+    let replacement_bulk = match request.replacement_bulk_data {
+        Some(body) => {
+            let bulk: Vec<u32> = member_indices
+                .iter()
+                .copied()
+                .filter(|index| toc.chunk_ids[*index as usize].chunk_type() == CHUNK_TYPE_BULK_DATA)
+                .collect();
+            if bulk.len() != 1 {
+                return Err(IoStoreError::Package(
+                    "a replacement body needs the package to own exactly one bulk-data chunk",
+                ));
+            }
+            if body.len() > i64::MAX as usize {
+                return Err(IoStoreError::Package(
+                    "replacement body is too large for SerialSize",
+                ));
+            }
+            Some((bulk[0], body))
+        }
+        None => None,
+    };
+
+    let indexed = toc.directory_index_size != 0;
+    let mut members = Vec::new();
+    let mut moved_indices = BTreeSet::new();
+    for index in &member_indices {
+        moved_indices.insert(*index);
+        let bytes = if *index == bundle_index {
+            retarget_package_identity(
+                &bundle_bytes,
+                request.old_package_path,
+                request.new_package_path,
+                replacement_bulk.map(|(_, body)| body.len() as i64),
+            )?
+        } else if let Some((bulk_index, body)) = replacement_bulk
+            && *index == bulk_index
+        {
+            body.to_vec()
+        } else {
+            archive.read_chunk(*index)?
+        };
+        let new_path = if indexed {
+            let entry = archive
+                .entries()
+                .iter()
+                .find(|entry| entry.chunk_index == *index)
+                .ok_or(IoStoreError::Package(
+                    "a chunk of the package to rename has no directory entry",
+                ))?;
+            Some(rename_entry_path(
+                &entry.path,
+                request.old_package_path,
+                request.new_package_path,
+            )?)
+        } else {
+            None
+        };
+        members.push(RenamedMember {
+            old_index: *index,
+            new_id: retarget_chunk_id(toc.chunk_ids[*index as usize], new_id),
+            bytes,
+            new_path,
+        });
+    }
+
+    // Retired slots are skipped, and that is the whole reason renaming a package
+    // back to a name it once had works. `retire_chunk_id` rewrites only the type
+    // and pad bytes, so a tombstone keeps the package id it was retired from --
+    // it just holds no payload and can never be resolved. Treating one as an
+    // occupant would make every name single-use for the life of the container.
+    if toc.chunk_ids.iter().any(|id| {
+        id.chunk_type() != RETIRED_CHUNK_TYPE && id.package_id() == new_id.0.to_le_bytes()
+    }) {
+        return Err(IoStoreError::Package(
+            "the destination package already has chunks in this container",
+        ));
+    }
+    let surviving_entries: Vec<Entry> = archive
+        .entries()
+        .iter()
+        .filter(|entry| !moved_indices.contains(&entry.chunk_index))
+        .cloned()
+        .collect();
+    if indexed
+        && members.iter().any(|member| {
+            member.new_path.as_ref().is_some_and(|path| {
+                surviving_entries
+                    .iter()
+                    .any(|entry| entry.path.eq_ignore_ascii_case(path))
+            })
+        })
+    {
+        return Err(IoStoreError::Package("destination path already exists"));
+    }
+
+    let header_indices: Vec<u32> = toc
+        .chunk_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(index, id)| {
+            (id.chunk_type() == CHUNK_TYPE_CONTAINER_HEADER).then_some(index as u32)
+        })
+        .collect();
+    if header_indices.len() != 1 {
+        return Err(IoStoreError::Package(
+            "target does not have exactly one ContainerHeader chunk",
+        ));
+    }
+    let header_index = header_indices[0];
+    if moved_indices.contains(&header_index) {
+        return Err(IoStoreError::Package(
+            "the package to rename is the ContainerHeader chunk",
+        ));
+    }
+    let mut container_header =
+        FIoContainerHeader::deserialize(&mut Cursor::new(archive.read_chunk(header_index)?), None)
+            .map_err(|_| IoStoreError::Package("container package-store header did not parse"))?;
+    if container_header.container_id.0 != toc.container_id {
+        return Err(IoStoreError::Package(
+            "ContainerHeader payload id does not match TOC",
+        ));
+    }
+    crate::iostore::compat::check_writable_container_header_version(container_header.version)
+        .map_err(|_| IoStoreError::Package("unsupported container package-store header"))?;
+    // Both are keyed by store-entry ordinal, and the store is a BTreeMap over
+    // FPackageId — so adding renumbers them exactly as removing does.
+    if container_header.has_soft_package_references() {
+        return Err(IoStoreError::Package(
+            "container header carries soft package references",
+        ));
+    }
+    if container_header.has_optional_segment() {
+        return Err(IoStoreError::Package(
+            "container header carries an optional segment",
+        ));
+    }
+    if container_header.is_localized_source(old_id) {
+        return Err(IoStoreError::Package(
+            "the package to rename is a localized source package",
+        ));
+    }
+    if container_header.get_store_entry(new_id).is_some() {
+        return Err(IoStoreError::Package(
+            "the destination package is already in the package store",
+        ));
+    }
+    // Carried over rather than re-derived. Nothing in a store entry depends on
+    // the package's own name, and re-deriving one from a header parsed without
+    // its store entry would silently drop every shader map hash it had.
+    let store = container_header
+        .get_store_entry(old_id)
+        .ok_or(IoStoreError::Package(
+            "the package to rename is not in the package store",
+        ))?;
+    if !container_header.remove_package(old_id) {
+        return Err(IoStoreError::Package(
+            "the package to rename is not in the package store",
+        ));
+    }
+    container_header.add_package(new_id, store);
+    // Anything that pointed at the old id follows it, so a package can be
+    // renamed more than once.
+    container_header.retarget_package_redirect(old_id, new_id);
+    if request.redirect {
+        container_header
+            .add_package_redirect(request.old_package_path, new_id)
+            .map_err(|_| IoStoreError::Package("failed to record the rename redirect"))?;
+    }
+    let expected_package_ids: BTreeSet<FPackageId> = container_header.package_ids().collect();
+    let header_bytes = serialize_aligned_container_header(&container_header)?;
+
+    Ok(ResolvedPackageRename {
+        new_package_id: new_id,
+        members,
+        surviving_entries,
+        header_index,
+        header_bytes,
+        expected_package_ids,
+    })
+}
+
+fn rename_package_in_place_impl(
+    archive: &IoStoreArchive,
+    utoc_path: &Path,
+    request: &InPlacePackageRename<'_>,
+    failure: Option<DuplicateFailurePoint>,
+) -> Result<()> {
+    let original_toc_bytes = std::fs::read(utoc_path)?;
+    if !archive.matches_utoc_path(utoc_path) || archive.toc_bytes() != original_toc_bytes {
+        return Err(IoStoreError::Package(
+            "archive handle is stale or targets another container",
+        ));
+    }
+    let toc = parse_toc(&original_toc_bytes)?;
+    if archive.chunk_count() != toc.entry_count {
+        return Err(IoStoreError::Package("archive handle chunk count is stale"));
+    }
+    for (index, expected_id) in toc.chunk_ids.iter().enumerate() {
+        if archive.chunk_id(index as u32)? != *expected_id {
+            return Err(IoStoreError::Package("archive handle chunk ids are stale"));
+        }
+    }
+    let mut raw_ids = BTreeSet::new();
+    for id in &toc.chunk_ids {
+        if !raw_ids.insert(id.0) {
+            return Err(IoStoreError::Package(
+                "target TOC contains a duplicate chunk id",
+            ));
+        }
+    }
+
+    let resolved = resolve_package_rename(archive, &toc, request)?;
+
+    let additions: Vec<NewTocChunk> = resolved
+        .members
+        .iter()
+        .map(|member| NewTocChunk {
+            id: member.new_id,
+            bytes: member.bytes.clone(),
+            path: member.new_path.clone(),
+        })
+        .collect();
+    let tombstones: Vec<TocTombstone> = resolved
+        .members
+        .iter()
+        .map(|member| TocTombstone {
+            chunk_index: member.old_index,
+        })
+        .collect();
+
+    let ucas_path = utoc_path.with_extension("ucas");
+    let old_ucas_len = std::fs::metadata(&ucas_path)?.len();
+    let plan = plan_toc_append(
+        &toc,
+        old_ucas_len,
+        additions,
+        vec![ExistingTocReplacement {
+            chunk_index: resolved.header_index,
+            bytes: resolved.header_bytes.clone(),
+        }],
+        &tombstones,
+        &resolved.surviving_entries,
+    )?;
+
+    append_ucas_items(&ucas_path, &plan.items)?;
+    if failure == Some(DuplicateFailurePoint::AfterAppend) {
+        return restore_original_toc(
+            utoc_path,
+            &original_toc_bytes,
+            IoStoreError::Package("injected post-append failure"),
+        );
+    }
+    if let Err(error) = atomic_replace_file(utoc_path, &plan.new_toc) {
+        return restore_original_toc(utoc_path, &original_toc_bytes, error);
+    }
+    if failure == Some(DuplicateFailurePoint::AfterTocWrite) {
+        return restore_original_toc(
+            utoc_path,
+            &original_toc_bytes,
+            IoStoreError::Package("injected post-TOC-write failure"),
+        );
+    }
+    if failure == Some(DuplicateFailurePoint::BeforeValidation) {
+        return restore_original_toc(
+            utoc_path,
+            &original_toc_bytes,
+            IoStoreError::Package("injected validation failure"),
+        );
+    }
+    if let Err(error) = validate_rename_result(utoc_path, &toc, request, &resolved, &plan) {
+        return restore_original_toc(utoc_path, &original_toc_bytes, error);
+    }
+    Ok(())
+}
+
+/// Reopen the container and prove the rename landed.
+///
+/// Not `validate_delete_result`: that asserts the chunk count is unchanged, and
+/// a rename grows it by one slot per member. The rest of the obligations are the
+/// same, plus the ones only a rename has — that the old ids are gone, the new
+/// ones resolve, and the store entry moved.
+fn validate_rename_result(
+    utoc_path: &Path,
+    original_toc: &ParsedToc,
+    request: &InPlacePackageRename<'_>,
+    resolved: &ResolvedPackageRename,
+    plan: &TocAppendPlan,
+) -> Result<()> {
+    let saved_toc_bytes = std::fs::read(utoc_path)?;
+    let saved_toc = parse_toc(&saved_toc_bytes)?;
+
+    if saved_toc.entry_count != original_toc.entry_count + resolved.members.len() as u32 {
+        return Err(IoStoreError::Package(
+            "rename did not add exactly one chunk per member",
+        ));
+    }
+    validate_perfect_hash_result(original_toc, &saved_toc, plan)?;
+    if saved_toc.partition_size != original_toc.partition_size
+        || saved_toc.container_id != original_toc.container_id
+        || saved_toc.block_size != original_toc.block_size
+    {
+        return Err(IoStoreError::Package("rename changed TOC header fields"));
+    }
+    if saved_toc.blocks.get(..original_toc.blocks.len()) != Some(original_toc.blocks.as_slice()) {
+        return Err(IoStoreError::Package(
+            "rename rewrote existing compression blocks",
+        ));
+    }
+
+    // Each retired slot keeps its position and its retired marker, so the
+    // surviving chunks' indices — and the perfect hash's modulo base — are
+    // untouched.
+    for member in &resolved.members {
+        let slot = member.old_index as usize;
+        let retired = retire_chunk_id(original_toc.chunk_ids[slot]);
+        if saved_toc.chunk_ids.get(slot) != Some(&retired) {
+            return Err(IoStoreError::Package(
+                "a renamed chunk's old slot was not retired",
+            ));
+        }
+        if saved_toc.offset_lengths.get(slot) != Some(&[0u8; 10]) {
+            return Err(IoStoreError::Package(
+                "a retired slot still points at payload",
+            ));
+        }
+    }
+
+    let reopened = IoStoreArchive::open(utoc_path)?;
+    for member in &resolved.members {
+        if reopened.find_chunk(&member.new_id).is_none() {
+            return Err(IoStoreError::Package(
+                "a renamed chunk is missing from the reopened container",
+            ));
+        }
+        if reopened
+            .find_chunk(&original_toc.chunk_ids[member.old_index as usize])
+            .is_some()
+        {
+            return Err(IoStoreError::Package(
+                "a renamed chunk's old id still resolves",
+            ));
+        }
+    }
+
+    // Paths are only meaningful where a directory index exists. An indexless
+    // overlay reconstructs them, and comparing against that would roll back
+    // correct writes over recovered casing.
+    if saved_toc.directory_index_size != 0 {
+        for member in &resolved.members {
+            let Some(path) = &member.new_path else { continue };
+            if !reopened
+                .entries()
+                .iter()
+                .any(|entry| entry.path.eq_ignore_ascii_case(path))
+            {
+                return Err(IoStoreError::Package(
+                    "a renamed chunk is not at its new path",
+                ));
+            }
+        }
+        for entry in &resolved.surviving_entries {
+            if !reopened
+                .entries()
+                .iter()
+                .any(|saved| saved.path == entry.path)
+            {
+                return Err(IoStoreError::Package("rename dropped a surviving entry"));
+            }
+        }
+    }
+
+    let header_bytes = reopened.read_chunk(resolved.header_index)?;
+    let header = FIoContainerHeader::deserialize(&mut Cursor::new(header_bytes), None)
+        .map_err(|_| IoStoreError::Package("rewritten container header did not parse"))?;
+    let saved_ids: BTreeSet<FPackageId> = header.package_ids().collect();
+    if saved_ids != resolved.expected_package_ids {
+        return Err(IoStoreError::Package(
+            "rename did not move the package store entry",
+        ));
+    }
+    if header.get_store_entry(resolved.new_package_id).is_none() {
+        return Err(IoStoreError::Package(
+            "the renamed package is not in the package store",
+        ));
+    }
+    if request.redirect
+        && header
+            .lookup_package_redirect(FPackageId::from_name(request.old_package_path))
+            != Some(resolved.new_package_id)
+    {
+        return Err(IoStoreError::Package(
+            "the rename redirect was not recorded",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_delete_result(
     utoc_path: &Path,
     original_toc: &ParsedToc,
@@ -2799,6 +3628,21 @@ fn add_package_override_to_writer(
         FZenPackageHeader::deserialize(&mut std::io::Cursor::new(&over.bytes), None, CV, HV, None)
             .map_err(|_| IoStoreError::Package("rebuilt package did not parse"))?;
     let package_id = FPackageId::from_name(&header.package_name());
+    // The chunk id came from the base container's path; the store key came from
+    // the rebuilt name. If an edit moved the name, those two now disagree, and
+    // the result is a container that builds and cannot be read: the engine
+    // resolves a name to a package id and that id to a chunk id, so it would
+    // compute one nothing in the container serves.
+    //
+    // `overwrite_packages_in_place_with` has always refused this. The override
+    // path silently accepted it, which made renaming a package look like an
+    // ordinary property edit right up until the mod did nothing.
+    if id.package_id() != package_id.0.to_le_bytes() {
+        return Err(IoStoreError::Package(
+            "rebuilt package identity changed; renaming a package needs a new chunk id and a \
+             container-header entry, not an override of the old one",
+        ));
+    }
     writer.add_package(id, over.bytes.clone(), package_id, over.store.clone());
     Ok(())
 }
@@ -3454,6 +4298,477 @@ pub fn cityhash64(s: &[u8]) -> u64 {
             .wrapping_add(z),
         hash_len16(v.1, w.1).wrapping_add(x),
     )
+}
+
+/// Prepare the one experiment that decides whether renaming in place is worth
+/// shipping at all.
+///
+/// Everything else about a rename can be proved here: the TOC surgery, the
+/// tombstones, the directory index, the store entry, the rollback. What cannot
+/// be proved here is whether the *game* loads the result — nothing in a pak
+/// records how the runtime resolves a package id, and this crate has never read
+/// a container redirect back (`lookup_package_redirect` has no callers). So the
+/// answer has to come from running the game, and this is the harness that sets
+/// that up and says what to look for.
+///
+/// Runs only against a **copy** of an install, behind its own environment
+/// variable, and refuses to run against the same directory `CE_PAKS` names.
+/// Every other gated test in this crate reads paks; this one writes to them.
+#[cfg(test)]
+mod rename_experiment {
+    use super::*;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    fn utocs_under(root: &str) -> Vec<PathBuf> {
+        let mut utocs: Vec<PathBuf> = std::fs::read_dir(root)
+            .expect("read the paks directory")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("utoc"))
+            })
+            .filter(|path| {
+                !path
+                    .file_name()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("global.utoc"))
+            })
+            .collect();
+        utocs.sort();
+        utocs
+    }
+
+    fn header_of(bytes: &[u8]) -> Option<FZenPackageHeader> {
+        use crate::iostore::compat::{CE_CONTAINER_HEADER_VERSION, CE_TOC_VERSION};
+        FZenPackageHeader::deserialize(
+            &mut Cursor::new(bytes),
+            None,
+            CE_TOC_VERSION,
+            CE_CONTAINER_HEADER_VERSION,
+            None,
+        )
+        .ok()
+    }
+
+    /// Which tag packages nothing imports, and which pak each one is in.
+    ///
+    /// Read-only, and gated on `CE_PAKS` like every other corpus control,
+    /// because it only reads. It exists so the experiment does not have to take
+    /// whatever candidate happens to sort first: that is in the largest pak, and
+    /// restoring a 37 GB pak to undo a one-package edit is a bad trade. Pick a
+    /// candidate in a small pak and pass it as `CE_RENAME_PACKAGE`.
+    ///
+    /// The count is also the answer to a real design question — how much of the
+    /// corpus a zero-referrer restriction would leave usable.
+    ///
+    ///   CE_PAKS=/path/to/Meteorite/Content/Paks \
+    ///     cargo test --release --features iostore rename_experiment \
+    ///       -- --ignored --nocapture report_packages
+    #[test]
+    #[ignore = "requires a Campaign Evolved install; set CE_PAKS"]
+    fn report_packages_nothing_imports() {
+        let root = std::env::var("CE_PAKS").expect("set CE_PAKS to the game's Content/Paks");
+        let utocs = utocs_under(&root);
+        assert!(!utocs.is_empty(), "no pakchunk .utoc found under {root}");
+
+        // Referrer count plus one example referrer's pak, per imported package.
+        // Counts rather than lists, because the corpus has 122k packages and
+        // keeping every edge would cost far more than the question is worth.
+        let mut imported: std::collections::HashMap<String, (usize, String)> =
+            std::collections::HashMap::new();
+        let mut tags: Vec<(String, String)> = Vec::new();
+        let mut assets: Vec<(String, String)> = Vec::new();
+        for utoc in &utocs {
+            let Ok(archive) = IoStoreArchive::open(utoc) else {
+                continue;
+            };
+            let label = utoc
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            for entry in archive.entries() {
+                let lower = entry.path.to_ascii_lowercase().replace('\\', "/");
+                if !lower.ends_with(".uasset") {
+                    continue;
+                }
+                let Ok(bytes) = archive.read(&entry.path) else {
+                    continue;
+                };
+                let Some(header) = header_of(&bytes) else {
+                    continue;
+                };
+                for import in &header.imported_package_names {
+                    let slot = imported
+                        .entry(import.to_ascii_lowercase())
+                        .or_insert((0, label.clone()));
+                    slot.0 += 1;
+                }
+                if lower.contains("/content/tags/") {
+                    tags.push((label.clone(), header.package_name()));
+                } else {
+                    // Everything that is not a tag: meshes, textures, materials,
+                    // Wwise events. These are what the *runtime* dereferences
+                    // through the import path, which a tag wrapper may never do
+                    // -- Campaign Evolved reads tag data through its own layer
+                    // and reaches the cooked asset directly. A rename experiment
+                    // on a tag can therefore pass while proving nothing.
+                    assets.push((label.clone(), header.package_name()));
+                }
+            }
+        }
+
+        let mut by_pak: std::collections::BTreeMap<&str, Vec<&str>> =
+            std::collections::BTreeMap::new();
+        // Exactly one referrer is what experiments B and C need: with more than
+        // one, a partial failure cannot be told from a partial success.
+        let mut single: Vec<(&str, &str, &str)> = Vec::new();
+        for (label, name) in &tags {
+            match imported.get(&name.to_ascii_lowercase()) {
+                None => by_pak.entry(label).or_default().push(name),
+                Some((1, referrer)) => single.push((label, name, referrer)),
+                Some(_) => {}
+            }
+        }
+        let free: usize = by_pak.values().map(Vec::len).sum();
+        let gb_of = |label: &str| {
+            std::fs::metadata(
+                std::path::Path::new(&root)
+                    .join(label)
+                    .with_extension("ucas"),
+            )
+            .map(|meta| meta.len() as f64 / 1024.0 / 1024.0 / 1024.0)
+            .unwrap_or(0.0)
+        };
+
+        println!("\ntag packages               {}", tags.len());
+        println!("with no importer at all    {free}");
+        println!("with exactly one importer  {}\n", single.len());
+        for (label, names) in &by_pak {
+            println!(
+                "{label:<28} {:>5} unimported  {:>6.2} GB ucas  e.g. {}",
+                names.len(),
+                gb_of(label),
+                names[0]
+            );
+        }
+
+        // Sorted so the cheapest pak to restore comes first, and same-pak
+        // referrers before cross-pak ones -- B is the experiment to run before
+        // C, because B failing makes C moot.
+        println!("\nsingle-importer candidates, cheapest pak first:");
+        single.sort_by(|a, b| {
+            // Same pak before cross-pak, then cheapest to restore first. The
+            // tuple compares a label against a label; comparing the package
+            // name against it instead silently sorts by nothing at all.
+            (a.0 != a.2).cmp(&(b.0 != b.2)).then(
+                gb_of(a.0)
+                    .partial_cmp(&gb_of(b.0))
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+        });
+        // Both kinds, cheapest of each, rather than the cheapest overall: the
+        // two are different experiments and the cost of running them differs by
+        // two orders of magnitude, so the choice is the caller's to make.
+        for (scope, cross) in [
+            ("B, referrer in the same pak", false),
+            ("C, referrer elsewhere", true),
+        ] {
+            println!("\n  experiment {scope}:");
+            let mut shown = 0;
+            for (label, name, referrer) in single.iter().filter(|(l, _, r)| (l != r) == cross) {
+                println!("  {:>6.2} GB  {label:<26} {name}", gb_of(label));
+                shown += 1;
+                if shown == 5 {
+                    break;
+                }
+            }
+            if shown == 0 {
+                println!("  (none)");
+            }
+        }
+        // Non-tag assets with exactly one referrer, in the cheapest paks. These
+        // are the only subjects that can actually falsify the redirect question:
+        // a mesh or texture that a single material or level imports is on the
+        // runtime's import path, so withholding the redirect has to break
+        // something visible. A test that cannot break anything cannot prove
+        // anything either.
+        let mut single_assets: Vec<(&str, &str, &str)> = assets
+            .iter()
+            .filter_map(
+                |(label, name)| match imported.get(&name.to_ascii_lowercase()) {
+                    Some((1, referrer)) => Some((label.as_str(), name.as_str(), referrer.as_str())),
+                    _ => None,
+                },
+            )
+            .collect();
+        single_assets.sort_by(|a, b| {
+            gb_of(a.0)
+                .partial_cmp(&gb_of(b.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        println!(
+            "\nnon-tag packages {}, of which {} have exactly one importer",
+            assets.len(),
+            single_assets.len()
+        );
+        println!("cheapest paks first:");
+        for (label, name, referrer) in single_assets.iter().take(20) {
+            println!(
+                "  {:>6.2} GB  {label:<26} {name}\n              imported by {referrer}",
+                gb_of(label)
+            );
+        }
+        // A named slice of the corpus, for picking a subject by what it *is*
+        // rather than by how cheap its pak is. Referrer counts here are UE
+        // imports only -- a tag is also reached through Halo's own reference
+        // path, which no count in this report can see, so a zero here does not
+        // mean nothing points at it.
+        if let Ok(filter) = std::env::var("CE_RENAME_FILTER") {
+            let filter = filter.to_ascii_lowercase();
+            let mut matched: Vec<(&str, &str, usize)> = tags
+                .iter()
+                .filter(|(_, name)| name.to_ascii_lowercase().contains(&filter))
+                .map(|(label, name)| {
+                    let count = imported
+                        .get(&name.to_ascii_lowercase())
+                        .map_or(0, |(count, _)| *count);
+                    (label.as_str(), name.as_str(), count)
+                })
+                .collect();
+            matched.sort_by_key(|(_, name, _)| *name);
+            println!("\n{} tags matching {filter:?}:", matched.len());
+            for (label, name, count) in matched.iter().take(40) {
+                println!("  {count:>3} importers  {label:<26} {name}");
+            }
+        }
+
+        assert!(!tags.is_empty(), "no tag package was found under CE_PAKS");
+    }
+
+    /// Move one package inside a copied install, and print what to watch for.
+    ///
+    /// Which experiment this is depends on what you point it at.
+    ///
+    /// **A — control.** No `CE_RENAME_PACKAGE`; a tag nothing imports is chosen
+    /// for you. This isolates the container surgery from the redirect question
+    /// entirely: if the level still loads, the TOC rewrite, the tombstones and
+    /// the store re-registration are all sound. If A fails, the redirect was
+    /// never the problem and the rest of the plan is moot.
+    ///
+    /// **B and C.** Name a package that something imports. One referrer in the
+    /// same pak is B; one in a different pak is C. B passing and C failing is
+    /// the signature of per-container redirect scoping, and it is the outcome
+    /// most likely to slip past casual testing.
+    ///
+    /// The decisive observable is not "does it look right" — it is the game's
+    /// own log. `LogStreaming` names the `FPackageId` in hex when a package
+    /// import fails to resolve, so the old id printed below is what to search
+    /// `Meteorite/Saved/Logs/*.log` for after loading a level.
+    ///
+    ///   CE_RENAME_EXPERIMENT=/path/to/a/COPY/of/Content/Paks \
+    ///     cargo test --release --features iostore rename_experiment \
+    ///       -- --ignored --nocapture
+    #[test]
+    #[ignore = "writes to a copied Campaign Evolved install; set CE_RENAME_EXPERIMENT"]
+    fn move_one_package_in_a_copied_install() {
+        let root = std::env::var("CE_RENAME_EXPERIMENT")
+            .expect("set CE_RENAME_EXPERIMENT to a COPY of the game's Content/Paks");
+        // The negative control, and the only thing that makes a positive result
+        // mean anything. If the referrer still resolves with no redirect
+        // installed, then whatever kept it working was never the redirect, and
+        // a passing run with one proves nothing about it.
+        let redirect = std::env::var("CE_RENAME_REDIRECT").as_deref() != Ok("0");
+        // The other gated tests read; this one writes. Pointing it at the
+        // install every other test measures would corrupt the baseline every
+        // later answer is compared against.
+        if let Ok(live) = std::env::var("CE_PAKS") {
+            let same = std::fs::canonicalize(&root)
+                .ok()
+                .zip(std::fs::canonicalize(&live).ok())
+                .is_some_and(|(a, b)| a == b);
+            assert!(
+                !same,
+                "CE_RENAME_EXPERIMENT points at the same directory as CE_PAKS.\n\
+                 Copy the Paks folder first — this test rewrites a .utoc in place."
+            );
+        }
+
+        let utocs = utocs_under(&root);
+        assert!(!utocs.is_empty(), "no pakchunk .utoc found under {root}");
+
+        // One pass over every package, collecting what each one imports. Cheaper
+        // than asking "who imports X?" per candidate, and it answers that for
+        // every package at once.
+        let mut imported: HashSet<String> = HashSet::new();
+        let mut referrers_of_target: Vec<(String, String)> = Vec::new();
+        let mut tags: Vec<(usize, String)> = Vec::new();
+        let mut found: Option<(usize, String)> = None;
+        let wanted = std::env::var("CE_RENAME_PACKAGE").ok();
+        let wanted_lower = wanted.as_ref().map(|name| name.to_ascii_lowercase());
+
+        for (index, utoc) in utocs.iter().enumerate() {
+            let Ok(archive) = IoStoreArchive::open(utoc) else {
+                continue;
+            };
+            let label = utoc
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            for entry in archive.entries() {
+                let lower = entry.path.to_ascii_lowercase().replace('\\', "/");
+                if !lower.ends_with(".uasset") {
+                    continue;
+                }
+                let Ok(bytes) = archive.read(&entry.path) else {
+                    continue;
+                };
+                let Some(header) = header_of(&bytes) else {
+                    continue;
+                };
+                let name = header.package_name();
+                // Located during the same pass that reads it, rather than by a
+                // second search afterwards. A named package and a reported
+                // candidate then agree by construction — a separate lookup can
+                // disagree with the scan about where a package is, and the
+                // failure looks like "not in any container" when it is right
+                // there.
+                if wanted_lower.as_deref() == Some(name.to_ascii_lowercase().as_str()) {
+                    found = Some((index, name.clone()));
+                }
+                for import in &header.imported_package_names {
+                    let import = import.to_ascii_lowercase();
+                    if wanted_lower.as_deref() == Some(import.as_str()) {
+                        referrers_of_target.push((name.clone(), label.clone()));
+                    }
+                    imported.insert(import);
+                }
+                if wanted.is_none() && lower.contains("/content/tags/") {
+                    tags.push((index, name));
+                }
+            }
+        }
+
+        let (container, package) = match wanted {
+            Some(package) => found.unwrap_or_else(|| {
+                panic!("no package under {root} is named {package}");
+            }),
+            None => {
+                let free: Vec<&(usize, String)> = tags
+                    .iter()
+                    .filter(|(_, name)| !imported.contains(&name.to_ascii_lowercase()))
+                    .collect();
+                println!(
+                    "{} of {} tag packages have no importer at all",
+                    free.len(),
+                    tags.len()
+                );
+                let chosen = free
+                    .first()
+                    .expect("no tag package is free of importers; name one with CE_RENAME_PACKAGE");
+                (chosen.0, chosen.1.clone())
+            }
+        };
+
+        let (parent, leaf) = split_package_path(&package);
+        let destination = format!("{parent}/baboonmoved-{leaf}");
+        let old_id = FPackageId::from_name(&package);
+        let new_id = FPackageId::from_name(&destination);
+        let utoc = &utocs[container];
+
+        println!("\n--- experiment ---");
+        println!("container   {}", utoc.display());
+        println!("from        {package}");
+        println!("to          {destination}");
+        println!("old id      0x{:016X}", old_id.0);
+        println!("new id      0x{:016X}", new_id.0);
+        println!(
+            "redirect    {}",
+            if redirect {
+                "installed"
+            } else {
+                "NONE - negative control"
+            }
+        );
+        println!("referrers   {}", referrers_of_target.len());
+        for (referrer, label) in &referrers_of_target {
+            let elsewhere = if label
+                == &utoc
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            {
+                "same pak"
+            } else {
+                "OTHER PAK — this is experiment C"
+            };
+            println!("            {referrer}  [{label}, {elsewhere}]");
+        }
+
+        let archive = IoStoreArchive::open(utoc).expect("open the container to write");
+        rename_package_in_place_with(
+            &archive,
+            utoc,
+            &InPlacePackageRename {
+                old_package_path: &package,
+                new_package_path: &destination,
+                replacement_export_bundle: None,
+                replacement_bulk_data: None,
+                minimum_appended_index: None,
+                redirect,
+            },
+        )
+        .expect("the rename itself");
+        drop(archive);
+
+        // Reopening proves only that the write is well-formed. It says nothing
+        // about the runtime, which is the entire point of the experiment.
+        let reopened = IoStoreArchive::open(utoc).expect("reopen after the rename");
+        assert!(
+            reopened
+                .find_chunk(&make_chunk_id(new_id.0, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA))
+                .is_some(),
+            "the package is at its new id"
+        );
+        assert!(
+            reopened
+                .find_chunk(&make_chunk_id(old_id.0, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA))
+                .is_none(),
+            "and no longer at the old one"
+        );
+
+        // Prove the redirect is in the container before any conclusion is drawn
+        // about whether the engine honours it. A negative in-game result means
+        // two completely different things depending on this, and the cheaper
+        // explanation -- that nothing was written -- has to be eliminated first.
+        if redirect {
+            let header_index = (0..reopened.chunk_count())
+                .find(|slot| {
+                    reopened
+                        .chunk_id(*slot)
+                        .is_ok_and(|id| id.chunk_type() == CHUNK_TYPE_CONTAINER_HEADER)
+                })
+                .expect("the container has a header chunk");
+            let header = FIoContainerHeader::deserialize(
+                &mut Cursor::new(reopened.read_chunk(header_index).expect("read header")),
+                None,
+            )
+            .expect("the container header parses");
+            match header.lookup_package_redirect(old_id) {
+                Some(target) if target == new_id => {
+                    println!("redirect verified in container: old -> new")
+                }
+                Some(other) => panic!("redirect points at 0x{:016X}, not the new id", other.0),
+                None => panic!("no redirect was written for 0x{:016X}", old_id.0),
+            }
+        }
+
+        println!("\nwritten. now run the copied install and load a level, then:");
+        println!("  grep -i {:016x} Meteorite/Saved/Logs/*.log", old_id.0);
+        println!(
+            "a hit is the runtime failing to resolve the old id — the redirect did not apply."
+        );
+        println!("no hit, and the asset renders: the redirect resolved imports.");
+    }
 }
 
 #[cfg(test)]
@@ -5326,5 +6641,566 @@ mod tests {
             assert_ne!(make_chunk_id(package_id.0, 0, chunk_type), retired_uasset);
             assert_ne!(make_chunk_id(package_id.0, 0, chunk_type), retired_ubulk);
         }
+    }
+
+    /// The id's index and type bytes have to survive the move; only the package
+    /// half changes. Byte substitution is used rather than `make_chunk_id`
+    /// because the two disagree about the index field's byte order, and every
+    /// call site passes zero, so nothing has ever settled it.
+    #[test]
+    fn retargeting_a_chunk_id_moves_only_the_package_half() {
+        let old = FIoChunkId([1, 2, 3, 4, 5, 6, 7, 8, 0xAA, 0xBB, 0xCC, CHUNK_TYPE_BULK_DATA]);
+        let moved = retarget_chunk_id(old, FPackageId(0x1122_3344_5566_7788));
+        assert_eq!(&moved.0[..8], &0x1122_3344_5566_7788u64.to_le_bytes());
+        assert_eq!(&moved.0[8..], &old.0[8..], "index, pad and type are carried");
+        assert_eq!(moved.chunk_type(), CHUNK_TYPE_BULK_DATA);
+
+        // At index 0 it agrees with `make_chunk_id`, which is the only shape
+        // anything in this crate has ever produced.
+        let zeroed = FIoChunkId([9, 9, 9, 9, 9, 9, 9, 9, 0, 0, 0, CHUNK_TYPE_BULK_DATA]);
+        assert_eq!(
+            retarget_chunk_id(zeroed, FPackageId(7)),
+            make_chunk_id(7, 0, CHUNK_TYPE_BULK_DATA)
+        );
+    }
+
+    /// The extension is carried from the directory index, never rebuilt from the
+    /// chunk type: `chunk_type_extension` has no `.umap` arm, so a level would
+    /// come back as `.uasset` and stop resolving.
+    #[test]
+    fn a_renamed_entry_path_keeps_its_extension_and_folder() {
+        let rename = |path: &str, old: &str, new: &str| rename_entry_path(path, old, new).unwrap();
+
+        assert_eq!(
+            rename(
+                "Meteorite/Content/Vehicles/SM_Warthog.uasset",
+                "/Game/Vehicles/SM_Warthog",
+                "/Game/Vehicles/SM_Scorpion"
+            ),
+            "Meteorite/Content/Vehicles/SM_Scorpion.uasset"
+        );
+        // A level keeps `.umap`.
+        assert_eq!(
+            rename(
+                "Meteorite/Content/Levels/C10.umap",
+                "/Game/Levels/C10",
+                "/Game/Levels/C20"
+            ),
+            "Meteorite/Content/Levels/C20.umap"
+        );
+        // A compound extension survives whole.
+        assert_eq!(
+            rename(
+                "Meteorite/Content/A/Mesh.m.ubulk",
+                "/Game/A/Mesh",
+                "/Game/A/Other"
+            ),
+            "Meteorite/Content/A/Other.m.ubulk"
+        );
+        // A folder move rewrites only the tail the package path names, keeping
+        // the container's own spelling of the mount prefix.
+        assert_eq!(
+            rename(
+                "Meteorite/Content/Vehicles/SM_Warthog.uasset",
+                "/Game/Vehicles/SM_Warthog",
+                "/Game/Props/Broken/SM_Warthog"
+            ),
+            "Meteorite/Content/Props/Broken/SM_Warthog.uasset"
+        );
+        // A chunk that is not where its package says it is has to be refused
+        // rather than guessed at.
+        assert!(
+            rename_entry_path(
+                "Meteorite/Content/Elsewhere/Other.uasset",
+                "/Game/Vehicles/SM_Warthog",
+                "/Game/Vehicles/SM_Scorpion"
+            )
+            .is_err()
+        );
+    }
+
+    fn rename_request<'a>(old: &'a str, new: &'a str) -> InPlacePackageRename<'a> {
+        InPlacePackageRename {
+            old_package_path: old,
+            new_package_path: new,
+            replacement_export_bundle: None,
+            replacement_bulk_data: None,
+            minimum_appended_index: None,
+            redirect: true,
+        }
+    }
+
+    fn container_header_of(archive: &IoStoreArchive) -> FIoContainerHeader {
+        let index = (0..archive.chunk_count())
+            .find(|index| {
+                archive
+                    .chunk_id(*index)
+                    .is_ok_and(|id| id.chunk_type() == CHUNK_TYPE_CONTAINER_HEADER)
+            })
+            .expect("the fixture has a container header");
+        FIoContainerHeader::deserialize(
+            &mut Cursor::new(archive.read_chunk(index).expect("read header")),
+            None,
+        )
+        .expect("container header parses")
+    }
+
+    #[test]
+    fn rename_moves_every_chunk_and_retires_the_old_slots() {
+        let (utoc, _source, source_header, old_uasset_path, old_ubulk_path, old_bulk) =
+            duplicate_fixture("rename", true, true);
+        let old_package = source_header.package_name();
+        let new_package = "/Game/Tags/Fixture/renamed-leading-empty";
+        let old_id = FPackageId::from_name(&old_package);
+        let new_id = FPackageId::from_name(new_package);
+
+        let original = parse_toc(&std::fs::read(&utoc).expect("read")).expect("parse");
+        let archive = IoStoreArchive::open(&utoc).expect("open fixture");
+        rename_package_in_place_with(&archive, &utoc, &rename_request(&old_package, new_package))
+            .expect("rename");
+        drop(archive);
+
+        let reopened = IoStoreArchive::open(&utoc).expect("reopen");
+        // One new slot per member; the old ones stay put, retired.
+        assert_eq!(reopened.chunk_count(), original.entry_count + 2);
+        for kind in [CHUNK_TYPE_EXPORT_BUNDLE_DATA, CHUNK_TYPE_BULK_DATA] {
+            assert!(
+                reopened
+                    .find_chunk(&make_chunk_id(new_id.0, 0, kind))
+                    .is_some(),
+                "the new chunk of type {kind} resolves"
+            );
+            assert!(
+                reopened
+                    .find_chunk(&make_chunk_id(old_id.0, 0, kind))
+                    .is_none(),
+                "the old chunk of type {kind} is gone"
+            );
+        }
+        // The payload came across untouched.
+        let bulk = reopened
+            .find_chunk(&make_chunk_id(new_id.0, 0, CHUNK_TYPE_BULK_DATA))
+            .expect("bulk chunk");
+        assert_eq!(reopened.read_chunk(bulk).expect("read bulk"), old_bulk);
+
+        // The package now says what it is called, and the index agrees.
+        let bundle = reopened
+            .find_chunk(&make_chunk_id(new_id.0, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA))
+            .expect("bundle chunk");
+        let header = FZenPackageHeader::deserialize(
+            &mut Cursor::new(reopened.read_chunk(bundle).expect("read bundle")),
+            None,
+            crate::iostore::compat::CE_TOC_VERSION,
+            crate::iostore::compat::CE_CONTAINER_HEADER_VERSION,
+            None,
+        )
+        .expect("the renamed package parses");
+        assert_eq!(header.package_name(), new_package);
+        let paths: Vec<&str> = reopened.entries().iter().map(|e| e.path.as_str()).collect();
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with("renamed-leading-empty.uasset"))
+        );
+        assert!(!paths.contains(&old_uasset_path.as_str()));
+        assert!(!paths.contains(&old_ubulk_path.as_str()));
+
+        // The store entry moved, and the old name still resolves.
+        let container = container_header_of(&reopened);
+        assert!(container.get_store_entry(new_id).is_some());
+        assert!(container.get_store_entry(old_id).is_none());
+        assert_eq!(container.lookup_package_redirect(old_id), Some(new_id));
+
+        drop(reopened);
+        remove_duplicate_fixture(&utoc);
+    }
+
+    /// Folders come free: `serialize_directory_index` creates intermediate
+    /// nodes on demand, so moving into a folder that does not exist makes it.
+    /// This is the same mechanism the browser's pending folders rely on.
+    #[test]
+    fn rename_into_a_new_folder_creates_the_intermediate_directories() {
+        let (utoc, _source, source_header, _old_uasset, _old_ubulk, _bulk) =
+            duplicate_fixture("renamefolder", true, true);
+        let old_package = source_header.package_name();
+        let new_package = "/Game/Tags/Fixture/New/Deeper/moved-leading-empty";
+
+        let archive = IoStoreArchive::open(&utoc).expect("open");
+        rename_package_in_place_with(&archive, &utoc, &rename_request(&old_package, new_package))
+            .expect("rename into a new folder");
+        drop(archive);
+
+        let reopened = IoStoreArchive::open(&utoc).expect("reopen");
+        assert!(
+            reopened.entries().iter().any(|entry| entry
+                .path
+                .replace('\\', "/")
+                .contains("Tags/Fixture/New/Deeper/moved-leading-empty.uasset")),
+            "the intermediate folders were materialised: {:?}",
+            reopened
+                .entries()
+                .iter()
+                .map(|entry| &entry.path)
+                .collect::<Vec<_>>()
+        );
+        drop(reopened);
+        remove_duplicate_fixture(&utoc);
+    }
+
+    /// Renaming A to B installs a redirect targeting B. Without retargeting,
+    /// renaming B to C would leave the first redirect pointing at a package
+    /// that is no longer there.
+    #[test]
+    fn renaming_twice_retargets_the_first_redirect() {
+        let (utoc, _source, source_header, _old_uasset, _old_ubulk, _bulk) =
+            duplicate_fixture("renametwice", true, true);
+        let first = source_header.package_name();
+        let second = "/Game/Tags/Fixture/second-name";
+        let third = "/Game/Tags/Fixture/third-name";
+
+        let archive = IoStoreArchive::open(&utoc).expect("open");
+        rename_package_in_place_with(&archive, &utoc, &rename_request(&first, second))
+            .expect("first rename");
+        drop(archive);
+        let archive = IoStoreArchive::open(&utoc).expect("reopen");
+        rename_package_in_place_with(&archive, &utoc, &rename_request(second, third))
+            .expect("second rename");
+        drop(archive);
+
+        let reopened = IoStoreArchive::open(&utoc).expect("reopen twice");
+        let container = container_header_of(&reopened);
+        let third_id = FPackageId::from_name(third);
+        assert_eq!(
+            container.lookup_package_redirect(FPackageId::from_name(&first)),
+            Some(third_id),
+            "the original name follows the whole chain"
+        );
+        assert_eq!(
+            container.lookup_package_redirect(FPackageId::from_name(second)),
+            Some(third_id)
+        );
+        drop(reopened);
+        remove_duplicate_fixture(&utoc);
+    }
+
+    /// `FPackageId::from_name` lowercases, so a case-only rename produces the
+    /// same id, and the addition would collide with its own tombstone.
+    #[test]
+    fn rename_refuses_a_case_only_change() {
+        let (utoc, _source, source_header, _old_uasset, _old_ubulk, _bulk) =
+            duplicate_fixture("renamecase", true, true);
+        let old_package = source_header.package_name();
+        let shouted = old_package.to_uppercase();
+        let archive = IoStoreArchive::open(&utoc).expect("open");
+        let error =
+            rename_package_in_place_with(&archive, &utoc, &rename_request(&old_package, &shouted))
+                .expect_err("a case-only rename is refused");
+        assert!(format!("{error}").contains("same id"), "{error}");
+        drop(archive);
+        remove_duplicate_fixture(&utoc);
+    }
+
+    /// Every step of the ladder restores the original `.utoc`. The appended
+    /// `.ucas` tail may remain as dead space, because it is unreachable.
+    #[test]
+    fn rename_rolls_back_after_each_injected_failure_point() {
+        for failure in [
+            DuplicateFailurePoint::AfterAppend,
+            DuplicateFailurePoint::AfterTocWrite,
+            DuplicateFailurePoint::BeforeValidation,
+        ] {
+            let (utoc, _source, source_header, _old_uasset, _old_ubulk, _bulk) =
+                duplicate_fixture(&format!("renameroll{failure:?}"), true, true);
+            let old_package = source_header.package_name();
+            let before = std::fs::read(&utoc).expect("original TOC");
+            let archive = IoStoreArchive::open(&utoc).expect("open");
+            let result = rename_package_in_place_with_failure_for_test(
+                &archive,
+                &utoc,
+                &rename_request(&old_package, "/Game/Tags/Fixture/rolled-back"),
+                failure,
+            );
+            drop(archive);
+            assert!(result.is_err(), "{failure:?} must fail");
+            assert_eq!(
+                std::fs::read(&utoc).expect("restored TOC"),
+                before,
+                "{failure:?} left the TOC as it was"
+            );
+            // And the container still opens with the package where it started.
+            let reopened = IoStoreArchive::open(&utoc).expect("reopen after rollback");
+            let old_id = FPackageId::from_name(&old_package);
+            assert!(
+                reopened
+                    .find_chunk(&make_chunk_id(old_id.0, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA))
+                    .is_some()
+            );
+            drop(reopened);
+            remove_duplicate_fixture(&utoc);
+        }
+    }
+
+    /// An overlay lists nothing, so paths are inert there and only ids matter.
+    #[test]
+    fn rename_works_on_an_indexless_container() {
+        let (utoc, _source, source_header, _old_uasset, _old_ubulk, _bulk) =
+            duplicate_fixture("renamebare", true, false);
+        let old_package = source_header.package_name();
+        let new_package = "/Game/Tags/Fixture/bare-renamed";
+        let archive = IoStoreArchive::open(&utoc).expect("open");
+        assert!(!archive.has_directory_index());
+        rename_package_in_place_with(&archive, &utoc, &rename_request(&old_package, new_package))
+            .expect("rename an indexless container");
+        drop(archive);
+
+        let reopened = IoStoreArchive::open(&utoc).expect("reopen");
+        let new_id = FPackageId::from_name(new_package);
+        assert!(
+            reopened
+                .find_chunk(&make_chunk_id(new_id.0, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA))
+                .is_some()
+        );
+        drop(reopened);
+        remove_duplicate_fixture(&utoc);
+    }
+
+    /// The operation is reversible, which is a good part of what makes it safe
+    /// to offer at all.
+    #[test]
+    fn a_renamed_package_can_be_renamed_back() {
+        let (utoc, _source, source_header, old_uasset_path, _old_ubulk, old_bulk) =
+            duplicate_fixture("renameback", true, true);
+        let old_package = source_header.package_name();
+        let moved = "/Game/Tags/Fixture/temporarily-moved";
+
+        let archive = IoStoreArchive::open(&utoc).expect("open");
+        rename_package_in_place_with(&archive, &utoc, &rename_request(&old_package, moved))
+            .expect("rename out");
+        drop(archive);
+        let archive = IoStoreArchive::open(&utoc).expect("reopen");
+        rename_package_in_place_with(&archive, &utoc, &rename_request(moved, &old_package))
+            .expect("rename back");
+        drop(archive);
+
+        let reopened = IoStoreArchive::open(&utoc).expect("reopen twice");
+        let old_id = FPackageId::from_name(&old_package);
+        let bulk = reopened
+            .find_chunk(&make_chunk_id(old_id.0, 0, CHUNK_TYPE_BULK_DATA))
+            .expect("the package is back");
+        assert_eq!(
+            reopened.read_chunk(bulk).expect("read"),
+            old_bulk,
+            "the payload survived the round trip"
+        );
+        assert!(
+            reopened
+                .entries()
+                .iter()
+                .any(|entry| entry.path == old_uasset_path),
+            "and so did its path"
+        );
+        drop(reopened);
+        remove_duplicate_fixture(&utoc);
+    }
+
+    /// A package that has been renamed before must still be renamable.
+    ///
+    /// It was not: the container header populated its localized-source set from
+    /// `package_redirects` instead of `localized_packages`, so re-parsing a
+    /// container reported every redirect's source as a localized package — and
+    /// both rename and delete refuse one of those. A rename installs a redirect,
+    /// so the second move of a package was refused, with a message about
+    /// localization that had nothing to do with what the caller had done.
+    #[test]
+    fn a_package_can_be_moved_again_after_a_round_trip_left_redirects_behind() {
+        let (utoc, _source, source_header, _old_uasset, _old_ubulk, _bulk) =
+            duplicate_fixture("renamerelocalized", true, true);
+        let home = source_header.package_name();
+        let away = "/Game/Tags/Fixture/away-empty";
+        let onward = "/Game/Tags/Fixture/onward-empty";
+
+        for (from, to) in [(home.as_str(), away), (away, home.as_str())] {
+            let archive = IoStoreArchive::open(&utoc).expect("open");
+            rename_package_in_place_with(&archive, &utoc, &rename_request(from, to))
+                .expect("the round trip itself works");
+            drop(archive);
+        }
+        // Redirects now name both paths as sources; neither is localized.
+        let reopened = IoStoreArchive::open(&utoc).expect("reopen");
+        let header = container_header_of(&reopened);
+        assert!(!header.is_localized_source(FPackageId::from_name(&home)));
+        assert!(!header.is_localized_source(FPackageId::from_name(away)));
+        drop(reopened);
+
+        let archive = IoStoreArchive::open(&utoc).expect("reopen");
+        rename_package_in_place_with(&archive, &utoc, &rename_request(&home, onward))
+            .expect("and the package can still be moved on");
+        drop(archive);
+        remove_duplicate_fixture(&utoc);
+    }
+
+    /// The group half of the leaf names the wrapper's native class, which no
+    /// package path can redefine — so this is refused rather than written and
+    /// discovered at load.
+    #[test]
+    fn a_tag_cannot_be_renamed_into_a_different_group() {
+        let (utoc, _source, source_header, _uasset, _ubulk, _bulk) =
+            duplicate_fixture("renametaggroup", true, true);
+        let tag_package = source_header.package_name();
+        let (stem, group) = tag_package.rsplit_once('-').expect("the fixture is a tag");
+        assert_ne!(group, "biped");
+        let other_group = format!("{stem}-biped");
+        let before = std::fs::read(&utoc).expect("TOC before");
+
+        let archive = IoStoreArchive::open(&utoc).expect("open");
+        let error = rename_tag_in_place_with(
+            &archive,
+            &utoc,
+            &InPlaceTagRename {
+                old_package_path: &tag_package,
+                new_package_path: &other_group,
+                tag_bytes: None,
+                minimum_appended_index: None,
+                redirect: true,
+            },
+        )
+        .expect_err("a group change is refused");
+        assert!(format!("{error}").contains("different group"), "{error}");
+        drop(archive);
+        assert_eq!(
+            std::fs::read(&utoc).expect("TOC after"),
+            before,
+            "and nothing was written"
+        );
+
+        // The same move within the group is allowed, so the refusal is about
+        // the group and not about the rename.
+        let within_group = format!("/Game/Tags/Fixture/Elsewhere/renamed-{group}");
+        let archive = IoStoreArchive::open(&utoc).expect("reopen");
+        rename_tag_in_place_with(
+            &archive,
+            &utoc,
+            &InPlaceTagRename {
+                old_package_path: &tag_package,
+                new_package_path: &within_group,
+                tag_bytes: None,
+                minimum_appended_index: None,
+                redirect: true,
+            },
+        )
+        .expect("a rename within the group is a plain move");
+        drop(archive);
+        remove_duplicate_fixture(&utoc);
+    }
+
+    /// A package outside the tag layout has no group to preserve, so the
+    /// wrapper cannot speak for it — in either direction. The general primitive
+    /// still can, which is why this refuses rather than falling back to it.
+    #[test]
+    fn a_package_outside_the_tag_layout_is_not_a_tag_rename() {
+        let (utoc, _source, source_header, _uasset, _ubulk, _bulk) =
+            duplicate_fixture("renamenontag", true, true);
+        let tag_package = source_header.package_name();
+        let archive = IoStoreArchive::open(&utoc).expect("open");
+
+        for (old, new) in [
+            ("/Game/Meshes/SM_Warthog", "/Game/Meshes/SM_Scorpion"),
+            (tag_package.as_str(), "/Game/Meshes/SM_Scorpion"),
+            ("/Game/Tags/Fixture/no-extension-here/", tag_package.as_str()),
+        ] {
+            let error = rename_tag_in_place_with(
+                &archive,
+                &utoc,
+                &InPlaceTagRename {
+                    old_package_path: old,
+                    new_package_path: new,
+                    tag_bytes: None,
+                    minimum_appended_index: None,
+                    redirect: true,
+                },
+            )
+            .expect_err("the wrapper refuses a non-tag path");
+            // Refused on the path alone, before the container is consulted.
+            assert!(format!("{error}").contains("/Game/Tags/"), "{error}");
+        }
+        drop(archive);
+        remove_duplicate_fixture(&utoc);
+    }
+
+    /// Renaming a tag whose body was edited is one transaction, not a save
+    /// followed by a move. The body's length lives in the package header, so
+    /// the two have to move together or the chunk reads short.
+    #[test]
+    fn renaming_a_tag_installs_an_edited_body_in_the_same_transaction() {
+        use crate::iostore::compat::{CE_CONTAINER_HEADER_VERSION, CE_TOC_VERSION};
+
+        let (utoc, _source, source_header, _uasset, _ubulk, old_bulk) =
+            duplicate_fixture("renametagbody", true, true);
+        let tag_package = source_header.package_name();
+        let group = tag_package.rsplit_once('-').expect("the fixture is a tag").1;
+        let new_package = format!("/Game/Tags/Fixture/edited-{group}");
+        let new_package = new_package.as_str();
+        let new_body = vec![0x5au8; old_bulk.len() + 41];
+
+        let serial_size_of = |archive: &IoStoreArchive, package: &str| -> i64 {
+            let id = FPackageId::from_name(package);
+            let index = archive
+                .find_chunk(&make_chunk_id(id.0, 0, CHUNK_TYPE_EXPORT_BUNDLE_DATA))
+                .expect("the package has an export bundle chunk");
+            let bytes = archive.read_chunk(index).expect("read the bundle");
+            let header = FZenPackageHeader::deserialize(
+                &mut Cursor::new(&bytes),
+                None,
+                CE_TOC_VERSION,
+                CE_CONTAINER_HEADER_VERSION,
+                None,
+            )
+            .expect("the bundle parses");
+            assert_eq!(header.bulk_data.len(), 1);
+            header.bulk_data[0].serial_size
+        };
+
+        let archive = IoStoreArchive::open(&utoc).expect("open");
+        let before = serial_size_of(&archive, &tag_package);
+        rename_tag_in_place_with(
+            &archive,
+            &utoc,
+            &InPlaceTagRename {
+                old_package_path: &tag_package,
+                new_package_path: new_package,
+                tag_bytes: Some(&new_body),
+                minimum_appended_index: None,
+                redirect: true,
+            },
+        )
+        .expect("rename and install the edited body");
+        drop(archive);
+
+        let reopened = IoStoreArchive::open(&utoc).expect("reopen");
+        let new_id = FPackageId::from_name(new_package);
+        let bulk = reopened
+            .find_chunk(&make_chunk_id(new_id.0, 0, CHUNK_TYPE_BULK_DATA))
+            .expect("the renamed tag has a bulk chunk");
+        assert_eq!(
+            reopened.read_chunk(bulk).expect("read the body"),
+            new_body,
+            "the edited body is what landed"
+        );
+        assert_ne!(before, new_body.len() as i64, "the length really changed");
+        assert_eq!(
+            serial_size_of(&reopened, new_package),
+            new_body.len() as i64,
+            "and the header says so"
+        );
+        // The path moved too, so this is a rename and not an overwrite.
+        let moved_leaf = format!("{}.ubulk", split_package_path(new_package).1);
+        assert!(
+            reopened
+                .entries()
+                .iter()
+                .any(|entry| entry.path.ends_with(&moved_leaf))
+        );
+        drop(reopened);
+        remove_duplicate_fixture(&utoc);
     }
 }

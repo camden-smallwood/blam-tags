@@ -1615,26 +1615,12 @@ fn read_regions(root: &TagStruct<'_>, game: Game) -> Result<Vec<Region>, RenderM
         .ok_or(RenderModelError::MissingField("regions"))?;
     // H2 maps a permutation to geometry by an LOD section index, and
     // `derive_render_meshes_h2` emits one `RenderMesh` per section (section i ->
-    // mesh i). For the preview we want the HIGHEST-detail section. The loose-tag
-    // `Lx section index` slots are unreliable (often garbage for the high LODs —
-    // e.g. rocket_launcher's L1/L2 are stale 24932/25714 while L3..L6 point at the
-    // 56-vtx low LOD, with the 1458-vtx mesh referenced by nobody), so pick by
-    // VERTEX COUNT instead of trusting the ordering.
-    let section_verts: Vec<u32> = root
+    // mesh i). For the preview we want the HIGHEST-detail section.
+    let section_count = root
         .field("sections")
         .and_then(|f| f.as_block())
-        .map(|b| {
-            (0..b.len())
-                .map(|s| {
-                    b.element(s)
-                        .and_then(|e| e.read_int_any("total vertex count"))
-                        .unwrap_or(0)
-                        .max(0) as u32
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let single_region = block.len() == 1;
+        .map(|b| b.len())
+        .unwrap_or(0);
     let mut out = Vec::with_capacity(block.len());
     for i in 0..block.len() {
         let r = block.element(i).unwrap();
@@ -1644,7 +1630,7 @@ fn read_regions(root: &TagStruct<'_>, game: Game) -> Result<Vec<Region>, RenderM
             for j in 0..perms.len() {
                 let p = perms.element(j).unwrap();
                 let (mesh_index, mesh_count) = if matches!(game, Game::Halo2) {
-                    (h2_permutation_section(&p, &section_verts, single_region), 1)
+                    (h2_permutation_section(&p, section_count), 1)
                 } else {
                     (
                         p.read_int_any("mesh index").unwrap_or(-1) as i16,
@@ -1669,33 +1655,29 @@ fn read_regions(root: &TagStruct<'_>, game: Game) -> Result<Vec<Region>, RenderM
     Ok(out)
 }
 
-/// Resolve an H2 permutation to its highest-detail section, by VERTEX COUNT
-/// (loose-tag `Lx section index` ordering is unreliable). Candidates are the
-/// permutation's in-range `L1..L6 section index` values; for a single-region
-/// model the candidates are ALL sections (they're that region's LODs, and the
-/// high-detail one is often referenced only by a garbage index). Returns the
-/// section index (= the `RenderMesh` index from `derive_render_meshes_h2`), or
-/// `-1` for an FX/empty permutation.
-fn h2_permutation_section(p: &TagStruct<'_>, section_verts: &[u32], single_region: bool) -> i16 {
-    let n = section_verts.len();
-    let candidates: Vec<usize> = if single_region {
-        (0..n).collect()
-    } else {
-        ["L1 section index", "L2 section index", "L3 section index",
-         "L4 section index", "L5 section index", "L6 section index"]
-            .iter()
-            .filter_map(|f| {
-                p.read_int_any(f)
-                    .map(|v| v as i64)
-                    .filter(|&v| v >= 0 && (v as usize) < n)
-                    .map(|v| v as usize)
-            })
-            .collect()
-    };
-    candidates
-        .into_iter()
-        .max_by_key(|&s| section_verts[s])
-        .map(|s| s as i16)
+/// Resolve an H2 permutation to its highest-detail section: the last in-range
+/// `L1..L6 section index`, scanning L6 first.
+///
+/// L6 is the high-detail end. The owning `model` (hlmt) states the ladder as
+/// `reduce to L1..L5` DISTANCES — the distance at which the object drops to
+/// that level — and those run strictly DOWNWARD (e.g. mongoose 36.1, 32.1,
+/// 20.0, 18.0, 0.0). L1 is therefore what you see farthest away, L6 what you
+/// see up close, which is what a preview should draw. Verified over the whole
+/// H2 kit: descending in all 224 models that state more than one distinct
+/// distance, ascending in none.
+///
+/// Returns the section index (= the `RenderMesh` index from
+/// `derive_render_meshes_h2`), or `-1` for an FX/empty permutation.
+fn h2_permutation_section(p: &TagStruct<'_>, section_count: usize) -> i16 {
+    ["L6 section index", "L5 section index", "L4 section index",
+     "L3 section index", "L2 section index", "L1 section index"]
+        .iter()
+        .find_map(|f| {
+            p.read_int_any(f)
+                .map(|v| v as i64)
+                .filter(|&v| v >= 0 && (v as usize) < section_count)
+        })
+        .map(|v| v as i16)
         .unwrap_or(-1)
 }
 
@@ -3292,5 +3274,65 @@ mod tests {
         let rm = RenderModel::default();
         let pose: Vec<RealOrientation> = rm.node_bind_pose();
         assert!(pose.is_empty());
+    }
+
+    /// Each Halo 2 permutation gets the section its own `L1..L6 section index`
+    /// slots name, high end first — not whichever section happens to be the
+    /// largest or last.
+    ///
+    /// The rule this replaced resolved by vertex count, reading
+    /// `total vertex count` off the section element root. That field lives one
+    /// level down in `section info`, so the read returned `None` for all 3,289
+    /// sections in the kit and every weight was 0. `max_by_key` keeps the LAST
+    /// maximum, so a single-region model resolved EVERY permutation to the last
+    /// section: h_turret_mp drew its 357-vertex `destroyed` LOD for both
+    /// permutations, and no variant could look different from any other. 33
+    /// regions across the kit collapsed that way.
+    ///
+    /// Ignored by default — it needs a loose Halo 2 tag tree.
+    ///
+    /// Run with:
+    ///   H2_TAGS=~/Halo/halo2_mcc/tags H2_DEFS=<definitions>/halo2_mcc \
+    ///     cargo test halo2_permutation -- --ignored
+    #[test]
+    #[ignore = "requires a loose Halo 2 tag tree; set H2_TAGS and H2_DEFS"]
+    fn halo2_permutation_draws_the_section_its_own_lod_slots_name() {
+        let (Ok(tags), Ok(defs)) = (std::env::var("H2_TAGS"), std::env::var("H2_DEFS")) else {
+            eprintln!("skipping: set H2_TAGS and H2_DEFS");
+            return;
+        };
+        let path = std::path::PathBuf::from(tags)
+            .join("objects/weapons/fixed/h_turret_mp/h_turret_mp.render_model");
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let layout =
+            crate::TagLayout::from_json(std::path::PathBuf::from(defs).join("render_model.json"))
+                .expect("render_model layout");
+        let tag = crate::classic::read_classic_tag_file(&bytes, layout).expect("decode h_turret_mp");
+
+        let model = RenderModel::from_tag(&tag).expect("read model");
+        let meshes = RenderModel::derive_render_meshes(&tag).expect("derive meshes");
+
+        // The premise: one region, so the collapse had nothing to disambiguate.
+        assert_eq!(model.regions.len(), 1, "h_turret_mp has a single region");
+        let perms = &model.regions[0].permutations;
+        assert_eq!(perms.len(), 2, "base and destroyed");
+
+        // `base` L1..L6 = [0,0,0,2,4,4], `destroyed` = [1,1,1,3,5,5]. The high
+        // end of each ladder is what the game draws up close.
+        assert_eq!(perms[0].mesh_index, 4, "base resolves to its own L6 section");
+        assert_eq!(perms[1].mesh_index, 5, "destroyed resolves to its own L6 section");
+        assert_ne!(
+            perms[0].mesh_index, perms[1].mesh_index,
+            "two permutations that share a section render identically"
+        );
+        assert_eq!(meshes[4].vertices.len(), 865, "base is the full-detail gun");
+        assert_eq!(meshes[5].vertices.len(), 357);
+
+        // Every section this tag ships is named by some permutation, so nothing
+        // needs to be recovered by guessing at sizes.
+        let named: std::collections::BTreeSet<i16> =
+            perms.iter().map(|p| p.mesh_index).collect();
+        assert_eq!(named.len(), 2);
     }
 }

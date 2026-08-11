@@ -62,6 +62,151 @@ pub enum HandWritten {
     MaterialLayersTree(MaterialLayersTree),
 }
 
+impl HandWritten {
+    /// Visit every [`FName`] this value carries — see
+    /// [`super::value::PropertyBlock::visit_names_mut`].
+    ///
+    /// Exhaustive on purpose: a variant that quietly stopped being visited would
+    /// leave stale resolved text behind a rename, and nothing about the file
+    /// would look wrong.
+    pub fn visit_names_mut(&mut self, f: &mut dyn FnMut(&mut FName)) {
+        match self {
+            HandWritten::NiagaraVariable(variable) => {
+                f(&mut variable.name);
+                variable.type_def.visit_names_mut(f);
+                // `NiagaraPayload` is an offset or opaque bytes.
+            }
+            HandWritten::NiagaraGpuParamInfo(info) => {
+                for function in &mut info.generated_functions {
+                    f(&mut function.definition_name);
+                    for (key, value) in &mut function.specifiers {
+                        f(key);
+                        f(value);
+                    }
+                    for reference in function
+                        .variadic_inputs
+                        .iter_mut()
+                        .chain(function.variadic_outputs.iter_mut())
+                    {
+                        f(&mut reference.name);
+                    }
+                }
+            }
+            HandWritten::Text(text) => text.visit_names_mut(f),
+            HandWritten::MovieSceneInlineValue(value) => {
+                if let Some(payload) = &mut value.payload {
+                    payload.visit_names_mut(f);
+                }
+            }
+            HandWritten::ShaderValueType(ty) => ty.visit_names_mut(f),
+            HandWritten::MaterialOverrideNanite(nanite) => nanite.properties.visit_names_mut(f),
+            HandWritten::TimeWarpVariant(variant) => match variant {
+                TimeWarpVariant::Typed { payload, .. } => {
+                    if let Some(payload) = payload {
+                        payload.visit_names_mut(f);
+                    }
+                }
+                TimeWarpVariant::Literal(_) => {}
+            },
+            HandWritten::LocatorFragment(fragment) => {
+                f(&mut fragment.fragment_type);
+                if let Some(payload) = &mut fragment.payload {
+                    payload.visit_names_mut(f);
+                }
+            }
+            HandWritten::InstancedPropertyBag(bag) => {
+                if let Some(descriptors) = &mut bag.descriptors {
+                    for descriptor in descriptors {
+                        f(&mut descriptor.name);
+                    }
+                }
+                if let Some(values) = &mut bag.values {
+                    values.visit_names_mut(f);
+                }
+            }
+            // Numeric, string or opaque throughout.
+            HandWritten::MovieSceneChannel(_)
+            | HandWritten::PcgPoint(_)
+            | HandWritten::SkeletalMeshSamplingLod(_)
+            | HandWritten::SkeletalMeshSamplingRegion(_)
+            | HandWritten::EvaluationTree(_)
+            | HandWritten::PerQualityLevel(_)
+            | HandWritten::FontData(_)
+            | HandWritten::MaterialLayersTree(_) => {}
+        }
+    }
+}
+
+impl TextValue {
+    pub fn visit_names_mut(&mut self, f: &mut dyn FnMut(&mut FName)) {
+        self.history.visit_names_mut(f);
+    }
+}
+
+impl TextHistory {
+    pub fn visit_names_mut(&mut self, f: &mut dyn FnMut(&mut FName)) {
+        match self {
+            TextHistory::StringTableEntry { table_id, .. } => f(table_id),
+            TextHistory::TextGenerator {
+                generator_type_id, ..
+            } => f(generator_type_id),
+            TextHistory::OrderedFormat {
+                source_fmt,
+                arguments,
+            } => {
+                source_fmt.visit_names_mut(f);
+                for argument in arguments {
+                    argument.visit_names_mut(f);
+                }
+            }
+            TextHistory::NamedFormat {
+                source_fmt,
+                arguments,
+                ..
+            } => {
+                source_fmt.visit_names_mut(f);
+                for (_, argument) in arguments {
+                    argument.visit_names_mut(f);
+                }
+            }
+            TextHistory::AsNumber { source_value, .. } => source_value.visit_names_mut(f),
+            TextHistory::Transform { source_text, .. } => source_text.visit_names_mut(f),
+            // Strings and numbers only.
+            TextHistory::None { .. }
+            | TextHistory::Base { .. }
+            | TextHistory::AsDateTime { .. } => {}
+        }
+    }
+}
+
+impl TextFormatArgument {
+    pub fn visit_names_mut(&mut self, f: &mut dyn FnMut(&mut FName)) {
+        match self {
+            TextFormatArgument::Text(text) => text.visit_names_mut(f),
+            TextFormatArgument::Int(_)
+            | TextFormatArgument::UInt(_)
+            | TextFormatArgument::Float(_)
+            | TextFormatArgument::Double(_)
+            | TextFormatArgument::Gender(_) => {}
+        }
+    }
+}
+
+impl ShaderValueType {
+    pub fn visit_names_mut(&mut self, f: &mut dyn FnMut(&mut FName)) {
+        match &mut self.body {
+            ShaderValueTypeBody::Struct { name, elements } => {
+                f(name);
+                for (element_name, element) in elements {
+                    f(element_name);
+                    element.visit_names_mut(f);
+                }
+            }
+            ShaderValueTypeBody::Dimension { .. } => {}
+        }
+    }
+}
+
 /// `FInstancedPropertyBag`: a struct type invented at runtime.
 ///
 /// The payload is **not** a `TArray<uint8>`. `Serialize` (PropertyBag.cpp:2295)
