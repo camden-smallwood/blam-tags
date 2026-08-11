@@ -803,7 +803,7 @@ mod new_package_corpus {
     use crate::iostore::package::builder::read_payloads;
     use crate::iostore::ue_types::EIoStoreTocVersion;
     use crate::iostore::usmap::Usmap;
-    use crate::iostore::writer::{write_new_tag_container, NewPackage};
+    use crate::iostore::writer::{write_new_tag_container, NewPackage, WrapperOrigin};
     use crate::iostore::IoStoreArchive;
     use std::io::Cursor;
     use std::path::PathBuf;
@@ -887,6 +887,8 @@ mod new_package_corpus {
                             package.rsplit('/').next().unwrap()
                         )),
                     }),
+                    // A donated template, which is what makes stripping right.
+                    origin: WrapperOrigin::Template,
                 }],
                 &out,
             )
@@ -960,6 +962,190 @@ mod new_package_corpus {
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// A copy keeps the bindings of the tag it was copied from.
+    ///
+    /// The mirror of the test above, and the pair is the point: seeded from an
+    /// unrelated donor, a new tag must *not* inherit its bindings; copied, it
+    /// must keep them, because there the donor is the original. One
+    /// [`WrapperOrigin`] decides which.
+    ///
+    /// A `model` donor, because that is the case that failed loudly. Stripping
+    /// rebuilds the import map from the script slots alone, on the premise that
+    /// every package import served `AssetReference` or
+    /// `CookedAssetsReferencedByTag`. `BlamModelTagDataAsset` has a third such
+    /// property -- `ModelRegionStringTable`, on 364 of the shipped models -- so
+    /// stripping orphaned it and the writer refused to ship the dangling
+    /// reference. Copying a character's model could not be exported at all.
+    ///
+    ///   CE_PAKS=... cargo test --features iostore a_copied_tag -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires a Campaign Evolved install; set CE_PAKS"]
+    fn a_copied_tag_keeps_its_own_bindings() {
+        let archives = open_shipped_archives();
+        let usmap = Usmap::meteorite().expect("bundled usmap");
+
+        // A model that carries a region table: the shape that could not be copied.
+        let mut donor = None;
+        'outer: for archive in &archives {
+            for entry in archive.entries() {
+                let lower = entry.path.to_ascii_lowercase().replace('\\', "/");
+                if !lower.ends_with("-model.uasset") || !lower.contains("/content/tags/") {
+                    continue;
+                }
+                let Ok(bytes) = archive.read(&entry.path) else { continue };
+                let Ok(header) =
+                    FZenPackageHeader::deserialize(&mut Cursor::new(&bytes[..]), None, CV, HV, None)
+                else {
+                    continue;
+                };
+                let Ok(payloads) = read_payloads(&header, &bytes) else { continue };
+                let names = header.name_map.copy_raw_names();
+                let Ok(export) = read_export(
+                    &payloads[0],
+                    &names,
+                    &usmap,
+                    "BlamModelTagDataAsset",
+                    header.export_map[0].object_flags,
+                ) else {
+                    continue;
+                };
+                let has_table = export
+                    .properties()
+                    .and_then(|b| b.get("ModelRegionStringTable"))
+                    .is_some();
+                if !has_table {
+                    continue;
+                }
+                let ubulk = entry.path.trim_end_matches(".uasset").to_owned() + ".ubulk";
+                let Ok(tag) = archive.read(&ubulk) else { continue };
+                donor = Some((bytes, tag, header, export));
+                break 'outer;
+            }
+        }
+        let (template, tag_bytes, donor_header, donor_export) =
+            donor.expect("a model donor carrying a ModelRegionStringTable");
+
+        // What the donor names, resolved through its own import map, so the copy
+        // can be compared against a package path rather than an index that both
+        // sides could get wrong in the same way.
+        let donor_block = donor_export.properties().expect("a block");
+        let donor_target = {
+            let Some(PropValue::Object(i)) =
+                donor_block.get("ModelRegionStringTable").map(PropValue::unwrapped)
+            else {
+                panic!("the donor's ModelRegionStringTable is not an object");
+            };
+            let slots = read_import_slots(&donor_header).expect("donor slots");
+            let ImportSlot::Package(target) =
+                &slots[import_slot_of(*i).expect("an import")]
+            else {
+                panic!("the donor's region table is not a package import");
+            };
+            target.package.clone()
+        };
+        println!("donor region table -> {donor_target}");
+
+        const NEW_PKG: &str = "/Game/Tags/objects/characters/test/probe_copy-model";
+        let dir = std::env::temp_dir().join(format!("blam-copytag-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let out = dir.join("probe-WinGDK_P.utoc");
+
+        let package = |origin| NewPackage {
+            template_uasset: &template,
+            tag_bytes: &tag_bytes,
+            new_package_path: NEW_PKG,
+            redirect_from: None,
+            asset_reference: None,
+            origin,
+        };
+
+        // The control that disagrees: as a donated template this is exactly the
+        // refusal users hit, so a copy passing means the origin was read, not
+        // that the guard stopped applying.
+        let stripped = crate::iostore::writer::write_mod_container_ex(
+            &[],
+            &[package(WrapperOrigin::Template)],
+            &dir.join("as-template.utoc"),
+        );
+        assert!(
+            stripped.is_err(),
+            "a model donated as a template should still be refused; the control proves \
+             this donor is one the strip path cannot handle"
+        );
+        println!("as a template: {}", stripped.unwrap_err());
+
+        crate::iostore::writer::write_mod_container_ex(
+            &[],
+            &[package(WrapperOrigin::Copy)],
+            &out,
+        )
+        .expect("a copy writes");
+
+        // Read the copy back out of the container.
+        let modded = IoStoreArchive::open(&out).expect("open the new container");
+        let id = crate::iostore::writer::make_chunk_id(
+            FPackageId::from_name(NEW_PKG).0,
+            0,
+            crate::iostore::CHUNK_TYPE_EXPORT_BUNDLE,
+        );
+        let index = modded.find_chunk(&id).expect("the container carries the wrapper");
+        let bytes = modded.read_chunk(index).expect("read the wrapper");
+        let header =
+            FZenPackageHeader::deserialize(&mut Cursor::new(&bytes[..]), None, CV, HV, None)
+                .expect("the copy's wrapper parses");
+
+        let payloads = read_payloads(&header, &bytes).expect("payloads");
+        let names = header.name_map.copy_raw_names();
+        let export = read_export(
+            &payloads[0],
+            &names,
+            &usmap,
+            "BlamModelTagDataAsset",
+            header.export_map[0].object_flags,
+        )
+        .expect("the copy's wrapper decodes");
+        let block = export.properties().expect("a block");
+
+        // The binding survives, and resolves to the same asset the original
+        // named -- referencing the shipped asset rather than duplicating it,
+        // which is what the shipped data does too: 364 models share 118 tables.
+        let Some(PropValue::Object(i)) =
+            block.get("ModelRegionStringTable").map(PropValue::unwrapped)
+        else {
+            panic!("the copy lost its ModelRegionStringTable");
+        };
+        let slots = read_import_slots(&header).expect("slots");
+        let ImportSlot::Package(target) = &slots[import_slot_of(*i).expect("an import")] else {
+            panic!("the copy's region table is not a package import");
+        };
+        assert_eq!(
+            target.package, donor_target,
+            "the copy should name the same region table the original did"
+        );
+        assert!(
+            header.imported_package_names.contains(&donor_target),
+            "the copy should declare the region table it references"
+        );
+
+        // The dependency list carries over too: a copy depends on what the
+        // original depended on.
+        assert_eq!(
+            block.get("CookedAssetsReferencedByTag").is_some(),
+            donor_block.get("CookedAssetsReferencedByTag").is_some(),
+            "a copy should keep the original's dependency list"
+        );
+
+        // Identity is still retargeted -- a copy is a different tag.
+        assert_eq!(header.package_name(), NEW_PKG);
+        assert_ne!(
+            header.package_name(),
+            donor_header.package_name(),
+            "the copy must not keep the original's package identity"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Open every `.utoc` under `CE_PAKS`, newest chunk last.

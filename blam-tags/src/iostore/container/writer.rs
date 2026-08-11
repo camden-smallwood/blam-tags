@@ -3213,6 +3213,33 @@ pub struct NewPackage<'a> {
     /// silently present as whichever biped supplied the template, with that
     /// tag's dependency list attached. Nothing said so.
     pub asset_reference: Option<ImportTarget>,
+    /// What the donor is *to* this tag, which decides whether its bindings are
+    /// the new tag's bindings. See [`WrapperOrigin`].
+    pub origin: WrapperOrigin,
+}
+
+/// What a donor `.uasset` is to the new tag being written.
+///
+/// The two differ in one thing that matters: whether the donor's own bindings
+/// -- `AssetReference`, `CookedAssetsReferencedByTag`, and anything else naming
+/// another package -- say something true about the tag being created.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum WrapperOrigin {
+    /// An unrelated tag, supplying package structure only. Its bindings belong
+    /// to it, not to the group, so a clone that kept them would present as the
+    /// donor and declare the donor's dependencies. They are stripped.
+    #[default]
+    Template,
+    /// The tag being copied. Its bindings *are* the copy's bindings: a
+    /// duplicate of a biped presents as the same Blueprint and depends on the
+    /// same assets, so the wrapper carries over whole and only identity
+    /// changes.
+    ///
+    /// This is also the only way a copy of a `model` can work. Stripping
+    /// rebuilds the import map from the script slots alone, which orphans
+    /// `ModelRegionStringTable` -- a third property, on 364 shipped models,
+    /// that names a package the two stripped ones never did.
+    Copy,
 }
 
 /// Add one same-name override (edited tag, plus the paired `.uasset` with its
@@ -3290,6 +3317,34 @@ fn add_new_package_to_writer(w: &mut OverrideContainerWriter, pkg: &NewPackage) 
         return Err(IoStoreError::Package("template .uasset has no export"));
     }
     let export_data = pkg.template_uasset[hdr.summary.header_size as usize..].to_vec();
+
+    // A donor only supplies structure. Everything that makes the wrapper belong
+    // to a *group* is derived from the destination path, so a tag can be created
+    // in a group the game ships no instance of -- there are 38 such groups, and
+    // before this they could not be created at all.
+    let Some((_, group)) = split_tag_package(pkg.new_package_path) else {
+        return Err(IoStoreError::Package(
+            "a new tag package path must be /Game/Tags/<path>-<group>",
+        ));
+    };
+
+    // A copy keeps its donor's wrapper whole. Sanitizing exists to stop a new
+    // tag inheriting an unrelated donor's bindings; for a copy the donor *is*
+    // the original, so the bindings are the copy's own and stripping them is
+    // the bug, not the fix.
+    if pkg.origin == WrapperOrigin::Copy {
+        // Structural for a copy, but checked rather than assumed: a donor of
+        // another group would leave a property block indexed against another
+        // class, which decodes to plausible values instead of failing.
+        let class_path = crate::iostore::package::imports::tag_wrapper_class_path(group);
+        if hdr.export_map[0].class_index != FPackageObjectIndex::create_script_import(&class_path) {
+            return Err(IoStoreError::Package(
+                "a copied wrapper must be of the tag's own group",
+            ));
+        }
+        return finish_new_package(w, pkg, hdr, export_data, group);
+    }
+
     // Strip what belongs to the donor rather than to the new tag, and set the
     // caller's binding if they gave one. Falls back to the verbatim copy only
     // when the wrapper carries nothing to strip.
@@ -3308,15 +3363,6 @@ fn add_new_package_to_writer(w: &mut OverrideContainerWriter, pkg: &NewPackage) 
         Err(SanitizeSkip::Failed(e)) => return Err(e),
     };
 
-    // A donor only supplies structure. Everything that makes the wrapper belong
-    // to a *group* is derived from the destination path, so a tag can be created
-    // in a group the game ships no instance of -- there are 38 such groups, and
-    // before this they could not be created at all.
-    let Some((_, group)) = split_tag_package(pkg.new_package_path) else {
-        return Err(IoStoreError::Package(
-            "a new tag package path must be /Game/Tags/<path>-<group>",
-        ));
-    };
     if !donor_was_same_group {
         // `sanitize_donated_export` decodes against the donor's own class, and
         // declines when that is not the destination group's. So a cross-group
@@ -3343,6 +3389,22 @@ fn add_new_package_to_writer(w: &mut OverrideContainerWriter, pkg: &NewPackage) 
             ));
         }
     }
+    finish_new_package(w, pkg, hdr, export_data, group)
+}
+
+/// Retarget a prepared wrapper to the new tag's identity and group, and add it
+/// to the writer.
+///
+/// Shared by both [`WrapperOrigin`] paths so identity is stamped by one piece of
+/// code: a copy and a new tag differ only in what reaches here.
+fn finish_new_package(
+    w: &mut OverrideContainerWriter,
+    pkg: &NewPackage,
+    mut hdr: crate::iostore::package::zen::FZenPackageHeader,
+    export_data: Vec<u8>,
+    group: &str,
+) -> Result<()> {
+    const HV: EIoContainerHeaderVersion = EIoContainerHeaderVersion::SoftPackageReferences;
     retarget_wrapper_to_group(&mut hdr, group)?;
 
     let new_obj = pkg
@@ -3586,6 +3648,8 @@ pub fn write_new_tag_container(
             new_package_path,
             redirect_from,
             asset_reference: None,
+            // A standalone new tag: the template is a donor, not the original.
+            origin: WrapperOrigin::Template,
         },
     )?;
     w.write(out_utoc)
