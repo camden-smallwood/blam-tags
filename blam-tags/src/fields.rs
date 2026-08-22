@@ -683,7 +683,25 @@ pub(crate) fn field_option_names<'a>(
     layout: &'a TagLayout,
     field: &TagFieldLayout,
 ) -> impl Iterator<Item = &'a str> + 'a {
-    let string_list = layout.string_lists.get(field.definition as usize);
+    // Only an enum or a plain flags field names a string list. The block-shaped
+    // relatives — `*_block_flags`, `*_block_index` — put a *block* index in the
+    // same slot, and their options are that block's elements at runtime, which
+    // a layout cannot know. Reading `string_lists` at a block index returns
+    // whichever list happens to sit there: `manual bsp flags` came back with
+    // the fifteen options of `scenario_type_enum`, and a cross-game comparison
+    // that pairs options by name then reported every one of them lost.
+    let names_a_string_list = matches!(
+        field.field_type,
+        TagFieldType::CharEnum
+            | TagFieldType::ShortEnum
+            | TagFieldType::LongEnum
+            | TagFieldType::LongFlags
+            | TagFieldType::WordFlags
+            | TagFieldType::ByteFlags,
+    );
+    let string_list = names_a_string_list
+        .then(|| layout.string_lists.get(field.definition as usize))
+        .flatten();
     let range = match string_list {
         Some(sl) => sl.first..sl.first + sl.count,
         None => 0..0,
