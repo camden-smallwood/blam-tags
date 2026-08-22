@@ -2612,6 +2612,15 @@ fn report_materials_without_a_shader(target: &TagFile, context: &mut ConversionC
 ///
 /// A zero-width hole is not a reason to fall back: the template it names resolves
 /// to nothing, so there is nothing the schema is failing to describe.
+///
+/// **As of the template fold in `schema.rs`, no hole has width any more** —
+/// `fold_template_bases` puts the inherited render method's fields in the struct
+/// that carries them, so `options`, `parameters` and `postprocess` have a field
+/// list and a schema-built particle can hold them. This check is left standing
+/// rather than deleted: it costs a scan of an already-built layout, and it is
+/// how a template that stops folding — a new group, a renamed ancestor, a
+/// `_meta.json` that loses an entry — announces itself instead of quietly
+/// converting into padding again.
 fn build_target_from_definitions(schema_path: &Path, allow_template_hole: bool) -> Option<TagFile> {
     std::panic::catch_unwind(|| {
         let layout = crate::layout::TagLayout::from_json(schema_path).ok()?;
@@ -6515,6 +6524,13 @@ pub fn normalize_conversion_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// How many of the kit's particles the conversion sweep covers. The layout
+    /// is schema-derived and so identical for every one of them; the corpus is
+    /// there for the *values* — a tag whose references do not survive, or one
+    /// the walk trips over. Bounded because the point is reached long before
+    /// Reach's 1,160th particle.
+    const SWEPT_PARTICLES: usize = 256;
+
     /// Where a scratch kit for a test lives. Named by process and clock so
     /// parallel test threads cannot collide.
     fn scratch(label: &str) -> PathBuf {
@@ -6526,6 +6542,94 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    /// A Reach particle converts into Halo 4 with its render method described,
+    /// from the definitions alone.
+    ///
+    /// The generated-layout path is the one under test, so the template index is
+    /// deliberately withheld: with a kit template the layout comes from a
+    /// game-authored tag and the schema import never runs. Without one it does,
+    /// and until the template fold it produced a `shader_particle_struct_definition`
+    /// of 52 bytes — no `definition`, no `options`, no `parameters`, no
+    /// `postprocess` — which is the tag Bonobo refused to open.
+    ///
+    /// References are asserted alongside the struct because the two failed
+    /// together: the render method's `definition` and `reference` are tag
+    /// references *inside* the bytes the old importer charged to a `tmpl`
+    /// custom, so a hole meant a particle that named nothing. No shipped Halo 4
+    /// particle has zero references.
+    ///
+    /// Ignored by default — it needs loose Halo Reach tags.
+    ///
+    /// Run with:
+    ///   REACH_TAGS=~/Halo/haloreach_mcc/tags cargo test a_reach_particle_converts -- --ignored
+    #[test]
+    #[ignore = "requires a loose Halo Reach tag tree; set REACH_TAGS"]
+    fn a_reach_particle_converts_into_halo_4_with_its_render_method_described() {
+        let Ok(root) = std::env::var("REACH_TAGS") else {
+            eprintln!("skipping: set REACH_TAGS to a loose Halo Reach tags directory");
+            return;
+        };
+        let mut particles: Vec<PathBuf> = walk_files(Path::new(&root))
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("particle")))
+            .collect();
+        particles.sort();
+        particles.truncate(SWEPT_PARTICLES);
+        assert!(!particles.is_empty(), "no particles under {root}");
+
+        let mut converted = 0usize;
+        for path in &particles {
+            let Ok(source) = crate::TagFile::read(path) else { continue };
+            let mut source_references = Vec::new();
+            collect_reference_values(source.root(), "", &mut source_references);
+
+            let draft = analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "halo4_mcc",
+                Path::new("../definitions"),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("convert {}: {e}", path.display()));
+            assert!(
+                draft.native_layout_template.is_none(),
+                "the generated path is under test"
+            );
+
+            let definitions = draft.tag.definitions();
+            let shader = definitions
+                .root_struct()
+                .fields()
+                .find(|field| field.name() == "actual shader?")
+                .and_then(|field| field.as_struct())
+                .unwrap_or_else(|| panic!("{}: no `actual shader?` struct", path.display()));
+            assert_eq!(shader.name(), "shader_particle_struct_definition");
+            assert_eq!(shader.size(), 152, "{}: the render method's base is missing", path.display());
+            let names: Vec<String> = shader.fields().map(|f| f.name().to_owned()).collect();
+            for expected in ["definition", "options", "parameters", "postprocess"] {
+                assert!(
+                    names.iter().any(|n| n == expected),
+                    "{}: no {expected:?} in {names:?}",
+                    path.display()
+                );
+            }
+
+            if !source_references.is_empty() {
+                let mut references = Vec::new();
+                collect_reference_values(draft.tag.root(), "", &mut references);
+                assert!(
+                    !references.is_empty(),
+                    "{}: names nothing after conversion; {} references went in",
+                    path.display(),
+                    source_references.len()
+                );
+            }
+            converted += 1;
+        }
+        assert!(converted > 0, "nothing converted");
+        eprintln!("converted {converted} of {} Reach particles", particles.len());
     }
 
     /// Routes are shortest first, walk the chain, and never double back.

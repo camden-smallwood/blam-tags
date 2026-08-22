@@ -156,13 +156,13 @@ fn index_of<V>(map: &BTreeMap<String, V>, name: &str) -> Option<u32> {
     map.keys().position(|k| k == name).map(|i| i as u32)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 struct TagBlockSchema {
     max_count: u32,
     #[serde(rename = "struct")] struct_name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 struct TagStructSchema {
     guid: String,
     size: u32,
@@ -173,35 +173,40 @@ struct TagStructSchema {
     tag: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 struct TagFieldSchema {
     #[serde(rename = "type")] ty: String,
     #[serde(default)] name: Option<String>,
     #[serde(default)] definition: serde_json::Value,
     #[serde(default)] group_tag: Option<String>,
+    /// Set by [`fold_template_bases`] on a `tmpl` custom whose template's
+    /// inherited base has been folded into the struct that follows it. Such a
+    /// custom occupies no bytes, so the expansion pass must leave it at zero
+    /// rather than widening it a second time. Never present in the JSON.
+    #[serde(skip)] folded: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 struct TagArraySchema {
     count: u32,
     #[serde(rename = "struct")] struct_name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 struct TagEnumSchema {
     options: Vec<Option<String>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 struct TagDataSchema {}
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 struct PageableResourceSchema {
     flags: u64,
     #[serde(rename = "struct")] struct_name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 struct ApiInteropSchema {
     guid: String,
     #[serde(rename = "struct")] struct_name: String,
@@ -419,6 +424,12 @@ impl TagLayout {
         // we don't silently drop it).
         merge_parent_schemas(&mut schema, defs_dir);
 
+        // A `tmpl` custom stands in for a template group that inherits from
+        // another; the inherited fields belong to the struct the custom
+        // introduces, not to the parent as padding. Fold them in before the
+        // build so the layout describes them.
+        fold_template_bases(&mut schema, defs_dir);
+
         let layout = build_layout_from_schema(schema, defs_dir)?;
         Ok((layout, meta))
     }
@@ -471,6 +482,406 @@ fn merge_parent_schemas(schema: &mut TagSchema, defs_dir: &Path) {
         }
 
         current_parent = parent_schema.parent_tag;
+    }
+}
+
+/// Fold the base a `tmpl` template inherits into the struct that carries it.
+///
+/// A `tmpl` custom names a *template group* — `?rmp`, `rmd `, `rmlv`, `rmb `,
+/// `?rmc` — and is followed by a `struct` field holding that template's fields.
+/// The template group derives from another (`?rmp` from `rm `), and on disk the
+/// base's fields are part of the same struct: every shipped Halo 4 particle
+/// writes `shader_particle_struct_definition` as 152 bytes beginning
+/// `definition`, `reference`, `options`, `parameters`, `postprocess`, …, and so
+/// does a particle ManagedBlam creates. The per-group schema carries only the
+/// derived half and says so — `shader_particle_struct_definition`'s
+/// `size_string` is literally
+/// `sizeof(c_render_method_shader_particle)-sizeof(c_render_method)` — so the
+/// base has to be read out of the ancestor group's own JSON and prepended here.
+///
+/// The importer used to leave the struct at its derived size and widen the
+/// preceding `tmpl` custom by the base's width instead. That balances the
+/// parent's declared size, which is why nothing caught it, but it describes the
+/// base as opaque padding: the blocks inside it (`parameters`, `postprocess`,
+/// `locked parameters`, and the ten struct definitions they bring) never reach
+/// the layout, and an editing kit walking its own field list against the tag's
+/// refuses to open it. Measured on a Halo 4 `particle`: 23 structs / 13 blocks /
+/// 211 fields the old way against ManagedBlam's 33 / 22 / 295.
+///
+/// Only *ancestors* are folded — the template's own fields already live in the
+/// struct being widened, which keeps that struct's name and GUID rather than
+/// adopting the template group's (`material_struct`/`230d8113…` is what a
+/// shipped tag writes, not `mat `'s own `material_block_struct`/`2b67f52e…`).
+/// The ancestor's root struct and root block are likewise left out: they name
+/// the base as a *definition*, and nothing in a shipped layout refers to it once
+/// its fields are inline.
+///
+/// A template with no ancestors (`mat `) or one that will not resolve (`ssfx`,
+/// which no `_meta.json` lists) folds nothing and is left exactly as it was.
+fn fold_template_bases(schema: &mut TagSchema, defs_dir: &Path) {
+    // (template group tag, name of the struct field that follows it). Collected
+    // before mutating because the walk borrows `schema.structs`.
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for struct_schema in schema.structs.values() {
+        let mut pending: Option<&str> = None;
+        for field in &struct_schema.fields {
+            if field.ty == "custom" && field.group_tag.as_deref() == Some("tmpl") {
+                pending = field.definition.as_str();
+            } else if field.ty == "struct"
+                && let Some(template) = pending.take()
+                && let Some(target) = field.definition.as_str()
+            {
+                pairs.push((template.to_owned(), target.to_owned()));
+            }
+        }
+    }
+
+    let mut folded_templates: Vec<String> = Vec::new();
+    let mut folded_targets: Vec<String> = Vec::new();
+    for (template_tag, target_name) in pairs {
+        // Two structs naming the same template each get the base; one struct
+        // reached twice must not get it twice.
+        if folded_targets.contains(&target_name) {
+            continue;
+        }
+        let ancestors = template_ancestor_schemas(defs_dir, &template_tag);
+        if ancestors.is_empty() {
+            continue;
+        }
+
+        // Fold only when the struct is missing the base — the arithmetic says
+        // which, without a per-game list. The template group's own root struct
+        // is the whole thing (`?rmp` = 152); the schema being built carries
+        // either the derived half (Halo 4 / Reach / ODST: 52, 4, or nothing at
+        // all, and 52 + 100 == 152 asks for the base) or the whole thing
+        // already (Halo 3: `shader_particle_struct_definition` is 64 and so is
+        // `rm `, because H3 dumps the common shader fields straight into the
+        // struct). Prepending to the second kind would count the base twice.
+        let base_size: u32 = ancestors
+            .iter()
+            .filter_map(|ancestor| {
+                let root = ancestor.blocks.get(&ancestor.block)?;
+                Some(ancestor.structs.get(&root.struct_name)?.size)
+            })
+            .sum();
+        let Some(template_root_size) = group_root_struct_size(defs_dir, &template_tag) else {
+            continue;
+        };
+        let Some(local_size) = schema.structs.get(&target_name).map(|s| s.size) else { continue };
+        if local_size.saturating_add(base_size) != template_root_size {
+            continue;
+        }
+
+        // Outermost ancestor first, matching the order a C++ base contributes
+        // its members: `rm `'s fields lead `shader_particle_struct_definition`.
+        let mut prefix: Vec<TagFieldSchema> = Vec::new();
+        let mut base_size: u32 = 0;
+        let mut folded_any = false;
+        for mut ancestor in ancestors {
+            let Some(root_block) = ancestor.blocks.get(&ancestor.block) else { continue };
+            let root_struct_name = root_block.struct_name.clone();
+            if !ancestor.structs.contains_key(&root_struct_name) {
+                continue;
+            }
+            let qualifier = ancestor.tag.clone();
+            let renames = qualify_colliding_definitions(schema, &mut ancestor, &qualifier);
+            let root_struct = &ancestor.structs[&root_struct_name];
+            base_size = base_size.saturating_add(root_struct.size);
+            // Renamed per ancestor, before joining the accumulated prefix: two
+            // ancestors' rename maps are keyed by the same names, so a second
+            // pass over fields the first already rewrote would rewrite them
+            // again under the wrong qualifier.
+            let mut base_fields: Vec<TagFieldSchema> = root_struct
+                .fields
+                .iter()
+                .filter(|field| field.ty != "terminator")
+                .cloned()
+                .collect();
+            rename_field_references(&mut base_fields, &renames);
+            prefix.extend(base_fields);
+            folded_any = true;
+            merge_template_base_registries(schema, ancestor, &root_struct_name);
+        }
+        if !folded_any {
+            continue;
+        }
+
+        let Some(target) = schema.structs.get_mut(&target_name) else { continue };
+        target.size = target.size.saturating_add(base_size);
+        prefix.append(&mut target.fields);
+        target.fields = prefix;
+        folded_templates.push(template_tag);
+        folded_targets.push(target_name);
+    }
+
+    if folded_templates.is_empty() {
+        return;
+    }
+    // The hole is gone; mark its custom so the expansion pass leaves it at zero.
+    for struct_schema in schema.structs.values_mut() {
+        for field in &mut struct_schema.fields {
+            if field.ty == "custom"
+                && field.group_tag.as_deref() == Some("tmpl")
+                && field.definition.as_str().is_some_and(|t| folded_templates.iter().any(|f| f == t))
+            {
+                field.folded = true;
+            }
+        }
+    }
+}
+
+/// The declared size of a group's root struct, or `None` if the group cannot be
+/// resolved. What a template's *whole* struct measures, against which
+/// [`fold_template_bases`] checks whether the base is already inline.
+fn group_root_struct_size(defs_dir: &Path, group_tag: &str) -> Option<u32> {
+    let meta_bytes = std::fs::read(defs_dir.join("_meta.json")).ok()?;
+    let meta: serde_json::Value = serde_json::from_slice(&meta_bytes).ok()?;
+    let name = meta.get("tag_index")?.get(group_tag)?.as_str()?;
+    let bytes = std::fs::read(defs_dir.join(format!("{name}.json"))).ok()?;
+    let schema: TagSchema = serde_json::from_slice(&bytes).ok()?;
+    let root_block = schema.blocks.get(&schema.block)?;
+    Some(schema.structs.get(&root_block.struct_name)?.size)
+}
+
+/// The schemas of every group above `target_tag` in its `parent_tag` chain,
+/// outermost first. The target itself is excluded — [`fold_template_bases`]
+/// folds what the template *inherits*, not what it declares. Empty when the
+/// chain cannot be walked, which is the same "leave it alone" answer a template
+/// with no parent gives.
+fn template_ancestor_schemas(defs_dir: &Path, target_tag: &str) -> Vec<TagSchema> {
+    let Ok(meta_bytes) = std::fs::read(defs_dir.join("_meta.json")) else { return Vec::new() };
+    let Ok(meta): Result<serde_json::Value, _> = serde_json::from_slice(&meta_bytes) else {
+        return Vec::new();
+    };
+    let Some(tag_index) = meta.get("tag_index").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+
+    let mut chain: Vec<TagSchema> = Vec::new();
+    let mut cur = target_tag.to_owned();
+    for _ in 0..32 {
+        let Some(name) = tag_index.get(&cur).and_then(|v| v.as_str()) else { break };
+        let Ok(bytes) = std::fs::read(defs_dir.join(format!("{name}.json"))) else { break };
+        let Ok(schema): Result<TagSchema, _> = serde_json::from_slice(&bytes) else { break };
+        let parent = schema.parent_tag.clone();
+        // Skip the target itself — only its ancestors contribute.
+        if cur != target_tag {
+            chain.push(schema);
+        }
+        let Some(parent) = parent else { break };
+        cur = parent;
+    }
+    chain.reverse();
+    chain
+}
+
+/// Separator between a definition's name and the group tag that disambiguates
+/// it. Chosen because no dumped definition name can contain a control
+/// character, and stripped again by [`definition_display_name`] so the layout
+/// still writes the plain name.
+const DEFINITION_QUALIFIER: char = '\u{1}';
+
+/// The name a definition is written under in the layout: everything before the
+/// qualifier [`qualify_colliding_definitions`] may have appended.
+///
+/// Two definitions really can share a name. A Halo 4 particle carries a
+/// `runtime_queryable_properties` array of 12 (the material's) *and* one of 28
+/// (the render method's), and ManagedBlam writes both records under that one
+/// name with their own counts and GUIDs. The registries here are keyed by name,
+/// so the second copy needs a distinct key; the key is an implementation
+/// detail and the name is what goes on disk.
+fn definition_display_name(key: &str) -> &str {
+    match key.split_once(DEFINITION_QUALIFIER) {
+        Some((name, _)) => name,
+        None => key,
+    }
+}
+
+/// Which registry a field's `definition` name resolves against, for rewriting
+/// references. Mirrors the dispatch in [`resolve_field_definition`] — a name
+/// means nothing without the kind, and `runtime_queryable_properties` is both a
+/// struct and an array in the same schema.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RegistryKind { Struct, Block, Array, EnumFlags, Data, Resource, Interop }
+
+fn registry_kind_of(ty: TagFieldType) -> Option<RegistryKind> {
+    Some(match ty {
+        TagFieldType::Struct => RegistryKind::Struct,
+        TagFieldType::Block
+        | TagFieldType::LongBlockFlags
+        | TagFieldType::WordBlockFlags
+        | TagFieldType::ByteBlockFlags
+        | TagFieldType::CharBlockIndex
+        | TagFieldType::ShortBlockIndex
+        | TagFieldType::LongBlockIndex => RegistryKind::Block,
+        TagFieldType::Array => RegistryKind::Array,
+        TagFieldType::CharEnum
+        | TagFieldType::ShortEnum
+        | TagFieldType::LongEnum
+        | TagFieldType::LongFlags
+        | TagFieldType::WordFlags
+        | TagFieldType::ByteFlags => RegistryKind::EnumFlags,
+        TagFieldType::Data => RegistryKind::Data,
+        TagFieldType::PageableResource => RegistryKind::Resource,
+        TagFieldType::ApiInterop => RegistryKind::Interop,
+        _ => return None,
+    })
+}
+
+/// A definition rename, by kind: `(kind, old name, new key)`.
+type DefinitionRenames = Vec<(RegistryKind, String, String)>;
+
+/// Re-key every definition in `ancestor` that collides with a *different*
+/// definition of the same name already in `schema`, and rewrite the ancestor's
+/// own references to match. Returns the renames so the caller can rewrite the
+/// base's field list too.
+///
+/// An identical collision is left alone — `mapping_function` and `g_null_block`
+/// are the same definition in both groups, and merging them is what
+/// [`merge_parent_schemas`] has always done. It is the ones that differ that
+/// used to be silently dropped: keeping the child's 12-element
+/// `runtime_queryable_properties` for a render-method field that wants 28 is
+/// how `render_method_postprocess_block` came out 32 bytes short.
+///
+/// Run to a fixed point, because separating one definition can separate
+/// another. `int_block` is the same block in both groups until the *struct* it
+/// names is re-keyed; then the two blocks disagree too, and ManagedBlam indeed
+/// writes both. Rounds are bounded — each one strictly grows the rename set,
+/// which is bounded by the ancestor's registry size, and eight is far past what
+/// any real chain needs.
+fn qualify_colliding_definitions(
+    schema: &TagSchema,
+    ancestor: &mut TagSchema,
+    qualifier: &str,
+) -> DefinitionRenames {
+    let mut renames: DefinitionRenames = Vec::new();
+
+    for _ in 0..8 {
+        let mut round: DefinitionRenames = Vec::new();
+
+        macro_rules! collect {
+            ($kind:expr, $registry:ident) => {
+                for (name, value) in ancestor.$registry.iter() {
+                    if schema.$registry.get(name).is_some_and(|existing| existing != value) {
+                        round.push((
+                            $kind,
+                            name.clone(),
+                            format!("{name}{DEFINITION_QUALIFIER}{qualifier}"),
+                        ));
+                    }
+                }
+            };
+        }
+        collect!(RegistryKind::Struct, structs);
+        collect!(RegistryKind::Block, blocks);
+        collect!(RegistryKind::Array, arrays);
+        collect!(RegistryKind::EnumFlags, enums_flags);
+        collect!(RegistryKind::Data, datas);
+        collect!(RegistryKind::Resource, resources);
+        collect!(RegistryKind::Interop, interops);
+
+        if round.is_empty() {
+            break;
+        }
+
+        macro_rules! rekey {
+            ($kind:expr, $registry:ident) => {
+                for (_, old, new) in round.iter().filter(|(kind, _, _)| *kind == $kind) {
+                    if let Some(value) = ancestor.$registry.remove(old) {
+                        ancestor.$registry.insert(new.clone(), value);
+                    }
+                }
+            };
+        }
+        rekey!(RegistryKind::Struct, structs);
+        rekey!(RegistryKind::Block, blocks);
+        rekey!(RegistryKind::Array, arrays);
+        rekey!(RegistryKind::EnumFlags, enums_flags);
+        rekey!(RegistryKind::Data, datas);
+        rekey!(RegistryKind::Resource, resources);
+        rekey!(RegistryKind::Interop, interops);
+
+        // Everything in the ancestor that names a struct by hand.
+        let struct_rename = |name: &mut String| {
+            if let Some((_, _, new)) =
+                round.iter().find(|(kind, old, _)| *kind == RegistryKind::Struct && old == name)
+            {
+                *name = new.clone();
+            }
+        };
+        for block in ancestor.blocks.values_mut() { struct_rename(&mut block.struct_name); }
+        for array in ancestor.arrays.values_mut() { struct_rename(&mut array.struct_name); }
+        for resource in ancestor.resources.values_mut() { struct_rename(&mut resource.struct_name); }
+        for interop in ancestor.interops.values_mut() { struct_rename(&mut interop.struct_name); }
+        for struct_schema in ancestor.structs.values_mut() {
+            rename_field_references(&mut struct_schema.fields, &round);
+        }
+
+        renames.extend(round);
+    }
+
+    renames
+}
+
+/// Point every field whose `definition` names a renamed definition at its new
+/// key. Kind-aware: the same name can belong to two registries at once.
+fn rename_field_references(fields: &mut [TagFieldSchema], renames: &DefinitionRenames) {
+    if renames.is_empty() {
+        return;
+    }
+    for field in fields {
+        let Some(kind) = field_type_info(&field.ty).and_then(|info| registry_kind_of(info.ty))
+        else {
+            continue;
+        };
+        let Some(name) = field.definition.as_str() else { continue };
+        if let Some((_, _, new)) =
+            renames.iter().find(|(k, old, _)| *k == kind && old == name)
+        {
+            field.definition = serde_json::Value::String(new.clone());
+        }
+    }
+}
+
+/// Merge everything an inlined base's fields can refer to into the schema being
+/// built, minus the base's own root struct and root block.
+///
+/// Existing entries win, as in [`merge_parent_schemas`]. By this point that is
+/// safe rather than lossy: [`qualify_colliding_definitions`] has already moved
+/// any entry that *disagreed* with the child's to a key of its own, so the
+/// collisions left are the ones where both groups describe the same thing.
+fn merge_template_base_registries(
+    schema: &mut TagSchema,
+    ancestor: TagSchema,
+    root_struct_name: &str,
+) {
+    let root_block_name = ancestor.block.clone();
+    for (k, v) in ancestor.blocks {
+        if k == root_block_name {
+            continue;
+        }
+        schema.blocks.entry(k).or_insert(v);
+    }
+    for (k, v) in ancestor.structs {
+        if k == root_struct_name {
+            continue;
+        }
+        schema.structs.entry(k).or_insert(v);
+    }
+    for (k, v) in ancestor.arrays {
+        schema.arrays.entry(k).or_insert(v);
+    }
+    for (k, v) in ancestor.enums_flags {
+        schema.enums_flags.entry(k).or_insert(v);
+    }
+    for (k, v) in ancestor.datas {
+        schema.datas.entry(k).or_insert(v);
+    }
+    for (k, v) in ancestor.resources {
+        schema.resources.entry(k).or_insert(v);
+    }
+    for (k, v) in ancestor.interops {
+        schema.interops.entry(k).or_insert(v);
     }
 }
 
@@ -546,7 +957,7 @@ fn build_layout_from_schema(
     let data_definition_name_offsets: Vec<u32> = schema
         .datas
         .keys()
-        .map(|n| strings.intern(n))
+        .map(|n| strings.intern(definition_display_name(n)))
         .collect();
 
     // Build string_lists (enums/flags). Each enum's options go into
@@ -555,7 +966,7 @@ fn build_layout_from_schema(
     let mut string_offsets: Vec<u32> = Vec::new();
     let mut string_lists: Vec<TagStringList> = Vec::new();
     for (name, enum_schema) in &schema.enums_flags {
-        let list_name_offset = strings.intern(name);
+        let list_name_offset = strings.intern(definition_display_name(name));
         let first = string_offsets.len() as u32;
         for opt in &enum_schema.options {
             let off = match opt {
@@ -583,7 +994,7 @@ fn build_layout_from_schema(
     let mut array_layouts: Vec<TagArrayLayout> = Vec::with_capacity(schema.arrays.len());
     for (name, array) in &schema.arrays {
         array_layouts.push(TagArrayLayout {
-            name_offset: strings.intern(name),
+            name_offset: strings.intern(definition_display_name(name)),
             count: array.count,
             struct_index: resolve_struct_name(&array.struct_name)?,
         });
@@ -593,7 +1004,7 @@ fn build_layout_from_schema(
     let mut resource_layouts: Vec<TagResourceLayout> = Vec::with_capacity(schema.resources.len());
     for (name, resource) in &schema.resources {
         resource_layouts.push(TagResourceLayout {
-            name_offset: strings.intern(name),
+            name_offset: strings.intern(definition_display_name(name)),
             unknown: resource.flags as u32,
             struct_index: resolve_struct_name(&resource.struct_name)?,
         });
@@ -603,7 +1014,7 @@ fn build_layout_from_schema(
     let mut interop_layouts: Vec<TagInteropLayout> = Vec::with_capacity(schema.interops.len());
     for (name, interop) in &schema.interops {
         interop_layouts.push(TagInteropLayout {
-            name_offset: strings.intern(name),
+            name_offset: strings.intern(definition_display_name(name)),
             struct_index: resolve_struct_name(&interop.struct_name)?,
             guid: parse_guid(&interop.guid)?,
         });
@@ -614,7 +1025,7 @@ fn build_layout_from_schema(
     for (i, (name, block)) in schema.blocks.iter().enumerate() {
         block_layouts.push(TagBlockLayout {
             index: i as u32,
-            name_offset: strings.intern(name),
+            name_offset: strings.intern(definition_display_name(name)),
             max_count: block.max_count,
             struct_index: resolve_struct_name(&block.struct_name)?,
         });
@@ -695,7 +1106,7 @@ fn build_layout_from_schema(
         struct_layouts.push(TagStructLayout {
             index: i as u32,
             guid: parse_guid(&struct_schema.guid)?,
-            name_offset: strings.intern(name),
+            name_offset: strings.intern(definition_display_name(name)),
             first_field_index: first,
             size: 0, // computed later
             version: 0,
@@ -803,6 +1214,13 @@ fn build_layout_from_schema(
     // to, and a dead template like `ssfx` still answers that question. Only
     // the non-zero ones go on to have their size patched into the field's
     // `definition` slot below, because only those change the arithmetic.
+    //
+    // A custom [`fold_template_bases`] has already handled is width zero: its
+    // template's base is described by real fields in the struct that follows,
+    // so widening the custom on top of that would double-count the bytes.
+    // Everything reaching `tmpl_expansion_size` here is a template whose
+    // ancestors could not be resolved, which sizes to nothing for the same
+    // reason it could not be folded.
     let mut tmpl_holes: Vec<TagTemplateHole> = Vec::new();
     let tmpl_expansions: Vec<(usize, u32)> = {
         let mut out = Vec::new();
@@ -812,7 +1230,7 @@ fn build_layout_from_schema(
                 if field.ty == "custom"
                     && field.group_tag.as_deref() == Some("tmpl")
                     && let Some(target) = field.definition.as_str() {
-                        let exp = tmpl_expansion_size(defs_dir, target);
+                        let exp = if field.folded { 0 } else { tmpl_expansion_size(defs_dir, target) };
                         // A template whose tag is unparseable is not recorded
                         // rather than recorded as zero: an unknown identity and
                         // a known-empty one are different claims.
@@ -883,7 +1301,86 @@ fn build_layout_from_schema(
     // Update header size-counts that depend on final string_data size.
     result.header.string_data_size = result.string_data.len() as u32;
 
+    // Everything above builds a layout that is *correct*. This makes it the one
+    // the engine would have written: the tables re-ordered by the walk from the
+    // root block, and the identifier a freshly-authored layout carries.
+    reemit_in_engine_order(&mut result);
+    result.version = persist_layout_version(defs_dir);
+    result.root_data_size = u32::MAX;
+    result.guid = new_layout_guid();
+
     Ok(result)
+}
+
+/// Which `blay` payload version the engine of this profile writes.
+///
+/// Not in the schema — it is a constant in each engine's layout writer
+/// (`c_tag_layout_builder(builder, 4)` in Halo 4's), so it is read off the
+/// profile name in `_meta.json`. Measured against the kits: 3,719 of 3,965
+/// sampled Halo 4 tags are version 4, 3,998 of 3,999 Reach and 3,966 of 3,979
+/// Halo 3 are version 3. The minority in each case are tags an older build
+/// wrote and nothing has re-saved since.
+///
+/// Version 3 is the safe answer for a profile we have not measured: it is what
+/// this importer emitted for every group before, every engine from Halo 3 on
+/// reads it, and the two differ only in whether `stv4`'s per-struct version
+/// field is present.
+fn persist_layout_version(defs_dir: &Path) -> u32 {
+    let Ok(bytes) = std::fs::read(defs_dir.join("_meta.json")) else { return 3 };
+    let Ok(meta): Result<serde_json::Value, _> = serde_json::from_slice(&bytes) else { return 3 };
+    match meta.get("game").and_then(|value| value.as_str()) {
+        Some("halo4_mcc") | Some("halo2amp_mcc") => 4,
+        _ => 3,
+    }
+}
+
+/// A fresh identifier for a layout this library authored.
+///
+/// The engine's rule is a two-line branch in
+/// `c_default_single_tag_file_layout_writer`: a *tracked* build stamps its build
+/// number and leaves the guid zero, an untracked one stamps `-1` and calls
+/// `system_global_unique_identifier_create`. The reader checks exactly that pair
+/// — `(build != -1) XOR (guid != 0)` — and every one of 57,418 shipped Halo 3
+/// and 449 Halo 4 kit tags satisfies it. We are an untracked build, so: `-1` and
+/// a guid.
+///
+/// It is a version-4 (random) UUID because that is what the kits carry: 22,769
+/// of the 22,773 Halo 4 tags with a guid have the version-4 nibble and an
+/// RFC 4122 variant. The bytes come from the clock, the process id and a
+/// counter rather than a random-number dependency — the guid has to be
+/// *different* every time a layout is authored, not unguessable, and nothing
+/// downstream derives anything from its value.
+///
+/// Note this is one field of a tag that cannot be reproduced by rebuilding it:
+/// two saves of the same layout get different guids, which is why the kit ships
+/// 1,070 prefabs with one layout and 1,070 distinct guids between them.
+fn new_layout_guid() -> [u8; 16] {
+    use std::hash::{BuildHasher, Hasher, RandomState};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let seed = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut guid = [0u8; 16];
+    for (half, chunk) in guid.chunks_mut(8).enumerate() {
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u64(seed);
+        hasher.write_u64(half as u64);
+        hasher.write_u32(std::process::id());
+        hasher.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0),
+        );
+        chunk.copy_from_slice(&hasher.finish().to_le_bytes());
+    }
+    // RFC 4122: version 4 in the high nibble of the third group's high byte,
+    // variant `10` in the top bits of the fourth group's first byte. The group
+    // fields are stored little-endian, as `s_system_global_unique_identifier`
+    // does.
+    guid[7] = (guid[7] & 0x0F) | 0x40;
+    guid[8] = (guid[8] & 0x3F) | 0x80;
+    guid
 }
 
 /// Translate a field schema's `definition` value into the `u32` that
@@ -1004,15 +1501,16 @@ fn resolve_field_definition(
         return Ok(0);
     }
 
-    // tag_reference: blay's `definition` holds flags. `allowed` list
-    // isn't part of blay's field record.
+    // tag_reference: the `definition` slot stays empty, and neither the schema's
+    // `flags` nor its `allowed` list goes into blay's field record. The engine
+    // keeps reference flags in its own definition and writes nothing here —
+    // measured across 501 shipped Halo 4 and Reach kit tags, all 1,631
+    // `tag reference` fields carry `definition == 0`, including the ones the
+    // schema gives flags to (`render_method`'s `definition*` is 16 in the JSON
+    // and 0 in every tag). Emitting the flags put a value in the field list that
+    // no tag has; nothing in the library reads the slot back for this type.
     if matches!(ty, TagFieldType::TagReference) {
-        let flags = def
-            .as_object()
-            .and_then(|m| m.get("flags"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        return Ok(flags as u32);
+        return Ok(0);
     }
 
     // Named-registry types: resolve by name.
@@ -1065,4 +1563,755 @@ fn resolve_field_definition(
         },
         name: name.to_owned(),
     })
+}
+
+/// The characters the engine truncates a persisted name at.
+///
+/// `find_tag_string_end` (tag_group_editing.cpp) scans for the first byte in
+/// this set and cuts there, and every string that enters a `blay` goes through
+/// it — field names, struct/block/array/interop names, and enum options alike.
+/// Measured to agree: across 1,489 sampled Halo 4 kit tags, not one string in a
+/// layout's table contains any of these.
+const TAG_STRING_DELIMITERS: &[u8] = b":*#^|!{}&~";
+
+/// A string as the engine persists it: everything before the first delimiter.
+fn persisted_string(name: &str) -> &str {
+    match name.bytes().position(|b| TAG_STRING_DELIMITERS.contains(&b)) {
+        Some(end) => &name[..end],
+        None => name,
+    }
+}
+
+/// Rebuilds a layout's tables in the order the engine's tag-layout writer emits
+/// them, so a schema-built layout is indistinguishable from a kit-authored one.
+///
+/// The importer builds its tables by walking the JSON registries alphabetically,
+/// which is a fine way to get a *correct* layout and the wrong way to get the
+/// engine's. `c_tag_layout_builder_context` walks the group from its root block
+/// instead, and the walk decides everything: which index each definition gets,
+/// which strings exist and in what order, even how many records a table has.
+///
+/// The rules, read out of `midnight_tag_debug`'s
+/// `c_tag_layout_builder_context` / `c_tag_layout_builder`:
+///
+/// - **Structs** are memoized by identity and their index is reserved on the way
+///   *down* (`reserve_struct_definition` before the field walk), so the struct
+///   table is pre-order. Their *fields* are appended on the way back *up*
+///   (`add_field_list` after the walk), so the flat field array is post-order,
+///   and a struct's own name is interned after everything its fields reached.
+/// - **Blocks, arrays, resources and interops** recurse into their struct first
+///   and are then find-or-added *by record content*, so two references to the
+///   same shape share a record and two same-named definitions that differ get
+///   one each.
+/// - **Field types** are interned on first use, so their order follows the walk.
+/// - **A field with no bytes is not persistent** (`tag_field_is_persistent` is
+///   `terminator || size > 0`): it is written with no name and the `custom`
+///   type, whatever the schema called it.
+/// - **Strings** are find-or-added over the raw character blob *including the
+///   terminator*, so a string that is a suffix of one already present reuses its
+///   offset rather than being appended again. That alone accounted for 15 of the
+///   strings this importer used to emit that no kit tag has.
+///
+/// Validated by construction: with this pass, a Halo 4 `particle` built from
+/// `definitions/halo4_mcc/particle.json` reproduces a ManagedBlam-authored one
+/// table for table — 36 structs, 24 blocks, 3 arrays, 30 field types, 295
+/// fields, 24 string lists, and all 7,377 bytes of string data, byte for byte.
+fn reemit_in_engine_order(layout: &mut TagLayout) {
+    // Classic Halo 2 layouts carry per-struct group tags and version variants in
+    // arrays parallel to `struct_layouts`, and a classic tag has no `blay` on
+    // disk for the order to matter to. Reordering would have to permute those
+    // too, for no gain; leave them alone.
+    if layout.struct_tags.iter().any(|tag| *tag != 0)
+        || layout.struct_version_table.iter().any(|entry| entry.is_some())
+    {
+        return;
+    }
+
+    let mut out = EngineOrderBuilder::default();
+    let root_block = layout.header.tag_group_block_index as usize;
+    let new_root = out.add_block(layout, root_block);
+
+    let mut header = TagLayoutHeader {
+        tag_group_block_index: new_root,
+        string_data_size: out.strings.len() as u32,
+        string_offset_count: out.string_offsets.len() as u32,
+        string_list_count: out.string_lists.len() as u32,
+        custom_block_index_search_names_count: out.custom_search_names.len() as u32,
+        data_definition_name_count: out.data_names.len() as u32,
+        array_layout_count: out.arrays.len() as u32,
+        field_type_count: out.field_types.len() as u32,
+        field_count: out.fields.len() as u32,
+        aggregate_layout_count: 0,
+        struct_layout_count: out.structs.len() as u32,
+        block_layout_count: out.blocks.len() as u32,
+        resource_layout_count: out.resources.len() as u32,
+        interop_layout_count: out.interops.len() as u32,
+    };
+    header.string_data_size = out.strings.len() as u32;
+
+    // `tmpl_holes` indexes the flat field array, which has just been rebuilt.
+    let mut holes: Vec<TagTemplateHole> = layout
+        .tmpl_holes
+        .iter()
+        .filter_map(|hole| {
+            out.field_remap
+                .get(&(hole.field_index as usize))
+                .map(|&new_index| TagTemplateHole { field_index: new_index as u32, ..*hole })
+        })
+        .collect();
+    holes.sort_by_key(|hole| hole.field_index);
+
+    let struct_count = out.structs.len();
+    layout.header = header;
+    layout.string_data = out.strings;
+    layout.string_offsets = out.string_offsets;
+    layout.string_lists = out.string_lists;
+    layout.custom_block_index_search_names_offsets = out.custom_search_names;
+    layout.data_definition_name_offsets = out.data_names;
+    layout.array_layouts = out.arrays;
+    layout.field_types = out.field_types;
+    layout.fields = out.fields;
+    layout.block_layouts = out.blocks;
+    layout.resource_layouts = out.resources;
+    layout.interop_layouts = out.interops;
+    layout.struct_layouts = out.structs;
+    layout.struct_tags = vec![0; struct_count];
+    layout.struct_version_table = vec![None; struct_count];
+    layout.tmpl_holes = holes;
+
+    // Sizes and offsets were computed against the old indices; redo them.
+    for entry in layout.struct_layouts.iter_mut() {
+        entry.size = 0;
+    }
+    for index in 0..layout.struct_layouts.len() {
+        layout.compute_struct_layout(index);
+    }
+}
+
+/// Scratch state for [`reemit_in_engine_order`] — one output table per `blay`
+/// section, plus the memo maps the engine keeps on its builder context.
+#[derive(Default)]
+struct EngineOrderBuilder {
+    strings: Vec<u8>,
+    string_offsets: Vec<u32>,
+    string_lists: Vec<TagStringList>,
+    custom_search_names: Vec<u32>,
+    data_names: Vec<u32>,
+    arrays: Vec<TagArrayLayout>,
+    field_types: Vec<TagFieldTypeLayout>,
+    fields: Vec<TagFieldLayout>,
+    blocks: Vec<TagBlockLayout>,
+    resources: Vec<TagResourceLayout>,
+    interops: Vec<TagInteropLayout>,
+    structs: Vec<TagStructLayout>,
+    struct_memo: BTreeMap<usize, u32>,
+    string_list_memo: BTreeMap<usize, u32>,
+    field_type_memo: BTreeMap<usize, u32>,
+    /// Old flat field index → new flat field index, for `tmpl_holes`.
+    field_remap: BTreeMap<usize, usize>,
+}
+
+impl EngineOrderBuilder {
+    /// Find-or-add over the raw blob, terminator included — so a string that is
+    /// a suffix of one already stored shares its offset.
+    fn add_string(&mut self, text: &str) -> u32 {
+        let mut needle = persisted_string(text).as_bytes().to_vec();
+        needle.push(0);
+        if let Some(at) = self
+            .strings
+            .windows(needle.len())
+            .position(|window| window == needle.as_slice())
+        {
+            return at as u32;
+        }
+        let at = self.strings.len() as u32;
+        self.strings.extend_from_slice(&needle);
+        at
+    }
+
+    fn string_at(layout: &TagLayout, offset: u32) -> String {
+        layout.get_string(offset).unwrap_or_default().to_owned()
+    }
+
+    fn add_field_type(&mut self, layout: &TagLayout, old_index: usize) -> u32 {
+        if let Some(&index) = self.field_type_memo.get(&old_index) {
+            return index;
+        }
+        let source = &layout.field_types[old_index];
+        let name = Self::string_at(layout, source.name_offset);
+        let record = TagFieldTypeLayout {
+            name_offset: self.add_string(&name),
+            size: source.size,
+            needs_sub_chunk: source.needs_sub_chunk,
+        };
+        let index = match self.field_types.iter().position(|existing| {
+            existing.name_offset == record.name_offset
+                && existing.size == record.size
+                && existing.needs_sub_chunk == record.needs_sub_chunk
+        }) {
+            Some(index) => index as u32,
+            None => {
+                self.field_types.push(record);
+                self.field_types.len() as u32 - 1
+            }
+        };
+        self.field_type_memo.insert(old_index, index);
+        index
+    }
+
+    fn add_block(&mut self, layout: &TagLayout, old_index: usize) -> u32 {
+        let source = layout.block_layouts[old_index];
+        let struct_index = self.add_struct(layout, source.struct_index as usize);
+        let name = Self::string_at(layout, source.name_offset);
+        let name_offset = self.add_string(&name);
+        match self.blocks.iter().position(|existing| {
+            existing.name_offset == name_offset
+                && existing.max_count == source.max_count
+                && existing.struct_index == struct_index
+        }) {
+            Some(index) => index as u32,
+            None => {
+                let index = self.blocks.len() as u32;
+                self.blocks.push(TagBlockLayout {
+                    index,
+                    name_offset,
+                    max_count: source.max_count,
+                    struct_index,
+                });
+                index
+            }
+        }
+    }
+
+    fn add_array(&mut self, layout: &TagLayout, old_index: usize) -> u32 {
+        let source = layout.array_layouts[old_index];
+        let struct_index = self.add_struct(layout, source.struct_index as usize);
+        let name = Self::string_at(layout, source.name_offset);
+        let name_offset = self.add_string(&name);
+        let record = TagArrayLayout { name_offset, count: source.count, struct_index };
+        match self.arrays.iter().position(|existing| {
+            existing.name_offset == record.name_offset
+                && existing.count == record.count
+                && existing.struct_index == record.struct_index
+        }) {
+            Some(index) => index as u32,
+            None => {
+                self.arrays.push(record);
+                self.arrays.len() as u32 - 1
+            }
+        }
+    }
+
+    fn add_resource(&mut self, layout: &TagLayout, old_index: usize) -> u32 {
+        let source = layout.resource_layouts[old_index];
+        let struct_index = self.add_struct(layout, source.struct_index as usize);
+        let name = Self::string_at(layout, source.name_offset);
+        let name_offset = self.add_string(&name);
+        let record = TagResourceLayout { name_offset, unknown: source.unknown, struct_index };
+        match self.resources.iter().position(|existing| {
+            existing.name_offset == record.name_offset
+                && existing.unknown == record.unknown
+                && existing.struct_index == record.struct_index
+        }) {
+            Some(index) => index as u32,
+            None => {
+                self.resources.push(record);
+                self.resources.len() as u32 - 1
+            }
+        }
+    }
+
+    fn add_interop(&mut self, layout: &TagLayout, old_index: usize) -> u32 {
+        let source = layout.interop_layouts[old_index];
+        let struct_index = self.add_struct(layout, source.struct_index as usize);
+        // Every interop definition in the engine answers to this name — 1,921
+        // Halo 4 kit tags, 1,807 Reach and 1,896 Halo 3, and no other spelling.
+        // The dumper records the C++ definition's identifier instead, which is
+        // a name no tag carries.
+        let name_offset = self.add_string(ENGINE_INTEROP_NAME);
+        let record = TagInteropLayout { name_offset, struct_index, guid: source.guid };
+        match self.interops.iter().position(|existing| {
+            existing.name_offset == record.name_offset
+                && existing.struct_index == record.struct_index
+                && existing.guid == record.guid
+        }) {
+            Some(index) => index as u32,
+            None => {
+                self.interops.push(record);
+                self.interops.len() as u32 - 1
+            }
+        }
+    }
+
+    fn add_data_definition(&mut self, layout: &TagLayout, old_index: usize) -> u32 {
+        let Some(&offset) = layout.data_definition_name_offsets.get(old_index) else {
+            return 0;
+        };
+        let name = Self::string_at(layout, offset);
+        let name_offset = self.add_string(&name);
+        match self.data_names.iter().position(|&existing| existing == name_offset) {
+            Some(index) => index as u32,
+            None => {
+                self.data_names.push(name_offset);
+                self.data_names.len() as u32 - 1
+            }
+        }
+    }
+
+    fn add_custom_search_name(&mut self, layout: &TagLayout, old_index: usize) -> u32 {
+        let Some(&offset) = layout.custom_block_index_search_names_offsets.get(old_index) else {
+            return 0;
+        };
+        let name = Self::string_at(layout, offset);
+        let name_offset = self.add_string(&name);
+        match self.custom_search_names.iter().position(|&existing| existing == name_offset) {
+            Some(index) => index as u32,
+            None => {
+                self.custom_search_names.push(name_offset);
+                self.custom_search_names.len() as u32 - 1
+            }
+        }
+    }
+
+    /// Options first, in order, then the list's own name — `add_string_list`.
+    fn add_string_list(&mut self, layout: &TagLayout, old_index: usize) -> u32 {
+        if let Some(&index) = self.string_list_memo.get(&old_index) {
+            return index;
+        }
+        let source = layout.string_lists[old_index];
+        let mut offsets = Vec::with_capacity(source.count as usize);
+        for entry in 0..source.count as usize {
+            let option = layout
+                .string_offsets
+                .get(source.first as usize + entry)
+                .map(|&offset| Self::string_at(layout, offset))
+                .unwrap_or_default();
+            offsets.push(self.add_string(&option));
+        }
+        let name = Self::string_at(layout, source.offset);
+        let name_offset = self.add_string(&name);
+        let first = self.string_offsets.len() as u32;
+        self.string_offsets.extend(offsets);
+        self.string_lists.push(TagStringList { offset: name_offset, count: source.count, first });
+        let index = self.string_lists.len() as u32 - 1;
+        self.string_list_memo.insert(old_index, index);
+        index
+    }
+
+    /// Reserve the index on the way down, append the field list on the way up.
+    fn add_struct(&mut self, layout: &TagLayout, old_index: usize) -> u32 {
+        if let Some(&index) = self.struct_memo.get(&old_index) {
+            return index;
+        }
+        let slot = self.structs.len();
+        self.structs.push(TagStructLayout {
+            index: slot as u32,
+            guid: [0u8; 16],
+            name_offset: 0,
+            first_field_index: 0,
+            size: 0,
+            version: 0,
+        });
+        self.struct_memo.insert(old_index, slot as u32);
+
+        let source = layout.struct_layouts[old_index];
+        let mut built: Vec<(usize, TagFieldLayout)> = Vec::new();
+        let mut field_index = source.first_field_index as usize;
+        loop {
+            let field = layout.fields[field_index];
+            let terminator = field.field_type == TagFieldType::Terminator;
+            // A field's width is the gap to the next field's offset; the
+            // terminator sits at the struct's end and has no next.
+            let width = if terminator {
+                0
+            } else {
+                layout.fields[field_index + 1].offset.saturating_sub(field.offset)
+            };
+            if terminator || width > 0 {
+                let name = Self::string_at(layout, field.name_offset);
+                let name_offset = self.add_string(&name);
+                let type_index = self.add_field_type(layout, field.type_index as usize);
+                let definition = match field.field_type {
+                    TagFieldType::Struct => self.add_struct(layout, field.definition as usize),
+                    TagFieldType::Block
+                    | TagFieldType::LongBlockFlags
+                    | TagFieldType::WordBlockFlags
+                    | TagFieldType::ByteBlockFlags
+                    | TagFieldType::CharBlockIndex
+                    | TagFieldType::ShortBlockIndex
+                    | TagFieldType::LongBlockIndex => {
+                        self.add_block(layout, field.definition as usize)
+                    }
+                    TagFieldType::Array => self.add_array(layout, field.definition as usize),
+                    TagFieldType::CharEnum
+                    | TagFieldType::ShortEnum
+                    | TagFieldType::LongEnum
+                    | TagFieldType::LongFlags
+                    | TagFieldType::WordFlags
+                    | TagFieldType::ByteFlags => {
+                        self.add_string_list(layout, field.definition as usize)
+                    }
+                    TagFieldType::Data => self.add_data_definition(layout, field.definition as usize),
+                    TagFieldType::PageableResource => {
+                        self.add_resource(layout, field.definition as usize)
+                    }
+                    TagFieldType::ApiInterop => self.add_interop(layout, field.definition as usize),
+                    TagFieldType::CustomCharBlockIndex
+                    | TagFieldType::CustomShortBlockIndex
+                    | TagFieldType::CustomLongBlockIndex => {
+                        self.add_custom_search_name(layout, field.definition as usize)
+                    }
+                    _ => field.definition,
+                };
+                built.push((
+                    field_index,
+                    TagFieldLayout { name_offset, type_index, definition, ..field },
+                ));
+            } else {
+                // Not persistent: no name, and the `custom` type regardless of
+                // what the schema called it.
+                let name_offset = self.add_string("");
+                let type_index = self.add_custom_field_type(layout);
+                built.push((
+                    field_index,
+                    TagFieldLayout {
+                        name_offset,
+                        type_index,
+                        definition: 0,
+                        field_type: TagFieldType::Custom,
+                        offset: field.offset,
+                    },
+                ));
+            }
+            if terminator {
+                break;
+            }
+            field_index += 1;
+        }
+
+        let name = Self::string_at(layout, source.name_offset);
+        let name_offset = self.add_string(&name);
+        let first = self.fields.len() as u32;
+        for (old, record) in built {
+            self.field_remap.insert(old, self.fields.len());
+            self.fields.push(record);
+        }
+        self.structs[slot] = TagStructLayout {
+            index: slot as u32,
+            guid: source.guid,
+            name_offset,
+            first_field_index: first,
+            size: 0,
+            version: source.version,
+        };
+        slot as u32
+    }
+
+    /// The `custom` field type, interned the way a non-persistent field asks for
+    /// it. Reuses the layout's own `custom` row when it has one so the type
+    /// table matches; falls back to synthesizing the row.
+    fn add_custom_field_type(&mut self, layout: &TagLayout) -> u32 {
+        if let Some(index) = layout
+            .field_types
+            .iter()
+            .position(|entry| layout.get_string(entry.name_offset) == Some("custom"))
+        {
+            return self.add_field_type(layout, index);
+        }
+        let name_offset = self.add_string("custom");
+        match self.field_types.iter().position(|entry| entry.name_offset == name_offset) {
+            Some(index) => index as u32,
+            None => {
+                self.field_types.push(TagFieldTypeLayout {
+                    name_offset,
+                    size: 0,
+                    needs_sub_chunk: 0,
+                });
+                self.field_types.len() as u32 - 1
+            }
+        }
+    }
+}
+
+/// What every `api interop` definition is called in a persisted layout.
+const ENGINE_INTEROP_NAME: &str = "blah";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::TagLayout;
+
+    /// The size and field list a group's `tmpl` template struct comes out with,
+    /// plus the width the `tmpl` custom that introduces it occupies.
+    fn template_struct(
+        game: &str,
+        group: &str,
+        struct_name: &str,
+    ) -> (usize, Vec<String>, Vec<u32>) {
+        let layout =
+            TagLayout::from_json(format!("../definitions/{game}/{group}.json")).unwrap();
+        let index = layout
+            .struct_layouts
+            .iter()
+            .position(|s| layout.get_string(s.name_offset) == Some(struct_name))
+            .unwrap_or_else(|| panic!("{game}/{group} has no struct {struct_name}"));
+        let mut names = Vec::new();
+        let mut field = layout.struct_layouts[index].first_field_index as usize;
+        loop {
+            let record = &layout.fields[field];
+            if record.field_type == TagFieldType::Terminator {
+                break;
+            }
+            names.push(layout.get_string(record.name_offset).unwrap_or_default().to_owned());
+            field += 1;
+        }
+        let hole_widths = layout
+            .tmpl_holes
+            .iter()
+            .map(|hole| layout.fields[hole.field_index as usize].definition)
+            .collect();
+        (layout.struct_layouts[index].size, names, hole_widths)
+    }
+
+    /// A template's inherited base lands in the struct, not in the parent.
+    ///
+    /// Halo 4's `particle` is the case that sent us here: Bonobo refused to open
+    /// a tag Baboon created, and the difference against the same tag from
+    /// ManagedBlam was `shader_particle_struct_definition` — 52 bytes and six
+    /// fields where the kit writes 152 and twenty, the missing hundred being
+    /// `rm `'s, which the importer had been charging to a `tmpl` custom in
+    /// `particle_struct_definition` as anonymous padding. The parent's size came
+    /// out right either way, so only the field list catches it.
+    #[test]
+    fn a_templates_inherited_base_lands_in_the_struct_it_belongs_to() {
+        let (size, names, holes) =
+            template_struct("halo4_mcc", "particle", "shader_particle_struct_definition");
+        assert_eq!(size, 152);
+        assert_eq!(names.first().map(String::as_str), Some(""), "the `rm ` leading custom");
+        assert_eq!(names.get(1).map(String::as_str), Some("definition"));
+        assert!(names.iter().any(|n| n == "parameters"), "{names:?}");
+        assert!(names.iter().any(|n| n == "postprocess"), "{names:?}");
+        assert!(names.iter().any(|n| n == "locked parameters"), "{names:?}");
+        assert_eq!(names.last().map(String::as_str), Some("palette"), "own fields still last");
+        // The bytes moved into the struct, so the custom that named the template
+        // occupies none — charging both would double-count the base.
+        assert!(holes.iter().all(|&width| width == 0), "{holes:?}");
+    }
+
+    /// The Halo 3 schemas already inline the base, and must be left alone.
+    ///
+    /// This is the case that keeps the fold honest: `?rmp`'s whole struct is 64
+    /// bytes there and so is `rm `'s, because H3's dump writes the common shader
+    /// fields straight into `shader_particle_struct_definition`. Folding on the
+    /// same rule that fixes Halo 4 would make it 128. Without a game that
+    /// *disagrees*, "the base is inline" and "the base was added" look identical.
+    #[test]
+    fn a_base_the_schema_already_inlines_is_not_added_twice() {
+        let (size, names, _) =
+            template_struct("halo3_mcc", "particle", "shader_particle_struct_definition");
+        assert_eq!(size, 64);
+        assert_eq!(names.iter().filter(|n| *n == "definition").count(), 1, "{names:?}");
+    }
+
+    /// A template with no ancestors contributes nothing and renames nothing.
+    ///
+    /// Halo 4's `light_volume_system` names `mat `, which has no `parent_tag`.
+    /// The struct that follows already is the whole material, and it keeps the
+    /// group's own `material_struct` identity rather than adopting `mat `'s
+    /// `material_block_struct` — which is what shipped tags carry.
+    #[test]
+    fn a_template_with_no_base_is_left_alone() {
+        let (size, names, holes) =
+            template_struct("halo4_mcc", "light_volume_system", "material_struct");
+        assert_eq!(size, 68);
+        assert_eq!(names.first().map(String::as_str), Some("material shader"));
+        assert!(holes.iter().all(|&width| width == 0), "{holes:?}");
+    }
+
+    /// The tables come out in the order the engine writes them.
+    ///
+    /// Four properties that all follow from the walk and all failed before it:
+    /// the root struct is reached first and so is index 0; the root *block* is
+    /// added on the way back up and so is last; no persisted string carries the
+    /// editor decorations the dump keeps; and an `api interop` is named the way
+    /// the engine names one rather than the way the dumper does.
+    #[test]
+    fn the_layout_tables_come_out_in_the_order_the_engine_writes_them() {
+        let layout = TagLayout::from_json("../definitions/halo4_mcc/particle.json").unwrap();
+
+        let root_block = layout.header.tag_group_block_index as usize;
+        assert_eq!(
+            root_block,
+            layout.block_layouts.len() - 1,
+            "the root block is added after everything it reaches",
+        );
+        assert_eq!(
+            layout.block_layouts[root_block].struct_index, 0,
+            "the root struct is reached first",
+        );
+
+        let mut offset = 0usize;
+        while offset < layout.string_data.len() {
+            let end = layout.string_data[offset..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .map(|len| offset + len)
+                .unwrap_or(layout.string_data.len());
+            let text = &layout.string_data[offset..end];
+            assert!(
+                !text.iter().any(|byte| TAG_STRING_DELIMITERS.contains(byte)),
+                "{:?} keeps a delimiter the engine cuts at",
+                String::from_utf8_lossy(text),
+            );
+            offset = end + 1;
+        }
+
+        assert!(!layout.interop_layouts.is_empty(), "a particle carries one");
+        for interop in &layout.interop_layouts {
+            assert_eq!(layout.get_string(interop.name_offset), Some(ENGINE_INTEROP_NAME));
+        }
+    }
+
+    /// A string that is a suffix of one already in the blob shares its offset.
+    ///
+    /// `find_or_add_explicit_list<char>` searches the raw character buffer for
+    /// the string *and its terminator*, so `flags` costs nothing once
+    /// `main flags` is there. Emitting it separately is what put fifteen strings
+    /// in a Halo 4 particle that no kit tag has.
+    #[test]
+    fn a_string_that_is_a_suffix_of_another_shares_its_offset() {
+        let layout = TagLayout::from_json("../definitions/halo4_mcc/particle.json").unwrap();
+        let long = layout
+            .string_data
+            .windows(b"main flags\0".len())
+            .position(|window| window == b"main flags\0")
+            .expect("the root's `main flags` field");
+        let short = layout
+            .string_data
+            .windows(b"flags\0".len())
+            .position(|window| window == b"flags\0")
+            .expect("`flags` resolves somewhere");
+        assert_eq!(short, long + "main ".len(), "`flags` reuses the tail of `main flags`");
+    }
+
+    /// The identifier says what the engine's writer would say.
+    ///
+    /// `version_get_build_number()` is -1 for an untracked build and the guid is
+    /// then generated; the reader accepts the pair only when exactly one of
+    /// "build is -1" and "guid is set" holds. The payload version is the
+    /// engine's per-profile constant, 4 for Halo 4 and 3 for Reach.
+    #[test]
+    fn the_layout_identifier_is_the_pair_the_engine_checks_for() {
+        for (game, expected_version) in [("halo4_mcc", 4u32), ("haloreach_mcc", 3)] {
+            let layout =
+                TagLayout::from_json(format!("../definitions/{game}/particle.json")).unwrap();
+            assert_eq!(layout.version, expected_version, "{game} payload version");
+            assert_eq!(layout.root_data_size, u32::MAX, "{game} build stamp");
+            assert_ne!(layout.guid, [0u8; 16], "{game} guid");
+            assert_eq!(layout.guid[7] & 0xF0, 0x40, "{game} guid is version 4");
+            assert_eq!(layout.guid[8] & 0xC0, 0x80, "{game} guid has the RFC variant");
+        }
+        // Two layouts authored separately must not share one.
+        let first = TagLayout::from_json("../definitions/halo4_mcc/particle.json").unwrap();
+        let second = TagLayout::from_json("../definitions/halo4_mcc/particle.json").unwrap();
+        assert_ne!(first.guid, second.guid);
+    }
+
+    /// The layout a schema builds is the layout the kit's own tags carry.
+    ///
+    /// The end of the whole exercise, and the only test that can tell "correct"
+    /// from "identical": every table, every index and every byte of string data
+    /// compared against tags the editing kit wrote, with only the 20-byte
+    /// identifier skipped — the build stamp and the guid, which are properties
+    /// of the *save* rather than of the layout and are not reproducible by
+    /// construction.
+    ///
+    /// Ignored by default — it needs a loose kit.
+    ///
+    /// Run with:
+    ///   BLAM_TEST_H4EK=~/Halo/halo4_mcc/tags cargo test the_generated_layout -- --ignored
+    #[test]
+    #[ignore = "requires a loose Halo 4 tag tree; set BLAM_TEST_H4EK"]
+    fn the_generated_layout_is_the_one_the_kits_tags_carry() {
+        let Ok(root) = std::env::var("BLAM_TEST_H4EK") else {
+            eprintln!("skipping: set BLAM_TEST_H4EK to a loose Halo 4 tags directory");
+            return;
+        };
+        // A group whose shipped tags were all authored against the definition
+        // the dump describes, so any mismatch is ours rather than drift.
+        let layout = TagLayout::from_json("../definitions/halo4_mcc/prefab.json").unwrap();
+        let mut ours = Vec::new();
+        layout.write(&mut ours).unwrap();
+        let ours = &ours[IDENTIFIER_END..];
+
+        let mut compared = 0usize;
+        for path in crate::convert::walk_files(std::path::Path::new(&root)) {
+            if path.extension().is_none_or(|e| !e.eq_ignore_ascii_case("prefab")) {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let Some(shipped) = shipped_layout_chunk(&bytes) else { continue };
+            assert_eq!(
+                &shipped[IDENTIFIER_END..],
+                ours,
+                "{} carries a different layout",
+                path.display()
+            );
+            compared += 1;
+            if compared == 64 {
+                break;
+            }
+        }
+        assert!(compared > 0, "no prefabs under {root}");
+        eprintln!("layout reproduced on {compared} shipped prefabs");
+    }
+
+    /// Past the `blay` chunk header and the identifier it starts with.
+    const IDENTIFIER_END: usize = 12 + 4 + 16;
+
+    /// The `blay` chunk of an MCC tag file, header included.
+    fn shipped_layout_chunk(bytes: &[u8]) -> Option<&[u8]> {
+        if bytes.len() < 80 || &bytes[60..64] != b"MALB" {
+            return None;
+        }
+        let read = |at: usize| -> u32 {
+            u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+        };
+        if &bytes[64..68] != b"!gat" {
+            return None;
+        }
+        let layout_at = 64 + 12;
+        if bytes.get(layout_at..layout_at + 4)? != b"yalb" {
+            return None;
+        }
+        let size = read(layout_at + 8) as usize;
+        bytes.get(layout_at..layout_at + 12 + size)
+    }
+
+    /// Two definitions that share a name and differ are both kept.
+    ///
+    /// A Halo 4 particle carries the material's 12-element
+    /// `runtime_queryable_properties` and the render method's 28-element one.
+    /// Merging the base's registry by name alone dropped the second, and
+    /// `render_method_postprocess_block` came out 32 bytes short — a size error
+    /// rather than a wrong tag, which is the only reason it was noticed.
+    #[test]
+    fn a_base_definition_that_collides_by_name_keeps_its_own_shape() {
+        let layout = TagLayout::from_json("../definitions/halo4_mcc/particle.json").unwrap();
+        let mut counts: Vec<u32> = layout
+            .array_layouts
+            .iter()
+            .filter(|a| layout.get_string(a.name_offset) == Some("runtime_queryable_properties"))
+            .map(|a| a.count)
+            .collect();
+        counts.sort_unstable();
+        assert_eq!(counts, vec![12, 28]);
+
+        let postprocess = layout
+            .struct_layouts
+            .iter()
+            .find(|s| layout.get_string(s.name_offset) == Some("render_method_postprocess_block"))
+            .unwrap();
+        assert_eq!(postprocess.size, 172);
+    }
 }

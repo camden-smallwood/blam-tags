@@ -15,7 +15,7 @@ use crate::io::*;
 
 /// An `sz[]` entry: a named list of strings, represented as a slice
 /// into [`TagLayout::string_offsets`]. Used for enum/flags value names.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct TagStringList {
     /// `name_offset`-style index into [`TagLayout::string_data`] — the
     /// display name of this list (e.g. an enum type name).
@@ -31,7 +31,7 @@ pub struct TagStringList {
 /// elements have no wrapping `tgst` — their raw bytes live inline in
 /// the parent struct's `raw_data`, and their sub-chunks flow inline
 /// into the parent's `tgst` content.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct TagArrayLayout {
     /// Offset into [`TagLayout::string_data`] of the array's name.
     pub name_offset: u32,
@@ -43,7 +43,7 @@ pub struct TagArrayLayout {
 
 /// A `tgft` entry: a field-type registry record. Indexed by
 /// [`TagFieldLayout::type_index`].
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct TagFieldTypeLayout {
     /// Offset into [`TagLayout::string_data`] of the canonical type name
     /// (e.g. `"real point 3d"`), resolved at read time via
@@ -62,7 +62,7 @@ pub struct TagFieldTypeLayout {
 /// form is 12 bytes (`name_offset` + `type_index` + `definition`); the
 /// derived `field_type` and `offset` are computed at read time and are
 /// not on the wire.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct TagFieldLayout {
     /// Offset into [`TagLayout::string_data`] of the field name.
     pub name_offset: u32,
@@ -83,7 +83,7 @@ pub struct TagFieldLayout {
 
 /// A `blv2` entry (v2/v3) or half of a v1 `agro` record: names a block
 /// whose elements are instances of a struct.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct TagBlockLayout {
     /// Position in [`TagLayout::block_layouts`]. Tracked so
     /// `crate::data::TagBlockData` can remember which block it came from.
@@ -98,7 +98,7 @@ pub struct TagBlockLayout {
 }
 
 /// An `rcv2` entry: declares a pageable-resource field's shape.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct TagResourceLayout {
     /// Offset into [`TagLayout::string_data`] of the resource name.
     pub name_offset: u32,
@@ -112,7 +112,7 @@ pub struct TagResourceLayout {
 
 /// A `]==[` entry (v3 only): declares an api-interop field — an opaque
 /// runtime-only pointer slot. Not parsed.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct TagInteropLayout {
     pub name_offset: u32,
     pub struct_index: u32,
@@ -124,7 +124,7 @@ pub struct TagInteropLayout {
 /// struct and points at its first field. Size is derived at read time
 /// by [`TagLayout::compute_struct_layout`] walking fields until the
 /// terminator.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct TagStructLayout {
     /// Position in [`TagLayout::struct_layouts`]. Tracked so
     /// `crate::data::TagStructData` can remember which struct it came from.
