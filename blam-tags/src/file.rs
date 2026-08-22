@@ -199,6 +199,7 @@ impl TagFile {
     /// computed size doesn't match the schema's stated size
     /// (both surfaced as `blam_tags::TagSchemaError`).
     pub fn new<P: AsRef<Path>>(schema_path: P) -> Result<Self, Box<dyn Error>> {
+        let schema_path = schema_path.as_ref();
         let (layout, meta) = TagLayout::from_json_with_meta(schema_path)?;
         let tag_stream = TagStream::new_default(layout);
         let header = TagFileHeader {
@@ -211,7 +212,7 @@ impl TagFile {
             checksum: 0,
             signature: u32::from_be_bytes(*b"BLAM"),
         };
-        Ok(Self {
+        let mut tag = Self {
             header,
             container: TagContainer::Mcc,
             endian: Endian::Le,
@@ -219,7 +220,17 @@ impl TagFile {
             dependency_list_stream: None,
             import_info_stream: None,
             asset_depot_storage_stream: None,
-        })
+        };
+        // Stamp the generation the profile's kit expects. The header's `version`
+        // has to agree with the one the embedded layout carries — the engine
+        // accepts an identifier only when exactly one of "build is -1" and "guid
+        // is set" holds, and `TagLayout::from_json` writes -1 and a guid. The
+        // table lives in `convert` and is deliberately not repeated here; a
+        // profile it does not know leaves the header zeroed, as before.
+        if let Some(game) = schema_profile_name(schema_path) {
+            let _ = crate::convert::apply_editing_kit_mcc_header(&mut tag, &game);
+        }
+        Ok(tag)
     }
 
     /// Assemble a [`TagFile`] from an already-built header + tag stream,
@@ -787,6 +798,16 @@ fn save_temp_location(path: &Path) -> std::io::Result<(PathBuf, String)> {
         )
     })?;
     Ok((parent, format!(".{}", file_name.to_string_lossy())))
+}
+
+/// The profile a schema path belongs to — the directory name that holds it,
+/// confirmed against the `_meta.json` sitting beside it so a path that merely
+/// looks like `<something>/<group>.json` cannot be mistaken for a kit profile.
+fn schema_profile_name(schema_path: &Path) -> Option<String> {
+    let directory = schema_path.parent()?;
+    let bytes = std::fs::read(directory.join("_meta.json")).ok()?;
+    let meta: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    Some(meta.get("game")?.as_str()?.to_owned())
 }
 
 fn patch_live_reload_checksum(bytes: &mut [u8], main_stream: &[u8]) {
