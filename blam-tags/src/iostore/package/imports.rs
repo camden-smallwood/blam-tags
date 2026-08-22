@@ -1200,8 +1200,15 @@ mod new_package_corpus {
         let dir = std::env::temp_dir().join(format!("blam-newgroup-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let out = dir.join("probe-WinGDK_P.utoc");
-        write_new_tag_container(&template, &tag_bytes, NEW_PKG, None, &out)
-            .expect("a group with no shipped tag must still build");
+        write_new_tag_container(
+            &template,
+            &tag_bytes,
+            NEW_PKG,
+            None,
+            WrapperOrigin::Template,
+            &out,
+        )
+        .expect("a group with no shipped tag must still build");
 
         let modded = IoStoreArchive::open(&out).expect("open the new container");
         let id = crate::iostore::writer::make_chunk_id(

@@ -3632,11 +3632,19 @@ fn sanitize_donated_export(
     Ok(out)
 }
 
+/// Write one package into a standalone `_P` container.
+///
+/// `origin` is what `template_uasset` is *to* the tag being written, and only
+/// the caller knows: a tag authored from an unrelated same-group donor is
+/// [`WrapperOrigin::Template`], a tag copied from the very package that donated
+/// the wrapper is [`WrapperOrigin::Copy`]. Assuming `Template` here is what made
+/// a copy lose the bindings that were its own — see [`WrapperOrigin`].
 pub fn write_new_tag_container(
     template_uasset: &[u8],
     tag_bytes: &[u8],
     new_package_path: &str,
     redirect_from: Option<&str>,
+    origin: WrapperOrigin,
     out_utoc: &std::path::Path,
 ) -> Result<()> {
     let mut w = OverrideContainerWriter::new("../../../");
@@ -3648,8 +3656,7 @@ pub fn write_new_tag_container(
             new_package_path,
             redirect_from,
             asset_reference: None,
-            // A standalone new tag: the template is a donor, not the original.
-            origin: WrapperOrigin::Template,
+            origin,
         },
     )?;
     w.write(out_utoc)
@@ -5472,6 +5479,7 @@ mod tests {
             &tag_bytes,
             new_pkg,
             Some("/Game/Tags/Default/default-biped"),
+            WrapperOrigin::Template,
             &utoc,
         )
         .expect("write new tag container");
