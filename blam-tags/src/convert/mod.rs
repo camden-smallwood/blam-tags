@@ -235,6 +235,14 @@ pub fn conversion_routes(source_game: &str, target_game: &str) -> Vec<Vec<String
     if source_game == CAMPAIGN_EVOLVED_GAME || target_game == CAMPAIGN_EVOLVED_GAME {
         return routes;
     }
+    // A profile has nothing between it and itself. Asked anyway by the
+    // byte-order upgrade, which is a real conversion at a pair that is otherwise
+    // meaningless — and by anything that enumerates pairs. Answering before the
+    // slice below is what stops `CONVERSION_CHAIN[to + 1..from]` being asked for
+    // a range that runs backwards.
+    if source_game == target_game {
+        return routes;
+    }
     let position = |game: &str| CONVERSION_CHAIN.iter().position(|entry| *entry == game);
     let (Some(from), Some(to)) = (position(source_game), position(target_game)) else {
         return routes;
@@ -1535,7 +1543,16 @@ pub fn converted_group(
 ) -> Result<Option<(u32, String)>, String> {
     let catalog = ConversionMappingCatalog::load()?;
     let mut cache = HashMap::new();
-    for route in conversion_routes(source_game, target_game) {
+    let mut routes = conversion_routes(source_game, target_game);
+    if routes.is_empty() && source_game == target_game {
+        // A profile-to-itself pair has no route, because normally it has no work
+        // to do. A big-endian source is the exception (see
+        // `analyze_conversion_inner`), and the class it lands in is still a real
+        // question: an alias rule can rename a group inside one profile. Ask it
+        // the way every other hop is asked, over a one-hop identity route.
+        routes.push(vec![source_game.to_owned(), target_game.to_owned()]);
+    }
+    for route in routes {
         let mut name = group_name.to_owned();
         let mut landed = None;
         for hop in route.windows(2) {
@@ -1837,13 +1854,18 @@ fn analyze_conversion_inner(
     native_templates: Option<&NativeTemplateIndex>,
     policy: LossPolicy,
 ) -> Result<TagConversionDraft, String> {
-    // A classic source is fine in either byte order — reading is endian-aware and
-    // Halo CE bodies are big-endian by design. A big-endian *MCC* tag is not: it
-    // is an Xbox 360 or legacy debug build with no round trip, the same carve-out
-    // `unsaveable_reason` makes.
-    if source.classic_engine().is_none() && source.endian != Endian::Le {
-        return Err("Only little-endian MCC tags can be converted".to_owned());
-    }
+    // Byte order is not a barrier in either container. Reading dispatches on
+    // `TagFile::endian` all the way down (see `crate::fields`), and the target is
+    // little-endian from birth — it is either built by `TagFile::new`, which
+    // hard-codes `Endian::Le`, or borrowed from a kit tag, and
+    // `find_native_target_template` only accepts a little-endian one. So the field
+    // walk below *is* the byte-order conversion: every value is read big-endian out
+    // of the source and written little-endian into the target.
+    //
+    // What does not cross for free is a pageable resource payload, an opaque codec
+    // stream in source byte order. `transfer_resource` decides that per resource
+    // and records whatever it cannot carry, so a 360 tag whose data cannot come
+    // with it is held back rather than landing half-converted.
     if source.classic_engine().is_some() && !CLASSIC_CONVERSION_GAMES.contains(&source_game) {
         return Err(format!(
             "{source_game} is not a classic profile, but this tag is a classic \
@@ -1851,7 +1873,16 @@ fn analyze_conversion_inner(
             source.classic_engine()
         ));
     }
-    if !conversion_pair_supported(source_game, target_game) {
+    // Converting a profile to itself is normally meaningless, and
+    // `conversion_pair_supported` refuses it. A big-endian source is the one case
+    // where it is not: an Xbox 360 tag and its MCC counterpart are the same profile
+    // at a different byte order, usually also at a different schema revision, so
+    // "Reach to Reach" is the honest description of the work. Routing is still
+    // never attempted for such a pair — there is nowhere to route through.
+    let byte_order_upgrade = source_game == target_game
+        && source.classic_engine().is_none()
+        && source.endian != Endian::Le;
+    if !byte_order_upgrade && !conversion_pair_supported(source_game, target_game) {
         return Err(unsupported_pair_message(source_game, target_game));
     }
 
@@ -2160,6 +2191,11 @@ fn analyze_conversion_inner(
     // inputs there are to seed.
     seed_material_parameters(&mut target, source, &mut context);
     report_materials_without_a_shader(&target, &mut context);
+    // Before the safety check, and only ever after the walk: it reads what the
+    // target ended up with, and its whole job is to take a resource back off the
+    // lost list.
+    forgive_hydrated_geometry(&target, &mut context);
+    convert_x360_bitmap_pixels(source, &mut target, &mut context);
     let fail_closed_losses = validate_critical_runtime_safety(source, &context, policy)?;
     if !fail_closed_losses.is_empty() {
         context.report.issues.push(ConversionIssue {
@@ -12978,5 +13014,250 @@ mod group_alias_regression {
             Some(TagFieldData::TagReference(reference)) => reference.group_tag_and_name,
             _ => None,
         }
+    }
+}
+
+
+/// A tag out of an Xbox 360 monolithic build, converted into the PC kit of the
+/// same engine.
+///
+/// This is the pair `conversion_pair_supported` refuses on purpose everywhere
+/// else: a profile to itself. It is legal here only because the source is
+/// big-endian, which is the one case where "Reach to Reach" is real work. See
+/// `analyze_conversion_inner`.
+#[cfg(test)]
+mod x360_cache_conversion {
+    use super::tests::kit_tags;
+    use super::*;
+    use crate::monolithic::MonolithicCache;
+
+    /// The Halo Reach July 2011 tags build this was developed against.
+    ///
+    /// Not a fixture that can be committed — it is a 27 GB game build. Every
+    /// test here says so and returns rather than failing, which is the same
+    /// bargain the kit-backed tests make.
+    fn reach_x360_cache() -> Option<MonolithicCache> {
+        let root = std::env::var("BLAM_TEST_REACH_X360_CACHE").ok()?;
+        let root = PathBuf::from(root);
+        if !root.join("blob_index.dat").is_file() {
+            return None;
+        }
+        MonolithicCache::open(&root).ok()
+    }
+
+    fn read_cache_tag(cache: &MonolithicCache, group: &[u8; 4], name: &str) -> Option<TagFile> {
+        cache.read_tag_by_name(u32::from_be_bytes(*group), name).ok()
+    }
+
+    fn convert_into_reach(
+        source: &TagFile,
+        reach: &Path,
+        definitions: &Path,
+    ) -> Result<TagConversionDraft, String> {
+        let groups = GameTagIndex::load(definitions, "haloreach_mcc")?;
+        let templates = NativeTemplateIndex::build(reach, &groups);
+        analyze_conversion_with_templates(
+            source,
+            "haloreach_mcc",
+            "haloreach_mcc",
+            definitions,
+            Some(&templates),
+        )
+    }
+
+    /// The whole point: a big-endian source produces a little-endian tag that
+    /// survives a save and a reparse.
+    ///
+    /// Reparsing matters more than the endian flag does. A tag whose header says
+    /// little-endian over a payload still in 360 byte order would pass a flag
+    /// check and open as nonsense, so this writes the bytes a save would produce
+    /// and reads them back.
+    #[test]
+    fn a_big_endian_cache_tag_converts_to_a_little_endian_reach_tag() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let mut converted = 0;
+        let mut refusals = Vec::new();
+        for entry in cache.iter_tags().filter(|entry| {
+            entry.group_tag == u32::from_be_bytes(*b"weap") && !entry.name.is_empty()
+        }) {
+            let Some(source) = read_cache_tag(&cache, b"weap", &entry.name) else {
+                continue;
+            };
+            assert_eq!(source.endian, Endian::Be, "{} is not a 360 tag", entry.name);
+            match convert_into_reach(&source, &reach, &definitions) {
+                Ok(draft) => {
+                    assert_eq!(
+                        draft.tag.endian,
+                        Endian::Le,
+                        "{} converted but stayed big-endian",
+                        entry.name
+                    );
+                    let bytes = draft.tag.write_to_bytes().expect("serialize");
+                    let reread = TagFile::read_from_bytes(&bytes)
+                        .unwrap_or_else(|e| panic!("{} did not reparse: {e}", entry.name));
+                    assert_eq!(reread.endian, Endian::Le);
+                    assert_eq!(reread.group().tag, u32::from_be_bytes(*b"weap"));
+                    converted += 1;
+                }
+                Err(error) => refusals.push(format!("{}: {error}", entry.name)),
+            }
+            if converted >= 8 {
+                break;
+            }
+        }
+        assert!(
+            converted > 0,
+            "no weapon converted out of the 360 cache; refusals: {refusals:#?}"
+        );
+    }
+
+    /// A render model's geometry survives the move without an encoder.
+    ///
+    /// The 360 keeps its vertex and index buffers in the pageable cache and
+    /// leaves the inline author-format blocks empty; `MonolithicCache::read_tag`
+    /// hydrates them on the way out, into exactly the blocks an MCC PC tag uses.
+    /// So the field walk carries the geometry and the GPU resource is dropped —
+    /// which is only correct if the vertices really did arrive.
+    #[test]
+    fn a_360_render_model_arrives_with_its_geometry_inline() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let mut checked = 0;
+        for entry in cache.iter_tags().filter(|entry| {
+            entry.group_tag == u32::from_be_bytes(*b"mode") && !entry.name.is_empty()
+        }) {
+            let Some(source) = read_cache_tag(&cache, b"mode", &entry.name) else {
+                continue;
+            };
+            // Only a model this build actually had resident says anything about
+            // the conversion; a `tag_cache` is an LRU, not a complete archive.
+            if crate::render_geometry::author_geometry_populated(&source) != Some(true) {
+                continue;
+            }
+            let draft = convert_into_reach(&source, &reach, &definitions)
+                .unwrap_or_else(|error| panic!("{} refused: {error}", entry.name));
+            assert_eq!(
+                crate::render_geometry::author_geometry_populated(&draft.tag),
+                Some(true),
+                "{} converted with no vertices",
+                entry.name
+            );
+            assert_eq!(draft.tag.endian, Endian::Le);
+            checked += 1;
+            if checked >= 3 {
+                break;
+            }
+        }
+        assert!(checked > 0, "no resident render model in the cache to check");
+    }
+
+    /// A 360 bitmap lands with its pixels in the blob a PC tag reads from.
+    ///
+    /// The metadata crosses on its own; the pixels do not, because they sit in
+    /// a per-image texture resource in Xenos tile order. What this proves is the
+    /// re-lay-out: one `processed pixel data` blob, each image pointed at its
+    /// own slice, and a mip count that matches the single level detiled.
+    #[test]
+    fn a_360_bitmap_arrives_with_pc_shaped_pixels() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let mut checked = 0;
+        for entry in cache.iter_tags().filter(|entry| {
+            entry.group_tag == u32::from_be_bytes(*b"bitm") && !entry.name.is_empty()
+        }) {
+            let Some(source) = read_cache_tag(&cache, b"bitm", &entry.name) else {
+                continue;
+            };
+            let Ok(draft) = convert_into_reach(&source, &reach, &definitions) else {
+                continue;
+            };
+            let root = draft.tag.root();
+            let pixels = root
+                .field_path("processed pixel data")
+                .and_then(|field| field.as_data())
+                .unwrap_or_default();
+            assert!(!pixels.is_empty(), "{} converted with no pixels", entry.name);
+            let images = root
+                .field_path("bitmaps")
+                .and_then(|field| field.as_block())
+                .expect("a converted bitmap keeps its bitmaps block");
+            let mut covered = 0usize;
+            for index in 0..images.len() {
+                let image = images.element(index).unwrap();
+                let offset = image.read_int_any("pixels offset").unwrap_or(-1);
+                let size = image.read_int_any("pixels size").unwrap_or(0);
+                assert!(offset >= 0 && size > 0, "{} image {index} has no slice", entry.name);
+                assert!(
+                    (offset + size) as usize <= pixels.len(),
+                    "{} image {index} points past the blob",
+                    entry.name
+                );
+                assert_eq!(
+                    image.read_int_any("mipmap count").unwrap_or(-1),
+                    0,
+                    "{} image {index} claims mips it does not carry",
+                    entry.name
+                );
+                covered += size as usize;
+            }
+            assert_eq!(covered, pixels.len(), "{} left pixels unaccounted for", entry.name);
+            // The 360 mirrors describe storage this tag no longer has.
+            assert!(
+                root.field_path("hardware textures")
+                    .and_then(|field| field.as_block())
+                    .is_none_or(|block| block.is_empty()),
+                "{} kept its 360 texture resources",
+                entry.name
+            );
+            checked += 1;
+            if checked >= 3 {
+                break;
+            }
+        }
+        assert!(checked > 0, "no bitmap converted out of the 360 cache");
+    }
+
+    /// What cannot cross is refused, not written half-converted.
+    ///
+    /// An animation graph is the case that matters: its payload *is* a pageable
+    /// resource, a compressed codec stream in 360 byte order that nothing here
+    /// reinterprets. Landing one as a tag full of metadata and no animation
+    /// would read as success in the report and play nothing in the game.
+    #[test]
+    fn a_360_animation_graph_is_refused_rather_than_emptied() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let Some(entry) = cache
+            .iter_tags()
+            .find(|entry| entry.group_tag == u32::from_be_bytes(*b"jmad") && !entry.name.is_empty())
+        else {
+            eprintln!("skipping: no animation graph in the cache");
+            return;
+        };
+        let source = read_cache_tag(&cache, b"jmad", &entry.name).expect("read the graph");
+        let error = convert_into_reach(&source, &reach, &definitions)
+            .err()
+            .unwrap_or_else(|| panic!("{} converted, which it has no way to do", entry.name));
+        assert!(
+            error.contains("pageable resource"),
+            "refused for the wrong reason: {error}"
+        );
     }
 }

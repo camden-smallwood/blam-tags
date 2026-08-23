@@ -530,9 +530,12 @@ impl TagFieldData {
 // raw_data. The 1-byte helpers don't take endian — endianness is
 // meaningless for a single byte.
 //
-// Writers always emit little-endian because we never serialize a BE
-// tag back to disk (Phase 1 set scope to read-only for X360). If that
-// ever changes, mirror the reader dispatch in the writer.
+// Writers dispatch on `endian` the same way, so an edit to a BE tag stays
+// big-endian in memory. What is *not* symmetric is the file: `TagFile::write`
+// emits little-endian headers and chunk wrappers unconditionally, so a BE tag
+// has no round trip. Moving one to PC goes through `crate::convert`, which
+// reads BE fields and writes LE ones into a fresh target rather than swapping
+// this buffer in place.
 //================================================================================
 
 #[inline] fn read_i8(raw: &[u8], o: usize) -> i8 { raw[o] as i8 }

@@ -109,6 +109,56 @@ pub fn hydrate(tag: &mut TagFile, cache_bytes: &[u8]) -> Result<usize, HydrateEr
     Ok(hydrated)
 }
 
+/// The field every geometry struct keeps its GPU buffers behind.
+///
+/// Named here rather than spelled out at each call site because the converter
+/// has to recognise a left-behind resource by it, and a literal in two modules
+/// is a literal that drifts.
+pub const API_RESOURCE_FIELD: &str = "api resource";
+
+/// Whether every geometry struct this tag's group declares already carries
+/// author-format vertex data.
+///
+/// `None` when the group declares no geometry struct, so a caller can tell
+/// "this tag has no geometry" apart from "this tag's geometry went missing".
+///
+/// The question matters to anything moving a 360 tag to PC. There the buffers
+/// arrive in the pageable cache and the inline blocks are empty; [`hydrate`]
+/// fills them in on read, which is the shape an MCC PC tag stores natively. A
+/// tag that answers `Some(true)` therefore has its geometry in hand, and its
+/// api resource is only a description of where the 360 kept its copy.
+///
+/// Deliberately all-or-nothing: `Lbsp` declares three geometry structs, and
+/// forgiving one struct's missing resource because a *different* struct
+/// hydrated is exactly the silent loss this exists to catch.
+pub fn author_geometry_populated(tag: &TagFile) -> Option<bool> {
+    let paths = geometry_struct_paths(tag.header.group_tag);
+    if paths.is_empty() {
+        return None;
+    }
+    let root = tag.root();
+    let mut seen = false;
+    let mut all = true;
+    for path in paths {
+        let Some(rg) = root.field_path(path).and_then(|f| f.as_struct()) else {
+            continue;
+        };
+        seen = true;
+        let populated = rg
+            .field("per mesh temporary")
+            .and_then(|f| f.as_block())
+            .is_some_and(|pmt| {
+                (0..pmt.len()).filter_map(|i| pmt.element(i)).any(|elem| {
+                    elem.field("raw vertices")
+                        .and_then(|f| f.as_block())
+                        .is_some_and(|rv| rv.len() > 0)
+                })
+            });
+        all &= populated;
+    }
+    if seen { Some(all) } else { None }
+}
+
 /// Decoded geometry for one geometry struct.
 struct GeometryPlan {
     path: &'static str,

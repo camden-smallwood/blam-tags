@@ -562,17 +562,21 @@ fn resolve_image_pixels<'a>(
 /// bytes (the smaller mip chain). See
 /// [`crate::monolithic::XSyncStateHeader`] for the (counterintuitive)
 /// byte-range pairing the hydrator uses to slice these out of the
-/// cache block. Both halves are in Xenos 32×32-tile swizzled order
-/// and big-endian byte order within each compressed block.
+/// cache block.
 ///
-/// Scope: this implementation detiles **only mip 0** (from the
-/// optional half) and returns it with a mip-count override of 1.
-/// The smaller mip chain has its own packed layout (each level
-/// 4KB-aligned, sub-16-pixel mips share tiles) that we don't yet
-/// reproduce; consumers that need full mip chains for X360
-/// bitmaps would need a per-level offset table à la TagTool's
-/// `GetXboxBitmapLevelOffset`.
-fn convert_x360_image<'a>(
+/// Neither the swizzle nor the byte swap is unconditional: the image's
+/// own `more flags` say which were applied, and a Reach build ships
+/// plenty of small or non-power-of-two textures stored linear. Detiling
+/// one of those would scramble it, and demanding the tile-aligned byte
+/// count that detiling needs is why they used to be rejected outright.
+///
+/// Scope: this reproduces **mip 0** only (from the optional half) and
+/// returns it with a mip-count override of 1. The smaller mip chain has
+/// its own packed layout (each level 4KB-aligned, sub-16-pixel mips
+/// share tiles) that we don't yet reproduce; consumers that need full
+/// mip chains for X360 bitmaps would need a per-level offset table à la
+/// TagTool's `GetXboxBitmapLevelOffset`.
+pub(crate) fn convert_x360_image<'a>(
     elem: TagStruct<'a>,
     payload: &[u8],
 ) -> Result<(Vec<u8>, Option<u32>), BitmapError> {
@@ -590,48 +594,65 @@ fn convert_x360_image<'a>(
         .block_dims_and_size()
         .ok_or_else(|| BitmapError::FormatNotSupported(format_name))?;
 
-    // Mip 0 in block units. Each tile is 32×32 blocks; the tiled
-    // surface rounds up to a tile-aligned grid.
+    // Resolved by schema name, so a build that shuffled the bit order
+    // still answers correctly.
+    let more_flags: Flags<BitmapMoreFlags, u8> = elem.try_read_flags("more flags").unwrap_or_default();
+    let tiled = more_flags.contains(BitmapMoreFlags::X360Tiled);
+    let byte_swapped = more_flags.contains(BitmapMoreFlags::X360ByteOrder);
+
+    // Mip 0 in block units. A tiled surface rounds up to a grid of
+    // 32×32-block tiles; a linear one is exactly its own block grid.
     let mip0_w_blocks = width.div_ceil(block_w);
     let mip0_h_blocks = height.div_ceil(block_h);
-    let aligned_w = (mip0_w_blocks + 31) & !31;
-    let aligned_h = (mip0_h_blocks + 31) & !31;
-    let tiled_size = (aligned_w as usize) * (aligned_h as usize) * (bytes_per_block as usize);
+    let linear_bytes = (mip0_w_blocks as usize) * (mip0_h_blocks as usize) * (bytes_per_block as usize);
 
-    if payload.len() < tiled_size {
-        return Err(BitmapError::PixelSliceOutOfBounds {
-            offset: 0,
-            size: tiled_size as u64,
-            available: payload.len() as u64,
-        });
-    }
-
-    let mut linear = xbox360::detile_blocks(
-        &payload[..tiled_size],
-        aligned_w,
-        aligned_h,
-        bytes_per_block,
-    );
-
-    // Strip down to the texture's actual block grid (drop the
-    // tile-alignment padding rows / columns).
-    let actual_block_count = (mip0_w_blocks as usize) * (mip0_h_blocks as usize);
-    let actual_bytes = actual_block_count * bytes_per_block as usize;
-    if mip0_w_blocks != aligned_w || mip0_h_blocks != aligned_h {
-        let mut compact = vec![0u8; actual_bytes];
-        let bpb = bytes_per_block as usize;
-        for y in 0..mip0_h_blocks as usize {
-            let src = y * aligned_w as usize * bpb;
-            let dst = y * mip0_w_blocks as usize * bpb;
-            let row = mip0_w_blocks as usize * bpb;
-            compact[dst..dst + row].copy_from_slice(&linear[src..src + row]);
+    let mut linear = if tiled {
+        let aligned_w = (mip0_w_blocks + 31) & !31;
+        let aligned_h = (mip0_h_blocks + 31) & !31;
+        let tiled_size = (aligned_w as usize) * (aligned_h as usize) * (bytes_per_block as usize);
+        if payload.len() < tiled_size {
+            return Err(BitmapError::PixelSliceOutOfBounds {
+                offset: 0,
+                size: tiled_size as u64,
+                available: payload.len() as u64,
+            });
         }
-        linear = compact;
+        let mut linear = xbox360::detile_blocks(
+            &payload[..tiled_size],
+            aligned_w,
+            aligned_h,
+            bytes_per_block,
+        );
+        // Strip down to the texture's actual block grid (drop the
+        // tile-alignment padding rows / columns).
+        if mip0_w_blocks != aligned_w || mip0_h_blocks != aligned_h {
+            let mut compact = vec![0u8; linear_bytes];
+            let bpb = bytes_per_block as usize;
+            for y in 0..mip0_h_blocks as usize {
+                let src = y * aligned_w as usize * bpb;
+                let dst = y * mip0_w_blocks as usize * bpb;
+                let row = mip0_w_blocks as usize * bpb;
+                compact[dst..dst + row].copy_from_slice(&linear[src..src + row]);
+            }
+            linear = compact;
+        } else {
+            linear.truncate(linear_bytes);
+        }
+        linear
     } else {
-        linear.truncate(actual_bytes);
-    }
+        if payload.len() < linear_bytes {
+            return Err(BitmapError::PixelSliceOutOfBounds {
+                offset: 0,
+                size: linear_bytes as u64,
+                available: payload.len() as u64,
+            });
+        }
+        payload[..linear_bytes].to_vec()
+    };
 
-    xbox360::swap_byte_pairs(&mut linear);
+    if byte_swapped {
+        xbox360::swap_byte_pairs(&mut linear);
+    }
 
     Ok((linear, Some(1)))
 }
