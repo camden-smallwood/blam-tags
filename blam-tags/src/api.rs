@@ -170,6 +170,24 @@ pub struct TagStruct<'a> {
 }
 
 impl<'a> TagStruct<'a> {
+    /// A view of the same struct type over somebody else's bytes.
+    ///
+    /// For reading a struct that is not part of a tag's chunk tree -- a
+    /// monolithic build's control data holds the engine's own memory image,
+    /// where the bytes are the schema's struct laid out in the source's byte
+    /// order and every pointer is an address rather than a sub-chunk. Fields
+    /// that live in the bytes read normally; fields that would need a sub-chunk
+    /// read as absent, which is the honest answer, because in that image they
+    /// are somewhere else entirely.
+    pub fn over_raw(&self, raw: &'a [u8]) -> TagStruct<'a> {
+        TagStruct {
+            layout: self.layout,
+            struct_data: self.struct_data,
+            struct_raw: raw,
+            endian: Endian::Be,
+        }
+    }
+
     /// The schema side of this instance — the struct definition it
     /// conforms to. Bridges to the [`crate::definition`] facade.
     pub fn definition(&self) -> crate::TagStructDefinition<'a> {

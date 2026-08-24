@@ -3,6 +3,7 @@
 //! field matching and the conversion walk belong to the parent module.
 
 use super::*;
+use crate::monolithic::{ControlReadTally, FixupAddress, FixupTier};
 
 /// Move `source`'s pageable resource onto `target`, returning whether anything
 /// was carried.
@@ -203,6 +204,9 @@ fn clear_processed_flag(geometry: &mut TagStructMut<'_>) {
 /// Un-describe one mesh's compiled buffers.
 fn settle_mesh(mesh: &mut TagStructMut<'_>) {
     set_int_field(mesh, "index buffer index", -1);
+    // The tessellated sibling of the same index, and the same -1 when there is
+    // no buffer to name.
+    set_int_field(mesh, "index buffer tessellation", -1);
     if let Some(mut field) = mesh.field_mut("vertex buffer indices")
         && let Some(mut slots) = field.as_array_mut()
     {
@@ -301,6 +305,127 @@ fn swap_user_data_in(value: &mut TagStructMut<'_>, swapped: &mut usize) {
             }
         }
     }
+}
+
+/// Bring a structure BSP's resource interface inline.
+///
+/// A BSP keeps its collision hierarchy and its instanced geometry definitions --
+/// which mesh each instance draws, which compression box it is quantized in,
+/// and the collision to go with it -- in a structure the two builds put in
+/// different places. A loose MCC tag holds it in `raw_resources[0]/raw_items`
+/// and sets `use resource items` to 0. A 360 build holds it in the pageable
+/// `tag_resources` and sets that field to 1, meaning "it is in the resource".
+///
+/// Carried across unchanged, the tag still says the definitions are in a
+/// resource, and the resource is gone: 1,795 instances with nothing to point at
+/// on one level alone. So the structure is read out of the build's control data
+/// and written where a loose tag keeps it, and the flag is set to say so.
+pub(super) fn carry_structure_resources(
+    byte_order_upgrade: bool,
+    source: &TagFile,
+    target: &mut TagFile,
+    context: &mut ConversionContext<'_>,
+) {
+    if !byte_order_upgrade || source.header.group_tag != u32::from_be_bytes(*b"sbsp") {
+        return;
+    }
+    let root = source.root();
+    let Some(resource) = root
+        .field_path("resource interface/tag_resources")
+        .and_then(|field| field.as_resource())
+    else {
+        return;
+    };
+    let Some(state) = resource.xsync_state() else {
+        // Already in the destination's shape, or empty.
+        return;
+    };
+    let control = state.apply_control_fixups();
+    let primary = resource.exploded_payload().unwrap_or(&[]);
+    let address = FixupAddress(state.header.root_address);
+    if address.tier() != FixupTier::Control {
+        record_unsupported(
+            context,
+            "resource interface/tag_resources".to_owned(),
+            "The Xbox 360 structure resource's root does not point into its control data"
+                .to_owned(),
+        );
+        return;
+    }
+
+    let mut tally = ControlReadTally::default();
+    let outcome = {
+        let mut target_root = target.root_mut();
+        let Some(mut interface_field) = target_root.field_mut("resource interface") else {
+            return;
+        };
+        let Some(mut interface) = interface_field.as_struct_mut() else {
+            return;
+        };
+        let Some(mut raw_field) = interface.field_mut("raw_resources") else {
+            return;
+        };
+        let Some(mut raw) = raw_field.as_block_mut() else {
+            return;
+        };
+        // One element, whatever the source left here: the destination keeps
+        // exactly one and reads `raw_items` out of it.
+        raw.clear();
+        let index = raw.add_element();
+        let Some(mut element) = raw.element_mut(index) else {
+            return;
+        };
+        let Some(mut items_field) = element.field_mut("raw_items") else {
+            return;
+        };
+        let Some(mut items) = items_field.as_struct_mut() else {
+            return;
+        };
+        // The resource's own root struct is `resource_items`, which is the same
+        // struct `raw_items` is, so its offset is the root's.
+        crate::monolithic::read_struct_into(
+            &control,
+            primary,
+            address.offset() as usize,
+            &mut items,
+            &mut tally,
+        )
+    };
+
+    if let Err(why) = outcome {
+        record_unsupported(
+            context,
+            "resource interface/tag_resources".to_owned(),
+            format!("The Xbox 360 structure resource could not be read: {why}"),
+        );
+        return;
+    }
+    // And say the definitions are here now rather than in a resource.
+    if let Some(mut interface_field) = target.root_mut().field_mut("resource interface")
+        && let Some(mut interface) = interface_field.as_struct_mut()
+    {
+        set_int_field(&mut interface, "use resource items", 0);
+        if let Some(mut field) = interface.field_mut("tag_resources") {
+            let _ = field.clear_resource();
+        }
+        if let Some(mut field) = interface.field_mut("cache_file_resources") {
+            let _ = field.clear_resource();
+        }
+    }
+
+    let counted = tally;
+    forgive_resources(
+        context,
+        |path| path.starts_with("resource interface"),
+        move |_| {
+            format!(
+                "The Xbox 360 structure resource was read out of the build's control data and \
+                 written where a loose tag keeps it ({} struct(s), {} block element(s), {} byte(s) \
+                 of payload)",
+                counted.structs, counted.block_elements, counted.data_bytes
+            )
+        },
+    );
 }
 
 /// Carry an Xbox 360 animation graph's payload across.
