@@ -164,8 +164,30 @@ pub(super) fn convert_x360_bitmap_pixels(
 
     // The whole blob is built before anything is written, so a failure part way
     // through cannot leave the tag describing pixels it does not have.
+    // What the destination says each image is, read before anything is built:
+    // a 360 tag carries both mirrors, and the PC one is the statement of what
+    // a PC pixel blob should hold.
+    let target_formats: Vec<Option<crate::bitmap::BitmapFormat>> = target
+        .root()
+        .field_path("bitmaps")
+        .and_then(|field| field.as_block())
+        .map(|block| {
+            (0..block.len())
+                .map(|index| {
+                    block
+                        .element(index)
+                        .and_then(|elem| elem.read_enum_name("format"))
+                        .and_then(|name| {
+                            crate::bitmap::BitmapFormat::from_schema_name(&name)
+                        })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut blob: Vec<u8> = Vec::new();
     let mut slices: Vec<(i32, i32)> = Vec::with_capacity(bitmap.len());
+    let mut mip_counts: Vec<i64> = Vec::with_capacity(bitmap.len());
     for index in 0..bitmap.len() {
         let Some(image) = bitmap.image(index) else {
             record_unsupported(
@@ -194,8 +216,62 @@ pub(super) fn convert_x360_bitmap_pixels(
                 return;
             }
         };
+        // What the 360 actually stored, which is what has to be decoded.
+        let source_format = image.format().ok();
+        // The two mirrors can disagree about the format. Halo's `ctx1`,
+        // `dxn_mono_alpha` and the `dxt3a`/`dxt5a` family are Xbox 360 block
+        // formats that the PC build ships decoded, so the tag's own PC image
+        // block asks for `v8u8`, `a8y8` or `y8` where the 360 stored blocks.
+        // Believe it: it is the destination's own statement of what it holds,
+        // and its `pixels size` is computed from it.
+        let target_format = target_formats
+            .get(index)
+            .copied()
+            .flatten()
+            .filter(|target| Some(*target) != source_format);
+        let pixels = match target_format {
+            None => pixels.to_vec(),
+            Some(target) => {
+                let Some(source) = source_format else {
+                    record_unsupported(
+                        context,
+                        format!("bitmaps[{index}]"),
+                        "The Xbox 360 image's format could not be resolved".to_owned(),
+                    );
+                    return;
+                };
+                match crate::bitmap::encode::transcode_levels(
+                    source,
+                    target,
+                    image.width(),
+                    image.height(),
+                    image.mipmap_levels(),
+                    image.layer_count(),
+                    pixels,
+                    crate::bitmap::P8Palette::Halo2,
+                ) {
+                    Ok(packed) => packed,
+                    Err(error) => {
+                        record_unsupported(
+                            context,
+                            format!("bitmaps[{index}]"),
+                            format!(
+                                "The Xbox 360 image is {source:?} and the target asks for \
+                                 {target:?}, which could not be produced: {error}"
+                            ),
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+
+        // Levels beyond the base, which is what the field counts. Taken from
+        // the image the detiler actually produced rather than from the source,
+        // so the number and the bytes can never disagree.
+        mip_counts.push(image.mipmap_levels().saturating_sub(1) as i64);
         slices.push((blob.len() as i32, pixels.len() as i32));
-        blob.extend_from_slice(pixels);
+        blob.extend_from_slice(&pixels);
     }
     if blob.is_empty() {
         return;
@@ -233,9 +309,7 @@ pub(super) fn convert_x360_bitmap_pixels(
         };
         set_int_field(&mut elem, "pixels offset", i64::from(*offset));
         set_int_field(&mut elem, "pixels size", i64::from(*size));
-        // `mipmap count` counts levels *beyond* the highest, so 0 means the base
-        // level on its own — which is exactly what was detiled.
-        set_int_field(&mut elem, "mipmap count", 0);
+        set_int_field(&mut elem, "mipmap count", mip_counts[index]);
         set_int_field(&mut elem, "high res pixels offset offset", 0);
         set_int_field(&mut elem, "high res pixels size", 0);
     }
@@ -271,14 +345,6 @@ pub(super) fn convert_x360_bitmap_pixels(
             )
         },
     );
-    context.report.issues.push(ConversionIssue {
-        kind: ConversionIssueKind::Warning,
-        path: "bitmaps".to_owned(),
-        message: format!(
-            "{images} image(s) came across at their base mip only; the Xbox 360 mip chain has a \
-             packed layout this does not reproduce"
-        ),
-    });
 }
 
 /// Whether every one of this bitmap's texture resources is still an unhydrated

@@ -34,9 +34,11 @@ use flate2::read::ZlibDecoder;
 use crate::api::{TagBlock, TagStruct};
 use crate::file::TagFile;
 use crate::typed_enums::{Enum, Flags, SchemaEnum};
+use xbox360::{EndianSwap, SurfaceDef, TextureType, level_data};
 
 pub mod dds;
 pub mod decode;
+pub mod encode;
 pub mod format;
 pub mod layout;
 mod p8;
@@ -536,12 +538,13 @@ fn resolve_image_pixels<'a>(
     shared_pixels: &'a [u8],
 ) -> Result<(Vec<u8>, Option<u32>), BitmapError> {
     if let Some(hw) = hw_elem
-        && let Some(payload) = hw
+        && let Some(resource) = hw
             .field("texture resource")
             .and_then(|f| f.as_resource())
-            .and_then(|r| r.exploded_payload())
+        && resource.exploded_payload().is_some()
     {
-        return convert_x360_image(elem, payload);
+        let (primary, secondary) = x360_buffers(&resource);
+        return convert_x360_image_full(elem, primary, secondary);
     }
 
     if !shared_pixels.is_empty() {
@@ -554,107 +557,133 @@ fn resolve_image_pixels<'a>(
     Ok((Vec::new(), None))
 }
 
-/// Convert an Xbox-360 per-image cache payload into a PC-shaped
-/// pixel buffer.
-///
-/// The payload is the concatenation of the resource's secondary
-/// buffer bytes (the high-res mip 0) followed by its primary buffer
-/// bytes (the smaller mip chain). See
-/// [`crate::monolithic::XSyncStateHeader`] for the (counterintuitive)
-/// byte-range pairing the hydrator uses to slice these out of the
-/// cache block.
-///
-/// Neither the swizzle nor the byte swap is unconditional: the image's
-/// own `more flags` say which were applied, and a Reach build ships
-/// plenty of small or non-power-of-two textures stored linear. Detiling
-/// one of those would scramble it, and demanding the tile-aligned byte
-/// count that detiling needs is why they used to be rejected outright.
-///
-/// Scope: this reproduces **mip 0** only (from the optional half) and
-/// returns it with a mip-count override of 1. The smaller mip chain has
-/// its own packed layout (each level 4KB-aligned, sub-16-pixel mips
-/// share tiles) that we don't yet reproduce; consumers that need full
-/// mip chains for X360 bitmaps would need a per-level offset table à la
-/// TagTool's `GetXboxBitmapLevelOffset`.
-pub(crate) fn convert_x360_image<'a>(
-    elem: TagStruct<'a>,
-    payload: &[u8],
-) -> Result<(Vec<u8>, Option<u32>), BitmapError> {
-    let width = elem.read_int_any("width").unwrap_or(0).max(0) as u32;
-    let height = elem.read_int_any("height").unwrap_or(0).max(0) as u32;
 
-    // Format → block dimensions + bytes-per-block. Bail out on any
-    // format we don't know how to detile yet.
-    let format_name = elem
-        .read_enum_name("format")
-        .ok_or(BitmapError::NotABitmapTag)?;
+/// How the GPU swapped this format's bytes.
+///
+/// By component, not by pixel. Every block format is a run of 16-bit words
+/// whatever its pixels are; an uncompressed format swaps by its own component
+/// width. A format with no `block_dims_and_size` cannot be reasoned about and
+/// is left alone.
+pub fn endian_swap_for(format: BitmapFormat) -> EndianSwap {
+    let Some((block_width, _, bytes_per_block)) = format.block_dims_and_size() else {
+        return EndianSwap::None;
+    };
+    if block_width > 1 {
+        return EndianSwap::In16;
+    }
+    match bytes_per_block {
+        1 => EndianSwap::None,
+        4 | 12 | 16 => EndianSwap::In32,
+        _ => EndianSwap::In16,
+    }
+}
+
+/// Read one `xenon bitmaps[i]` element into the shape the layout rules want.
+///
+/// Everything is taken from the tag rather than assumed: whether the surface was
+/// tiled, whether its bytes were swapped, and whether the base level was moved
+/// into the high-resolution buffer are all flags the build wrote, and a Reach
+/// corpus disagrees with every guess about them.
+fn surface_def(elem: TagStruct<'_>) -> Result<SurfaceDef, BitmapError> {
+    let format_name = elem.read_enum_name("format").ok_or(BitmapError::NotABitmapTag)?;
     let format = BitmapFormat::from_schema_name(&format_name)
         .ok_or_else(|| BitmapError::FormatNotSupported(format_name.clone()))?;
-    let (block_w, block_h, bytes_per_block) = format
+    let (block_width, block_height, bytes_per_block) = format
         .block_dims_and_size()
-        .ok_or_else(|| BitmapError::FormatNotSupported(format_name))?;
+        .ok_or(BitmapError::FormatNotSupported(format_name))?;
 
-    // Resolved by schema name, so a build that shuffled the bit order
-    // still answers correctly.
-    let more_flags: Flags<BitmapMoreFlags, u8> = elem.try_read_flags("more flags").unwrap_or_default();
-    let tiled = more_flags.contains(BitmapMoreFlags::X360Tiled);
-    let byte_swapped = more_flags.contains(BitmapMoreFlags::X360ByteOrder);
-
-    // Mip 0 in block units. A tiled surface rounds up to a grid of
-    // 32×32-block tiles; a linear one is exactly its own block grid.
-    let mip0_w_blocks = width.div_ceil(block_w);
-    let mip0_h_blocks = height.div_ceil(block_h);
-    let linear_bytes = (mip0_w_blocks as usize) * (mip0_h_blocks as usize) * (bytes_per_block as usize);
-
-    let mut linear = if tiled {
-        let aligned_w = (mip0_w_blocks + 31) & !31;
-        let aligned_h = (mip0_h_blocks + 31) & !31;
-        let tiled_size = (aligned_w as usize) * (aligned_h as usize) * (bytes_per_block as usize);
-        if payload.len() < tiled_size {
-            return Err(BitmapError::PixelSliceOutOfBounds {
-                offset: 0,
-                size: tiled_size as u64,
-                available: payload.len() as u64,
-            });
-        }
-        let mut linear = xbox360::detile_blocks(
-            &payload[..tiled_size],
-            aligned_w,
-            aligned_h,
-            bytes_per_block,
-        );
-        // Strip down to the texture's actual block grid (drop the
-        // tile-alignment padding rows / columns).
-        if mip0_w_blocks != aligned_w || mip0_h_blocks != aligned_h {
-            let mut compact = vec![0u8; linear_bytes];
-            let bpb = bytes_per_block as usize;
-            for y in 0..mip0_h_blocks as usize {
-                let src = y * aligned_w as usize * bpb;
-                let dst = y * mip0_w_blocks as usize * bpb;
-                let row = mip0_w_blocks as usize * bpb;
-                compact[dst..dst + row].copy_from_slice(&linear[src..src + row]);
-            }
-            linear = compact;
-        } else {
-            linear.truncate(linear_bytes);
-        }
-        linear
+    let type_name = elem.read_enum_name("type").unwrap_or_default();
+    let texture_type = if type_name.eq_ignore_ascii_case("cube map") {
+        TextureType::CubeMap
+    } else if type_name.eq_ignore_ascii_case("3D texture") {
+        TextureType::Volume
     } else {
-        if payload.len() < linear_bytes {
-            return Err(BitmapError::PixelSliceOutOfBounds {
-                offset: 0,
-                size: linear_bytes as u64,
-                available: payload.len() as u64,
-            });
-        }
-        payload[..linear_bytes].to_vec()
+        TextureType::Flat
     };
 
-    if byte_swapped {
-        xbox360::swap_byte_pairs(&mut linear);
-    }
+    let more_flags: Flags<BitmapMoreFlags, u8> =
+        elem.try_read_flags("more flags").unwrap_or_default();
 
-    Ok((linear, Some(1)))
+    Ok(SurfaceDef {
+        width: elem.read_int_any("width").unwrap_or(0).max(0) as u32,
+        height: elem.read_int_any("height").unwrap_or(0).max(0) as u32,
+        depth: (elem.read_int_any("depth").unwrap_or(1).max(1) as u32).max(1),
+        texture_type,
+        bits_per_pixel: bytes_per_block * 8 / (block_width * block_height),
+        block_width,
+        block_height,
+        tiled: more_flags.contains(BitmapMoreFlags::X360Tiled),
+        endian_swap: if more_flags.contains(BitmapMoreFlags::X360ByteOrder) {
+            endian_swap_for(format)
+        } else {
+            EndianSwap::None
+        },
+        mipmap_count: elem.read_int_any("mipmap count").unwrap_or(0).max(0) as u32,
+        // Filled in by the caller, which is the only side that can see whether
+        // there is a secondary buffer at all.
+        high_res_in_secondary: false,
+    })
+}
+
+/// Convert an Xbox 360 image into the linear, PC-ordered pixel buffer a
+/// `processed pixel data` blob holds.
+///
+/// Every layer, every level, laid out layer-major with each layer's full mip
+/// chain — which is the order [`BitmapImage::pixel_bytes`] reads back and the
+/// order a DDS writer expects.
+///
+/// The two buffers are the resource's own. A hydrated monolithic resource
+/// concatenates them secondary-first; [`x360_buffers`] splits them apart again.
+fn convert_x360_image_full(
+    elem: TagStruct<'_>,
+    primary: &[u8],
+    secondary: &[u8],
+) -> Result<(Vec<u8>, Option<u32>), BitmapError> {
+    let mut def = surface_def(elem)?;
+    if def.width == 0 || def.height == 0 {
+        return Err(BitmapError::NotABitmapTag);
+    }
+    // Where the base level lives, asked of the data rather than of a flag. A
+    // resource with a secondary buffer keeps its highest-resolution level there
+    // and the rest of the chain in the primary one; a resource with only one
+    // buffer keeps everything in it. The image's own
+    // `xbox360 high resolution offset is valid` bit does not track this - it is
+    // set on images with no secondary buffer at all, and trusting it reads the
+    // mip chain as though it were the base.
+    def.high_res_in_secondary = !secondary.is_empty();
+    let mut out = Vec::new();
+    for layer in 0..def.layer_count() {
+        for level in 0..def.level_count() {
+            let data = level_data(&def, primary, secondary, level, layer).ok_or(
+                BitmapError::PixelSliceOutOfBounds {
+                    offset: 0,
+                    size: 0,
+                    available: (primary.len() + secondary.len()) as u64,
+                },
+            )?;
+            out.extend_from_slice(&data);
+        }
+    }
+    if out.is_empty() {
+        return Err(BitmapError::NotABitmapTag);
+    }
+    Ok((out, Some(def.level_count())))
+}
+
+/// Split a hydrated resource's payload back into its primary and secondary
+/// buffers.
+///
+/// `MonolithicCache` concatenates them secondary-first so a consumer reading
+/// mip 0 first sees the high-resolution buffer; the layout rules need them
+/// apart, and the xsync header says where the seam is. A resource that was
+/// already exploded on disk has no seam and is all primary.
+fn x360_buffers<'a>(resource: &crate::api::TagResource<'a>) -> (&'a [u8], &'a [u8]) {
+    let payload = resource.exploded_payload().unwrap_or(&[]);
+    let Some(state) = resource.xsync_state() else {
+        return (payload, &[]);
+    };
+    let secondary_len = (state.header.optional_location_size as usize).min(payload.len());
+    (&payload[secondary_len..], &payload[..secondary_len])
 }
 
 /// A bitmap tag's **color plate** — the artist's original source sheet

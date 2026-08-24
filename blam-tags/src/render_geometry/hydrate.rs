@@ -38,6 +38,13 @@ pub enum HydrateError {
     /// Mesh referenced a vertex / index buffer index outside the
     /// resource's table.
     InvalidBufferIndex { kind: &'static str, index: i128, len: usize },
+    /// The mesh names a vertex format `MeshVertexType` does not know.
+    ///
+    /// Was a panic, which is the wrong shape for a reader: this is reached
+    /// from `MonolithicCache::read_tag`, so one unrecognised format in one
+    /// mesh took down whatever was walking the cache. Every build spells its
+    /// own enum, and a corpus this old will always have one more.
+    UnknownVertexType { name: String },
 }
 
 impl std::fmt::Display for HydrateError {
@@ -49,6 +56,10 @@ impl std::fmt::Display for HydrateError {
             ),
             Self::InvalidBufferIndex { kind, index, len } => write!(
                 f, "{kind} buffer index {index} out of range (len={len})",
+            ),
+            Self::UnknownVertexType { name } => write!(
+                f,
+                "unsupported mesh vertex type {name:?}; register it in MeshVertexType or                  extend the schema-name table",
             ),
         }
     }
@@ -267,16 +278,13 @@ fn decode_mesh(
         return Ok(MeshPlanItem { vertices: Vec::new(), indices: Vec::new(), is_index32: false });
     }
 
-    // Vertex type — schema enum → Rust enum via the option name. If
-    // we have a buffer but can't resolve a decoder, panic so the
-    // missing case surfaces loudly.
+    // Vertex type — a schema enum resolved to a decoder through the option
+    // name. A name nothing knows is reported, not fatal: the caller decides
+    // whether a mesh it cannot read is worth failing the whole tag over.
     let vt_name = mesh.read_enum_name("vertex type").unwrap_or_default();
-    let vertex_type = MeshVertexType::from_schema_name(&vt_name).unwrap_or_else(|| {
-        panic!(
-            "unsupported mesh vertex type {vt_name:?} (vbi[0]={vbi0}, ibi={ibi}); \
-             register it in MeshVertexType or extend the schema-name table",
-        )
-    });
+    let vertex_type = MeshVertexType::from_schema_name(&vt_name)
+        .ok_or_else(|| HydrateError::UnknownVertexType { name: vt_name.clone() })?;
+    let _ = ibi;
 
     let vb = resource
         .xenon_vertex_buffers

@@ -13260,4 +13260,100 @@ mod x360_cache_conversion {
             "refused for the wrong reason: {error}"
         );
     }
+
+    /// Every image assembles to exactly the byte count its own tag declares.
+    ///
+    /// A 360 bitmap tag carries both mirrors: the `xenon bitmaps` block that
+    /// describes what the 360 stored, and the `bitmaps` block that describes
+    /// what a PC build would. The PC block's `pixels size` is therefore ground
+    /// truth for this conversion, written by the same tool chain that would have
+    /// built the PC tag, and it is not a number this code can talk itself into.
+    ///
+    /// It also covers far more than a size. Landing on it means every mip level
+    /// was found at the right offset, every cube face and array layer was
+    /// walked, the packed tail of small mips was read out of its shared tile,
+    /// and a format the PC ships decoded was decoded rather than copied. Any one
+    /// of those going wrong moves the total.
+    #[test]
+    fn a_360_bitmap_assembles_to_the_size_its_tag_declares() {
+        let Some(cache) = reach_x360_cache() else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE");
+            return;
+        };
+        let tag_group = u32::from_be_bytes(*b"bitm");
+        let (mut checked, mut wrong) = (0, 0);
+        let mut examples: Vec<String> = Vec::new();
+        for entry in cache
+            .iter_tags()
+            .filter(|entry| entry.group_tag == tag_group && !entry.name.is_empty())
+            .step_by(23)
+            .take(800)
+        {
+            let Ok(source) = cache.read_tag_by_name(tag_group, &entry.name) else {
+                continue;
+            };
+            let Ok(bitmap) = crate::bitmap::Bitmap::new(&source) else {
+                continue;
+            };
+            let Some(pc_images) = source
+                .root()
+                .field_path("bitmaps")
+                .and_then(|field| field.as_block())
+            else {
+                continue;
+            };
+            for index in 0..bitmap.len() {
+                let (Some(image), Some(pc)) = (bitmap.image(index), pc_images.element(index))
+                else {
+                    continue;
+                };
+                let Ok(raw) = image.pixel_bytes() else { continue };
+                let declared = pc.read_int_any("pixels size").unwrap_or(0).max(0) as usize;
+                if declared == 0 {
+                    continue;
+                }
+                let source_format = image.format().ok();
+                let target_format = pc
+                    .read_enum_name("format")
+                    .and_then(|name| crate::bitmap::BitmapFormat::from_schema_name(&name));
+                let built = match (source_format, target_format) {
+                    (Some(from), Some(to)) if from != to => {
+                        match crate::bitmap::encode::transcode_levels(
+                            from,
+                            to,
+                            image.width(),
+                            image.height(),
+                            image.mipmap_levels(),
+                            image.layer_count(),
+                            raw,
+                            crate::bitmap::P8Palette::Halo2,
+                        ) {
+                            Ok(packed) => packed.len(),
+                            Err(_) => continue,
+                        }
+                    }
+                    _ => raw.len(),
+                };
+                checked += 1;
+                if built != declared {
+                    wrong += 1;
+                    if examples.len() < 8 {
+                        examples.push(format!(
+                            "{}[{index}] {}x{} {} {} mips={} layers={}: built {built}, tag says \
+                             {declared}",
+                            entry.name,
+                            image.width(),
+                            image.height(),
+                            image.format_name().unwrap_or_default(),
+                            image.type_name().unwrap_or_default(),
+                            image.mipmap_levels(),
+                            image.layer_count(),
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(checked > 100, "only {checked} images had anything to check");
+        assert_eq!(wrong, 0, "{wrong} of {checked} images: {examples:#?}");
+    }
 }
