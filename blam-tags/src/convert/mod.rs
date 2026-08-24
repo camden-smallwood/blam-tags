@@ -2217,9 +2217,11 @@ fn analyze_conversion_inner(
     // target ended up with, and its whole job is to take a resource back off the
     // lost list.
     forgive_hydrated_geometry(&target, &mut context);
+    settle_uncompiled_geometry(byte_order_upgrade, &mut target, &mut context);
     convert_x360_bitmap_pixels(source, &mut target, &mut context);
     forgive_externally_stored_payload(byte_order_upgrade, &mut target, &mut context);
     swap_function_curves(byte_order_upgrade, &mut target, &mut context);
+    swap_geometry_user_data(byte_order_upgrade, &mut target, &mut context);
     let fail_closed_losses = validate_critical_runtime_safety(source, &context, policy)?;
     if !fail_closed_losses.is_empty() {
         context.report.issues.push(ConversionIssue {
@@ -13302,6 +13304,221 @@ mod x360_cache_conversion {
         );
     }
 
+    /// A converted 360 bitmap must reproduce the kit's own pixels for the tags
+    /// the two builds share.
+    ///
+    /// The kit's 2010-dated tag for the same name is the oracle. Restricting
+    /// the comparison to images whose size, format, type and mip count all
+    /// match keeps re-authored art out of it; what is left is the pixel path,
+    /// and it either lands on the same bytes or it does not.
+    ///
+    /// The bar is deliberately not 100%: a handful of textures genuinely were
+    /// redrawn between the July 2011 build and the shipped game, and both of
+    /// the bugs this guards against -- the resource's two buffers read with
+    /// each other's sizes, and cube faces stored in Xenos rather than D3D
+    /// order -- took the rate to a fifth of this.
+    #[test]
+    fn a_360_bitmap_arrives_with_the_kits_own_pixels() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and an HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let Ok(groups) = GameTagIndex::load(&definitions, "haloreach_mcc") else {
+            eprintln!("skipping: no haloreach_mcc definitions");
+            return;
+        };
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        // Only tags the kit has not had written over by an import of its own:
+        // one of those is this converter's output, not an oracle.
+        let cutoff =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        let shared: Vec<_> = cache
+            .iter_tags()
+            .filter(|entry| entry.group_tag == u32::from_be_bytes(*b"bitm"))
+            .filter_map(|entry| {
+                let path = reach.join(format!("{}.bitmap", entry.name.replace('\\', "/")));
+                std::fs::metadata(&path)
+                    .and_then(|meta| meta.modified())
+                    .map(|when| when < cutoff)
+                    .unwrap_or(false)
+                    .then_some((entry, path))
+            })
+            .collect();
+        if shared.is_empty() {
+            eprintln!("skipping: the kit and the build share no untouched bitmaps");
+            return;
+        }
+        let describe = |tag: &TagFile| -> Vec<String> {
+            tag.root()
+                .field_path("bitmaps")
+                .and_then(|field| field.as_block())
+                .map(|block| {
+                    (0..block.len())
+                        .filter_map(|index| block.element(index))
+                        .map(|image| {
+                            format!(
+                                "{}x{}x{} {} {} mips={}",
+                                image.read_int_any("width").unwrap_or(-1),
+                                image.read_int_any("height").unwrap_or(-1),
+                                image.read_int_any("depth").unwrap_or(-1),
+                                image.read_enum_name("format").unwrap_or_default(),
+                                image.read_enum_name("type").unwrap_or_default(),
+                                image.read_int_any("mipmap count").unwrap_or(-1),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let pixels = |tag: &TagFile| {
+            tag.root()
+                .field_path("processed pixel data")
+                .and_then(|field| field.as_data())
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default()
+        };
+        let step = (shared.len() / 200).max(1);
+        let (mut comparable, mut exact) = (0usize, 0usize);
+        let mut misses: Vec<String> = Vec::new();
+        for (entry, path) in shared.iter().step_by(step).take(200) {
+            let (Ok(source), Ok(stock)) = (cache.read_tag(entry), TagFile::read(path)) else {
+                continue;
+            };
+            let Ok(draft) = analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "haloreach_mcc",
+                &definitions,
+                Some(&templates),
+            ) else {
+                continue;
+            };
+            if describe(&draft.tag) != describe(&stock) {
+                continue;
+            }
+            let (ours, theirs) = (pixels(&draft.tag), pixels(&stock));
+            if theirs.is_empty() {
+                continue;
+            }
+            comparable += 1;
+            assert_eq!(
+                ours.len(),
+                theirs.len(),
+                "{}: {} byte(s) of pixels where the kit has {}",
+                entry.name,
+                ours.len(),
+                theirs.len(),
+            );
+            if ours == theirs {
+                exact += 1;
+            } else if misses.len() < 5 {
+                misses.push(entry.name.clone());
+            }
+        }
+        if comparable < 20 {
+            eprintln!("skipping: only {comparable} bitmap(s) were comparable");
+            return;
+        }
+        assert!(
+            exact * 100 >= comparable * 90,
+            "only {exact} of {comparable} converted bitmap(s) match the kit's own pixels; \
+             e.g. {misses:?}"
+        );
+    }
+
+    /// A converted 360 BSP must describe itself as uncompiled.
+    ///
+    /// The GPU buffers do not come across -- they are Xenos-shaped and this
+    /// engine cannot read them -- so the tag has to stop claiming they exist.
+    /// A kit's own BSPs are unanimous about how: `processed` clear, every
+    /// `index buffer index` -1, every vertex buffer slot 0, and no
+    /// `rigid compressed` in sight. Left as the 360 wrote them, the engine
+    /// looks for buffers that are not there.
+    #[test]
+    fn a_360_bsp_arrives_described_as_uncompiled() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and an HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let Ok(groups) = GameTagIndex::load(&definitions, "haloreach_mcc") else {
+            eprintln!("skipping: no haloreach_mcc definitions");
+            return;
+        };
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let group = u32::from_be_bytes(*b"sbsp");
+        let Some(entry) = cache
+            .iter_tags()
+            .filter(|entry| entry.group_tag == group)
+            .find(|entry| cache.read_tag(entry).is_ok())
+        else {
+            eprintln!("skipping: the build has no readable BSP");
+            return;
+        };
+        let Ok(source) = cache.read_tag(entry) else { return };
+        let draft = match analyze_conversion_with_templates(
+            &source,
+            "haloreach_mcc",
+            "haloreach_mcc",
+            &definitions,
+            Some(&templates),
+        ) {
+            Ok(draft) => draft,
+            Err(why) => {
+                eprintln!("skipping: {} would not convert: {why}", entry.name);
+                return;
+            }
+        };
+        let root = draft.tag.root();
+        if let Some(TagFieldData::LongFlags { names, .. }) = root
+            .field_path("render geometry/runtime flags")
+            .and_then(|field| field.value())
+        {
+            assert!(
+                !names.iter().any(|(_, name)| name == "processed"),
+                "{}: the geometry still claims it has been processed",
+                entry.name,
+            );
+        }
+        let Some(meshes) = root
+            .field_path("render geometry/meshes")
+            .and_then(|field| field.as_block())
+        else {
+            eprintln!("skipping: {} has no meshes", entry.name);
+            return;
+        };
+        assert!(meshes.len() > 0, "{}: no meshes to check", entry.name);
+        for index in 0..meshes.len() {
+            let Some(mesh) = meshes.element(index) else { continue };
+            assert_eq!(
+                mesh.read_int_any("index buffer index"),
+                Some(-1),
+                "{} mesh {index}: still names an index buffer",
+                entry.name,
+            );
+            let vertex_type = mesh.read_enum_name("vertex type").unwrap_or_default();
+            assert!(
+                !vertex_type.ends_with(" compressed"),
+                "{} mesh {index}: vertex type is {vertex_type}, which only the 360 compiles",
+                entry.name,
+            );
+            if let Some(slots) = mesh.field("vertex buffer indices").and_then(|f| f.as_array()) {
+                for slot in 0..slots.len() {
+                    let Some(slot_elem) = slots.element(slot) else { continue };
+                    assert_eq!(
+                        slot_elem.read_int_any("vertex buffer index"),
+                        Some(0),
+                        "{} mesh {index}: vertex buffer slot {slot} still names a buffer",
+                        entry.name,
+                    );
+                }
+            }
+        }
+    }
+
     /// Every image assembles to exactly the byte count its own tag declares.
     ///
     /// A 360 bitmap tag carries both mirrors: the `xenon bitmaps` block that
@@ -13647,5 +13864,1225 @@ mod x360_cache_conversion {
                 Err(error) => eprintln!("REFUSED\t{line}\t{error}"),
             }
         }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_bsp_geometry() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let name = std::env::var("BSP_NAME")
+            .unwrap_or_else(|_| r"levels\multi\archive\70_boneyard_v2\70_boneyard_v2_000".to_owned());
+        let group = u32::from_be_bytes(*b"sbsp");
+        let Ok(source) = cache.read_tag_by_name(group, &name) else {
+            eprintln!("could not read {name}");
+            return;
+        };
+        report_geometry("SOURCE", &source);
+        match analyze_conversion_with_templates(
+            &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+        ) {
+            Ok(draft) => report_geometry("CONVERTED", &draft.tag),
+            Err(e) => eprintln!("CONVERTED\trefused: {e}"),
+        }
+        // And a stock kit BSP, as the shape a correct one has.
+        if let Some(path) = walk_files(&reach)
+            .into_iter()
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("scenario_structure_bsp"))
+            && let Ok(stock) = TagFile::read(&path)
+        {
+            report_geometry("STOCK", &stock);
+        }
+    }
+
+    /// Diff a converted tag against the kit's own copy of the same tag.
+    /// HREK ships several levels the 2011 build also carries, so for those the
+    /// shipped tag is an exact statement of what the conversion should produce.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_diff_against_kit() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let name = std::env::var("DIFF_NAME").unwrap_or_default();
+        let ext = std::env::var("DIFF_EXT").unwrap_or_else(|_| "scenario_structure_bsp".to_owned());
+        let group_tag = std::env::var("DIFF_GROUP").unwrap_or_else(|_| "sbsp".to_owned());
+        let mut gb = [b' '; 4];
+        for (i, c) in group_tag.bytes().take(4).enumerate() { gb[i] = c; }
+        let source = match cache.read_tag_by_name(u32::from_be_bytes(gb), &name) {
+            Ok(t) => t,
+            Err(e) => { eprintln!("could not read source: {e}"); return; }
+        };
+        let kit_path = reach.join(format!("{}.{ext}", name.replace('\\', "/")));
+        let stock = match TagFile::read(&kit_path) {
+            Ok(t) => t,
+            Err(e) => { eprintln!("could not read {}: {e}", kit_path.display()); return; }
+        };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let draft = match analyze_conversion_with_templates(
+            &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+        ) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("refused: {e}"); return; }
+        };
+        for (label, tag) in [("CONVERTED", &draft.tag), ("STOCK", &stock)] {
+            let bytes = tag.write_to_bytes().map(|b| b.len()).unwrap_or(0);
+            let res = tag
+                .root()
+                .field_path("render geometry/api resource")
+                .and_then(|f| f.as_resource())
+                .map(|r| format!("kind={:?}, xsync={}", r.kind(), r.xsync_state().is_some()))
+                .unwrap_or_else(|| "none".to_owned());
+            eprintln!("{label}	{bytes} bytes on disk	api resource: {res}");
+        }
+        if let (Ok(ours), Ok(theirs)) = (draft.tag.write_to_bytes(), stock.write_to_bytes()) {
+            if ours == theirs {
+                eprintln!("BYTES	identical ({} bytes)", ours.len());
+            } else {
+                let first = ours.iter().zip(theirs.iter()).position(|(a, b)| a != b);
+                let differing = ours.iter().zip(theirs.iter()).filter(|(a, b)| a != b).count();
+                eprintln!(
+                    "BYTES	{} of {} differ, first at {first:?}",
+                    differing,
+                    ours.len().min(theirs.len())
+                );
+            }
+        }
+        let mut differences = Vec::new();
+        diff_structs("", &draft.tag.root(), &stock.root(), &mut differences, 0);
+        let limit: usize = std::env::var("DIFF_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(80);
+        eprintln!("{} difference(s) vs {}", differences.len(), kit_path.display());
+        if std::env::var("DIFF_RAW").is_ok() {
+            for line in differences.iter().take(limit) { eprintln!("  {line}"); }
+            return;
+        }
+        // Collapse `foo[3]/bar` to `foo[]/bar` so one wrong field does not
+        // present as ten thousand findings.
+        let mut grouped: std::collections::BTreeMap<String, (usize, String)> = Default::default();
+        for line in &differences {
+            let (path, detail) = line.split_once(": ").unwrap_or((line.as_str(), ""));
+            let mut key = String::with_capacity(path.len());
+            let mut skipping = false;
+            for ch in path.chars() {
+                match ch {
+                    '[' | '<' => { skipping = true; key.push(ch); }
+                    ']' | '>' => { skipping = false; key.push(ch); }
+                    _ if skipping => {}
+                    _ => key.push(ch),
+                }
+            }
+            let slot = grouped.entry(key).or_insert((0, detail.to_owned()));
+            slot.0 += 1;
+        }
+        let mut rows: Vec<_> = grouped.into_iter().collect();
+        rows.sort_by_key(|(_, (count, _))| std::cmp::Reverse(*count));
+        for (path, (count, sample)) in rows.iter().take(limit) {
+            let sample: String = sample.chars().take(150).collect();
+            eprintln!("  x{count:<6} {path}
+           {sample}");
+        }
+    }
+
+    fn diff_structs(
+        path: &str,
+        ours: &TagStruct<'_>,
+        theirs: &TagStruct<'_>,
+        out: &mut Vec<String>,
+        depth: usize,
+    ) {
+        if depth > 12 || out.len() > 4000 { return; }
+        for name in theirs.field_names() {
+            let here = if path.is_empty() { name.to_string() } else { format!("{path}/{name}") };
+            let (Some(a), Some(b)) = (ours.field(&name), theirs.field(&name)) else {
+                out.push(format!("{here}: missing on one side"));
+                continue;
+            };
+            if let (Some(ab), Some(bb)) = (a.as_block(), b.as_block()) {
+                if ab.len() != bb.len() {
+                    out.push(format!("{here}: {} element(s) vs {}", ab.len(), bb.len()));
+                    continue;
+                }
+                for i in 0..ab.len() {
+                    let (Some(ae), Some(be)) = (ab.element(i), bb.element(i)) else { continue };
+                    diff_structs(&format!("{here}[{i}]"), &ae, &be, out, depth + 1);
+                    if out.len() > 4000 { return; }
+                }
+                continue;
+            }
+            if let (Some(aa), Some(ba)) = (a.as_array(), b.as_array()) {
+                for i in 0..aa.len().min(ba.len()) {
+                    let (Some(ae), Some(be)) = (aa.element(i), ba.element(i)) else { continue };
+                    diff_structs(&format!("{here}<{i}>"), &ae, &be, out, depth + 1);
+                }
+                continue;
+            }
+            if let (Some(a_s), Some(b_s)) = (a.as_struct(), b.as_struct()) {
+                diff_structs(&here, &a_s, &b_s, out, depth + 1);
+                continue;
+            }
+            let (av, bv) = (a.value(), b.value());
+            let (astr, bstr) = (format!("{av:?}"), format!("{bv:?}"));
+            if astr != bstr {
+                out.push(format!("{here}: {astr} vs {bstr}"));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_lbsp_read() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let group = u32::from_be_bytes(*b"Lbsp");
+        let mut ok = 0usize;
+        let mut failed: Vec<(String, String)> = Vec::new();
+        let entries: Vec<_> = cache.iter_tags().filter(|e| e.group_tag == group).collect();
+        eprintln!("{} Lbsp tag(s) in the cache", entries.len());
+        for entry in entries.iter().take(60) {
+            match cache.read_tag(entry) {
+                Ok(_) => ok += 1,
+                Err(e) => failed.push((entry.name.clone(), e.to_string())),
+            }
+        }
+        eprintln!("read ok: {ok}, failed: {}", failed.len());
+        let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
+        for (_, why) in &failed {
+            *reasons.entry(why.clone()).or_default() += 1;
+        }
+        for (why, count) in reasons.iter().take(10) {
+            eprintln!("  x{count}	{why}");
+        }
+        for (name, why) in failed.iter().take(4) {
+            eprintln!("  e.g. {name}: {why}");
+        }
+
+        // Is a missing tag-heap block a whole-build symptom or an Lbsp one?
+        let mut by_group: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+        for entry in cache.iter_tags() {
+            let name = String::from_utf8_lossy(&entry.group_tag.to_be_bytes()).trim().to_owned();
+            let slot = by_group.entry(name).or_default();
+            slot.0 += 1;
+            if cache.resolve_tag_block(entry).is_none() {
+                slot.1 += 1;
+            }
+        }
+        let (mut tags, mut missing) = (0usize, 0usize);
+        for (_, (total, gone)) in &by_group {
+            tags += total;
+            missing += gone;
+        }
+        eprintln!("whole build: {missing} of {tags} tag(s) have no tag-heap block");
+        let mut worst: Vec<_> = by_group.iter().filter(|(_, (_, g))| *g > 0).collect();
+        worst.sort_by_key(|(_, (_, g))| std::cmp::Reverse(*g));
+        for (group, (total, gone)) in worst.iter().take(15) {
+            eprintln!("  {group:<6} {gone}/{total}");
+        }
+    }
+
+    /// Which BSPs exist in both the build and an untouched kit, so a diff has
+    /// a genuine oracle rather than an earlier run of this same converter.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_shared_bsp_names() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let ext = std::env::var("SHARED_EXT").unwrap_or_else(|_| "scenario_structure_bsp".to_owned());
+        let group_name = std::env::var("SHARED_GROUP").unwrap_or_else(|_| "sbsp".to_owned());
+        let mut gb = [b' '; 4];
+        for (i, c) in group_name.bytes().take(4).enumerate() { gb[i] = c; }
+        let group = u32::from_be_bytes(gb);
+        let cutoff = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_577_836_800); // 2020-01-01
+        for entry in cache.iter_tags().filter(|e| e.group_tag == group) {
+            let relative = format!("{}.{ext}", entry.name.replace('\\', "/"));
+            let path = reach.join(&relative);
+            let Ok(meta) = std::fs::metadata(&path) else { continue };
+            let stock = meta.modified().map(|m| m < cutoff).unwrap_or(false);
+            eprintln!("{}	{relative}", if stock { "STOCK  " } else { "touched" });
+        }
+    }
+
+    /// What an untouched kit puts in the fields that describe compiled
+    /// geometry, so the converter can match it rather than guess.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_kit_geometry_conventions() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        let cutoff = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_577_836_800);
+        let want: Vec<String> = std::env::var("CONV_EXT")
+            .unwrap_or_else(|_| "scenario_structure_bsp,render_model".to_owned())
+            .split(',').map(|s| s.to_owned()).collect();
+        let mut vertex_types: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut index_buffer: std::collections::BTreeMap<i128, usize> = Default::default();
+        let mut vertex_buffer: std::collections::BTreeMap<i128, usize> = Default::default();
+        let mut analytical: std::collections::BTreeMap<i128, usize> = Default::default();
+        let mut runtime: std::collections::BTreeMap<u64, usize> = Default::default();
+        let mut pmt_flags: std::collections::BTreeMap<u64, usize> = Default::default();
+        let mut seen = 0usize;
+        let cap: usize = std::env::var("CONV_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+        for path in walk_files(&reach) {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_owned();
+            if !want.contains(&ext) { continue; }
+            if std::fs::metadata(&path).and_then(|m| m.modified()).map(|m| m >= cutoff).unwrap_or(true) {
+                continue; // touched by an import; not an oracle
+            }
+            let Ok(tag) = TagFile::read(&path) else { continue };
+            let root = tag.root();
+            if let Some(TagFieldData::LongFlags { value, .. }) =
+                root.field_path("render geometry/runtime flags").and_then(|f| f.value())
+            {
+                *runtime.entry(value as u64).or_default() += 1;
+            }
+            if let Some(meshes) = root.field_path("render geometry/meshes").and_then(|f| f.as_block()) {
+                for i in 0..meshes.len() {
+                    let Some(m) = meshes.element(i) else { continue };
+                    *vertex_types.entry(m.read_enum_name("vertex type").unwrap_or_default()).or_default() += 1;
+                    if let Some(v) = m.read_int_any("index buffer index") {
+                        *index_buffer.entry(v).or_default() += 1;
+                    }
+                    if let Some(vb) = m.field("vertex buffer indices").and_then(|f| f.as_array()) {
+                        for k in 0..vb.len() {
+                            if let Some(v) = vb.element(k).and_then(|e| e.read_int_any("vertex buffer index")) {
+                                *vertex_buffer.entry(v * 100 + k as i128).or_default() += 1;
+                            }
+                        }
+                    }
+                    if let Some(sp) = m.field("subparts").and_then(|f| f.as_block()) {
+                        for k in 0..sp.len() {
+                            if let Some(v) = sp.element(k).and_then(|e| e.read_int_any("analytical light index")) {
+                                *analytical.entry(v).or_default() += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(pmt) = root.field_path("render geometry/per mesh temporary").and_then(|f| f.as_block()) {
+                for i in 0..pmt.len() {
+                    if let Some(TagFieldData::LongFlags { value, .. }) =
+                        pmt.element(i).and_then(|e| e.field("flags")).and_then(|f| f.value())
+                    {
+                        *pmt_flags.entry(value as u64).or_default() += 1;
+                    }
+                }
+            }
+            seen += 1;
+            if seen >= cap { break; }
+        }
+        eprintln!("{seen} untouched tag(s) of {want:?}");
+        eprintln!("vertex type:          {vertex_types:?}");
+        eprintln!("index buffer index:   {:?}", index_buffer.iter().take(8).collect::<Vec<_>>());
+        eprintln!("vertex buffer index (value,slot): {:?}",
+            vertex_buffer.iter().map(|(k, n)| ((k - k.rem_euclid(100)) / 100, k.rem_euclid(100), n)).take(20).collect::<Vec<_>>());
+        eprintln!("analytical light idx: {:?}", analytical.iter().take(8).collect::<Vec<_>>());
+        eprintln!("rg runtime flags:     {runtime:?}");
+        eprintln!("per mesh temp flags:  {pmt_flags:?}");
+    }
+
+    /// Every distinct reason a bitmap in the build refuses to convert, and how
+    /// many bitmaps hit each one.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_bitmap_failures() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let group = u32::from_be_bytes(*b"bitm");
+        let filter = std::env::var("BITM_FILTER").unwrap_or_default();
+        let cap: usize = std::env::var("BITM_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
+        let entries: Vec<_> = cache
+            .iter_tags()
+            .filter(|e| e.group_tag == group)
+            .filter(|e| filter.is_empty() || e.name.contains(&filter))
+            .collect();
+        eprintln!("{} candidate bitmap(s)", entries.len());
+        let step = (entries.len() / cap.max(1)).max(1);
+        let (mut ok, mut bad) = (0usize, 0usize);
+        let mut reasons: std::collections::BTreeMap<String, (usize, String)> = Default::default();
+        for entry in entries.iter().step_by(step).take(cap) {
+            let Ok(source) = cache.read_tag(entry) else { continue };
+            match analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) {
+                Ok(_) => ok += 1,
+                Err(e) => {
+                    bad += 1;
+                    // Strip the tag-specific tail so like reasons group.
+                    let text = e.to_string();
+                    let key: String = text.chars().take(90).collect();
+                    let slot = reasons.entry(key).or_insert((0, entry.name.clone()));
+                    slot.0 += 1;
+                }
+            }
+        }
+        eprintln!("converted {ok}, refused {bad}");
+        let mut rows: Vec<_> = reasons.into_iter().collect();
+        rows.sort_by_key(|(_, (count, _))| std::cmp::Reverse(*count));
+        for (reason, (count, sample)) in rows.iter().take(12) {
+            eprintln!("  x{count:<5} {reason}
+         e.g. {sample}");
+        }
+    }
+
+    /// How many bitmaps in the build describe their images only in the 360
+    /// mirror, and what a kit tag puts in the PC block for the same picture.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_bitmaps_block_missing() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let group = u32::from_be_bytes(*b"bitm");
+        let (mut both, mut mirror_only, mut neither) = (0usize, 0usize, 0usize);
+        let mut examples: Vec<String> = Vec::new();
+        for entry in cache.iter_tags().filter(|e| e.group_tag == group) {
+            let Ok(tag) = cache.read_tag_bytes(entry).and_then(|b| Ok(TagFile::read_from_bytes(&b)?))
+            else { continue };
+            let root = tag.root();
+            let count = |name: &str| {
+                root.field_path(name).and_then(|f| f.as_block()).map(|b| b.len()).unwrap_or(0)
+            };
+            let (pc, xenon) = (count("bitmaps"), count("xenon bitmaps"));
+            match (pc, xenon) {
+                (0, 0) => neither += 1,
+                (0, _) => {
+                    mirror_only += 1;
+                    if examples.len() < 5 { examples.push(entry.name.clone()); }
+                }
+                _ => both += 1,
+            }
+        }
+        eprintln!("both={both}  mirror only={mirror_only}  neither={neither}");
+        for name in &examples { eprintln!("  e.g. {name}"); }
+
+        // The 360 mirror for one of the same, field by field.
+        let chosen = std::env::var("MIRROR_NAME").ok();
+        let examples = match &chosen { Some(n) => vec![n.clone()], None => examples };
+        if let Some(name) = examples.first()
+            && let Ok(tag) = cache
+                .read_tag_bytes(cache.find_tag(group, name).unwrap())
+                .and_then(|b| Ok(TagFile::read_from_bytes(&b)?))
+        {
+            let root = tag.root();
+            eprintln!("MIRROR {name}");
+            if let Some(elem) = root
+                .field_path("xenon bitmaps")
+                .and_then(|f| f.as_block())
+                .and_then(|b| b.element(0))
+            {
+                for field in elem.field_names() {
+                    let value = elem.field(&field).and_then(|f| f.value());
+                    let text = format!("{value:?}");
+                    eprintln!("    {field}: {}", text.chars().take(110).collect::<String>());
+                }
+            }
+        }
+
+        // And what the kit writes for one of these.
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        let Ok(relative) = std::env::var("STOCK_BITMAP") else { return };
+        let Ok(stock) = TagFile::read(&reach.join(&relative)) else {
+            eprintln!("could not read {relative}");
+            return;
+        };
+        let root = stock.root();
+        eprintln!("STOCK {relative}");
+        eprintln!(
+            "  processed pixel data: {} byte(s)",
+            root.field_path("processed pixel data").and_then(|f| f.as_data()).map(<[u8]>::len).unwrap_or(0)
+        );
+        for name in ["bitmaps", "xenon bitmaps", "hardware textures"] {
+            eprintln!(
+                "  {name}: {}",
+                root.field_path(name).and_then(|f| f.as_block()).map(|b| b.len()).unwrap_or(0)
+            );
+        }
+        if let Some(elem) = root.field_path("bitmaps").and_then(|f| f.as_block()).and_then(|b| b.element(0)) {
+            for name in elem.field_names() {
+                let value = elem.field(&name).and_then(|f| f.value());
+                let text = format!("{value:?}");
+                eprintln!("    {name}: {}", text.chars().take(110).collect::<String>());
+            }
+        }
+    }
+
+    /// Convert every tag of a group the build and an untouched kit both carry,
+    /// and report what the conversions disagree with the kit about.
+    ///
+    /// The kit's own 2010-dated tag for the same name is the only oracle here
+    /// that cannot be a previous run of this converter, so keep the date test:
+    /// an import writes over the kit and turns the oracle into a mirror.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_bulk_diff_against_kit() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let ext = std::env::var("SHARED_EXT").unwrap_or_else(|_| "bitmap".to_owned());
+        let group_name = std::env::var("SHARED_GROUP").unwrap_or_else(|_| "bitm".to_owned());
+        let cap: usize = std::env::var("SHARED_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+        let mut gb = [b' '; 4];
+        for (i, c) in group_name.bytes().take(4).enumerate() { gb[i] = c; }
+        let group = u32::from_be_bytes(gb);
+        let cutoff = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_577_836_800);
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+
+        let shared: Vec<_> = cache
+            .iter_tags()
+            .filter(|e| e.group_tag == group)
+            .filter_map(|e| {
+                let path = reach.join(format!("{}.{ext}", e.name.replace('\\', "/")));
+                let stock = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map(|m| m < cutoff)
+                    .unwrap_or(false);
+                stock.then(|| (e, path))
+            })
+            .collect();
+        eprintln!("{} tag(s) the build and an untouched kit share", shared.len());
+        let step = (shared.len() / cap.max(1)).max(1);
+
+        let (mut identical, mut differing, mut refused, mut unreadable) = (0, 0, 0, 0);
+        let mut uncompiled = 0;
+        let mut fields: std::collections::BTreeMap<String, (usize, String)> = Default::default();
+        let mut refusals: std::collections::BTreeMap<String, usize> = Default::default();
+        for (entry, path) in shared.iter().step_by(step).take(cap) {
+            let (Ok(source), Ok(stock)) = (cache.read_tag(entry), TagFile::read(path)) else {
+                unreadable += 1;
+                continue;
+            };
+            let draft = match analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    refused += 1;
+                    *refusals.entry(e.chars().take(80).collect()).or_default() += 1;
+                    continue;
+                }
+            };
+            // A kit ships plenty of bitmaps with no compiled pixels at all --
+            // it recompiles them from the artist source. Comparing a converted
+            // tag that does carry pixels against one of those says nothing
+            // about the detiler, so count them apart rather than as failures.
+            let stock_pixels = stock
+                .root()
+                .field_path("processed pixel data")
+                .and_then(|f| f.as_data())
+                .map(<[u8]>::len)
+                .unwrap_or(0);
+            if stock_pixels == 0 {
+                uncompiled += 1;
+                continue;
+            }
+            let mut differences = Vec::new();
+            diff_structs("", &draft.tag.root(), &stock.root(), &mut differences, 0);
+            if differences.is_empty() {
+                identical += 1;
+                continue;
+            }
+            differing += 1;
+            for line in &differences {
+                let (field, detail) = line.split_once(": ").unwrap_or((line.as_str(), ""));
+                let mut key = String::with_capacity(field.len());
+                let mut skipping = false;
+                for ch in field.chars() {
+                    match ch {
+                        '[' | '<' => { skipping = true; key.push(ch); }
+                        ']' | '>' => { skipping = false; key.push(ch); }
+                        _ if skipping => {}
+                        _ => key.push(ch),
+                    }
+                }
+                let slot = fields
+                    .entry(key)
+                    .or_insert((0, format!("{detail}   [{}]", entry.name)));
+                slot.0 += 1;
+            }
+        }
+        eprintln!(
+            "identical to the kit: {identical}   differing: {differing}   refused: {refused}   unreadable: {unreadable}   kit ships no pixels: {uncompiled}"
+        );
+        for (reason, count) in refusals.iter() {
+            eprintln!("  refused x{count}: {reason}");
+        }
+        let mut rows: Vec<_> = fields.into_iter().collect();
+        rows.sort_by_key(|(_, (count, _))| std::cmp::Reverse(*count));
+        for (field, (count, sample)) in rows.iter().take(20) {
+            eprintln!("  x{count:<6} {field}\n           {}", sample.chars().take(120).collect::<String>());
+        }
+    }
+
+    /// Compare converted pixels against the kit's own, for the tags where the
+    /// two agree about what the picture is.
+    ///
+    /// A build five months older than the shipped game has re-authored art in
+    /// it, so a byte difference on its own proves nothing. Restricting the
+    /// comparison to images whose size, format, type and mip count all match
+    /// removes that: what is left can only be the detiler.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_pixel_fidelity() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let cap: usize = std::env::var("SHARED_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
+        let group = u32::from_be_bytes(*b"bitm");
+        let cutoff = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_577_836_800);
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let shared: Vec<_> = cache
+            .iter_tags()
+            .filter(|e| e.group_tag == group)
+            .filter_map(|e| {
+                let path = reach.join(format!("{}.bitmap", e.name.replace('\\', "/")));
+                std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map(|m| m < cutoff)
+                    .unwrap_or(false)
+                    .then(|| (e, path))
+            })
+            .collect();
+        let step = (shared.len() / cap.max(1)).max(1);
+        let describe = |tag: &TagFile| -> Vec<String> {
+            tag.root()
+                .field_path("bitmaps")
+                .and_then(|f| f.as_block())
+                .map(|block| {
+                    (0..block.len())
+                        .filter_map(|i| block.element(i))
+                        .map(|e| {
+                            format!(
+                                "{}x{}x{} {} {} mips={}",
+                                e.read_int_any("width").unwrap_or(-1),
+                                e.read_int_any("height").unwrap_or(-1),
+                                e.read_int_any("depth").unwrap_or(-1),
+                                e.read_enum_name("format").unwrap_or_default(),
+                                e.read_enum_name("type").unwrap_or_default(),
+                                e.read_int_any("mipmap count").unwrap_or(-1),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let (mut comparable, mut exact, mut same_size, mut wrong_size) = (0, 0, 0, 0);
+        let mut examples: Vec<String> = Vec::new();
+        let mut spread: Vec<f64> = Vec::new();
+        let mut by_shape: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+        let (mut within_base, mut after_base) = (0usize, 0usize);
+        for (entry, path) in shared.iter().step_by(step).take(cap) {
+            let (Ok(source), Ok(stock)) = (cache.read_tag(entry), TagFile::read(path)) else {
+                continue;
+            };
+            let Ok(draft) = analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) else {
+                continue;
+            };
+            if describe(&draft.tag) != describe(&stock) {
+                continue;
+            }
+            let pixels = |tag: &TagFile| {
+                tag.root()
+                    .field_path("processed pixel data")
+                    .and_then(|f| f.as_data())
+                    .map(<[u8]>::to_vec)
+                    .unwrap_or_default()
+            };
+            let (ours, theirs) = (pixels(&draft.tag), pixels(&stock));
+            if theirs.is_empty() {
+                continue;
+            }
+            comparable += 1;
+            // What shape was it? Grouping the verdict by shape is what turns
+            // "some differ" into "this kind differs".
+            let shape = draft
+                .tag
+                .root()
+                .field_path("bitmaps")
+                .and_then(|f| f.as_block())
+                .and_then(|b| b.element(0))
+                .map(|e| {
+                    format!(
+                        "{:<10} {:<10} mips={} layers={}",
+                        e.read_enum_name("type").unwrap_or_default(),
+                        e.read_enum_name("format").unwrap_or_default(),
+                        e.read_int_any("mipmap count").unwrap_or(-1),
+                        e.read_int_any("depth").unwrap_or(-1),
+                    )
+                })
+                .unwrap_or_default();
+            let slot = by_shape.entry(shape).or_insert((0usize, 0usize));
+            slot.1 += 1;
+            if ours == theirs {
+                exact += 1;
+                slot.0 += 1;
+            } else if ours.len() == theirs.len() {
+                same_size += 1;
+                // How far apart, not just how often. Art re-authored between
+                // the two builds differs everywhere by a little; a detiler that
+                // reads the wrong texels differs by a lot.
+                let total: u64 = ours
+                    .iter()
+                    .zip(&theirs)
+                    .map(|(a, b)| a.abs_diff(*b) as u64)
+                    .sum();
+                let mean = total as f64 / ours.len() as f64;
+                let format = draft
+                    .tag
+                    .root()
+                    .field_path("bitmaps")
+                    .and_then(|f| f.as_block())
+                    .and_then(|b| b.element(0))
+                    .and_then(|e| e.read_enum_name("format"))
+                    .unwrap_or_default();
+                spread.push(mean);
+                // Where does it first go wrong, against the size of the base
+                // level? A chain problem starts after the base; a detile
+                // problem starts at nothing.
+                let base = draft
+                    .tag
+                    .root()
+                    .field_path("bitmaps")
+                    .and_then(|f| f.as_block())
+                    .and_then(|b| b.element(0))
+                    .and_then(|e| {
+                        let name = e.read_enum_name("format")?;
+                        let format = crate::bitmap::BitmapFormat::from_schema_name(&name)?;
+                        Some(format.surface_bytes(
+                            e.read_int_any("width").unwrap_or(0) as u32,
+                            e.read_int_any("height").unwrap_or(0) as u32,
+                            1,
+                        ))
+                    })
+                    .unwrap_or(0);
+                let first = ours.iter().zip(&theirs).position(|(a, b)| a != b).unwrap_or(0);
+                if (first as u64) >= base { after_base += 1; } else { within_base += 1; }
+                if examples.len() < 8 {
+                    let differing = ours.iter().zip(&theirs).filter(|(a, b)| a != b).count();
+                    examples.push(format!(
+                        "  {format:<12} mean |delta| {mean:6.2}  first diff at {first} of base {base}, {differing}/{} differ: {}",
+                        ours.len(),
+                        entry.name
+                    ));
+                }
+            } else {
+                wrong_size += 1;
+                if examples.len() < 6 {
+                    examples.push(format!(
+                        "  {} byte(s) vs {}: {}",
+                        ours.len(),
+                        theirs.len(),
+                        entry.name
+                    ));
+                }
+            }
+        }
+        eprintln!(
+            "comparable: {comparable}   byte-identical: {exact}   same size but different: {same_size}   wrong size: {wrong_size}"
+        );
+        if !spread.is_empty() {
+            spread.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            eprintln!(
+                "mean |delta| per byte -- min {:.2}  median {:.2}  max {:.2}",
+                spread[0],
+                spread[spread.len() / 2],
+                spread[spread.len() - 1]
+            );
+        }
+        for line in &examples {
+            eprintln!("{line}");
+        }
+        eprintln!("first difference within the base level: {within_base}   after it: {after_base}");
+        eprintln!("identical / comparable, by shape:");
+        let mut rows: Vec<_> = by_shape.into_iter().collect();
+        rows.sort_by_key(|(_, (_, total))| std::cmp::Reverse(*total));
+        for (shape, (good, total)) in rows.iter().take(16) {
+            eprintln!("  {good:>4}/{total:<4}  {shape}");
+        }
+    }
+
+    /// Is each mip level a smaller copy of the one above it?
+    ///
+    /// A mip chain is made by filtering the level above, so box-downsampling
+    /// level N and comparing against level N+1 should come out close on any
+    /// correctly read chain. It needs no second copy of the art to compare to,
+    /// which is what makes it usable on a build the shipped game has moved on
+    /// from -- and running it on a kit tag first says what "close" is.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_mip_chain_agrees() {
+        let kit = kit_tags("BLAM_TEST_HREK", "HREK");
+        let cache = reach_x360_cache();
+        let mut sources: Vec<(String, TagFile)> = Vec::new();
+        if let Some(kit) = &kit {
+            for relative in std::env::var("KIT_BITMAPS").unwrap_or_default().split(';') {
+                if relative.is_empty() { continue }
+                if let Ok(tag) = TagFile::read(&kit.join(relative)) {
+                    sources.push((format!("KIT   {relative}"), tag));
+                }
+            }
+        }
+        if let Some(cache) = &cache {
+            for name in std::env::var("COHERENCE_NAMES").unwrap_or_default().split(';') {
+                if name.is_empty() { continue }
+                if let Some(entry) = cache.find_tag(u32::from_be_bytes(*b"bitm"), name)
+                    && let Ok(tag) = cache.read_tag(entry)
+                {
+                    sources.push((format!("BUILD {name}"), tag));
+                }
+            }
+        }
+        for (label, tag) in &sources {
+            let Ok(bitmap) = crate::bitmap::Bitmap::new(tag) else { continue };
+            let Some(image) = bitmap.image(0) else { continue };
+            let Ok(format) = image.format() else { continue };
+            let Ok(pixels) = image.pixel_bytes() else { continue };
+            let levels = image.mipmap_levels();
+            if levels < 2 {
+                eprintln!("{label}: single level");
+                continue;
+            }
+            let (mut width, mut height, mut at) = (image.width(), image.height(), 0usize);
+            let mut previous: Option<(Vec<u8>, u32, u32)> = None;
+            let mut scores = Vec::new();
+            for _ in 0..levels {
+                let size = format.level_bytes(width, height) as usize;
+                if at + size > pixels.len() { break }
+                let Ok(rgba) = crate::bitmap::decode::decode_to_rgba8(
+                    format, width, height, &pixels[at..at + size], crate::bitmap::P8Palette::Halo2,
+                ) else { break };
+                if let Some((above, above_width, above_height)) = &previous
+                    && *above_width / 2 == width.max(1)
+                    && *above_height / 2 == height.max(1)
+                    && width >= 4
+                {
+                    // Box-downsample the level above and see how far off it is.
+                    let mut total = 0u64;
+                    let mut count = 0u64;
+                    for y in 0..height as usize {
+                        for x in 0..width as usize {
+                            for channel in 0..3 {
+                                let mut sum = 0u32;
+                                for dy in 0..2usize {
+                                    for dx in 0..2usize {
+                                        let sx = x * 2 + dx;
+                                        let sy = y * 2 + dy;
+                                        let index =
+                                            (sy * *above_width as usize + sx) * 4 + channel;
+                                        sum += above[index] as u32;
+                                    }
+                                }
+                                let expected = (sum / 4) as u8;
+                                let got = rgba[(y * width as usize + x) * 4 + channel];
+                                total += expected.abs_diff(got) as u64;
+                                count += 1;
+                            }
+                        }
+                    }
+                    scores.push(total as f64 / count.max(1) as f64);
+                }
+                previous = Some((rgba, width, height));
+                at += size;
+                width = (width / 2).max(1);
+                height = (height / 2).max(1);
+            }
+            let text: Vec<String> = scores.iter().map(|s| format!("{s:.1}")).collect();
+            eprintln!("{label}\n  mip-to-mip mean |delta|: {}", text.join("  "));
+        }
+    }
+
+    /// Where does each cube face's base level actually start?
+    ///
+    /// Reads a face-sized window at every plausible offset in the resource,
+    /// puts it through the same de-tile and swap the working path uses, and
+    /// says which offsets reproduce the kit's faces. The answer is the stride,
+    /// measured rather than derived.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_cube_face_stride() {
+        use crate::bitmap::xbox360::{EndianSwap, detile_blocks};
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let name = std::env::var("DIFF_NAME").unwrap_or_default();
+        let Some(entry) = cache.find_tag(u32::from_be_bytes(*b"bitm"), &name) else { return };
+        let Ok(source) = cache.read_tag(entry) else { return };
+        let Ok(stock) = TagFile::read(&reach.join(format!("{}.bitmap", name.replace('\\', "/"))))
+        else { return };
+        let root = source.root();
+        let Some(elem) = root
+            .field_path("xenon bitmaps")
+            .and_then(|f| f.as_block())
+            .and_then(|b| b.element(0))
+        else { return };
+        let Some(resource) = root
+            .field_path("hardware textures[0]/texture resource")
+            .and_then(|f| f.as_resource())
+        else { return };
+        let payload = resource.exploded_payload().unwrap_or(&[]);
+        let optional = resource
+            .xsync_state()
+            .map(|s| s.header.optional_location_size as usize)
+            .unwrap_or(0)
+            .min(payload.len());
+        eprintln!(
+            "{name}: payload {} byte(s), optional {optional}, more flags {:?}",
+            payload.len(),
+            elem.field("more flags").and_then(|f| f.value())
+        );
+        let width = elem.read_int_any("width").unwrap_or(0) as u32;
+        let height = elem.read_int_any("height").unwrap_or(0) as u32;
+        let format_name = elem.read_enum_name("format").unwrap_or_default();
+        let Some(format) = crate::bitmap::BitmapFormat::from_schema_name(&format_name) else { return };
+        let Some((block_width, block_height, bytes_per_block)) = format.block_dims_and_size() else { return };
+        let face = format.level_bytes(width, height) as usize;
+        let stock_pixels = stock
+            .root()
+            .field_path("processed pixel data")
+            .and_then(|f| f.as_data())
+            .unwrap_or(&[]);
+        let columns = width / block_width;
+        let rows = height / block_height;
+        // The kit's blob is level-major: the six base faces come first.
+        for wanted in 0..6usize {
+            let want = &stock_pixels[wanted * face..(wanted + 1) * face];
+            let mut hits = Vec::new();
+            let mut at = 0usize;
+            while at + face <= payload.len() {
+                for swap in [EndianSwap::None, EndianSwap::In16, EndianSwap::In32] {
+                    for detile in [true, false] {
+                        let mut data = payload[at..at + face].to_vec();
+                        if detile {
+                            data = detile_blocks(&data, columns, rows, bytes_per_block);
+                        }
+                        swap.apply(&mut data);
+                        if data == want {
+                            hits.push(format!("{at} (detile={detile}, swap={swap:?})"));
+                        }
+                    }
+                }
+                at += 4;
+            }
+            eprintln!("  kit face {wanted}: found at {}", if hits.is_empty() { "nowhere".to_owned() } else { hits.join(", ") });
+        }
+    }
+
+    /// Why do most of the build's lightmap tags have no bytes?
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_lbsp_blocks() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let group = u32::from_be_bytes(*b"Lbsp");
+        let (mut with_tag, mut with_cache, mut neither, mut cache_only) = (0, 0, 0, 0);
+        let mut examples: Vec<String> = Vec::new();
+        for entry in cache.iter_tags().filter(|e| e.group_tag == group) {
+            let tag_block = cache.resolve_tag_block(entry);
+            let cache_block = cache.resolve_cache_block(entry);
+            match (tag_block.is_some(), cache_block.is_some()) {
+                (true, true) => { with_tag += 1; with_cache += 1; }
+                (true, false) => with_tag += 1,
+                (false, true) => {
+                    cache_only += 1;
+                    if examples.len() < 4 {
+                        let size = cache_block.as_ref().map(|b| b.size).unwrap_or(0);
+                        examples.push(format!("{} (cache block {size} byte(s))", entry.name));
+                    }
+                }
+                (false, false) => {
+                    neither += 1;
+                    if examples.len() < 8 { examples.push(format!("{} (nothing)", entry.name)); }
+                }
+            }
+        }
+        eprintln!(
+            "Lbsp: {with_tag} have tag bytes ({with_cache} of those also cache bytes), \
+             {cache_only} have only cache bytes, {neither} have neither"
+        );
+        for line in &examples { eprintln!("  {line}"); }
+        // And the same question for the level the user named.
+        for name in [r"levels\multi\archive\70_boneyard_v2\70_boneyard_v2_000",
+                     r"levels\multi\70_boneyard\70_boneyard"] {
+            let Some(entry) = cache.find_tag(group, name) else {
+                eprintln!("{name}: not in the cache at all");
+                continue;
+            };
+            eprintln!(
+                "{name}: tag block {:?}, cache block {:?}",
+                cache.resolve_tag_block(entry).map(|b| (b.file_index, b.offset, b.size)),
+                cache.resolve_cache_block(entry).map(|b| (b.file_index, b.offset, b.size)),
+            );
+        }
+    }
+
+    /// Do the lightmap tags whose bytes are in the build actually convert?
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_lbsp_convert() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let group = u32::from_be_bytes(*b"Lbsp");
+        let (mut ok, mut refused, mut unreadable) = (0usize, 0usize, 0usize);
+        let mut reasons: std::collections::BTreeMap<String, (usize, String)> = Default::default();
+        let entries: Vec<_> = cache
+            .iter_tags()
+            .filter(|e| e.group_tag == group && cache.resolve_tag_block(e).is_some())
+            .collect();
+        eprintln!("{} Lbsp tag(s) with bytes", entries.len());
+        let cap: usize = std::env::var("LBSP_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+        for entry in entries.iter().take(cap) {
+            let source = match cache.read_tag(entry) {
+                Ok(t) => t,
+                Err(e) => {
+                    unreadable += 1;
+                    let slot = reasons.entry(format!("unreadable: {e}").chars().take(90).collect())
+                        .or_insert((0, entry.name.clone()));
+                    slot.0 += 1;
+                    continue;
+                }
+            };
+            match analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) {
+                Ok(_) => ok += 1,
+                Err(e) => {
+                    refused += 1;
+                    let slot = reasons.entry(e.chars().take(90).collect())
+                        .or_insert((0, entry.name.clone()));
+                    slot.0 += 1;
+                }
+            }
+        }
+        eprintln!("converted {ok}, refused {refused}, unreadable {unreadable}");
+        for (why, (count, sample)) in reasons.iter() {
+            eprintln!("  x{count} {why}
+      e.g. {sample}");
+        }
+    }
+
+    fn report_geometry(label: &str, tag: &TagFile) {
+        let root = tag.root();
+        let info = root
+            .field_path("render geometry/compression info")
+            .and_then(|f| f.as_block());
+        let count = info.as_ref().map(|b| b.len()).unwrap_or(0);
+        eprintln!("{label}\tcompression info: {count} element(s)");
+        if let Some(block) = info.as_ref()
+            && let Some(elem) = block.element(0)
+        {
+            let p0 = elem.read_point3d("position bounds 0");
+            let p1 = elem.read_point3d("position bounds 1");
+            eprintln!(
+                "{label}\t  bounds0 ({:.3}, {:.3}, {:.3})  bounds1 ({:.3}, {:.3}, {:.3})",
+                p0.x, p0.y, p0.z, p1.x, p1.y, p1.z
+            );
+        }
+        let Some(pmt) = root
+            .field_path("render geometry/per mesh temporary")
+            .and_then(|f| f.as_block())
+        else {
+            eprintln!("{label}\tno per mesh temporary");
+            return;
+        };
+        let mut total = 0usize;
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for index in 0..pmt.len() {
+            let Some(elem) = pmt.element(index) else { continue };
+            let Some(rv) = elem.field("raw vertices").and_then(|f| f.as_block()) else { continue };
+            for v in 0..rv.len() {
+                let Some(vertex) = rv.element(v) else { continue };
+                let p = vertex.read_point3d("position");
+                for (axis, value) in [p.x, p.y, p.z].into_iter().enumerate() {
+                    lo[axis] = lo[axis].min(value);
+                    hi[axis] = hi[axis].max(value);
+                }
+                total += 1;
+            }
+        }
+        eprintln!(
+            "{label}\t  {total} raw vertices, x {:.3}..{:.3}  y {:.3}..{:.3}  z {:.3}..{:.3}",
+            lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_bsp_block_counts() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let name = r"levels\multi\archive\70_boneyard_v2\70_boneyard_v2_000";
+        let Ok(source) = cache.read_tag_by_name(u32::from_be_bytes(*b"sbsp"), name) else { return };
+        let Ok(draft) = analyze_conversion_with_templates(
+            &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+        ) else {
+            eprintln!("refused");
+            return;
+        };
+        let mut before: Vec<(String, usize)> = Vec::new();
+        let mut after: Vec<(String, usize)> = Vec::new();
+        top_block_counts(source.root(), &mut before);
+        top_block_counts(draft.tag.root(), &mut after);
+        let after_map: HashMap<String, usize> = after.iter().cloned().collect();
+        eprintln!("block\tsource\tconverted");
+        for (name, count) in &before {
+            let now = after_map.get(name).copied().unwrap_or(0);
+            if *count != now {
+                eprintln!("DIFF\t{name}\t{count}\t{now}");
+            }
+        }
+        for (name, count) in &after {
+            if !before.iter().any(|(n, _)| n == name) && *count > 0 {
+                eprintln!("ONLY-IN-CONVERTED\t{name}\t{count}");
+            }
+        }
+        eprintln!("(top-level blocks compared: {})", before.len());
+    }
+
+    fn top_block_counts(value: TagStruct<'_>, out: &mut Vec<(String, usize)>) {
+        for field in value.fields() {
+            if let Some(block) = field.as_block() {
+                out.push((field.name().to_owned(), block.len()));
+            } else if let Some(nested) = field.as_struct() {
+                let base = field.name().to_owned();
+                let mut inner = Vec::new();
+                top_block_counts(nested, &mut inner);
+                for (name, count) in inner {
+                    out.push((format!("{base}/{name}"), count));
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_mesh_coverage() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            return;
+        };
+        for (label, tag) in [
+            ("SOURCE-BSP", cache.read_tag_by_name(
+                u32::from_be_bytes(*b"sbsp"),
+                r"levels\multi\archive\70_boneyard_v2\70_boneyard_v2_000",
+            ).ok()),
+        ] {
+            if let Some(tag) = tag {
+                coverage(label, &tag);
+            }
+        }
+        // A stock kit BSP and a stock render model, as the shape of "complete".
+        for extension in ["scenario_structure_bsp", "render_model"] {
+            if let Some(path) = walk_files(&reach)
+                .into_iter()
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some(extension))
+                .find(|p| !p.to_string_lossy().contains("cex_"))
+                && let Ok(tag) = TagFile::read(&path)
+            {
+                coverage(&format!("STOCK-{extension}"), &tag);
+            }
+        }
+        // And a converted render model, since models render too.
+        if let Ok(model) = cache.read_tag_by_name(
+            u32::from_be_bytes(*b"mode"),
+            r"objects\characters\elite\elite",
+        ) {
+            coverage("SOURCE-MODEL", &model);
+        }
+    }
+
+    fn coverage(label: &str, tag: &TagFile) {
+        for path in ["render geometry", "geometry"] {
+            let Some(rg) = tag.root().field_path(path).and_then(|f| f.as_struct()) else { continue };
+            let meshes = rg.field("meshes").and_then(|f| f.as_block()).map(|b| b.len()).unwrap_or(0);
+            let Some(pmt) = rg.field("per mesh temporary").and_then(|f| f.as_block()) else {
+                eprintln!("{label}\tmeshes={meshes}\tno per mesh temporary");
+                continue;
+            };
+            let mut with = 0;
+            for i in 0..pmt.len() {
+                if pmt
+                    .element(i)
+                    .and_then(|e| e.field("raw vertices"))
+                    .and_then(|f| f.as_block())
+                    .is_some_and(|rv| rv.len() > 0)
+                {
+                    with += 1;
+                }
+            }
+            eprintln!(
+                "{label}\tmeshes={meshes}\tper mesh temporary={}\twith vertices={with}",
+                pmt.len()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_hydration_effect() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let name = r"levels\multi\archive\70_boneyard_v2\70_boneyard_v2_000";
+        let group = u32::from_be_bytes(*b"sbsp");
+        let Some(entry) = cache.find_tag(group, name) else { return };
+
+        // Unhydrated: the tag exactly as the build wrote it.
+        let Ok(bytes) = cache.read_tag_bytes(entry) else { return };
+        let Ok(raw) = TagFile::read_from_bytes(&bytes) else { return };
+        vertex_summary("UNHYDRATED", &raw);
+
+        // Hydrated: what `read_tag` hands every consumer.
+        let Ok(hydrated) = cache.read_tag(entry) else { return };
+        vertex_summary("HYDRATED  ", &hydrated);
+    }
+
+    fn vertex_summary(label: &str, tag: &TagFile) {
+        let Some(rg) = tag.root().field_path("render geometry").and_then(|f| f.as_struct()) else {
+            return;
+        };
+        let has_resource = rg
+            .field("api resource")
+            .and_then(|f| f.as_resource())
+            .map(|r| format!("{:?}", r.kind()))
+            .unwrap_or_else(|| "none".to_owned());
+        let Some(pmt) = rg.field("per mesh temporary").and_then(|f| f.as_block()) else { return };
+        let (mut verts, mut idx, mut with) = (0usize, 0usize, 0usize);
+        let mut first = String::new();
+        for i in 0..pmt.len() {
+            let Some(elem) = pmt.element(i) else { continue };
+            let rv = elem.field("raw vertices").and_then(|f| f.as_block());
+            let ri = elem.field("raw indices").and_then(|f| f.as_block());
+            let n = rv.as_ref().map(|b| b.len()).unwrap_or(0);
+            let m = ri.as_ref().map(|b| b.len()).unwrap_or(0);
+            if n > 0 {
+                with += 1;
+                if first.is_empty()
+                    && let Some(v) = rv.as_ref().and_then(|b| b.element(0))
+                {
+                    let p = v.read_point3d("position");
+                    first = format!("first vertex ({:.3}, {:.3}, {:.3})", p.x, p.y, p.z);
+                }
+            }
+            verts += n;
+            idx += m;
+        }
+        eprintln!(
+            "{label}\tapi resource={has_resource}\tmeshes with verts={with}/{}\tverts={verts}\tindices={idx}\t{first}",
+            pmt.len()
+        );
     }
 }

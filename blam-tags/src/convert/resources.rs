@@ -89,6 +89,220 @@ pub(super) fn forgive_hydrated_geometry(target: &TagFile, context: &mut Conversi
     );
 }
 
+/// Put a hydrated tag's compiled-geometry bookkeeping back to the shape an
+/// uncompiled kit tag carries.
+///
+/// [`forgive_hydrated_geometry`] drops the GPU resource once the mesh data has
+/// landed in the author-format blocks, which is right -- the buffers inside it
+/// are Xenos-shaped and mean nothing to this engine. What it leaves behind is a
+/// tag that still describes those buffers: every mesh points at a buffer slot,
+/// the geometry claims it has been `processed`, and the meshes name vertex
+/// formats only the 360 build compiles. The engine believes all of it, looks
+/// for buffers that are not there, and draws the result.
+///
+/// The three things a kit's own tags say instead, measured across untouched
+/// Reach BSPs and render models rather than assumed:
+///
+/// - `runtime flags` never has `processed` set. That is the bit that claims the
+///   compiled buffers exist.
+/// - `index buffer index` is always `-1`, and every slot of
+///   `vertex buffer indices` is always `0`. Not the same sentinel, which is why
+///   these are set separately rather than cleared to one value.
+/// - `vertex type` is only ever `world`, `rigid` or `skinned`. The 360's
+///   `rigid compressed` and `skinned compressed` describe the same vertex in a
+///   packed buffer, and the packing is a property of the buffer this tag no
+///   longer has.
+///
+/// Left alone deliberately: `analytical light index`, which holds the same
+/// uninitialised value in tags the kit ships itself, and the budget flags, which
+/// describe the geometry rather than the resource.
+pub(super) fn settle_uncompiled_geometry(
+    byte_order_upgrade: bool,
+    target: &mut TagFile,
+    context: &mut ConversionContext<'_>,
+) {
+    if !byte_order_upgrade
+        || crate::render_geometry::author_geometry_populated(target) != Some(true)
+    {
+        return;
+    }
+    let mut settled = 0usize;
+    settle_geometry_in(&mut target.root_mut(), &mut settled);
+    if settled > 0 {
+        context.report.issues.push(ConversionIssue {
+            kind: ConversionIssueKind::Warning,
+            path: String::new(),
+            message: format!(
+                "{settled} mesh(es) were re-described as uncompiled, because the compiled \
+                 geometry buffers they named did not come across"
+            ),
+        });
+    }
+}
+
+/// Walk for `render_geometry` structs. Identified by shape rather than by a
+/// path table: the same struct appears under half a dozen field names across
+/// the groups that carry geometry, and a tag that grows another one should not
+/// need a list edited.
+fn settle_geometry_in(value: &mut TagStructMut<'_>, settled: &mut usize) {
+    let is_geometry = {
+        let view = value.as_ref();
+        view.field("meshes").and_then(|f| f.as_block()).is_some()
+            && view.field("runtime flags").is_some()
+    };
+    if is_geometry {
+        clear_processed_flag(value);
+        if let Some(mut field) = value.field_mut("meshes")
+            && let Some(mut meshes) = field.as_block_mut()
+        {
+            for index in 0..meshes.len() {
+                if let Some(mut mesh) = meshes.element_mut(index) {
+                    settle_mesh(&mut mesh);
+                    *settled += 1;
+                }
+            }
+        }
+    }
+    for index in 0..value.as_ref().fields().count() {
+        let Some(mut field) = value.field_at_mut(index) else {
+            continue;
+        };
+        if let Some(mut nested) = field.as_struct_mut() {
+            settle_geometry_in(&mut nested, settled);
+            continue;
+        }
+        if let Some(mut block) = field.as_block_mut() {
+            for element in 0..block.len() {
+                if let Some(mut element) = block.element_mut(element) {
+                    settle_geometry_in(&mut element, settled);
+                }
+            }
+        }
+    }
+}
+
+/// Clear the `processed` bit and leave the rest of `runtime flags` alone.
+fn clear_processed_flag(geometry: &mut TagStructMut<'_>) {
+    let Some(mut field) = geometry.field_mut("runtime flags") else {
+        return;
+    };
+    // By name: the bit's position is the schema's business, and `names` lists
+    // only the bits actually set, so an absent entry means nothing to clear.
+    let cleared = match field.as_ref().value() {
+        Some(TagFieldData::LongFlags { value, names }) => {
+            let Some((bit, _)) = names.iter().find(|(_, name)| name == "processed") else {
+                return;
+            };
+            TagFieldData::LongFlags { value: value & !(1i32 << bit), names: names.clone() }
+        }
+        _ => return,
+    };
+    let _ = field.set(cleared);
+}
+
+/// Un-describe one mesh's compiled buffers.
+fn settle_mesh(mesh: &mut TagStructMut<'_>) {
+    set_int_field(mesh, "index buffer index", -1);
+    if let Some(mut field) = mesh.field_mut("vertex buffer indices")
+        && let Some(mut slots) = field.as_array_mut()
+    {
+        for index in 0..slots.len() {
+            if let Some(mut slot) = slots.element_mut(index) {
+                set_int_field(&mut slot, "vertex buffer index", 0);
+            }
+        }
+    }
+    let Some(mut field) = mesh.field_mut("vertex type") else {
+        return;
+    };
+    // Named rather than numbered: the pair differs by how a buffer packs the
+    // vertex, and the buffer is gone, so what is left is the plain format.
+    let plain = match field.as_ref().value() {
+        Some(TagFieldData::CharEnum { name: Some(name), .. }) => match name.as_str() {
+            "rigid compressed" => "rigid",
+            "skinned compressed" => "skinned",
+            _ => return,
+        },
+        _ => return,
+    };
+    let Some(TagOptions::Enum { names, .. }) = field.as_ref().options() else {
+        return;
+    };
+    let Some(ordinal) = names.iter().position(|name| *name == plain) else {
+        return;
+    };
+    let _ = field.set(TagFieldData::CharEnum { value: ordinal as i8, name: None });
+}
+
+/// Put a geometry `user data` blob into the destination's byte order.
+///
+/// `render geometry/user data` pairs a header naming the payload's type, count
+/// and size with an opaque `data` blob, so the field walk carries the blob
+/// verbatim and every word inside it stays big-endian. The one type Reach
+/// declares is `PRT Info`, whose 20 bytes are five longs; read the wrong way
+/// round the first of them is 50331648 rather than 3.
+///
+/// Gated on the type name rather than on the blob looking word-shaped, so a
+/// payload type added later is left alone instead of quietly mangled.
+pub(super) fn swap_geometry_user_data(
+    byte_order_upgrade: bool,
+    target: &mut TagFile,
+    context: &mut ConversionContext<'_>,
+) {
+    if !byte_order_upgrade {
+        return;
+    }
+    let mut swapped = 0usize;
+    swap_user_data_in(&mut target.root_mut(), &mut swapped);
+    if swapped > 0 {
+        context.report.issues.push(ConversionIssue {
+            kind: ConversionIssueKind::Warning,
+            path: String::new(),
+            message: format!("{swapped} geometry user-data blob(s) were byte-swapped for the target"),
+        });
+    }
+}
+
+fn swap_user_data_in(value: &mut TagStructMut<'_>, swapped: &mut usize) {
+    let is_word_payload = {
+        let view = value.as_ref();
+        view.field_path("user data header")
+            .and_then(|f| f.as_struct())
+            .and_then(|header| header.read_enum_name("data type"))
+            .is_some_and(|kind| kind == "PRT Info")
+    };
+    if is_word_payload
+        && let Some(mut field) = value.field_mut("user data")
+    {
+        let payload = field.as_ref().as_data().map(<[u8]>::to_vec);
+        if let Some(mut bytes) = payload
+            && bytes.len() % 4 == 0
+        {
+            for word in bytes.chunks_exact_mut(4) {
+                word.reverse();
+            }
+            let _ = field.set(TagFieldData::Data(bytes));
+            *swapped += 1;
+        }
+    }
+    for index in 0..value.as_ref().fields().count() {
+        let Some(mut field) = value.field_at_mut(index) else {
+            continue;
+        };
+        if let Some(mut nested) = field.as_struct_mut() {
+            swap_user_data_in(&mut nested, swapped);
+            continue;
+        }
+        if let Some(mut block) = field.as_block_mut() {
+            for element in 0..block.len() {
+                if let Some(mut element) = block.element_mut(element) {
+                    swap_user_data_in(&mut element, swapped);
+                }
+            }
+        }
+    }
+}
+
 /// Move an Xbox 360 bitmap's pixels into the shape a PC tag keeps them in.
 ///
 /// The two builds disagree about where a bitmap's pixels live. A PC tag puts
@@ -103,11 +317,12 @@ pub(super) fn forgive_hydrated_geometry(target: &TagFile, context: &mut Conversi
 /// bytes, so this is a re-lay-out rather than a decode: concatenate the images,
 /// write the blob, and point each `bitmaps[i]` at its slice.
 ///
-/// **One mip.** The detiler reproduces the base level only — the smaller chain
-/// has its own packed layout (each level 4KB-aligned, sub-16-pixel mips sharing
-/// a tile) that nothing here reconstructs. Every image is written with a mip
-/// count of 0 and the report says so, because a bitmap claiming mips it does not
-/// carry is worse than one honestly missing them.
+/// **The whole chain.** Every level and every layer comes across: the smaller
+/// levels out of their packed layout (each 4KB-aligned, sub-16-pixel levels
+/// sharing a tile), a cube map's six faces put back in D3D order from the one
+/// Xenos stores them in, and an array's layers in the level-major order a kit
+/// tag holds them. Each image is written with the mip count it actually
+/// carries.
 ///
 /// All or nothing: an image that will not decode leaves the whole tag untouched
 /// and its resources on the lost list, so the tag is held back rather than
@@ -200,12 +415,12 @@ pub(super) fn convert_x360_bitmap_pixels(
         let pixels = match image.pixel_bytes() {
             Ok(pixels) => pixels,
             Err(error) => {
-                // Named apart because it is a known gap rather than a surprise:
-                // a cube map's six faces and an array's layers each sit in their
-                // own 360 surface, and only the first is reproduced here.
+                // Say how many surfaces were being assembled: a multi-layer
+                // image has six or more of them and which one ran short is the
+                // first thing anybody reading this will want.
                 let detail = if image.layer_count() > 1 {
                     format!(
-                        "A {}-layer Xbox 360 {} is not reproduced yet; only single-layer images                          come across",
+                        "The {}-layer Xbox 360 {} could not be detiled: {error}",
                         image.layer_count(),
                         image.type_name().unwrap_or_else(|| "image".to_owned())
                     )
@@ -279,6 +494,9 @@ pub(super) fn convert_x360_bitmap_pixels(
 
     let images = slices.len();
     let mut target_root = target.root_mut();
+    // A tag that described its images only in the 360 mirror has nowhere to
+    // record what was just detiled, so give it the block a kit tag would have.
+    describe_images_from_mirror(source, &mut target_root);
     let Some(mut bitmaps_field) = target_root.field_mut("bitmaps") else {
         record_unsupported(
             context,
@@ -312,6 +530,12 @@ pub(super) fn convert_x360_bitmap_pixels(
         set_int_field(&mut elem, "mipmap count", mip_counts[index]);
         set_int_field(&mut elem, "high res pixels offset offset", 0);
         set_int_field(&mut elem, "high res pixels size", 0);
+        // Two handles the 360 build filled in at run time and a kit tag ships
+        // zero: the D3D format the texture was created with, and where the tag
+        // happened to be loaded. Carried across they describe a machine that is
+        // not this one.
+        set_int_field(&mut elem, "hardware format", 0);
+        set_int_field(&mut elem, "runtime tag base address", 0);
     }
     drop(bitmaps_field);
 
@@ -334,6 +558,9 @@ pub(super) fn convert_x360_bitmap_pixels(
     if let Some(mut field) = target_root.field_mut("xenon processed pixel data") {
         let _ = field.set(TagFieldData::Data(Vec::new()));
     }
+    // And the tag no longer reaches its pixels through an interop handle, which
+    // is what this bit claims. A kit tag for the same texture has it clear.
+    clear_flags_by_name(&mut target_root, "Flags", &["using tag_interop and tag_resource"]);
 
     forgive_resources(
         context,
@@ -524,11 +751,131 @@ fn swap_curves_in(value: &mut TagStructMut<'_>, swapped: &mut usize) {
     }
 }
 
-/// Set an integer field at whatever width the schema declares it.
+/// Give a mirror-only bitmap the PC image block it never had.
+///
+/// A Reach tag describes each image twice: `bitmaps` for the PC build and
+/// `xenon bitmaps` for the 360 one. Most of the 2011 build's bitmaps carry
+/// both, and the pixel pass only has to fill in offsets. Around one in eight --
+/// every lightmap among them -- carries the 360 mirror alone, and there is
+/// nowhere to record the pixels it just detiled.
+///
+/// The two blocks share one struct definition, and a kit tag for the same
+/// texture holds the mirror's own values almost verbatim: the same size, type,
+/// format, curve and flags. What it does not keep is the three fields that
+/// describe how the 360 stored the picture rather than what the picture is --
+/// the tiled and pitch bits, the tile-size shorthand, and the hardware format
+/// handle. Those are cleared, because after detiling they would be a lie.
+///
+/// Returns how many elements were written, so the caller can tell "the mirror
+/// was missing too" apart from "nothing needed doing".
+fn describe_images_from_mirror(source: &TagFile, target: &mut TagStructMut<'_>) -> usize {
+    let root = source.root();
+    let Some(mirror) = root.field_path("xenon bitmaps").and_then(|f| f.as_block()) else {
+        return 0;
+    };
+    if mirror.is_empty() {
+        return 0;
+    }
+    let Some(mut field) = target.field_mut("bitmaps") else {
+        return 0;
+    };
+    let Some(mut images) = field.as_block_mut() else {
+        return 0;
+    };
+    if !images.is_empty() {
+        return 0;
+    }
+    let mut written = 0usize;
+    for index in 0..mirror.len() {
+        let Some(source_image) = mirror.element(index) else {
+            continue;
+        };
+        let at = images.add_element();
+        let Some(mut target_image) = images.element_mut(at) else {
+            continue;
+        };
+        copy_fields_by_name(&source_image, &mut target_image);
+        clear_flags_by_name(
+            &mut target_image,
+            "more flags",
+            &["xbox360 tiled texture", "xbox360 pitch (memory spacing)"],
+        );
+        set_int_field(&mut target_image, "four times log2 size", 0);
+        set_int_field(&mut target_image, "hardware format", 0);
+        written += 1;
+    }
+    written
+}
+
+/// Copy every field the two structs share, by name.
+///
+/// Not [`crate::api::TagBlockMut::paste_element`]: the two blocks share a
+/// definition in the kit's schema but not necessarily in the tag's own, and a
+/// 2011 tag widens `hardware format` differently. Name and value, coerced to
+/// whatever width the destination declares, is the part that always holds.
+fn copy_fields_by_name(source: &TagStruct<'_>, target: &mut TagStructMut<'_>) {
+    for name in source.field_names() {
+        let Some(value) = source.field(&name).and_then(|f| f.value()) else {
+            continue;
+        };
+        if let Some(number) = source.read_int_any(&name) {
+            set_int_field(target, &name, number as i64);
+            continue;
+        }
+        if let Some(mut field) = target.field_mut(&name)
+            && std::mem::discriminant(&value)
+                == field.as_ref().value().map(|v| std::mem::discriminant(&v)).unwrap_or_else(
+                    || std::mem::discriminant(&value),
+                )
+        {
+            let _ = field.set(value);
+        }
+    }
+}
+
+/// Clear named bits of a flags field, leaving every other bit as it was.
+fn clear_flags_by_name(elem: &mut TagStructMut<'_>, field_name: &str, bits: &[&str]) {
+    let Some(mut field) = elem.field_mut(field_name) else {
+        return;
+    };
+    let cleared = match field.as_ref().value() {
+        Some(TagFieldData::ByteFlags { mut value, names }) => {
+            for (bit, name) in &names {
+                if bits.contains(&name.as_str()) {
+                    value &= !(1u8 << bit);
+                }
+            }
+            TagFieldData::ByteFlags { value, names }
+        }
+        Some(TagFieldData::WordFlags { mut value, names }) => {
+            for (bit, name) in &names {
+                if bits.contains(&name.as_str()) {
+                    value &= !(1u16 << bit);
+                }
+            }
+            TagFieldData::WordFlags { value, names }
+        }
+        Some(TagFieldData::LongFlags { mut value, names }) => {
+            for (bit, name) in &names {
+                if bits.contains(&name.as_str()) {
+                    value &= !(1i32 << bit);
+                }
+            }
+            TagFieldData::LongFlags { value, names }
+        }
+        _ => return,
+    };
+    let _ = field.set(cleared);
+}
+
+/// Set an integer-shaped field at whatever width and shape the schema declares.
 ///
 /// The same field is a `char_integer` in one profile and a `short_integer` in
 /// the next, and `TagFieldMut::set` takes the variant rather than a number, so
-/// guessing the wrong one writes nothing at all.
+/// guessing the wrong one writes nothing at all. Enums, flags and block indices
+/// are integer-shaped too -- [`TagStruct::read_int_any`] reads all of them --
+/// and a setter that handled only the plain widths would silently drop half of
+/// what a caller copying a struct by name hands it.
 fn set_int_field(elem: &mut TagStructMut<'_>, name: &str, value: i64) {
     let Some(mut field) = elem.field_mut(name) else {
         return;
@@ -540,6 +887,43 @@ fn set_int_field(elem: &mut TagStructMut<'_>, name: &str, value: i64) {
         Some(TagFieldData::WordInteger(_)) => TagFieldData::WordInteger(value as u16),
         Some(TagFieldData::LongInteger(_)) => TagFieldData::LongInteger(value as i32),
         Some(TagFieldData::DwordInteger(_)) => TagFieldData::DwordInteger(value as u32),
+        Some(TagFieldData::Int64Integer(_)) => TagFieldData::Int64Integer(value),
+        Some(TagFieldData::QwordInteger(_)) => TagFieldData::QwordInteger(value as u64),
+        Some(TagFieldData::CharBlockIndex(_)) => TagFieldData::CharBlockIndex(value as i8),
+        Some(TagFieldData::ShortBlockIndex(_)) => TagFieldData::ShortBlockIndex(value as i16),
+        Some(TagFieldData::LongBlockIndex(_)) => TagFieldData::LongBlockIndex(value as i32),
+        Some(TagFieldData::CustomCharBlockIndex(_)) => {
+            TagFieldData::CustomCharBlockIndex(value as i8)
+        }
+        Some(TagFieldData::CustomShortBlockIndex(_)) => {
+            TagFieldData::CustomShortBlockIndex(value as i16)
+        }
+        Some(TagFieldData::CustomLongBlockIndex(_)) => {
+            TagFieldData::CustomLongBlockIndex(value as i32)
+        }
+        // Names are resolved from the layout on read, so `None` here is not a
+        // loss -- the next read of this field resolves the new value's name.
+        Some(TagFieldData::CharEnum { .. }) => {
+            TagFieldData::CharEnum { value: value as i8, name: None }
+        }
+        Some(TagFieldData::ShortEnum { .. }) => {
+            TagFieldData::ShortEnum { value: value as i16, name: None }
+        }
+        Some(TagFieldData::LongEnum { .. }) => {
+            TagFieldData::LongEnum { value: value as i32, name: None }
+        }
+        Some(TagFieldData::ByteFlags { names, .. }) => {
+            TagFieldData::ByteFlags { value: value as u8, names }
+        }
+        Some(TagFieldData::WordFlags { names, .. }) => {
+            TagFieldData::WordFlags { value: value as u16, names }
+        }
+        Some(TagFieldData::LongFlags { names, .. }) => {
+            TagFieldData::LongFlags { value: value as i32, names }
+        }
+        Some(TagFieldData::ByteBlockFlags(_)) => TagFieldData::ByteBlockFlags(value as u8),
+        Some(TagFieldData::WordBlockFlags(_)) => TagFieldData::WordBlockFlags(value as u16),
+        Some(TagFieldData::LongBlockFlags(_)) => TagFieldData::LongBlockFlags(value as i32),
         _ => return,
     };
     let _ = field.set(replacement);
