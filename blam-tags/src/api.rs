@@ -1790,6 +1790,32 @@ impl<'a> TagFieldMut<'a> {
         })
     }
 
+    /// Give this resource field an empty payload of its own declared shape,
+    /// ready to be filled in through [`Self::as_resource_struct_mut`].
+    ///
+    /// For a resource being built rather than copied. A 360 monolithic build
+    /// keeps an animation graph's payload as a flat control-data buffer, so
+    /// there is no exploded resource to copy from -- the members have to be read
+    /// out of it and written into a payload made here.
+    pub fn init_resource(&mut self) -> Result<(), TagResourceCopyError> {
+        let field = &self.layout.fields[self.field_index];
+        if field.field_type != TagFieldType::PageableResource {
+            return Err(TagResourceCopyError::NotAResourceField);
+        }
+        let resource_layout_index = field.definition as usize;
+        let struct_index =
+            self.layout.resource_layouts[resource_layout_index].struct_index as usize;
+        let struct_size = self.layout.struct_layouts[struct_index].size as usize;
+        let struct_data =
+            crate::data::TagStructData::new_default(self.layout, struct_index, Endian::Le);
+        self.set_sub_chunk(TagSubChunkContent::Resource(TagResourceChunk::Exploded {
+            exploded: vec![0u8; struct_size],
+            struct_data,
+            xsync_state: None,
+        }));
+        Ok(())
+    }
+
     /// Reset this resource field to the null shape.
     pub fn clear_resource(&mut self) -> Result<(), TagResourceCopyError> {
         if self.resource_definition().is_none() {

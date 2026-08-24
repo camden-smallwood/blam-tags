@@ -264,9 +264,9 @@ impl<'a> AnimationGroup<'a> {
                     | Codec::ReverseWordKeyframeLightlyQuantized)) =>
                     try_animated(c, || decode_keyframe(anim_blob, c, frame_count, 2)),
                 Some(c @ Codec::Curve) =>
-                    try_animated(c, || decode_curve(anim_blob, c, frame_count, false)),
+                    try_animated(c, || decode_curve(Cursor::new(anim_blob), c, frame_count, false)),
                 Some(c @ Codec::RevisedCurve) =>
-                    try_animated(c, || decode_curve(anim_blob, c, frame_count, true)),
+                    try_animated(c, || decode_curve(Cursor::new(anim_blob), c, frame_count, true)),
                 Some(other) => (None, AnimatedStreamStatus::Unsupported(other)),
             };
             // For Reach, the animated codec size is recorded
@@ -927,9 +927,35 @@ fn decode_keyframe(
 /// position-based read pattern (read forward, occasionally `skip(-6)`
 /// to back up so the next keyframe's `p1` reads where the previous
 /// keyframe's `p2` was).
-struct Cursor<'a> { data: &'a [u8], pos: usize }
+/// A reader over one codec stream.
+///
+/// Two things beyond a position. It reads in a chosen byte order, so the same
+/// traversal works on a stream an Xbox 360 build wrote; and it can record where
+/// every multi-byte read landed. The recording is what lets a big-endian stream
+/// be byte-swapped without a second copy of the traversal: run the decoder over
+/// it, and the reads it made are exactly the words that need turning round.
+struct Cursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+    endian: crate::Endian,
+    /// `(offset, width)` per multi-byte read, when recording.
+    reads: Option<Vec<(usize, u8)>>,
+}
 impl<'a> Cursor<'a> {
-    fn new(data: &'a [u8]) -> Self { Self { data, pos: 0 } }
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0, endian: crate::Endian::Le, reads: None }
+    }
+
+    /// A cursor that reads big-endian and notes every word it reads.
+    fn recording_be(data: &'a [u8]) -> Self {
+        Self { data, pos: 0, endian: crate::Endian::Be, reads: Some(Vec::new()) }
+    }
+
+    fn note(&mut self, at: usize, width: u8) {
+        if let Some(reads) = self.reads.as_mut() {
+            reads.push((at, width));
+        }
+    }
     fn seek(&mut self, off: usize) -> Result<(), AnimationError> {
         if off > self.data.len() {
             return Err(AnimationError::TruncatedPayload {
@@ -952,8 +978,14 @@ impl<'a> Cursor<'a> {
         let bs = self.data.get(self.pos..self.pos + 2).ok_or(AnimationError::TruncatedPayload {
             codec: Codec::Curve, want_end: self.pos + 2, blob_size: self.data.len(),
         })?;
-        let v = u16::from_le_bytes([bs[0], bs[1]]);
-        self.pos += 2; Ok(v)
+        let v = match self.endian {
+            crate::Endian::Le => u16::from_le_bytes([bs[0], bs[1]]),
+            crate::Endian::Be => u16::from_be_bytes([bs[0], bs[1]]),
+        };
+        let at = self.pos;
+        self.pos += 2;
+        self.note(at, 2);
+        Ok(v)
     }
     fn read_s16(&mut self) -> Result<i16, AnimationError> {
         Ok(self.read_u16()? as i16)
@@ -962,12 +994,38 @@ impl<'a> Cursor<'a> {
         let bs = self.data.get(self.pos..self.pos + 4).ok_or(AnimationError::TruncatedPayload {
             codec: Codec::Curve, want_end: self.pos + 4, blob_size: self.data.len(),
         })?;
-        let v = u32::from_le_bytes([bs[0], bs[1], bs[2], bs[3]]);
-        self.pos += 4; Ok(v)
+        let v = match self.endian {
+            crate::Endian::Le => u32::from_le_bytes([bs[0], bs[1], bs[2], bs[3]]),
+            crate::Endian::Be => u32::from_be_bytes([bs[0], bs[1], bs[2], bs[3]]),
+        };
+        let at = self.pos;
+        self.pos += 4;
+        self.note(at, 4);
+        Ok(v)
     }
     fn read_f32(&mut self) -> Result<f32, AnimationError> {
         Ok(f32::from_bits(self.read_u32()?))
     }
+}
+
+/// Where every multi-byte word sits in a big-endian Curve stream.
+///
+/// Runs the ordinary [`decode_curve`] walk over the stream with the cursor
+/// reading big-endian and noting each word it reads. Nothing about the walk
+/// changes, which is the point: a Curve stream's shape depends on values read
+/// out of it -- key counts, per-node offsets, a flags bit that decides whether
+/// frames are stored directly -- so the only reliable way to find its words is
+/// to read it the way the decoder does. `None` when the stream will not walk,
+/// which is the honest answer for a stream this cannot convert.
+pub(super) fn curve_word_offsets(
+    blob: &[u8],
+    codec: Codec,
+    frame_count: u16,
+    revised: bool,
+) -> Option<Vec<(usize, u8)>> {
+    let mut cursor = Cursor::recording_be(blob);
+    decode_curve_inner(&mut cursor, codec, frame_count, revised).ok()?;
+    cursor.reads.take()
 }
 
 /// Slot 9 — Curve codec. Per-component (rotation/translation/scale),
@@ -994,12 +1052,21 @@ impl<'a> Cursor<'a> {
 /// `w := 2|w| - 1` and all components scale by `sqrt(max(1 - w², 0))`
 /// before final normalization. Mirrors Foundry's `_decompress_quat`.
 fn decode_curve(
-    blob: &[u8],
+    mut c: Cursor<'_>,
     codec: Codec,
     frame_count: u16,
     revised: bool,
 ) -> Result<AnimationTracks, AnimationError> {
-    let mut c = Cursor::new(blob);
+    decode_curve_inner(&mut c, codec, frame_count, revised)
+}
+
+fn decode_curve_inner(
+    c: &mut Cursor<'_>,
+    codec: Codec,
+    frame_count: u16,
+    revised: bool,
+) -> Result<AnimationTracks, AnimationError> {
+    let blob = c.data;
     if blob.len() < 32 {
         return Err(AnimationError::TruncatedHeader { codec, want: 32, have: blob.len() });
     }
@@ -1025,7 +1092,7 @@ fn decode_curve(
     let mut rotations = Vec::with_capacity(n_rot);
     for &node_off in &rotation_offsets {
         c.seek(payload_data_offset + node_off)?;
-        rotations.push(read_curve_rotation_node(&mut c, frames, revised)?);
+        rotations.push(read_curve_rotation_node(c, frames, revised)?);
     }
 
     let mut translations = Vec::with_capacity(n_trans);
@@ -1035,7 +1102,7 @@ fn decode_curve(
         for _ in 0..n_trans { trans_offsets.push(c.read_u32()? as usize); }
         for &node_off in &trans_offsets {
             c.seek(payload_data_offset + node_off)?;
-            translations.push(read_curve_translation_node(&mut c, frames)?);
+            translations.push(read_curve_translation_node(c, frames)?);
         }
     }
 
@@ -1046,7 +1113,7 @@ fn decode_curve(
         for _ in 0..n_scale { scale_offsets.push(c.read_u32()? as usize); }
         for &node_off in &scale_offsets {
             c.seek(payload_data_offset + node_off)?;
-            scales.push(read_curve_scale_node(&mut c, frames)?);
+            scales.push(read_curve_scale_node(c, frames)?);
         }
     }
 
