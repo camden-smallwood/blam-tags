@@ -135,40 +135,42 @@ pub struct XSyncState {
 /// 36 (v0) or 44 (v3) byte header at the start of every `tgxc`
 /// payload. Layout = 9 × BE u32.
 ///
-/// **Field-naming caveat.** BCS labels these four words as two
-/// `(offset, size)` pairs (`cache_location_*` and
-/// `optional_location_*`), but the pairing is wrong — empirically
-/// verified against Halo 4 monolithic bitmaps, each name's `offset`
-/// and `size` describe *different* buffers:
+/// **The two regions.** BCS labels these four words as two `(offset, size)`
+/// pairs (`cache_location_*` and `optional_location_*`), and each pair is one
+/// region: its own offset with its own size.
 ///
-/// - The **secondary** (high-res, e.g. bitmap mip 0) buffer starts
-///   at byte `cache_location_offset` of the cache block and is
-///   `optional_location_size` bytes long.
-/// - The **primary** (always-resident, e.g. bitmap mip chain)
-///   buffer starts at byte `optional_location_offset` (always `0`
-///   in observed corpora) and is `cache_location_size` bytes long.
+/// - The **primary** (always-resident, e.g. a bitmap's mip chain) buffer starts
+///   at `cache_location_offset` — `0` in observed corpora — and is
+///   `cache_location_size` bytes long.
+/// - The **secondary** (high-res, e.g. a bitmap's base level) buffer starts at
+///   `optional_location_offset` and is `optional_location_size` bytes long.
+///   Both are `0` on a resource that has no second region, which is every
+///   geometry resource and every bitmap with no mips.
 ///
 /// The cache_block's physical layout is
-/// `[primary][alignment padding][secondary]`. Field names are kept
-/// as `cache_location_*` / `optional_location_*` for traceability
-/// against BCS, but consumers should use the pairings above.
+/// `[primary][alignment padding][secondary]`.
+///
+/// This was read the other way round until 2026-08-24 — each offset paired with
+/// the other name's size. On a resource with only one region the two readings
+/// agree, which is why it survived: it is exactly the mipless bitmaps and the
+/// geometry that were being checked. A mipped bitmap read that way lands both
+/// slices in the wrong region and every level of it comes out scrambled.
 #[derive(Debug, Clone, Copy)]
 pub struct XSyncStateHeader {
-    /// Byte offset of the **secondary** (high-res) buffer inside the
-    /// tag's cache block. Pair with [`Self::optional_location_size`]
-    /// — not `cache_location_size` — to get the secondary buffer's
-    /// span. See type-level doc for the corrected pairing.
+    /// Byte offset of the **primary** (always-resident) buffer inside the
+    /// tag's cache block. Observed value is `0`. Pair with
+    /// [`Self::cache_location_size`] — each named pair is one region, its own
+    /// offset with its own size.
     pub cache_location_offset: u32,
-    /// Byte length of the **primary** (always-resident) buffer. Pair
-    /// with [`Self::optional_location_offset`] to slice it.
+    /// Byte length of the **primary** (always-resident) buffer. For a bitmap
+    /// with mips this is the smaller levels; for geometry it is everything.
     pub cache_location_size: u32,
-    /// Byte offset of the **primary** (always-resident) buffer
-    /// inside the same cache block. Observed value is `0` (primary
-    /// stored at the start of the block); the secondary buffer
-    /// follows after alignment padding.
+    /// Byte offset of the **secondary** (high-res) buffer inside the same
+    /// cache block, which follows the primary one after alignment padding.
+    /// `0` when there is no secondary buffer.
     pub optional_location_offset: u32,
-    /// Byte length of the **secondary** (high-res) buffer. `0` when
-    /// there's no high-res streaming buffer for this resource.
+    /// Byte length of the **secondary** (high-res) buffer — a bitmap's base
+    /// level. `0` when there's no high-res streaming buffer for this resource.
     pub optional_location_size: u32,
     /// Alignment hint for control data — opaque, preserved for
     /// round-trip.

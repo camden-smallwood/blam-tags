@@ -205,11 +205,12 @@ fn build_plan(
         return Ok(None);
     };
 
-    // Primary buffer = `[optional_location_offset ..
-    // optional_location_offset + cache_location_size]`. The xsync
-    // header field-name pairing is non-obvious — see
-    // [`crate::monolithic::XSyncStateHeader`].
-    let primary_offset = state.header.optional_location_offset as usize;
+    // The GPU buffers are the resource's `cache_location` region: its own
+    // offset with its own size. A geometry resource has no `optional_location`
+    // -- that is the slot a bitmap keeps its high-resolution level in -- so the
+    // two offsets are both zero here and the distinction only shows up on
+    // bitmaps. See [`crate::monolithic::XSyncStateHeader`].
+    let primary_offset = state.header.cache_location_offset as usize;
     let primary_size = state.header.cache_location_size as usize;
     let primary = cache_bytes
         .get(primary_offset..primary_offset + primary_size)
