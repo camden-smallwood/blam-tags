@@ -3549,7 +3549,22 @@ fn accepts_native_header(header: &TagFileHeader, target_game: &str) -> bool {
             && header.build_number == build_number
             && header.version == version;
     }
-    header.version != u32::MAX
+    // Nothing to test for an MCC target. The header carries a generation and a
+    // `version` that is a per-file *source revision*, and a source revision says
+    // nothing about whether a tag is a good template — most shipped content has
+    // none. What actually decides a candidate is its group, its byte order,
+    // whether it parses and resets, and whether its root size matches the
+    // schema; all four are checked by the search itself.
+    //
+    // This used to reject `version == u32::MAX`, which is the value
+    // `apply_editing_kit_mcc_header` stamps on everything and the value a tag
+    // with no recorded revision carries. Whole groups carry it and nothing
+    // else: of Halo Reach's 9,286 shipped bitmaps and 10,624 shipped sounds not
+    // one has a revision, so not one could ever be a template, and every
+    // converted bitmap, sound, shader and render-method template was built from
+    // a schema instead of from the kit's own tag.
+    let _ = header;
+    true
 }
 
 /// The root size `target_schema` declares, or `None` if it will not build.
@@ -7267,7 +7282,7 @@ mod tests {
     /// deliberate limit, and without a test it would be indistinguishable from
     /// the search being broken. What it buys: proving a group has *no* usable
     /// template used to mean opening every tag in it, and Halo Reach ships
-    /// 10,675 bitmaps — 6.4 GB, none acceptable, half a minute to say so.
+    /// 10,675 bitmaps, 6.4 GB, and reading a header out of each one to decide.
     #[test]
     fn the_native_template_search_stops_after_a_bounded_number_of_candidates() {
         let definitions = locate_definitions_root();
@@ -7275,17 +7290,13 @@ mod tests {
         let tags = root.join("tags/objects");
         fs::create_dir_all(&tags).unwrap();
 
-        // Rejected: `version == u32::MAX` is what a tag with no recorded source
-        // revision carries, which is also what Baboon stamps on its own output.
-        let mut reject =
-            TagFile::new(definitions.join("haloreach_mcc/particle.json")).unwrap();
-        apply_editing_kit_mcc_header(&mut reject, "haloreach_mcc").unwrap();
-        assert_eq!(reject.header.version, u32::MAX, "the reject must be rejected");
-        // Accepted: any recorded revision will do.
+        // Accepted: a tag stamped like the kit's own. `version == u32::MAX` is
+        // part of that stamp and not a disqualification — every shipped Reach
+        // bitmap and sound carries it, and rejecting it once meant neither group
+        // could ever find a template.
         let mut accept =
             TagFile::new(definitions.join("haloreach_mcc/particle.json")).unwrap();
         apply_editing_kit_mcc_header(&mut accept, "haloreach_mcc").unwrap();
-        accept.header.version = 3;
 
         // Sorted order is what the search walks, so zero-padded names put the
         // acceptable tag at an exact, chosen index.
@@ -7293,9 +7304,15 @@ mod tests {
             tag.write_atomic(tags.join(format!("tag_{index:05}.particle")))
                 .unwrap();
         };
+        // Rejected: bytes that carry the extension and are not a tag. The
+        // header sift throws these out without opening them, which is the same
+        // path a real unusable candidate takes.
+        let place_reject = |index: usize| {
+            fs::write(tags.join(format!("tag_{index:05}.particle")), b"not a tag").unwrap();
+        };
         let past_the_bound = NATIVE_TEMPLATE_SCAN_LIMIT + 20;
         for index in 0..past_the_bound {
-            place(index, &reject);
+            place_reject(index);
         }
         place(past_the_bound, &accept);
 
@@ -13490,5 +13507,61 @@ mod x360_cache_conversion {
         }
         eprintln!("--- {converted}/{attempted} sampled tags converted ---");
         assert!(attempted > 0);
+    }
+
+    /// The classes a kit ships in bulk find a template in it.
+    ///
+    /// A conversion starts either from a tag the kit authored or from the
+    /// schema, and the two are not equivalent: a kit tag carries the layout the
+    /// kit's own tools expect, expansions and all, while a schema-built one
+    /// carries whatever the dumped JSON describes. The schema path is the
+    /// fallback for a group the kit does not ship.
+    ///
+    /// Reach ships 9,286 bitmaps and 10,624 sounds and every one of them records
+    /// no source revision — `version` is `0xFFFFFFFF`, the same value
+    /// `apply_editing_kit_mcc_header` stamps on everything it writes. The
+    /// template search read that as a disqualification, so those two groups, the
+    /// whole shader pipeline and the render-method templates could never find a
+    /// template, and every one of them was built from a schema. That is 34,000
+    /// tags in a Reach build taking the fallback path, silently.
+    ///
+    /// Named groups rather than a threshold: each is one the kit demonstrably
+    /// ships thousands of, so "no template" can only mean the search is wrong
+    /// again.
+    #[test]
+    fn the_classes_a_kit_ships_in_bulk_find_a_template() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else {
+            eprintln!("skipping: needs HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let mut starved = Vec::new();
+        for group in [
+            *b"bitm", *b"snd!", *b"pixl", *b"vtsh", *b"rmt2", *b"hlsl", *b"weap", *b"mode",
+        ] {
+            let tag_group = u32::from_be_bytes(group);
+            let name = groups
+                .by_tag
+                .get(&tag_group)
+                .cloned()
+                .unwrap_or_else(|| String::from_utf8_lossy(&group).into_owned());
+            let schema = definitions.join("haloreach_mcc").join(format!("{name}.json"));
+            let found = find_native_target_template(
+                &templates,
+                tag_group,
+                "haloreach_mcc",
+                None,
+                &definitions,
+                &schema,
+            );
+            match found {
+                Ok(Some(_)) => {}
+                Ok(None) => starved.push(format!("{name}: no template in a kit that ships them")),
+                Err(error) => starved.push(format!("{name}: {error}")),
+            }
+        }
+        assert!(starved.is_empty(), "{starved:#?}");
     }
 }
