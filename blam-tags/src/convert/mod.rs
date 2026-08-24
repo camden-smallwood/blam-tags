@@ -2170,11 +2170,33 @@ fn analyze_conversion_inner(
     if let Some(error) = context.fatal_error.take() {
         return Err(error);
     }
+    // Nothing matched at the root. Usually that means the two profiles disagree
+    // about what this group even is, and writing the template out under the
+    // source's name would be worse than refusing.
+    //
+    // Not always, though: a few groups carry nothing at the root at all.
+    // `scenario_structure_lighting_resource` is one -- both sides declare a
+    // single byte of padding and put the substance in the resource -- so there
+    // is no field for a match to happen on and zero matches is the whole
+    // conversion rather than the absence of one. Only when the two roots are
+    // the same struct: the GUID says so outright, and a shared name says so for
+    // the profiles that carry no GUIDs.
     if context.root_matches == 0 {
-        return Err(format!(
-            "{} and {} do not share a compatible root structure for {}",
-            source_game, target_game, source_group_name
-        ));
+        let source_root = source.root();
+        let target_root = target.root();
+        let (source_definition, target_definition) =
+            (source_root.definition(), target_root.definition());
+        let same_struct = (source_definition.guid() == target_definition.guid()
+            && source_definition.guid() != [0u8; 16])
+            || source_definition.name() == target_definition.name();
+        let nothing_to_match =
+            source_root.fields().count() == 0 && target_root.fields().count() == 0;
+        if !(same_struct && nothing_to_match) {
+            return Err(format!(
+                "{} and {} do not share a compatible root structure for {}",
+                source_game, target_game, source_group_name
+            ));
+        }
     }
 
     let dependency_schema = definitions_root
@@ -2218,6 +2240,7 @@ fn analyze_conversion_inner(
     // lost list.
     forgive_hydrated_geometry(&target, &mut context);
     settle_uncompiled_geometry(byte_order_upgrade, &mut target, &mut context);
+    carry_animation_resources(byte_order_upgrade, source, &mut target, &mut context);
     convert_x360_bitmap_pixels(source, &mut target, &mut context);
     forgive_externally_stored_payload(byte_order_upgrade, &mut target, &mut context);
     swap_function_curves(byte_order_upgrade, &mut target, &mut context);
@@ -13273,35 +13296,271 @@ mod x360_cache_conversion {
         assert!(checked > 0, "no bitmap converted out of the 360 cache");
     }
 
-    /// What cannot cross is refused, not written half-converted.
+    /// An animation graph's payload comes across, and the animations in it are
+    /// the ones the kit has.
     ///
-    /// An animation graph is the case that matters: its payload *is* a pageable
-    /// resource, a compressed codec stream in 360 byte order that nothing here
-    /// reinterprets. Landing one as a tag full of metadata and no animation
-    /// would read as success in the report and play nothing in the game.
+    /// Its payload *is* a pageable resource: a codec stream in 360 byte order,
+    /// kept as a flat control-data buffer rather than the inline members a loose
+    /// tag holds. Both have to change for the tag to be worth writing, and
+    /// neither shows up in a field count -- a graph full of metadata and no
+    /// animation reads as a success and plays nothing.
+    ///
+    /// The check is the rest pose, against the kit's own copy of the same graph.
+    /// The animated tracks are not comparable: MCC re-encoded these on the way
+    /// to the PC and a July 2011 build has animations that were still being
+    /// worked on. A rest pose comes from the model and does not move, so a
+    /// difference there is this converter's.
     #[test]
-    fn a_360_animation_graph_is_refused_rather_than_emptied() {
+    fn a_360_animation_graph_arrives_with_its_animations() {
         let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
         else {
             eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and HREK");
             return;
         };
         let definitions = locate_definitions_root();
-        let Some(entry) = cache
-            .iter_tags()
-            .find(|entry| entry.group_tag == u32::from_be_bytes(*b"jmad") && !entry.name.is_empty())
-        else {
-            eprintln!("skipping: no animation graph in the cache");
+        let Ok(groups) = GameTagIndex::load(&definitions, "haloreach_mcc") else {
+            eprintln!("skipping: no haloreach_mcc definitions");
             return;
         };
-        let source = read_cache_tag(&cache, b"jmad", &entry.name).expect("read the graph");
-        let error = convert_into_reach(&source, &reach, &definitions)
-            .err()
-            .unwrap_or_else(|| panic!("{} converted, which it has no way to do", entry.name));
-        assert!(
-            error.contains("pageable resource"),
-            "refused for the wrong reason: {error}"
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let cutoff =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        // Only a kit tag the kit shipped: an imported one is this converter's
+        // own output and proves nothing.
+        let shared: Vec<_> = cache
+            .iter_tags()
+            .filter(|entry| entry.group_tag == u32::from_be_bytes(*b"jmad"))
+            .filter_map(|entry| {
+                let path =
+                    reach.join(format!("{}.model_animation_graph", entry.name.replace('\\', "/")));
+                std::fs::metadata(&path)
+                    .and_then(|meta| meta.modified())
+                    .map(|when| when < cutoff)
+                    .unwrap_or(false)
+                    .then_some((entry, path))
+            })
+            .collect();
+        if shared.is_empty() {
+            eprintln!("skipping: the kit and the build share no untouched animation graphs");
+            return;
+        }
+        let step = (shared.len() / 25).max(1);
+        let (mut converted, mut animations, mut matching) = (0usize, 0usize, 0usize);
+        for (entry, path) in shared.iter().step_by(step).take(25) {
+            let (Ok(source), Ok(kit)) = (cache.read_tag(entry), TagFile::read(path)) else {
+                continue;
+            };
+            let Ok(draft) = analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "haloreach_mcc",
+                &definitions,
+                Some(&templates),
+            ) else {
+                // A graph can still refuse for reasons of its own -- the two
+                // profiles disagree about some animation flags -- and that is a
+                // different test's business.
+                continue;
+            };
+            converted += 1;
+            let ours = inline_animation_clips(&draft.tag);
+            let theirs = inline_animation_clips(&kit);
+            assert_eq!(
+                ours.len(),
+                theirs.len(),
+                "{}: converted to {} animation(s) where the kit has {}",
+                entry.name,
+                ours.len(),
+                theirs.len(),
+            );
+            for (index, (mine, kits)) in ours.iter().zip(&theirs).enumerate() {
+                animations += 1;
+                let mine = mine.as_ref().unwrap_or_else(|| {
+                    panic!("{} animation {index} would not decode after converting", entry.name)
+                });
+                let Some(kits) = kits else { continue };
+                if rest_pose_distance(mine, kits) <= 0.05 {
+                    matching += 1;
+                }
+            }
+        }
+        if converted == 0 {
+            eprintln!("skipping: no shared animation graph converted");
+            return;
+        }
+        assert!(animations > 0, "{converted} graph(s) converted but carried no animations");
+        assert_eq!(
+            matching, animations,
+            "{matching} of {animations} animation(s) rest at the pose the kit has them at",
         );
+    }
+
+    /// Every animation in a tag that holds its resources inline, decoded.
+    fn inline_animation_clips(tag: &TagFile) -> Vec<Option<crate::animation::AnimationClip>> {
+        let mut out = Vec::new();
+        let Some(groups) = tag.root().field_path("tag resource groups").and_then(|f| f.as_block())
+        else {
+            return out;
+        };
+        for group in 0..groups.len() {
+            let Some(members) = groups
+                .element(group)
+                .and_then(|entry| entry.field("tag_resource"))
+                .and_then(|field| field.as_resource())
+                .and_then(|resource| resource.as_struct())
+                .and_then(|payload| payload.field("group_members").and_then(|f| f.as_block()))
+            else {
+                continue;
+            };
+            for index in 0..members.len() {
+                let Some(member) = members.element(index) else { continue };
+                let Some(blob) = member.field("animation_data").and_then(|f| f.as_data()) else {
+                    out.push(None);
+                    continue;
+                };
+                let mut sizes = Vec::new();
+                if let Some(declared) = member.field_path("data sizes").and_then(|f| f.as_struct()) {
+                    for name in declared.field_names() {
+                        sizes.push((name.to_owned(), declared.read_int_any(&name).unwrap_or(0) as i64));
+                    }
+                }
+                let group = crate::animation::AnimationGroup::for_blob(
+                    blob,
+                    (!sizes.is_empty()).then_some(crate::animation::PackedDataSizes { fields: sizes }),
+                    member.read_int_any("frame count").unwrap_or(1) as i16,
+                    member.read_int_any("node count").unwrap_or(0) as i8,
+                    None,
+                );
+                out.push(group.decode().ok());
+            }
+        }
+        out
+    }
+
+    /// How far apart two rest poses are: the mean of the angle between paired
+    /// rotations and the distance between paired translations.
+    fn rest_pose_distance(
+        a: &crate::animation::AnimationClip,
+        b: &crate::animation::AnimationClip,
+    ) -> f32 {
+        let (a, b) = (&a.static_tracks, &b.static_tracks);
+        let (mut total, mut count) = (0.0f32, 0usize);
+        for (left, right) in a.rotations.iter().zip(&b.rotations) {
+            for (left, right) in left.iter().zip(right) {
+                // A quaternion and its negation are the same rotation.
+                let dot =
+                    (left.i * right.i + left.j * right.j + left.k * right.k + left.w * right.w).abs();
+                total += (1.0 - dot.min(1.0)) * 2.0;
+                count += 1;
+            }
+        }
+        for (left, right) in a.translations.iter().zip(&b.translations) {
+            for (left, right) in left.iter().zip(right) {
+                total += ((left.x - right.x).powi(2)
+                    + (left.y - right.y).powi(2)
+                    + (left.z - right.z).powi(2))
+                .sqrt();
+                count += 1;
+            }
+        }
+        if count == 0 { 0.0 } else { total / count as f32 }
+    }
+
+    /// A struct's GUID reads the same whichever byte order its tag is in.
+    ///
+    /// A GUID is four 32-bit words, so a big-endian tag stores each of them the
+    /// other way round. Read as sixteen loose bytes it never equals the same
+    /// struct's GUID in a little-endian tag -- and that is the identity key the
+    /// converter uses to decide two structs are the same type, so every
+    /// big-endian struct was failing that test against its own PC counterpart
+    /// and falling back to matching on field names.
+    #[test]
+    fn a_big_endian_tag_reads_the_same_struct_guids_as_a_little_endian_one() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and HREK");
+            return;
+        };
+        let cutoff =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        let (mut compared, mut agreed) = (0usize, 0usize);
+        let mut differing: Vec<String> = Vec::new();
+        for entry in cache.iter_tags().step_by(701).take(80) {
+            let Some(extension) = crate::paths::group_tag_to_extension(entry.group_tag) else {
+                continue;
+            };
+            let path = reach.join(format!("{}.{extension}", entry.name.replace('\\', "/")));
+            // An imported tag is this converter's own output; only one the kit
+            // shipped says anything about how a GUID should read.
+            if std::fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .map(|when| when >= cutoff)
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            let (Ok(build), Ok(kit)) = (cache.read_tag(entry), TagFile::read(&path)) else {
+                continue;
+            };
+            compared += 1;
+            let (ours, theirs) = (build.root().definition().guid(), kit.root().definition().guid());
+            if ours == theirs {
+                agreed += 1;
+            } else if differing.len() < 5 {
+                let hex = |guid: [u8; 16]| {
+                    guid.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+                };
+                differing.push(format!("{extension}: {} vs {}", hex(ours), hex(theirs)));
+            }
+        }
+        if compared < 5 {
+            eprintln!("skipping: only {compared} tag(s) are in both the build and an untouched kit");
+            return;
+        }
+        assert_eq!(
+            agreed, compared,
+            "{} of {compared} root struct GUID(s) disagree between the two byte orders: {differing:?}",
+            compared - agreed,
+        );
+    }
+
+    /// A lighting resource carries nothing at its root, and converts anyway.
+    ///
+    /// `scenario_structure_lighting_resource` declares one byte of padding on
+    /// both sides and keeps its substance elsewhere, so the field walk has
+    /// nothing to match and the guard against an incompatible root fired on a
+    /// tag that had already converted completely.
+    #[test]
+    fn a_360_lighting_resource_converts_though_its_root_is_empty() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let Ok(groups) = GameTagIndex::load(&definitions, "haloreach_mcc") else {
+            eprintln!("skipping: no haloreach_mcc definitions");
+            return;
+        };
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let group = u32::from_be_bytes(*b"sslt");
+        let mut converted = 0usize;
+        for entry in cache.iter_tags().filter(|entry| entry.group_tag == group).take(8) {
+            let Ok(source) = cache.read_tag(entry) else { continue };
+            match analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "haloreach_mcc",
+                &definitions,
+                Some(&templates),
+            ) {
+                Ok(_) => converted += 1,
+                Err(why) => panic!("{} would not convert: {why}", entry.name),
+            }
+        }
+        if converted == 0 {
+            eprintln!("skipping: the build has no lighting resources");
+        }
     }
 
     /// A converted 360 bitmap must reproduce the kit's own pixels for the tags
@@ -14034,56 +14293,6 @@ mod x360_cache_conversion {
         }
     }
 
-    #[test]
-    #[ignore = "diagnostic"]
-    fn scratch_lbsp_read() {
-        let Some(cache) = reach_x360_cache() else { return };
-        let group = u32::from_be_bytes(*b"Lbsp");
-        let mut ok = 0usize;
-        let mut failed: Vec<(String, String)> = Vec::new();
-        let entries: Vec<_> = cache.iter_tags().filter(|e| e.group_tag == group).collect();
-        eprintln!("{} Lbsp tag(s) in the cache", entries.len());
-        for entry in entries.iter().take(60) {
-            match cache.read_tag(entry) {
-                Ok(_) => ok += 1,
-                Err(e) => failed.push((entry.name.clone(), e.to_string())),
-            }
-        }
-        eprintln!("read ok: {ok}, failed: {}", failed.len());
-        let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
-        for (_, why) in &failed {
-            *reasons.entry(why.clone()).or_default() += 1;
-        }
-        for (why, count) in reasons.iter().take(10) {
-            eprintln!("  x{count}	{why}");
-        }
-        for (name, why) in failed.iter().take(4) {
-            eprintln!("  e.g. {name}: {why}");
-        }
-
-        // Is a missing tag-heap block a whole-build symptom or an Lbsp one?
-        let mut by_group: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
-        for entry in cache.iter_tags() {
-            let name = String::from_utf8_lossy(&entry.group_tag.to_be_bytes()).trim().to_owned();
-            let slot = by_group.entry(name).or_default();
-            slot.0 += 1;
-            if cache.resolve_tag_block(entry).is_none() {
-                slot.1 += 1;
-            }
-        }
-        let (mut tags, mut missing) = (0usize, 0usize);
-        for (_, (total, gone)) in &by_group {
-            tags += total;
-            missing += gone;
-        }
-        eprintln!("whole build: {missing} of {tags} tag(s) have no tag-heap block");
-        let mut worst: Vec<_> = by_group.iter().filter(|(_, (_, g))| *g > 0).collect();
-        worst.sort_by_key(|(_, (_, g))| std::cmp::Reverse(*g));
-        for (group, (total, gone)) in worst.iter().take(15) {
-            eprintln!("  {group:<6} {gone}/{total}");
-        }
-    }
-
     /// Which BSPs exist in both the build and an untouched kit, so a diff has
     /// a genuine oracle rather than an earlier run of this same converter.
     #[test]
@@ -14372,13 +14581,18 @@ mod x360_cache_conversion {
             // it recompiles them from the artist source. Comparing a converted
             // tag that does carry pixels against one of those says nothing
             // about the detiler, so count them apart rather than as failures.
-            let stock_pixels = stock
-                .root()
-                .field_path("processed pixel data")
-                .and_then(|f| f.as_data())
-                .map(<[u8]>::len)
-                .unwrap_or(0);
-            if stock_pixels == 0 {
+            // Bitmaps only: a kit ships plenty with no compiled pixels at
+            // all, and comparing one of those against a converted tag that does
+            // carry pixels says nothing about the detiler.
+            if group == u32::from_be_bytes(*b"bitm")
+                && stock
+                    .root()
+                    .field_path("processed pixel data")
+                    .and_then(|f| f.as_data())
+                    .map(<[u8]>::len)
+                    .unwrap_or(0)
+                    == 0
+            {
                 uncompiled += 1;
                 continue;
             }
@@ -14869,6 +15083,689 @@ mod x360_cache_conversion {
             eprintln!("  x{count} {why}
       e.g. {sample}");
         }
+    }
+
+    /// Every distinct reason a group's tags refuse to convert.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_group_failures() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let group_name = std::env::var("FAIL_GROUP").unwrap_or_else(|_| "sslt".to_owned());
+        let mut gb = [b' '; 4];
+        for (i, c) in group_name.bytes().take(4).enumerate() { gb[i] = c; }
+        let group = u32::from_be_bytes(gb);
+        let cap: usize = std::env::var("FAIL_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        let entries: Vec<_> = cache.iter_tags().filter(|e| e.group_tag == group).collect();
+        eprintln!("{} {group_name} tag(s) in the build", entries.len());
+        let step = (entries.len() / cap.max(1)).max(1);
+        let (mut ok, mut bad, mut unreadable) = (0usize, 0usize, 0usize);
+        let mut reasons: std::collections::BTreeMap<String, (usize, String)> = Default::default();
+        for entry in entries.iter().step_by(step).take(cap) {
+            let source = match cache.read_tag(entry) {
+                Ok(t) => t,
+                Err(e) => {
+                    unreadable += 1;
+                    let slot = reasons.entry(format!("UNREADABLE {e}").chars().take(120).collect())
+                        .or_insert((0, entry.name.clone()));
+                    slot.0 += 1;
+                    continue;
+                }
+            };
+            match analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) {
+                Ok(draft) => {
+                    ok += 1;
+                    for issue in draft.report.issues.iter().take(3) {
+                        eprintln!("   note {:?} {} {}", issue.kind, issue.path, issue.message.chars().take(100).collect::<String>());
+                    }
+                }
+                Err(e) => {
+                    bad += 1;
+                    let slot = reasons.entry(e.chars().take(160).collect())
+                        .or_insert((0, entry.name.clone()));
+                    slot.0 += 1;
+                }
+            }
+        }
+        eprintln!("converted {ok}, refused {bad}, unreadable {unreadable}");
+        for (why, (count, sample)) in reasons.iter() {
+            eprintln!("  x{count} {why}\n      e.g. {sample}");
+        }
+    }
+
+    /// Which animation codecs does each side actually use?
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_animation_codecs() {
+        let mut kit_codecs: std::collections::BTreeMap<u8, usize> = Default::default();
+        let mut build_codecs: std::collections::BTreeMap<u8, usize> = Default::default();
+        if let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") {
+            let cutoff =
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+            let mut seen = 0usize;
+            for path in walk_files(&reach) {
+                if path.extension().and_then(|e| e.to_str()) != Some("model_animation_graph") {
+                    continue;
+                }
+                if std::fs::metadata(&path).and_then(|m| m.modified()).map(|w| w >= cutoff).unwrap_or(true) {
+                    continue;
+                }
+                let Ok(tag) = TagFile::read(&path) else { continue };
+                let Some(groups) = tag.root().field_path("tag resource groups").and_then(|f| f.as_block())
+                else { continue };
+                for g in 0..groups.len() {
+                    let Some(list) = groups
+                        .element(g)
+                        .and_then(|e| e.field("tag_resource"))
+                        .and_then(|f| f.as_resource())
+                        .and_then(|r| r.as_struct())
+                        .and_then(|s| s.field("group_members").and_then(|f| f.as_block()))
+                    else { continue };
+                    for m in 0..list.len() {
+                        if let Some(data) = list
+                            .element(m)
+                            .and_then(|e| e.field("animation_data"))
+                            .and_then(|f| f.as_data())
+                            && let Some(first) = data.first()
+                        {
+                            *kit_codecs.entry(*first).or_default() += 1;
+                        }
+                    }
+                }
+                seen += 1;
+                if seen >= 300 { break }
+            }
+        }
+        if let Some(cache) = reach_x360_cache() {
+            let group = u32::from_be_bytes(*b"jmad");
+            for entry in cache.iter_tags().filter(|e| e.group_tag == group).step_by(11).take(300) {
+                let Ok(tag) = cache.read_tag(entry) else { continue };
+                let Some(groups) = tag.root().field_path("tag resource groups").and_then(|f| f.as_block())
+                else { continue };
+                for g in 0..groups.len() {
+                    let Some(resource) = groups
+                        .element(g)
+                        .and_then(|e| e.field("tag_resource"))
+                        .and_then(|f| f.as_resource())
+                    else { continue };
+                    let Some(state) = resource.xsync_state() else { continue };
+                    let primary = resource.exploded_payload().unwrap_or(&[]);
+                    let Some(members) = crate::animation::resource::read_members(&state, primary)
+                    else { continue };
+                    for member in members {
+                        if let Some(first) = member.animation_data.first() {
+                            *build_codecs.entry(*first).or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let name = |b: u8| {
+            crate::animation::codec::Codec::from_byte(b)
+                .map(|c| format!("{c:?}"))
+                .unwrap_or_else(|| "?".to_owned())
+        };
+        eprintln!("kit codec bytes:");
+        for (b, n) in &kit_codecs { eprintln!("  {b:>3} {:<32} x{n}", name(*b)); }
+        eprintln!("build codec bytes:");
+        for (b, n) in &build_codecs { eprintln!("  {b:>3} {:<32} x{n}", name(*b)); }
+    }
+
+    /// Which `data sizes` sections a 360 animation blob actually uses.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_animation_sections() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let names = [
+            "static_codec", "animated_codec", "static_flags", "animated_flags",
+            "movement", "pill_offset", "default_data", "uncompressed", "compressed",
+            "blend_screen", "object_space_offset", "ik_chain_event", "ik_chain_control",
+            "ik_chain_proxy", "ik_chain_pole", "uncompressed_object_space", "fik_anchor",
+        ];
+        let mut used = [0usize; 17];
+        let mut codecs: std::collections::BTreeMap<(u8, u8), usize> = Default::default();
+        let mut total = 0usize;
+        let mut mismatched = 0usize;
+        let group = u32::from_be_bytes(*b"jmad");
+        for entry in cache.iter_tags().filter(|e| e.group_tag == group).step_by(7).take(450) {
+            let Ok(tag) = cache.read_tag(entry) else { continue };
+            let Some(groups) = tag.root().field_path("tag resource groups").and_then(|f| f.as_block())
+            else { continue };
+            for g in 0..groups.len() {
+                let Some(resource) = groups
+                    .element(g)
+                    .and_then(|e| e.field("tag_resource"))
+                    .and_then(|f| f.as_resource())
+                else { continue };
+                let Some(state) = resource.xsync_state() else { continue };
+                let primary = resource.exploded_payload().unwrap_or(&[]);
+                let Some(members) = crate::animation::resource::read_members(&state, primary)
+                else { continue };
+                for member in members {
+                    total += 1;
+                    let sum: i64 = member.data_sizes.iter().map(|v| *v as i64).sum();
+                    if sum != member.animation_data.len() as i64 {
+                        mismatched += 1;
+                    }
+                    for (index, size) in member.data_sizes.iter().enumerate() {
+                        if *size != 0 {
+                            used[index] += 1;
+                        }
+                    }
+                    let static_codec = member.animation_data.first().copied().unwrap_or(255);
+                    let animated_at = member.data_sizes[0].max(0) as usize;
+                    let animated_codec = member
+                        .animation_data
+                        .get(animated_at)
+                        .copied()
+                        .filter(|_| member.data_sizes[1] > 0)
+                        .unwrap_or(255);
+                    *codecs.entry((static_codec, animated_codec)).or_default() += 1;
+                }
+            }
+        }
+        eprintln!("{total} member(s); {mismatched} whose sections do not sum to the blob");
+        for (index, count) in used.iter().enumerate() {
+            if *count > 0 {
+                eprintln!("  {:<28} used by {count}", names[index]);
+            }
+        }
+        eprintln!("(static codec, animated codec) pairs -- 255 means absent:");
+        for ((s, a), n) in codecs.iter() {
+            eprintln!("  ({s:>3}, {a:>3}) x{n}");
+        }
+    }
+
+    /// Swap a 360 animation blob, then ask the ordinary decoder to read it.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_animation_swap_check() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let group = u32::from_be_bytes(*b"jmad");
+        let cap: usize = std::env::var("JMAD_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
+        let (mut total, mut swapped, mut decoded) = (0usize, 0usize, 0usize);
+        let mut refusals: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut statuses: std::collections::BTreeMap<String, usize> = Default::default();
+        for entry in cache.iter_tags().filter(|e| e.group_tag == group).step_by(7).take(cap) {
+            let Ok(tag) = cache.read_tag(entry) else { continue };
+            let Some(groups) = tag.root().field_path("tag resource groups").and_then(|f| f.as_block())
+            else { continue };
+            for g in 0..groups.len() {
+                let Some(resource) = groups
+                    .element(g)
+                    .and_then(|e| e.field("tag_resource"))
+                    .and_then(|f| f.as_resource())
+                else { continue };
+                let Some(state) = resource.xsync_state() else { continue };
+                let primary = resource.exploded_payload().unwrap_or(&[]);
+                let Some(members) = crate::animation::resource::read_members(&state, primary)
+                else { continue };
+                for member in members {
+                    total += 1;
+                    let mut blob = member.animation_data.clone();
+                    let frames = member.frame_count.max(1) as u16;
+                    match crate::animation::byte_order::swap_animation_blob(
+                        &mut blob, &member.data_sizes, frames,
+                    ) {
+                        Err(why) => {
+                            *refusals.entry(why.to_string()).or_default() += 1;
+                            continue;
+                        }
+                        Ok(()) => swapped += 1,
+                    }
+                    // Read it back the way a PC tag would be read.
+                    let sizes = crate::animation::PackedDataSizes {
+                        fields: SECTION_NAMES
+                            .iter()
+                            .zip(member.data_sizes.iter())
+                            .map(|(n, v)| ((*n).to_owned(), *v as i64))
+                            .collect(),
+                    };
+                    let probe = crate::animation::AnimationGroup::for_blob(
+                        &blob, Some(sizes), member.frame_count, member.node_count, None,
+                    );
+                    match probe.decode() {
+                        Ok(clip) => {
+                            decoded += 1;
+                            let status = format!("{:?}", clip.animated_status);
+                            *statuses.entry(status).or_default() += 1;
+                        }
+                        Err(e) => {
+                            *statuses.entry(format!("decode failed: {e}").chars().take(70).collect())
+                                .or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("{total} member(s): {swapped} swapped, {decoded} decoded back");
+        for (why, count) in refusals.iter() {
+            eprintln!("  refused x{count}: {why}");
+        }
+        for (status, count) in statuses.iter() {
+            eprintln!("  status  x{count}: {status}");
+        }
+    }
+
+    /// The seventeen `data sizes` field names, in schema order.
+    const SECTION_NAMES: [&str; 17] = [
+        "static_node_flags", "animated_node_flags", "movement_data", "pill_offset_data",
+        "default_data", "uncompressed_data", "compressed_data", "blend_screen_data",
+        "object_space_offset_data", "ik_chain_event_data", "ik_chain_control_data",
+        "ik_chain_proxy_data", "ik_chain_pole_vector_data", "uncompressed_object_space_data",
+        "fik_anchor_data", "uncompressed_object_space_node_flags", "compressed_event_curve",
+    ];
+
+    /// Decode a swapped 360 animation and the kit's own copy of the same one,
+    /// and see whether they describe the same motion.
+    ///
+    /// The kit re-encoded these when the game was ported -- a 360 keyframe or
+    /// curve stream comes out of MCC's tools uncompressed -- so the bytes never
+    /// match and only the decoded tracks can be compared. Which is the better
+    /// test anyway: it is the motion that has to survive, not the encoding.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_animation_pose_compare() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let group = u32::from_be_bytes(*b"jmad");
+        let cutoff =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        let cap: usize = std::env::var("JMAD_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+        let shared: Vec<_> = cache
+            .iter_tags()
+            .filter(|e| e.group_tag == group)
+            .filter_map(|e| {
+                let path = reach.join(format!("{}.model_animation_graph", e.name.replace('\\', "/")));
+                std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map(|w| w < cutoff)
+                    .unwrap_or(false)
+                    .then_some((e, path))
+            })
+            .collect();
+        let step = (shared.len() / cap.max(1)).max(1);
+        let (mut compared, mut agreed) = (0usize, 0usize);
+        let mut worst: Vec<(f32, String)> = Vec::new();
+        for (entry, path) in shared.iter().step_by(step).take(cap) {
+            let (Ok(source), Ok(kit)) = (cache.read_tag(entry), TagFile::read(path)) else {
+                continue;
+            };
+            let ours = swapped_clips(&source);
+            let theirs = kit_clips(&kit);
+            if ours.len() != theirs.len() {
+                continue;
+            }
+            for (index, (mine, kits)) in ours.iter().zip(&theirs).enumerate() {
+                let (Some(mine), Some(kits)) = (mine, kits) else { continue };
+                compared += 1;
+                let delta = track_distance(mine, kits);
+                if delta <= 0.05 {
+                    agreed += 1;
+                } else if worst.len() < 8 {
+                    worst.push((delta, format!("{} member {index}", entry.name)));
+                }
+            }
+        }
+        eprintln!("{compared} animation(s) compared against the kit: {agreed} agree");
+        worst.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        for (delta, name) in worst.iter().take(8) {
+            eprintln!("  off by {delta:.3}: {name}");
+        }
+    }
+
+    fn swapped_clips(tag: &TagFile) -> Vec<Option<crate::animation::AnimationClip>> {
+        let mut out = Vec::new();
+        let Some(groups) = tag.root().field_path("tag resource groups").and_then(|f| f.as_block())
+        else { return out };
+        for g in 0..groups.len() {
+            let Some(resource) = groups
+                .element(g)
+                .and_then(|e| e.field("tag_resource"))
+                .and_then(|f| f.as_resource())
+            else { continue };
+            let Some(state) = resource.xsync_state() else { continue };
+            let primary = resource.exploded_payload().unwrap_or(&[]);
+            let Some(members) = crate::animation::resource::read_members(&state, primary) else {
+                continue;
+            };
+            for member in members {
+                let mut blob = member.animation_data.clone();
+                let frames = member.frame_count.max(1) as u16;
+                if crate::animation::byte_order::swap_animation_blob(
+                    &mut blob, &member.data_sizes, frames,
+                ).is_err() {
+                    out.push(None);
+                    continue;
+                }
+                let sizes = crate::animation::PackedDataSizes {
+                    fields: SECTION_NAMES
+                        .iter()
+                        .zip(member.data_sizes.iter())
+                        .map(|(n, v)| ((*n).to_owned(), *v as i64))
+                        .collect(),
+                };
+                let probe = crate::animation::AnimationGroup::for_blob(
+                    &blob, Some(sizes), member.frame_count, member.node_count, None,
+                );
+                out.push(probe.decode().ok());
+            }
+        }
+        out
+    }
+
+    fn kit_clips(tag: &TagFile) -> Vec<Option<crate::animation::AnimationClip>> {
+        let mut out = Vec::new();
+        let Some(groups) = tag.root().field_path("tag resource groups").and_then(|f| f.as_block())
+        else { return out };
+        for g in 0..groups.len() {
+            let Some(list) = groups
+                .element(g)
+                .and_then(|e| e.field("tag_resource"))
+                .and_then(|f| f.as_resource())
+                .and_then(|r| r.as_struct())
+                .and_then(|s| s.field("group_members").and_then(|f| f.as_block()))
+            else { continue };
+            for m in 0..list.len() {
+                let Some(member) = list.element(m) else { continue };
+                let Some(blob) = member.field("animation_data").and_then(|f| f.as_data()) else {
+                    out.push(None);
+                    continue;
+                };
+                let mut fields = Vec::new();
+                if let Some(sizes) = member.field_path("data sizes").and_then(|f| f.as_struct()) {
+                    for name in sizes.field_names() {
+                        let value = sizes.read_int_any(&name).unwrap_or(0) as i64;
+                        fields.push((name.to_string(), value));
+                    }
+                }
+                let probe = crate::animation::AnimationGroup::for_blob(
+                    blob,
+                    (!fields.is_empty()).then_some(crate::animation::PackedDataSizes { fields }),
+                    member.read_int_any("frame count").unwrap_or(1) as i16,
+                    member.read_int_any("node count").unwrap_or(0) as i8,
+                    None,
+                );
+                out.push(probe.decode().ok());
+            }
+        }
+        out
+    }
+
+    /// Mean distance between two clips' animated tracks. Compares whichever
+    /// nodes and frames both carry -- the two encodings can disagree about how
+    /// many keys they need, never about where the bones end up.
+    fn track_distance(
+        a: &crate::animation::AnimationClip,
+        b: &crate::animation::AnimationClip,
+    ) -> f32 {
+        let statics = std::env::var("JMAD_STATIC").is_ok();
+        let (at, bt) = if statics {
+            (&a.static_tracks, &b.static_tracks)
+        } else {
+            let (Some(at), Some(bt)) = (a.animated_tracks.as_ref(), b.animated_tracks.as_ref())
+            else { return 0.0 };
+            (at, bt)
+        };
+        let (mut total, mut count) = (0.0f32, 0usize);
+        for (an, bn) in at.rotations.iter().zip(&bt.rotations) {
+            for (af, bf) in an.iter().zip(bn) {
+                // A quaternion and its negation are the same rotation.
+                let dot = (af.i * bf.i + af.j * bf.j + af.k * bf.k + af.w * bf.w).abs();
+                total += (1.0 - dot.min(1.0)) * 2.0;
+                count += 1;
+            }
+        }
+        for (an, bn) in at.translations.iter().zip(&bt.translations) {
+            for (af, bf) in an.iter().zip(bn) {
+                let d = ((af.x - bf.x).powi(2) + (af.y - bf.y).powi(2) + (af.z - bf.z).powi(2)).sqrt();
+                total += d;
+                count += 1;
+            }
+        }
+        if count == 0 { 0.0 } else { total / count as f32 }
+    }
+
+    /// Are the values in a swapped animation plausible, and were they not before?
+    ///
+    /// Needs no second copy of the animation. A translation is a float in
+    /// metres, so read the wrong way round it comes out denormal or astronomical
+    /// almost every time; a quaternion is four quantized shorts, which say
+    /// nothing on their own but do once their squares have to sum to about one.
+    /// Measuring both readings of the same bytes is what makes this a test
+    /// rather than an observation: the wrong one should fail it loudly.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_animation_value_sanity() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let group = u32::from_be_bytes(*b"jmad");
+        let cap: usize = std::env::var("JMAD_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
+        let mut score = |clip: &crate::animation::AnimationClip, out: &mut (usize, usize, usize, usize)| {
+            for tracks in std::iter::once(&clip.static_tracks)
+                .chain(clip.animated_tracks.as_ref())
+            {
+                for node in &tracks.translations {
+                    for value in node {
+                        for component in [value.x, value.y, value.z] {
+                            out.1 += 1;
+                            // Metres. Halo levels are hundreds of units across
+                            // and a bone offset is a fraction of one.
+                            // Only the absurd counts against it: a bone offset
+                            // of a millionth of a metre is ordinary, a
+                            // denormal or an astronomical one is what a float
+                            // read back to front looks like.
+                            let plausible = component == 0.0
+                                || (component.is_finite()
+                                    && component.abs() > 1.0e-30
+                                    && component.abs() < 1.0e4);
+                            if plausible {
+                                out.0 += 1;
+                            }
+                        }
+                    }
+                }
+                for node in &tracks.rotations {
+                    for q in node {
+                        out.3 += 1;
+                        let length = (q.i * q.i + q.j * q.j + q.k * q.k + q.w * q.w).sqrt();
+                        if (length - 1.0).abs() < 1.0e-3 {
+                            out.2 += 1;
+                        }
+                    }
+                }
+            }
+        };
+        let mut swapped_score = (0usize, 0usize, 0usize, 0usize);
+        let mut raw_score = (0usize, 0usize, 0usize, 0usize);
+        for entry in cache.iter_tags().filter(|e| e.group_tag == group).step_by(11).take(cap) {
+            let Ok(tag) = cache.read_tag(entry) else { continue };
+            let Some(groups) = tag.root().field_path("tag resource groups").and_then(|f| f.as_block())
+            else { continue };
+            for g in 0..groups.len() {
+                let Some(resource) = groups
+                    .element(g)
+                    .and_then(|e| e.field("tag_resource"))
+                    .and_then(|f| f.as_resource())
+                else { continue };
+                let Some(state) = resource.xsync_state() else { continue };
+                let primary = resource.exploded_payload().unwrap_or(&[]);
+                let Some(members) = crate::animation::resource::read_members(&state, primary)
+                else { continue };
+                for member in members {
+                    let sizes = crate::animation::PackedDataSizes {
+                        fields: SECTION_NAMES
+                            .iter()
+                            .zip(member.data_sizes.iter())
+                            .map(|(n, v)| ((*n).to_owned(), *v as i64))
+                            .collect(),
+                    };
+                    // As the 360 wrote them, which is the wrong way round here.
+                    let raw = crate::animation::AnimationGroup::for_blob(
+                        &member.animation_data,
+                        Some(sizes.clone()),
+                        member.frame_count,
+                        member.node_count,
+                        None,
+                    );
+                    if let Ok(clip) = raw.decode() {
+                        score(&clip, &mut raw_score);
+                    }
+                    let mut blob = member.animation_data.clone();
+                    if crate::animation::byte_order::swap_animation_blob(
+                        &mut blob,
+                        &member.data_sizes,
+                        member.frame_count.max(1) as u16,
+                    )
+                    .is_err()
+                    {
+                        continue;
+                    }
+                    let turned = crate::animation::AnimationGroup::for_blob(
+                        &blob, Some(sizes), member.frame_count, member.node_count, None,
+                    );
+                    if let Ok(clip) = turned.decode() {
+                        score(&clip, &mut swapped_score);
+                    }
+                }
+            }
+        }
+        let percent = |a: usize, b: usize| if b == 0 { 0.0 } else { a as f64 * 100.0 / b as f64 };
+        eprintln!(
+            "as the 360 wrote them: {:.1}% of {} translation value(s) plausible, {:.1}% of {} rotation(s) unit",
+            percent(raw_score.0, raw_score.1), raw_score.1,
+            percent(raw_score.2, raw_score.3), raw_score.3,
+        );
+        eprintln!(
+            "turned round:          {:.1}% of {} translation value(s) plausible, {:.1}% of {} rotation(s) unit",
+            percent(swapped_score.0, swapped_score.1), swapped_score.1,
+            percent(swapped_score.2, swapped_score.3), swapped_score.3,
+        );
+    }
+
+    /// Convert an animation graph, write it, read it back, and compare its rest
+    /// poses against the kit's own copy of the same graph.
+    ///
+    /// End to end rather than on the blobs alone: it is the written tag that has
+    /// to hold the animations, so this goes through the file.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_jmad_round_trip() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let groups_index = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups_index);
+        let group = u32::from_be_bytes(*b"jmad");
+        let cutoff =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        let cap: usize = std::env::var("JMAD_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+        let shared: Vec<_> = cache
+            .iter_tags()
+            .filter(|e| e.group_tag == group)
+            .filter_map(|e| {
+                let path = reach.join(format!("{}.model_animation_graph", e.name.replace('\\', "/")));
+                std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map(|w| w < cutoff)
+                    .unwrap_or(false)
+                    .then_some((e, path))
+            })
+            .collect();
+        let step = (shared.len() / cap.max(1)).max(1);
+        let scratch = std::env::temp_dir().join("blam_jmad_round_trip");
+        let _ = std::fs::create_dir_all(&scratch);
+        let (mut tags, mut refused, mut animations, mut agreed, mut undecodable) =
+            (0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut notes: Vec<String> = Vec::new();
+        for (entry, path) in shared.iter().step_by(step).take(cap) {
+            let (Ok(source), Ok(kit)) = (cache.read_tag(entry), TagFile::read(path)) else {
+                continue;
+            };
+            let draft = match analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) {
+                Ok(draft) => draft,
+                Err(why) => {
+                    refused += 1;
+                    if notes.len() < 4 {
+                        notes.push(format!("  refused: {} -- {why}", entry.name));
+                    }
+                    continue;
+                }
+            };
+            let written = scratch.join("round_trip.model_animation_graph");
+            if draft.tag.write_atomic(&written).is_err() {
+                continue;
+            }
+            let Ok(reread) = TagFile::read(&written) else { continue };
+            tags += 1;
+            let ours = kit_clips(&reread);
+            let theirs = kit_clips(&kit);
+            if ours.len() != theirs.len() {
+                if notes.len() < 8 {
+                    notes.push(format!(
+                        "  {} animation(s) vs kit {}: {}", ours.len(), theirs.len(), entry.name
+                    ));
+                }
+                continue;
+            }
+            for (mine, kits) in ours.iter().zip(&theirs) {
+                animations += 1;
+                let (Some(mine), Some(kits)) = (mine, kits) else {
+                    undecodable += 1;
+                    continue;
+                };
+                if track_distance(mine, kits) <= 0.05 {
+                    agreed += 1;
+                }
+            }
+        }
+        eprintln!(
+            "{tags} graph(s) converted and read back ({refused} refused): {animations} animation(s), \
+             {agreed} whose rest pose matches the kit, {undecodable} that would not decode"
+        );
+        for note in &notes {
+            eprintln!("{note}");
+        }
+    }
+
+    /// A work list for the ManagedBlam probe: a spread of every class, with
+    /// extra weight on the ones this round changed.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_probe_list() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let mut by_group: std::collections::BTreeMap<u32, Vec<String>> = Default::default();
+        for entry in cache.iter_tags() {
+            if entry.name.is_empty() {
+                continue;
+            }
+            by_group.entry(entry.group_tag).or_default().push(entry.name.clone());
+        }
+        let heavier = [*b"jmad", *b"sslt", *b"bitm", *b"sbsp", *b"mode"];
+        let mut lines = Vec::new();
+        for (group, names) in by_group.iter() {
+            let Some(extension) = groups.by_tag.get(group) else { continue };
+            let want = if heavier.contains(&group.to_be_bytes()) { 40 } else { 4 };
+            let step = (names.len() / want.max(1)).max(1);
+            for name in names.iter().step_by(step).take(want) {
+                lines.push(format!("baboon_probe\\{name}|{extension}"));
+            }
+        }
+        let out = std::env::var("PROBE_LIST_OUT").unwrap_or_default();
+        if out.is_empty() {
+            eprintln!("{} line(s); set PROBE_LIST_OUT to write them", lines.len());
+            return;
+        }
+        std::fs::write(&out, lines.join("\n")).unwrap();
+        eprintln!("wrote {} line(s) to {out}", lines.len());
     }
 
     fn report_geometry(label: &str, tag: &TagFile) {

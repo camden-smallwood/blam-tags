@@ -303,6 +303,157 @@ fn swap_user_data_in(value: &mut TagStructMut<'_>, swapped: &mut usize) {
     }
 }
 
+/// Carry an Xbox 360 animation graph's payload across.
+///
+/// An animation graph keeps its substance in pageable resources: one per
+/// `tag resource groups[i]`, each a list of members with a header and a codec
+/// stream. A loose MCC tag stores that list inline; a monolithic 360 build
+/// stores it as the engine had it in memory, a flat control-data buffer with
+/// the pointers stubbed out. So there is nothing to copy -- the members have to
+/// be read out of the one shape and written into the other, and the streams
+/// turned round on the way.
+///
+/// All or nothing per tag. A graph with half its animations is worse than one
+/// that says why it did not convert, and the streams that refuse are the four
+/// in a 2011 build whose sections claim bytes the blob does not have.
+pub(super) fn carry_animation_resources(
+    byte_order_upgrade: bool,
+    source: &TagFile,
+    target: &mut TagFile,
+    context: &mut ConversionContext<'_>,
+) {
+    if !byte_order_upgrade || source.header.group_tag != u32::from_be_bytes(*b"jmad") {
+        return;
+    }
+    if context.resources_left_behind.is_empty() {
+        return;
+    }
+    // Read every group first, so a stream that will not turn round is found
+    // before anything has been written.
+    let root = source.root();
+    let Some(groups) = root.field_path("tag resource groups").and_then(|f| f.as_block()) else {
+        return;
+    };
+    let mut carried: Vec<Vec<crate::animation::resource::AnimationResourceMember>> =
+        Vec::with_capacity(groups.len());
+    for index in 0..groups.len() {
+        let Some(resource) = groups
+            .element(index)
+            .and_then(|group| group.field("tag_resource"))
+            .and_then(|field| field.as_resource())
+        else {
+            carried.push(Vec::new());
+            continue;
+        };
+        let Some(state) = resource.xsync_state() else {
+            // Already in the destination's shape; the ordinary transfer has it.
+            carried.push(Vec::new());
+            continue;
+        };
+        let primary = resource.exploded_payload().unwrap_or(&[]);
+        let Some(mut members) = crate::animation::resource::read_members(&state, primary) else {
+            record_unsupported(
+                context,
+                format!("tag resource groups[{index}]/tag_resource"),
+                "The Xbox 360 animation resource's control data could not be walked".to_owned(),
+            );
+            return;
+        };
+        for (member_index, member) in members.iter_mut().enumerate() {
+            let frames = member.frame_count.max(1) as u16;
+            if let Err(why) = crate::animation::byte_order::swap_animation_blob(
+                &mut member.animation_data,
+                &member.data_sizes,
+                frames,
+            ) {
+                record_unsupported(
+                    context,
+                    format!("tag resource groups[{index}]/tag_resource"),
+                    format!(
+                        "Animation {member_index} could not be put into this side's byte \
+                         order: {why}"
+                    ),
+                );
+                return;
+            }
+        }
+        carried.push(members);
+    }
+
+    let mut written = 0usize;
+    {
+        let mut target_root = target.root_mut();
+        let Some(mut groups_field) = target_root.field_mut("tag resource groups") else {
+            return;
+        };
+        let Some(mut target_groups) = groups_field.as_block_mut() else {
+            return;
+        };
+        let mismatch = (target_groups.len() != carried.len())
+            .then(|| (target_groups.len(), carried.len()));
+        if let Some((theirs, ours)) = mismatch {
+            drop(target_groups);
+            drop(groups_field);
+            record_unsupported(
+                context,
+                "tag resource groups".to_owned(),
+                format!("The target carries {theirs} resource group(s) but the source has {ours}"),
+            );
+            return;
+        }
+        for (index, members) in carried.iter().enumerate() {
+            if members.is_empty() {
+                continue;
+            }
+            let Some(mut group) = target_groups.element_mut(index) else { continue };
+            let Some(mut field) = group.field_mut("tag_resource") else { continue };
+            if field.init_resource().is_err() {
+                continue;
+            }
+            let Some(mut payload) = field.as_resource_struct_mut() else { continue };
+            let Some(mut members_field) = payload.field_mut("group_members") else { continue };
+            let Some(mut list) = members_field.as_block_mut() else { continue };
+            for member in members {
+                let at = list.add_element();
+                let Some(mut element) = list.element_mut(at) else { continue };
+                set_int_field(&mut element, "animation_index", member.animation_index as i64);
+                set_int_field(&mut element, "animation_checksum", member.animation_checksum as i64);
+                set_int_field(&mut element, "frame count", member.frame_count as i64);
+                set_int_field(&mut element, "node count", member.node_count as i64);
+                set_int_field(
+                    &mut element,
+                    "movement_data_type",
+                    member.movement_data_type as i64,
+                );
+                if let Some(mut sizes_field) = element.field_mut("data sizes")
+                    && let Some(mut sizes) = sizes_field.as_struct_mut()
+                {
+                    let names: Vec<String> = sizes.as_ref().field_names().map(str::to_owned).collect();
+                    for (name, value) in names.iter().zip(member.data_sizes.iter()) {
+                        set_int_field(&mut sizes, name, *value as i64);
+                    }
+                }
+                if let Some(mut data) = element.field_mut("animation_data") {
+                    let _ = data.set(TagFieldData::Data(member.animation_data.clone()));
+                }
+                written += 1;
+            }
+        }
+    }
+
+    forgive_resources(
+        context,
+        |path| path.starts_with("tag resource groups"),
+        move |_| {
+            format!(
+                "The Xbox 360 animation resource was read out of the build's control data and \
+                 written back as the inline members a loose tag carries ({written} animation(s), \
+                 codec streams turned round)"
+            )
+        },
+    );
+}
+
 /// Move an Xbox 360 bitmap's pixels into the shape a PC tag keeps them in.
 ///
 /// The two builds disagree about where a bitmap's pixels live. A PC tag puts
