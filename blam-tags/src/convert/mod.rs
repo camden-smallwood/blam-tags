@@ -1941,8 +1941,14 @@ fn analyze_conversion_inner(
             ));
         }
     }
-    if let Some(reason) =
-        mapping_catalog.incompatibility_reason(source_group_name, source_game, target_game)
+    // Every rule in the catalog answers "what changes between these engines?".
+    // A byte-order upgrade changes no engine, so none of them is about it. The
+    // sound rule is the one that matters in practice: it refuses a conversion
+    // because the audio sits in a bank the *target game* does not have, which
+    // cannot be true when the target game is the source game.
+    if let Some(reason) = mapping_catalog
+        .incompatibility_reason(source_group_name, source_game, target_game)
+        .filter(|_| !byte_order_upgrade)
     {
         let native_contrail_layout =
             native_target.is_some() && source_group_name.eq_ignore_ascii_case("contrail_system");
@@ -2196,6 +2202,7 @@ fn analyze_conversion_inner(
     // lost list.
     forgive_hydrated_geometry(&target, &mut context);
     convert_x360_bitmap_pixels(source, &mut target, &mut context);
+    forgive_externally_stored_payload(byte_order_upgrade, &mut target, &mut context);
     let fail_closed_losses = validate_critical_runtime_safety(source, &context, policy)?;
     if !fail_closed_losses.is_empty() {
         context.report.issues.push(ConversionIssue {
@@ -13355,5 +13362,133 @@ mod x360_cache_conversion {
         }
         assert!(checked > 100, "only {checked} images had anything to check");
         assert_eq!(wrong, 0, "{wrong} of {checked} images: {examples:#?}");
+    }
+
+    /// A sound arrives in the shape the destination's own sounds are in.
+    ///
+    /// An Xbox 360 build keeps a sound's samples in the tag as an XMA stream.
+    /// MCC Reach does not: every one of its own sound tags carries
+    /// `sound data resource` null and names an FMOD bank instead. So the stream
+    /// is the one part of the tag that cannot move, and also the one part the
+    /// destination has no use for — the tag arrives complete otherwise and finds
+    /// its samples by name in the kit's banks, as a stock tag there does.
+    ///
+    /// The conversion catalog refuses `sound` for every pair, which is right
+    /// across engines and wrong within one; this is the test that keeps the
+    /// carve-out honest.
+    #[test]
+    fn a_360_sound_arrives_with_its_audio_left_to_the_kit() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let mut checked = 0;
+        for entry in cache
+            .iter_tags()
+            .filter(|entry| entry.group_tag == u32::from_be_bytes(*b"snd!") && !entry.name.is_empty())
+            .step_by(997)
+        {
+            let Some(source) = read_cache_tag(&cache, b"snd!", &entry.name) else {
+                continue;
+            };
+            let draft = convert_into_reach(&source, &reach, &definitions)
+                .unwrap_or_else(|error| panic!("{} refused: {error}", entry.name));
+            assert_eq!(draft.tag.endian, Endian::Le);
+            // Null, not carried: 360 audio under a Reach MCC header would be a
+            // tag that looks playable and is not.
+            let carried = draft
+                .tag
+                .root()
+                .field_path("sound data resource")
+                .and_then(|field| field.as_resource())
+                .map(|resource| resource.kind());
+            assert!(
+                matches!(carried, None | Some(TagResourceKind::Null)),
+                "{} kept its Xbox 360 audio stream",
+                entry.name
+            );
+            checked += 1;
+            if checked >= 4 {
+                break;
+            }
+        }
+        assert!(checked > 0, "no sound converted out of the 360 cache");
+    }
+
+    /// What fraction of every tag class in a 360 build converts, class by class.
+    ///
+    /// The measure behind "translate everything that can be translated", kept in
+    /// the tree because the answer moves: a build has 200-odd classes and the
+    /// only honest way to know which ones still refuse is to try them all. Prints
+    /// a table of `class, tags in build, converted/sampled, first refusal`.
+    ///
+    /// `#[ignore]` because it reads a 27 GB build and takes minutes. Run it with
+    /// `--ignored`, and `SURVEY_SAMPLE` to widen or narrow the per-class sample.
+    #[test]
+    #[ignore = "reads a whole Xbox 360 build; run with --ignored"]
+    fn every_class_in_a_360_build_reports_whether_it_converts() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+
+        let mut counts: HashMap<u32, usize> = HashMap::new();
+        for entry in cache.iter_tags().filter(|entry| !entry.name.is_empty()) {
+            *counts.entry(entry.group_tag).or_default() += 1;
+        }
+        let mut ordered: Vec<(u32, usize)> = counts.into_iter().collect();
+        ordered.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+
+        let sample: usize = std::env::var("SURVEY_SAMPLE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(4);
+        let (mut converted, mut attempted) = (0usize, 0usize);
+        for (group, total) in ordered {
+            let names: Vec<String> = cache
+                .iter_tags()
+                .filter(|entry| entry.group_tag == group && !entry.name.is_empty())
+                .step_by((total / sample).max(1))
+                .take(sample)
+                .map(|entry| entry.name.clone())
+                .collect();
+            let (mut ok, mut refusal) = (0, String::new());
+            for name in &names {
+                let Ok(source) = cache.read_tag_by_name(group, name) else {
+                    if refusal.is_empty() {
+                        refusal = "unreadable from the cache".to_owned();
+                    }
+                    continue;
+                };
+                match analyze_conversion_with_templates(
+                    &source,
+                    "haloreach_mcc",
+                    "haloreach_mcc",
+                    &definitions,
+                    Some(&templates),
+                ) {
+                    Ok(_) => ok += 1,
+                    Err(error) if refusal.is_empty() => {
+                        refusal = error.replace('\n', " ").chars().take(160).collect();
+                    }
+                    Err(_) => {}
+                }
+            }
+            converted += ok;
+            attempted += names.len();
+            eprintln!(
+                "{}\t{total}\t{ok}/{}\t{refusal}",
+                format_group_tag(group),
+                names.len()
+            );
+        }
+        eprintln!("--- {converted}/{attempted} sampled tags converted ---");
+        assert!(attempted > 0);
     }
 }

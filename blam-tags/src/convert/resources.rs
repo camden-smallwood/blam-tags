@@ -368,6 +368,91 @@ fn x360_payloads_are_unhydrated(root: &TagStruct<'_>) -> bool {
         .all(|resource| matches!(resource.kind(), TagResourceKind::Xsync))
 }
 
+/// Groups whose substance the PC build keeps outside the tag.
+///
+/// A `sound` is the case: MCC Reach's own sound tags carry
+/// `sound data resource` null and name an FMOD bank instead, so the samples
+/// were never in the tag to begin with. An Xbox 360 build put them there as an
+/// XMA stream, and that stream is the one thing about the tag that genuinely
+/// cannot move — but it also is not wanted, because the destination does not
+/// read it.
+/// The second field says whether the group also carries geometry that has to
+/// have arrived first. A BSP's meshes come across as author-format blocks like a
+/// render model's, and forgiving its resources before checking that would write
+/// a level with no geometry and no complaint.
+const PAYLOAD_LIVES_OUTSIDE_THE_TAG: &[(&str, bool)] =
+    &[("sound", false), ("scenario_structure_bsp", true)];
+
+/// Stop counting a resource as lost when the destination would not carry it.
+///
+/// Only for a byte-order upgrade, and only for a group on the list above. Both
+/// halves matter. Across engines the audio really is stranded, which is what the
+/// conversion catalog's `sound` rule is about; within one engine the tag is
+/// simply moving to the side of that engine that keeps its samples in banks,
+/// and arriving with a null resource is arriving in the right shape.
+///
+/// What this cannot do is bring the audio with it. The tag lands complete in
+/// every other respect and finds its samples by name in the destination kit's
+/// banks, exactly as a stock tag there does; a sound the kit has no bank for is
+/// silent, and the report says so.
+pub(super) fn forgive_externally_stored_payload(
+    byte_order_upgrade: bool,
+    target: &mut TagFile,
+    context: &mut ConversionContext<'_>,
+) {
+    if !byte_order_upgrade || context.resources_left_behind.is_empty() {
+        return;
+    }
+    let Some((_, needs_geometry)) = PAYLOAD_LIVES_OUTSIDE_THE_TAG
+        .iter()
+        .find(|(group, _)| context.group_name.eq_ignore_ascii_case(group))
+    else {
+        return;
+    };
+    if *needs_geometry && crate::render_geometry::author_geometry_populated(target) != Some(true) {
+        return;
+    }
+    // Cleared rather than left as the template found it: a resource copied from
+    // a kit tag underneath a source that had its own would be somebody else's
+    // audio.
+    clear_all_resources(&mut target.root_mut());
+    let group = context.group_name.to_owned();
+    forgive_resources(
+        context,
+        |_| true,
+        move |_| {
+            format!(
+                "The Xbox 360 payload was dropped; a {group} on this side of the engine carries \
+                 this resource null and finds what it needs outside the tag"
+            )
+        },
+    );
+}
+
+/// Null every pageable resource in a tag.
+fn clear_all_resources(value: &mut TagStructMut<'_>) {
+    for index in 0..value.as_ref().fields().count() {
+        let Some(mut field) = value.field_at_mut(index) else {
+            continue;
+        };
+        if field.as_ref().field_type() == TagFieldType::PageableResource {
+            let _ = field.clear_resource();
+            continue;
+        }
+        if let Some(mut nested) = field.as_struct_mut() {
+            clear_all_resources(&mut nested);
+            continue;
+        }
+        if let Some(mut block) = field.as_block_mut() {
+            for element in 0..block.len() {
+                if let Some(mut element) = block.element_mut(element) {
+                    clear_all_resources(&mut element);
+                }
+            }
+        }
+    }
+}
+
 /// Set an integer field at whatever width the schema declares it.
 ///
 /// The same field is a `char_integer` in one profile and a `short_integer` in
