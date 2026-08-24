@@ -2241,6 +2241,7 @@ fn analyze_conversion_inner(
     forgive_hydrated_geometry(&target, &mut context);
     settle_uncompiled_geometry(byte_order_upgrade, &mut target, &mut context);
     carry_animation_resources(byte_order_upgrade, source, &mut target, &mut context);
+    carry_structure_resources(byte_order_upgrade, source, &mut target, &mut context);
     convert_x360_bitmap_pixels(source, &mut target, &mut context);
     forgive_externally_stored_payload(byte_order_upgrade, &mut target, &mut context);
     swap_function_curves(byte_order_upgrade, &mut target, &mut context);
@@ -3637,6 +3638,70 @@ fn declared_root_size(target_schema: &Path) -> Option<usize> {
     usize::try_from(size).ok()
 }
 
+/// Every struct a schema declares, by name and packed size.
+///
+/// The root size alone does not tell the revisions apart. A kit can ship the
+/// same group at two revisions that agree about the root and differ several
+/// blocks down -- HREK's animation graphs do, 259 of them without
+/// `override blend out time` on an animation and 136 with -- and a conversion
+/// against the shorter one drops whatever the source had in the missing field
+/// while reporting a perfectly matched root.
+fn declared_struct_sizes(target_schema: &Path) -> HashMap<String, usize> {
+    let mut out = HashMap::new();
+    let Ok(bytes) = fs::read(target_schema) else { return out };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else { return out };
+    let Some(structs) = value.get("structs").and_then(Value::as_object) else { return out };
+    for (name, definition) in structs {
+        if let Some(size) = definition.get("size").and_then(Value::as_u64) {
+            out.insert(name.clone(), size as usize);
+        }
+    }
+    out
+}
+
+/// Every struct a template's own layout declares, by name and packed size.
+///
+/// Walked from the root declaration rather than from data, so a block with no
+/// elements still contributes the shape of the elements it would hold.
+fn template_struct_sizes(tag: &TagFile) -> HashMap<String, usize> {
+    let mut out = HashMap::new();
+    let mut pending = vec![tag.definitions().root_struct()];
+    while let Some(structure) = pending.pop() {
+        if out.insert(structure.name().to_owned(), structure.size()).is_some() {
+            // Seen it: the declaration tree is a graph and a struct can name
+            // itself, directly or round a loop.
+            continue;
+        }
+        for field in structure.fields() {
+            if let Some(nested) = field.as_struct() {
+                pending.push(nested);
+            } else if let Some(block) = field.as_block() {
+                pending.push(block.struct_definition());
+            } else if let Some(array) = field.as_array() {
+                pending.push(array.struct_definition());
+            } else if let Some(resource) = field.as_resource() {
+                pending.push(resource.struct_definition());
+            }
+        }
+    }
+    out
+}
+
+/// How many structs a template disagrees with the schema about.
+///
+/// Only names the two share count. A template declaring structs the schema
+/// does not is the normal case and the reason a kit tag is preferred over a
+/// generated layout in the first place.
+fn template_disagreements(
+    template: &HashMap<String, usize>,
+    schema: &HashMap<String, usize>,
+) -> usize {
+    template
+        .iter()
+        .filter(|(name, size)| schema.get(*name).is_some_and(|declared| declared != *size))
+        .count()
+}
+
 fn find_native_target_template(
     templates: &NativeTemplateIndex,
     target_group_tag: u32,
@@ -3694,11 +3759,20 @@ fn find_native_target_template(
     // converts against a different layout. Same editor, same tag, different
     // machine, different output: that is the bug this exists to remove.
     let wanted_root_size = declared_root_size(target_schema);
+    // And which revision of everything below it. The root size settles the
+    // outermost shape; a kit that ships two revisions of the same group can
+    // agree there and differ several blocks down, so the nested structs decide
+    // between the survivors.
+    let wanted_struct_sizes = declared_struct_sizes(target_schema);
     // The best of the wrong ones, kept in case the kit ships no matching
     // revision at all. A template of the wrong revision still beats none: the
     // fallback from here is a layout built from the schema, which no kit ever
     // authored.
     let mut fallback: Option<(TagFile, PathBuf)> = None;
+    // The best of the right ones. A candidate that agrees about the root but
+    // not about everything under it is worth keeping while the scan looks for
+    // one that agrees about both.
+    let mut best: Option<(usize, TagFile, PathBuf)> = None;
     for path in paths.iter().take(NATIVE_TEMPLATE_SCAN_LIMIT) {
         // Sift on the 64-byte header first. Every candidate has to be *ruled
         // out* somehow, and for a group the kit ships in bulk the ruled-out ones
@@ -3736,8 +3810,19 @@ fn find_native_target_template(
                 }
                 continue;
             }
-            return cache_native_template(templates, target_group_tag, tag, path.clone());
+            let disagreements =
+                template_disagreements(&template_struct_sizes(&tag), &wanted_struct_sizes);
+            if disagreements == 0 {
+                return cache_native_template(templates, target_group_tag, tag, path.clone());
+            }
+            if best.as_ref().is_none_or(|(worst, _, _)| disagreements < *worst) {
+                best = Some((disagreements, tag, path.to_path_buf()));
+            }
+            continue;
         }
+    }
+    if let Some((_, tag, path)) = best {
+        return cache_native_template(templates, target_group_tag, tag, path);
     }
     if let Some((tag, path)) = fallback {
         return cache_native_template(templates, target_group_tag, tag, path);
@@ -14002,6 +14087,112 @@ mod x360_cache_conversion {
         assert!(attempted > 0);
     }
 
+    /// The template a group picks is the best its kit has, not the first.
+    ///
+    /// The root size is not enough to tell two revisions apart. HREK ships its
+    /// animation graphs at two: 259 whose animations have eleven fields and 136
+    /// whose animations have twelve, the twelfth being
+    /// `override blend out time`. Both agree about the root, so the picker took
+    /// whichever sorted first -- and a 2011 graph converted against the shorter
+    /// one lost that field on all 208 of its animations, along with a flag bit
+    /// and a block of velocity boundaries. 784 fields, and the conversion
+    /// refused rather than write them away.
+    ///
+    /// The bar is *no worse than any other candidate*, not *perfect*. A kit's
+    /// own tags disagree with the dumped JSON about plenty of structs -- havok
+    /// shapes, debug info, several weapon and biped blocks -- and a template
+    /// that matched everything does not exist to be picked.
+    #[test]
+    fn a_chosen_template_is_the_closest_one_its_kit_has() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else {
+            eprintln!("skipping: needs HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let Ok(groups) = GameTagIndex::load(&definitions, "haloreach_mcc") else {
+            eprintln!("skipping: no haloreach_mcc definitions");
+            return;
+        };
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let tag_group = u32::from_be_bytes(*b"jmad");
+        let Some(name) = groups.by_tag.get(&tag_group).cloned() else { return };
+        let schema = definitions.join("haloreach_mcc").join(format!("{name}.json"));
+        let Ok(Some((chosen, path))) = find_native_target_template(
+            &templates,
+            tag_group,
+            "haloreach_mcc",
+            None,
+            &definitions,
+            &schema,
+        ) else {
+            eprintln!("skipping: the kit ships no animation graph");
+            return;
+        };
+        let wanted = declared_struct_sizes(&schema);
+        if wanted.is_empty() {
+            eprintln!("skipping: no struct sizes in the schema");
+            return;
+        }
+        let ours = template_disagreements(&template_struct_sizes(&chosen), &wanted);
+
+        // Nothing the kit has does better.
+        let Some(candidates) = templates.by_group.get(&tag_group) else { return };
+        let mut best = ours;
+        let mut better = None;
+        for candidate in candidates.iter().take(NATIVE_TEMPLATE_SCAN_LIMIT) {
+            let Ok(tag) = TagFile::read(candidate) else { continue };
+            if tag.group().tag != tag_group || tag.endian != Endian::Le {
+                continue;
+            }
+            let score = template_disagreements(&template_struct_sizes(&tag), &wanted);
+            if score < best {
+                best = score;
+                better = Some(candidate.clone());
+            }
+        }
+        assert!(
+            better.is_none(),
+            "picked {} with {ours} disagreement(s) when {} has {best}",
+            path.display(),
+            better.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+        );
+
+        // And the concrete thing the elite needed: an animation that can hold
+        // every field a 2011 one carries.
+        // Asked of the layout, not of the data: a template is reset to defaults
+        // before it is handed out, so its blocks are empty by the time anybody
+        // sees it. What matters is what it can hold.
+        let animation_fields: Vec<String> = chosen
+            .definitions()
+            .root_struct()
+            .fields()
+            .find(|field| crate::field_name::clean_field_name(field.name()) == "definitions")
+            .and_then(|field| field.as_struct())
+            .and_then(|definitions| {
+                definitions.fields().find(|field| {
+                    crate::field_name::clean_field_name(field.name()) == "animations"
+                })
+            })
+            .and_then(|field| field.as_block())
+            .map(|block| {
+                block
+                    .struct_definition()
+                    .fields()
+                    .map(|field| crate::field_name::clean_field_name(field.name()).into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if animation_fields.is_empty() {
+            eprintln!("skipping: the chosen template declares no animations to look at");
+            return;
+        }
+        assert!(
+            animation_fields.iter().any(|name| name.contains("override blend out")),
+            "the chosen animation graph template has no `override blend out time`, so a 2011              graph converted against it loses that field on every animation: {}",
+            path.display(),
+        );
+    }
+
     /// The classes a kit ships in bulk find a template in it.
     ///
     /// A conversion starts either from a tag the kit authored or from the
@@ -14255,7 +14446,11 @@ mod x360_cache_conversion {
         out: &mut Vec<String>,
         depth: usize,
     ) {
-        if depth > 12 || out.len() > 4000 { return; }
+        let ceiling: usize = std::env::var("DIFF_CEILING")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4000);
+        if depth > 12 || out.len() > ceiling { return; }
         for name in theirs.field_names() {
             let here = if path.is_empty() { name.to_string() } else { format!("{path}/{name}") };
             let (Some(a), Some(b)) = (ours.field(&name), theirs.field(&name)) else {
@@ -14270,7 +14465,7 @@ mod x360_cache_conversion {
                 for i in 0..ab.len() {
                     let (Some(ae), Some(be)) = (ab.element(i), bb.element(i)) else { continue };
                     diff_structs(&format!("{here}[{i}]"), &ae, &be, out, depth + 1);
-                    if out.len() > 4000 { return; }
+                    if out.len() > ceiling { return; }
                 }
                 continue;
             }
@@ -15714,15 +15909,30 @@ mod x360_cache_conversion {
                 }
                 continue;
             }
-            for (mine, kits) in ours.iter().zip(&theirs) {
+            let mut tag_agreed = 0usize;
+            let mut tag_total = 0usize;
+            let mut misses: Vec<usize> = Vec::new();
+            for (index, (mine, kits)) in ours.iter().zip(&theirs).enumerate() {
                 animations += 1;
+                tag_total += 1;
                 let (Some(mine), Some(kits)) = (mine, kits) else {
                     undecodable += 1;
                     continue;
                 };
                 if track_distance(mine, kits) <= 0.05 {
                     agreed += 1;
+                    tag_agreed += 1;
+                } else {
+                    misses.push(index);
                 }
+            }
+            if tag_agreed != tag_total && notes.len() < 10 {
+                notes.push(format!(
+                    "  {tag_agreed}/{tag_total} rest poses match: {}
+     indices {:?}",
+                    entry.name,
+                    &misses[..misses.len().min(40)],
+                ));
             }
         }
         eprintln!(
@@ -15756,7 +15966,11 @@ mod x360_cache_conversion {
             let want = if heavier.contains(&group.to_be_bytes()) { 40 } else { 4 };
             let step = (names.len() / want.max(1)).max(1);
             for name in names.iter().step_by(step).take(want) {
-                lines.push(format!("baboon_probe\\{name}|{extension}"));
+                // Sorted last on purpose: a template is picked from the
+                // kit by path order, and a folder of this converter's own
+                // output near the front of the alphabet becomes the template
+                // for the next run.
+                lines.push(format!("zz_baboon_probe\\{name}|{extension}"));
             }
         }
         let out = std::env::var("PROBE_LIST_OUT").unwrap_or_default();
@@ -15766,6 +15980,542 @@ mod x360_cache_conversion {
         }
         std::fs::write(&out, lines.join("\n")).unwrap();
         eprintln!("wrote {} line(s) to {out}", lines.len());
+    }
+
+    /// Which fields a tag would lose, grouped by the field rather than the path.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_lost_fields() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let group_name = std::env::var("LOST_GROUP").unwrap_or_else(|_| "jmad".to_owned());
+        let want = std::env::var("LOST_NAME").unwrap_or_else(|_| "elite".to_owned());
+        let mut gb = [b' '; 4];
+        for (i, c) in group_name.bytes().take(4).enumerate() { gb[i] = c; }
+        let Some(entry) = cache
+            .iter_tags()
+            .filter(|e| e.group_tag == u32::from_be_bytes(gb))
+            .find(|e| e.name.ends_with(&want) || e.name.contains(&want))
+        else { eprintln!("no such tag"); return };
+        let Ok(source) = cache.read_tag(entry) else { return };
+        eprintln!("{}", entry.name);
+        let draft = match analyze_conversion_inner(
+            &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            LossPolicy::Accept,
+        ) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("refused even with Accept: {e}"); return }
+        };
+        let mut by_field: std::collections::BTreeMap<String, (usize, String)> = Default::default();
+        for issue in &draft.report.issues {
+            let mut key = String::new();
+            let mut skipping = false;
+            for ch in issue.path.chars() {
+                match ch {
+                    '[' => { skipping = true; key.push(ch); }
+                    ']' => { skipping = false; key.push(ch); }
+                    _ if skipping => {}
+                    _ => key.push(ch),
+                }
+            }
+            let slot = by_field
+                .entry(format!("{:?} {key}", issue.kind))
+                .or_insert((0, issue.message.clone()));
+            slot.0 += 1;
+        }
+        eprintln!("{} issue(s)", draft.report.issues.len());
+        for (key, (count, sample)) in by_field.iter().take(20) {
+            eprintln!("  x{count:<5} {key}\n         {}", sample.chars().take(150).collect::<String>());
+        }
+    }
+
+    /// Do the kit's own animation graphs agree about what an animation has?
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_jmad_template_layouts() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        let cutoff =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        let mut shapes: std::collections::BTreeMap<String, (usize, String)> = Default::default();
+        let mut seen = 0usize;
+        for path in walk_files(&reach) {
+            if path.extension().and_then(|e| e.to_str()) != Some("model_animation_graph") {
+                continue;
+            }
+            if std::fs::metadata(&path).and_then(|m| m.modified()).map(|w| w >= cutoff).unwrap_or(true) {
+                continue;
+            }
+            let Ok(tag) = TagFile::read(&path) else { continue };
+            let root = tag.root();
+            let Some(animations) = root
+                .field_path("definitions/animations")
+                .and_then(|f| f.as_block())
+            else { continue };
+            let names: Vec<String> = animations
+                .element(0)
+                .map(|e| e.field_names().map(str::to_owned).collect())
+                .unwrap_or_default();
+            let flags = animations
+                .element(0)
+                .and_then(|e| e.field("user flags"))
+                .and_then(|f| f.options())
+                .map(|o| match o {
+                    crate::api::TagOptions::Flags(bits) => {
+                        bits.iter().map(|b| b.name.to_owned()).collect::<Vec<_>>().join(",")
+                    }
+                    _ => String::new(),
+                })
+                .unwrap_or_default();
+            let key = format!(
+                "{} field(s), blend out {}, flags [{flags}]",
+                names.len(),
+                names.iter().any(|n| n.contains("override blend out")),
+            );
+            let slot = shapes.entry(key).or_insert((0, path.display().to_string()));
+            slot.0 += 1;
+            seen += 1;
+            if seen >= 400 { break }
+        }
+        eprintln!("{seen} untouched animation graph(s)");
+        for (shape, (count, sample)) in shapes.iter() {
+            eprintln!("  x{count:<4} {}\n         e.g. {sample}", shape.chars().take(200).collect::<String>());
+        }
+    }
+
+    /// Do the two builds agree about which animation is which?
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_jmad_checksums() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let want = std::env::var("JMAD_NAME").unwrap_or_else(|_| "characters".to_owned());
+        let Some(entry) = cache
+            .iter_tags()
+            .filter(|e| e.group_tag == u32::from_be_bytes(*b"jmad"))
+            .find(|e| e.name.contains(&want))
+        else { return };
+        let path = reach.join(format!("{}.model_animation_graph", entry.name.replace('\\', "/")));
+        let (Ok(source), Ok(kit)) = (cache.read_tag(entry), TagFile::read(&path)) else { return };
+        let ours: Vec<(i32, i16, i8)> = {
+            let mut out = Vec::new();
+            if let Some(groups) = source.root().field_path("tag resource groups").and_then(|f| f.as_block()) {
+                for g in 0..groups.len() {
+                    let Some(resource) = groups.element(g)
+                        .and_then(|e| e.field("tag_resource")).and_then(|f| f.as_resource())
+                    else { continue };
+                    let Some(state) = resource.xsync_state() else { continue };
+                    let primary = resource.exploded_payload().unwrap_or(&[]);
+                    if let Some(members) = crate::animation::resource::read_members(&state, primary) {
+                        for m in members {
+                            out.push((m.animation_checksum, m.frame_count, m.node_count));
+                        }
+                    }
+                }
+            }
+            out
+        };
+        let theirs: Vec<(i32, i16, i8)> = {
+            let mut out = Vec::new();
+            if let Some(groups) = kit.root().field_path("tag resource groups").and_then(|f| f.as_block()) {
+                for g in 0..groups.len() {
+                    let Some(list) = groups.element(g)
+                        .and_then(|e| e.field("tag_resource")).and_then(|f| f.as_resource())
+                        .and_then(|r| r.as_struct())
+                        .and_then(|s| s.field("group_members").and_then(|f| f.as_block()))
+                    else { continue };
+                    for m in 0..list.len() {
+                        let Some(member) = list.element(m) else { continue };
+                        out.push((
+                            member.read_int_any("animation_checksum").unwrap_or(0) as i32,
+                            member.read_int_any("frame count").unwrap_or(0) as i16,
+                            member.read_int_any("node count").unwrap_or(0) as i8,
+                        ));
+                    }
+                }
+            }
+            out
+        };
+        eprintln!("{}: {} member(s) vs kit {}", entry.name, ours.len(), theirs.len());
+        let mut same_checksum = 0usize;
+        let mut same_shape = 0usize;
+        let mut differing: Vec<usize> = Vec::new();
+        for (index, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+            if a.0 == b.0 { same_checksum += 1; }
+            if a.1 == b.1 && a.2 == b.2 { same_shape += 1; } else { differing.push(index); }
+        }
+        eprintln!(
+            "  same checksum: {same_checksum}; same frame and node count: {same_shape}"
+        );
+        eprintln!("  differing shape at {:?}", &differing[..differing.len().min(30)]);
+    }
+
+    /// Compare a converted BSP's raw indices and vertices against the kit's,
+    /// per mesh, with nothing truncating the comparison.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_bsp_index_compare() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let cutoff =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        let cap: usize = std::env::var("BSP_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        let shared: Vec<_> = cache
+            .iter_tags()
+            .filter(|e| e.group_tag == u32::from_be_bytes(*b"sbsp"))
+            .filter_map(|e| {
+                let path = reach.join(format!("{}.scenario_structure_bsp", e.name.replace('\\', "/")));
+                std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map(|w| w < cutoff)
+                    .unwrap_or(false)
+                    .then_some((e, path))
+            })
+            .collect();
+        let step = (shared.len() / cap.max(1)).max(1);
+        for (entry, path) in shared.iter().step_by(step).take(cap) {
+            let (Ok(source), Ok(kit)) = (cache.read_tag(entry), TagFile::read(path)) else {
+                continue;
+            };
+            let Ok(draft) = analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) else { continue };
+            let read = |tag: &TagFile| -> Vec<(usize, usize, Vec<u32>, Vec<[f32; 3]>)> {
+                let mut out = Vec::new();
+                let Some(pmt) = tag
+                    .root()
+                    .field_path("render geometry/per mesh temporary")
+                    .and_then(|f| f.as_block())
+                else { return out };
+                for i in 0..pmt.len() {
+                    let Some(elem) = pmt.element(i) else { continue };
+                    let mut indices = Vec::new();
+                    if let Some(block) = elem.field("raw indices").and_then(|f| f.as_block()) {
+                        for k in 0..block.len() {
+                            let Some(item) = block.element(k) else { continue };
+                            let value = item
+                                .field_names()
+                                .next()
+                                .and_then(|name| item.read_int_any(&name))
+                                .unwrap_or(-1);
+                            indices.push(value as u32);
+                        }
+                    }
+                    let mut vertices = Vec::new();
+                    if let Some(block) = elem.field("raw vertices").and_then(|f| f.as_block()) {
+                        for k in 0..block.len() {
+                            let Some(item) = block.element(k) else { continue };
+                            let p = if std::env::var("BSP_COLOR").is_ok() {
+                                item.read_point3d("vertex color")
+                            } else {
+                                item.read_point3d("position")
+                            };
+                            vertices.push([p.x, p.y, p.z]);
+                        }
+                    }
+                    out.push((indices.len(), vertices.len(), indices, vertices));
+                }
+                out
+            };
+            let boxes = |tag: &TagFile| -> Vec<[f32; 6]> {
+                let mut out = Vec::new();
+                let Some(block) = tag.root()
+                    .field_path("render geometry/compression info")
+                    .and_then(|f| f.as_block())
+                else { return out };
+                for i in 0..block.len() {
+                    let Some(e) = block.element(i) else { continue };
+                    let a = e.read_point3d("position bounds 0");
+                    let b = e.read_point3d("position bounds 1");
+                    out.push([a.x, a.y, a.z, b.x, b.y, b.z]);
+                }
+                out
+            };
+            let (ob, kb) = (boxes(&draft.tag), boxes(&kit));
+            let same_boxes = ob.iter().zip(&kb).filter(|(a, b)| a == b).count();
+            eprintln!(
+                "   compression info: {} vs kit {}, {same_boxes} identical",
+                ob.len(), kb.len()
+            );
+            for i in 0..ob.len().min(3) {
+                if ob.get(i) != kb.get(i) {
+                    eprintln!("     box {i} ours {:?}", ob.get(i));
+                    eprintln!("     box {i} kit  {:?}", kb.get(i));
+                }
+            }
+            let ours = read(&draft.tag);
+            let theirs = read(&kit);
+            eprintln!("{} : {} mesh(es) vs kit {}", entry.name, ours.len(), theirs.len());
+            let kinds: Vec<String> = draft.tag.root()
+                .field_path("render geometry/meshes")
+                .and_then(|f| f.as_block())
+                .map(|b| (0..b.len())
+                    .map(|i| b.element(i)
+                        .and_then(|m| m.read_enum_name("vertex type"))
+                        .unwrap_or_default())
+                    .collect())
+                .unwrap_or_default();
+            let mut worst_by_kind: std::collections::BTreeMap<String, (usize, usize, f32)> =
+                Default::default();
+            let (mut same_counts, mut same_indices, mut same_vertices, mut compared) =
+                (0usize, 0usize, 0usize, 0usize);
+            let mut examples: Vec<String> = Vec::new();
+            for (index, (mine, kits)) in ours.iter().zip(&theirs).enumerate() {
+                compared += 1;
+                if mine.0 == kits.0 && mine.1 == kits.1 {
+                    same_counts += 1;
+                } else if examples.len() < 4 {
+                    examples.push(format!(
+                        "   mesh {index}: {} indices/{} verts vs kit {}/{}",
+                        mine.0, mine.1, kits.0, kits.1
+                    ));
+                    continue;
+                }
+                if mine.2 == kits.2 { same_indices += 1 }
+                else if examples.len() < 8 {
+                    let first = mine.2.iter().zip(&kits.2).position(|(a, b)| a != b);
+                    examples.push(format!(
+                        "   mesh {index}: indices differ from {first:?} -- ours {:?} kit {:?}",
+                        &mine.2[first.unwrap_or(0)..(first.unwrap_or(0) + 6).min(mine.2.len())],
+                        &kits.2[first.unwrap_or(0)..(first.unwrap_or(0) + 6).min(kits.2.len())],
+                    ));
+                }
+                {
+                    let kind = kinds.get(index).cloned().unwrap_or_default();
+                    let slot = worst_by_kind.entry(kind).or_insert((0, 0, 0.0));
+                    slot.1 += 1;
+                    if mine.3 == kits.3 { slot.0 += 1 }
+                    for (a, b) in mine.3.iter().zip(&kits.3) {
+                        let d = ((a[0]-b[0]).powi(2) + (a[1]-b[1]).powi(2) + (a[2]-b[2]).powi(2)).sqrt();
+                        if d > slot.2 { slot.2 = d }
+                    }
+                }
+                if mine.3 == kits.3 { same_vertices += 1 }
+                else if examples.len() < 12 {
+                    let mut worst = 0.0f32;
+                    let mut total = 0.0f32;
+                    let mut first = None;
+                    for (k, (a, b)) in mine.3.iter().zip(&kits.3).enumerate() {
+                        let d = ((a[0]-b[0]).powi(2) + (a[1]-b[1]).powi(2) + (a[2]-b[2]).powi(2)).sqrt();
+                        if d > 1.0e-4 && first.is_none() { first = Some(k) }
+                        worst = worst.max(d);
+                        total += d;
+                    }
+                    let vt = kits.3.len().max(1);
+                    examples.push(format!(
+                        "   mesh {index}: {} vert(s), mean off {:.4}, worst {:.4}, first at {first:?}
+      ours {:?}
+      kit  {:?}",
+                        mine.3.len(), total / vt as f32, worst,
+                        &mine.3[first.unwrap_or(0)..(first.unwrap_or(0)+2).min(mine.3.len())],
+                        &kits.3[first.unwrap_or(0)..(first.unwrap_or(0)+2).min(kits.3.len())],
+                    ));
+                }
+            }
+            eprintln!(
+                "   {compared} mesh(es): {same_counts} same counts, {same_indices} same indices, {same_vertices} same vertices"
+            );
+            if std::env::var("BSP_COLOR").is_ok() {
+                let mut ours_seen: std::collections::BTreeMap<String, usize> = Default::default();
+                let mut kit_seen: std::collections::BTreeMap<String, usize> = Default::default();
+                for (mine, kits) in ours.iter().zip(&theirs) {
+                    for c in &mine.3 { *ours_seen.entry(format!("{:.2},{:.2},{:.2}", c[0], c[1], c[2])).or_default() += 1 }
+                    for c in &kits.3 { *kit_seen.entry(format!("{:.2},{:.2},{:.2}", c[0], c[1], c[2])).or_default() += 1 }
+                }
+                eprintln!("   ours colours: {:?}", ours_seen.iter().rev().take(4).collect::<Vec<_>>());
+                eprintln!("   kit  colours: {:?}", kit_seen.iter().rev().take(4).collect::<Vec<_>>());
+                // Is the kit white per mesh, and what marks those meshes?
+                let meshes = kit.root().field_path("render geometry/meshes").and_then(|f| f.as_block());
+                let mut tally: std::collections::BTreeMap<String, usize> = Default::default();
+                for (i, kits) in theirs.iter().enumerate() {
+                    if kits.3.is_empty() { continue }
+                    let white = kits.3.iter().filter(|c| c[0] > 0.5).count();
+                    let shade = if white == kits.3.len() { "all white" }
+                        else if white == 0 { "all black" } else { "mixed" };
+                    let mesh = meshes.as_ref().and_then(|b| b.element(i));
+                    let kind = mesh.as_ref().and_then(|m| m.read_enum_name("vertex type")).unwrap_or_default();
+                    let flags = mesh.as_ref()
+                        .and_then(|m| m.field("mesh flags"))
+                        .and_then(|f| f.value())
+                        .map(|v| format!("{v:?}"))
+                        .unwrap_or_default();
+                    let has_color = flags.contains("vertex color");
+                    *tally.entry(format!("{shade} | {kind} | mesh has vertex color={has_color}")).or_default() += 1;
+                }
+                for (k, n) in tally.iter() { eprintln!("     {n:>5}  {k}") }
+            }
+            for (kind, (same, total, worst)) in worst_by_kind.iter() {
+                eprintln!("   {kind:<20} {same}/{total} exact, worst vertex off by {worst:.4}");
+            }
+            for line in &examples.iter().take(2).collect::<Vec<_>>() { eprintln!("{line}") }
+        }
+    }
+
+    /// The tell-tale fields of a BSP already sitting in a kit.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_inspect_kit_bsp() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        for relative in std::env::var("INSPECT").unwrap_or_default().split(';') {
+            if relative.is_empty() { continue }
+            let path = reach.join(relative);
+            let Ok(tag) = TagFile::read(&path) else { eprintln!("{relative}: unreadable"); continue };
+            let root = tag.root();
+            let flags = root.field_path("render geometry/runtime flags").and_then(|f| f.value());
+            let meshes = root.field_path("render geometry/meshes").and_then(|f| f.as_block());
+            let count = meshes.as_ref().map(|b| b.len()).unwrap_or(0);
+            let mut types: std::collections::BTreeMap<String, usize> = Default::default();
+            let mut ibi: std::collections::BTreeMap<i128, usize> = Default::default();
+            let mut vbi: std::collections::BTreeMap<i128, usize> = Default::default();
+            if let Some(block) = meshes.as_ref() {
+                for i in 0..block.len() {
+                    let Some(m) = block.element(i) else { continue };
+                    *types.entry(m.read_enum_name("vertex type").unwrap_or_default()).or_default() += 1;
+                    if let Some(v) = m.read_int_any("index buffer index") { *ibi.entry(v).or_default() += 1 }
+                    if let Some(a) = m.field("vertex buffer indices").and_then(|f| f.as_array()) {
+                        for k in 0..a.len() {
+                            if let Some(v) = a.element(k).and_then(|e| e.read_int_any("vertex buffer index")) {
+                                *vbi.entry(v).or_default() += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            eprintln!("{relative}");
+            eprintln!("   header version {} | {count} mesh(es)", tag.header.version);
+            eprintln!("   runtime flags {flags:?}");
+            eprintln!("   vertex types {types:?}");
+            eprintln!("   index buffer index {ibi:?}");
+            eprintln!("   vertex buffer index {vbi:?}");
+        }
+    }
+
+    /// What a BSP's resource interface holds, on each side.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_bsp_resource_interface() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let name = std::env::var("DIFF_NAME").unwrap_or_default();
+        let Some(entry) = cache
+            .iter_tags()
+            .find(|e| e.group_tag == u32::from_be_bytes(*b"sbsp") && e.name == name)
+        else { eprintln!("no such bsp"); return };
+        let Ok(source) = cache.read_tag(entry) else { return };
+        let kit_path = reach.join(format!("{}.scenario_structure_bsp", name.replace('\\', "/")));
+        let Ok(kit) = TagFile::read(&kit_path) else { eprintln!("no kit copy"); return };
+        let Ok(draft) = analyze_conversion_with_templates(
+            &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+        ) else { eprintln!("refused"); return };
+        if let Some(resource) = source.root()
+            .field_path("resource interface/tag_resources")
+            .and_then(|f| f.as_resource())
+            && let Some(state) = resource.xsync_state()
+        {
+            let control = state.apply_control_fixups();
+            let at = crate::monolithic::FixupAddress(state.header.root_address).offset() as usize;
+            eprintln!("control {} byte(s), root at {at}", control.len());
+            for k in 0..6 {
+                let o = at + k * 12;
+                if o + 12 <= control.len() {
+                    let raw = &control[o..o+12];
+                    let count = u32::from_be_bytes(raw[0..4].try_into().unwrap());
+                    let addr = u32::from_be_bytes(raw[4..8].try_into().unwrap());
+                    eprintln!(
+                        "   +{:>3}: count {count} addr {addr:#010x} tier {:?} off {} | {}",
+                        k * 12,
+                        crate::monolithic::FixupAddress(addr).tier(),
+                        crate::monolithic::FixupAddress(addr).offset(),
+                        raw.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "),
+                    );
+                }
+            }
+        }
+        for issue in &draft.report.issues {
+            if issue.path.contains("resource interface") || issue.message.contains("structure resource") {
+                eprintln!("ISSUE {:?} {} -- {}", issue.kind, issue.path, issue.message.chars().take(200).collect::<String>());
+            }
+        }
+        let scratch = std::env::temp_dir().join("blam_bsp_round_trip");
+        let _ = std::fs::create_dir_all(&scratch);
+        let written = scratch.join("round_trip.scenario_structure_bsp");
+        let reread = match draft.tag.write_atomic(&written) {
+            Ok(()) => match TagFile::read(&written) {
+                Ok(t) => {
+                    eprintln!(
+                        "ROUND TRIP: {} byte(s) on disk",
+                        std::fs::metadata(&written).map(|m| m.len()).unwrap_or(0)
+                    );
+                    Some(t)
+                }
+                Err(e) => { eprintln!("ROUND TRIP: re-read failed: {e}"); None }
+            },
+            Err(e) => { eprintln!("ROUND TRIP: write failed: {e}"); None }
+        };
+        for (label, tag) in [("SOURCE", &source), ("CONVERTED", &draft.tag), ("KIT", &kit)]
+            .into_iter()
+            .chain(reread.as_ref().map(|t| ("REREAD", t)))
+        {
+            let root = tag.root();
+            let interface = root.field_path("resource interface");
+            let raw = root
+                .field_path("resource interface/raw_resources")
+                .and_then(|f| f.as_block());
+            eprintln!(
+                "{label}: use resource items {:?}, raw_resources {:?}",
+                root.field_path("resource interface/use resource items").and_then(|f| f.value()),
+                raw.as_ref().map(|b| b.len()),
+            );
+            if let Some(field) = interface.as_ref().and_then(|f| f.as_struct()) {
+                for n in field.field_names() {
+                    let f = field.field(&n);
+                    let extra = f.as_ref().and_then(|f| f.as_block()).map(|b| b.len());
+                    let res = f.as_ref().and_then(|f| f.as_resource()).map(|r| {
+                        let state = r.xsync_state();
+                        format!(
+                            "kind={:?} control={} primary={} root={:?}",
+                            r.kind(),
+                            state.as_ref().map(|s| s.control_data.len()).unwrap_or(0),
+                            r.exploded_payload().map(<[u8]>::len).unwrap_or(0),
+                            state.as_ref().map(|s| (
+                                crate::monolithic::FixupAddress(s.header.root_address).tier(),
+                                crate::monolithic::FixupAddress(s.header.root_address).offset(),
+                            )),
+                        )
+                    });
+                    eprintln!("    {n}: block {extra:?} resource {res:?}");
+                }
+            }
+            if let Some(defs) = root
+                .field_path("resource interface/raw_resources[0]/raw_items/instanced geometries definitions")
+                .and_then(|f| f.as_block())
+            {
+                eprintln!("    instanced geometry definitions: {}", defs.len());
+            }
+            let instances = root
+                .field_path("instanced geometry instances")
+                .and_then(|f| f.as_block())
+                .map(|b| b.len());
+            eprintln!("    instanced geometry instances: {instances:?}");
+            for path in [
+                "render geometry/per_mesh_prt_data",
+                "render geometry/per mesh temporary",
+                "render geometry/water bounding box block",
+            ] {
+                eprintln!(
+                    "    {path}: {:?}",
+                    root.field_path(path).and_then(|f| f.as_block()).map(|b| b.len())
+                );
+            }
+        }
     }
 
     fn report_geometry(label: &str, tag: &TagFile) {
