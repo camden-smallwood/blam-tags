@@ -628,9 +628,17 @@ fn surface_def(elem: TagStruct<'_>) -> Result<SurfaceDef, BitmapError> {
 /// Convert an Xbox 360 image into the linear, PC-ordered pixel buffer a
 /// `processed pixel data` blob holds.
 ///
-/// Every layer, every level, laid out layer-major with each layer's full mip
-/// chain — which is the order [`BitmapImage::pixel_bytes`] reads back and the
-/// order a DDS writer expects.
+/// Every level, every layer, laid out level-major: all six faces of the base,
+/// then all six of the next level, and so on. That is the order a shipped MCC
+/// cube map holds -- checked against the kit's own `processed pixel data`,
+/// where the first six face-sized runs are the six base faces rather than one
+/// face's whole chain. For a single-layer or single-level image the two orders
+/// are the same sequence.
+///
+/// The faces themselves are not in D3D order in the resource: Xenos exchanges
+/// the second and third, so the kit's face 1 is the resource's face 2 and the
+/// other way round. Measured by finding each of the kit's faces in the
+/// resource, not assumed.
 ///
 /// The two buffers are the resource's own. A hydrated monolithic resource
 /// concatenates them secondary-first; [`x360_buffers`] splits them apart again.
@@ -652,8 +660,9 @@ fn convert_x360_image_full(
     // mip chain as though it were the base.
     def.high_res_in_secondary = !secondary.is_empty();
     let mut out = Vec::new();
-    for layer in 0..def.layer_count() {
-        for level in 0..def.level_count() {
+    for level in 0..def.level_count() {
+        for layer in 0..def.layer_count() {
+            let layer = swap_xenos_cube_faces(def.texture_type, layer);
             let data = level_data(&def, primary, secondary, level, layer).ok_or(
                 BitmapError::PixelSliceOutOfBounds {
                     offset: 0,
@@ -668,6 +677,18 @@ fn convert_x360_image_full(
         return Err(BitmapError::NotABitmapTag);
     }
     Ok((out, Some(def.level_count())))
+}
+
+/// Map a D3D cube face index to the one the Xenos resource stores it at.
+///
+/// Only the second and third are exchanged; the rest sit where they are, and a
+/// non-cube surface is untouched.
+fn swap_xenos_cube_faces(texture_type: TextureType, layer: u32) -> u32 {
+    match (texture_type, layer) {
+        (TextureType::CubeMap, 1) => 2,
+        (TextureType::CubeMap, 2) => 1,
+        _ => layer,
+    }
 }
 
 /// Split a hydrated resource's payload back into its primary and secondary
