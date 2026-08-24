@@ -427,7 +427,7 @@ impl TagLayout {
         let blay_offset = reader.stream_position()?;
 
         let root_data_size = read_u32(reader, endian)?;
-        let guid = read_u8_array(reader)?;
+        let guid = read_guid(reader, endian)?;
         let version = read_u32(reader, endian)?;
         let block_layout_version = version;
 
@@ -665,7 +665,7 @@ impl TagLayout {
                 // Convert v1 agro records (28 bytes: guid[16] + name_offset + max_count + first_field_index)
                 // into stv2 (24 bytes: guid[16] + name_offset + first_field_index)
                 // and blv2 (12 bytes: name_offset + max_count + struct_index) format.
-                let guid = read_u8_array(reader)?;
+                let guid = read_guid(reader, endian)?;
                 let name_offset = read_u32(reader, endian)?;
                 let max_count = read_u32(reader, endian)?;
                 let first_field_index = read_u32(reader, endian)?;
@@ -742,7 +742,7 @@ impl TagLayout {
                     interop_layouts.push(TagInteropLayout {
                         name_offset: read_u32(reader, endian)?,
                         struct_index: read_u32(reader, endian)?,
-                        guid: read_u8_array(reader)?,
+                        guid: read_guid(reader, endian)?,
                     });
                 }
             }
@@ -771,7 +771,7 @@ impl TagLayout {
             struct_layouts = Vec::with_capacity(header.struct_layout_count as usize);
 
             for i in 0..header.struct_layout_count {
-                let guid = read_u8_array(reader)?;
+                let guid = read_guid(reader, endian)?;
                 let name_offset = read_u32(reader, endian)?;
                 let first_field_index = read_u32(reader, endian)?;
                 let version = if block_layout_version == 4 { read_u32(reader, endian)? } else { 0 };

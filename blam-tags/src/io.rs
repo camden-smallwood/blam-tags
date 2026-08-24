@@ -122,6 +122,27 @@ pub fn read_u8_array<R: Read, const N: usize>(
     Ok(buffer)
 }
 
+/// Read a 16-byte struct GUID, in the byte order the reading side means it.
+///
+/// A GUID is four 32-bit words, not sixteen loose bytes, so a big-endian tag
+/// stores each of them the other way round. Read as raw bytes it never equals
+/// the same struct's GUID in a little-endian tag, and a GUID that never matches
+/// is worse than no GUID at all: it is the identity key the converter uses to
+/// decide two structs are the same type, and every big-endian struct was
+/// failing that test against its own PC counterpart.
+pub fn read_guid<R: Read>(
+    reader: &mut std::io::BufReader<R>,
+    endian: crate::Endian,
+) -> io::Result<[u8; 16]> {
+    let mut guid: [u8; 16] = read_u8_array(reader)?;
+    if endian == crate::Endian::Be {
+        for word in guid.chunks_exact_mut(4) {
+            word.reverse();
+        }
+    }
+    Ok(guid)
+}
+
 /// 12-byte on-disk header that prefixes every tag chunk.
 ///
 /// The layout is three little-endian `u32`s: signature, version, size.
