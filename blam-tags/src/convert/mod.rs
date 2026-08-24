@@ -16386,8 +16386,33 @@ mod x360_cache_conversion {
                     }
                 }
             }
+            let defs = root
+                .field_path("resource interface/raw_resources[0]/raw_items/instanced geometries definitions")
+                .and_then(|f| f.as_block())
+                .map(|b| b.len())
+                .unwrap_or(0);
+            let use_items = root
+                .field_path("resource interface/use resource items")
+                .and_then(|f| f.value())
+                .map(|v| format!("{v:?}"))
+                .unwrap_or_default();
+            let mut flagged = 0usize;
+            let mut with_indices = 0usize;
+            if let Some(pmt) = root.field_path("render geometry/per mesh temporary").and_then(|f| f.as_block()) {
+                for i in 0..pmt.len() {
+                    let Some(e) = pmt.element(i) else { continue };
+                    let n = e.field("raw indices").and_then(|f| f.as_block()).map(|b| b.len()).unwrap_or(0);
+                    if n == 0 { continue }
+                    with_indices += 1;
+                    if e.field("flags").and_then(|f| f.value()).map(|v| format!("{v:?}").contains("indices are")).unwrap_or(false) {
+                        flagged += 1;
+                    }
+                }
+            }
             eprintln!("{relative}");
             eprintln!("   header version {} | {count} mesh(es)", tag.header.version);
+            eprintln!("   instanced geometry definitions: {defs}, use resource items {use_items}");
+            eprintln!("   {flagged}/{with_indices} mesh(es) say how their indices read");
             eprintln!("   runtime flags {flags:?}");
             eprintln!("   vertex types {types:?}");
             eprintln!("   index buffer index {ibi:?}");
@@ -16515,6 +16540,318 @@ mod x360_cache_conversion {
                     root.field_path(path).and_then(|f| f.as_block()).map(|b| b.len())
                 );
             }
+        }
+    }
+
+    /// Convert every BSP under a folder and report what each one lands as.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_folder_bsps() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let prefix = std::env::var("FOLDER").unwrap_or_default();
+        for entry in cache
+            .iter_tags()
+            .filter(|e| e.group_tag == u32::from_be_bytes(*b"sbsp"))
+            .filter(|e| e.name.starts_with(&prefix))
+        {
+            let Ok(source) = cache.read_tag(entry) else {
+                eprintln!("{}: unreadable from the cache", entry.name);
+                continue;
+            };
+            match analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) {
+                Err(why) => {
+                    eprintln!("{}: REFUSED {}", entry.name, why.chars().take(140).collect::<String>());
+                    let root = source.root();
+                    let hydrated = crate::render_geometry::author_geometry_populated(&source);
+                    let resource = root
+                        .field_path("render geometry/api resource")
+                        .and_then(|f| f.as_resource());
+                    eprintln!(
+                        "      author geometry populated: {hydrated:?}; api resource {:?} xsync {:?} payload {}",
+                        resource.as_ref().map(|r| r.kind()),
+                        resource.as_ref().map(|r| r.xsync_state().is_some()),
+                        resource.as_ref().and_then(|r| r.exploded_payload()).map(<[u8]>::len).unwrap_or(0),
+                    );
+                    let meshes = root.field_path("render geometry/meshes").and_then(|f| f.as_block()).map(|b| b.len()).unwrap_or(0);
+                    let verts: usize = root
+                        .field_path("render geometry/per mesh temporary")
+                        .and_then(|f| f.as_block())
+                        .map(|b| (0..b.len()).filter_map(|i| b.element(i))
+                            .filter_map(|e| e.field("raw vertices").and_then(|f| f.as_block()))
+                            .map(|v| v.len()).sum())
+                        .unwrap_or(0);
+                    eprintln!("      {meshes} mesh(es), {verts} raw vertex(es) after hydration");
+                }
+                Ok(draft) => {
+                    let root = draft.tag.root();
+                    let defs = root
+                        .field_path("resource interface/raw_resources[0]/raw_items/instanced geometries definitions")
+                        .and_then(|f| f.as_block())
+                        .map(|b| b.len())
+                        .unwrap_or(0);
+                    let use_items = root
+                        .field_path("resource interface/use resource items")
+                        .and_then(|f| f.value()).and_then(|v| match v { TagFieldData::LongInteger(n) => Some(n as i64), _ => None })
+                        .unwrap_or(-1);
+                    let instances = root
+                        .field_path("instanced geometry instances")
+                        .and_then(|f| f.as_block())
+                        .map(|b| b.len())
+                        .unwrap_or(0);
+                    let meshes = root
+                        .field_path("render geometry/meshes")
+                        .and_then(|f| f.as_block())
+                        .map(|b| b.len())
+                        .unwrap_or(0);
+                    // Every mesh should say how its indices read.
+                    let mut unflagged = 0usize;
+                    if let Some(pmt) = root
+                        .field_path("render geometry/per mesh temporary")
+                        .and_then(|f| f.as_block())
+                    {
+                        for i in 0..pmt.len() {
+                            let flagged = pmt
+                                .element(i)
+                                .and_then(|e| e.field("flags"))
+                                .and_then(|f| f.value())
+                                .map(|v| format!("{v:?}").contains("indices are"))
+                                .unwrap_or(false);
+                            let empty = pmt
+                                .element(i)
+                                .and_then(|e| e.field("raw indices"))
+                                .and_then(|f| f.as_block())
+                                .map(|b| b.len() == 0)
+                                .unwrap_or(true);
+                            if !flagged && !empty {
+                                unflagged += 1;
+                            }
+                        }
+                    }
+                    let unsupported = draft
+                        .report
+                        .issues
+                        .iter()
+                        .filter(|i| matches!(i.kind, ConversionIssueKind::Unsupported))
+                        .count();
+                    eprintln!(
+                        "{}: ok -- {meshes} mesh(es), {defs} definition(s), {instances} instance(s), \
+                         use resource items {use_items}, {unflagged} mesh(es) with unflagged indices, \
+                         {unsupported} unsupported field(s)",
+                        entry.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// The fields the engine checks before it agrees a BSP is loadable.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_bsp_load_metadata() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let name = std::env::var("DIFF_NAME").unwrap_or_default();
+        let report = |label: &str, tag: &TagFile| {
+            let root = tag.root();
+            let mut manifest = Vec::new();
+            if let Some(block) = root.field_path("manifest build identifiers").and_then(|f| f.as_block()) {
+                for i in 0..block.len() {
+                    let Some(e) = block.element(i) else { continue };
+                    manifest.push(format!(
+                        "build {:?} importer {:?}",
+                        e.read_int_any("build_index"),
+                        e.read_int_any("structure importer version"),
+                    ));
+                }
+            }
+            let count = |path: &str| root.field_path(path).and_then(|f| f.as_block()).map(|b| b.len());
+            eprintln!(
+                "{label}: import info checksum {:?}, manifest {manifest:?}",
+                root.read_int_any("import info checksum"),
+            );
+            for path in [
+                "pathfinding data",
+                "collision materials",
+                "clusters",
+                "cluster portals",
+                "structure_physics/mopp code block",
+                "instanced geometry instances",
+                "leaves",
+                "world bounds x",
+            ] {
+                eprintln!("    {path}: {:?}", count(path));
+            }
+            if let Some(block) = root.field_path("render geometry/per_mesh_prt_data").and_then(|f| f.as_block()) {
+                let mut empty = 0usize;
+                let mut bytes = 0usize;
+                let mut instances = 0usize;
+                for i in 0..block.len() {
+                    let Some(e) = block.element(i) else { continue };
+                    let n = e.field("mesh pca data").and_then(|f| f.as_data()).map(<[u8]>::len).unwrap_or(0);
+                    if n == 0 { empty += 1 } else { bytes += n }
+                    instances += e.field("per instance prt data").and_then(|f| f.as_block()).map(|b| b.len()).unwrap_or(0);
+                }
+                eprintln!(
+                    "    per_mesh_prt_data: {} entry(s), {empty} with an empty pca blob, {bytes} byte(s) total, {instances} per-instance entry(s)",
+                    block.len()
+                );
+            }
+            for path in ["structure_physics/mopp code block", "structure_physics/breakable surfaces mopp code block"] {
+                if let Some(block) = root.field_path(path).and_then(|f| f.as_block())
+                    && let Some(e) = block.element(0)
+                {
+                    let data = e.field("mopp data").and_then(|f| f.as_data()).map(<[u8]>::len);
+                    eprintln!("    {path}[0] mopp data: {data:?} byte(s)");
+                }
+            }
+        };
+        let Some(entry) = cache
+            .iter_tags()
+            .find(|e| e.group_tag == u32::from_be_bytes(*b"sbsp") && e.name == name)
+        else { eprintln!("no such bsp"); return };
+        let Ok(source) = cache.read_tag(entry) else { return };
+        report("SOURCE", &source);
+        if let Ok(draft) = analyze_conversion_with_templates(
+            &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+        ) {
+            report("CONVERTED", &draft.tag);
+        }
+        let path = reach.join(format!("{}.scenario_structure_bsp", name.replace('\\', "/")));
+        if let Ok(kit) = TagFile::read(&path) {
+            report("KIT", &kit);
+        }
+    }
+
+    /// How many BSPs keep something in the cache-file resource we drop.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_bsp_cache_file_resources() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let (mut with_data, mut without, mut unreadable) = (0usize, 0usize, 0usize);
+        let mut examples: Vec<String> = Vec::new();
+        for entry in cache
+            .iter_tags()
+            .filter(|e| e.group_tag == u32::from_be_bytes(*b"sbsp"))
+            .step_by(7)
+            .take(120)
+        {
+            let Ok(tag) = cache.read_tag(entry) else { unreadable += 1; continue };
+            let root = tag.root();
+            let describe = |path: &str| -> Option<(usize, usize, u32)> {
+                let resource = root.field_path(path).and_then(|f| f.as_resource())?;
+                let state = resource.xsync_state()?;
+                Some((
+                    state.control_data.len(),
+                    resource.exploded_payload().map(<[u8]>::len).unwrap_or(0),
+                    state.header.root_address,
+                ))
+            };
+            match describe("resource interface/cache_file_resources") {
+                Some((control, primary, root_address)) if control > 0 || primary > 0 => {
+                    with_data += 1;
+                    if examples.len() < 6 {
+                        examples.push(format!(
+                            "   {}: control {control}, primary {primary}, root {root_address:#010x}",
+                            entry.name
+                        ));
+                    }
+                }
+                _ => without += 1,
+            }
+        }
+        eprintln!(
+            "cache_file_resources: {with_data} BSP(s) carry data, {without} do not, {unreadable} unreadable"
+        );
+        for line in &examples { eprintln!("{line}") }
+    }
+
+    /// Every tag reference in a kit tag, and whether the file is there.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_kit_references() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        for relative in std::env::var("INSPECT").unwrap_or_default().split(';') {
+            if relative.is_empty() { continue }
+            let path = reach.join(relative);
+            let Ok(tag) = TagFile::read(&path) else { eprintln!("{relative}: unreadable"); continue };
+            eprintln!("{relative}");
+            let mut missing = 0usize;
+            let mut present = 0usize;
+            let mut refs: Vec<(String, String, bool)> = Vec::new();
+            collect_refs(&tag.root(), "", &mut refs, &reach, 0);
+            for (path_in_tag, target, exists) in &refs {
+                if *exists { present += 1 } else {
+                    missing += 1;
+                    if missing <= 8 { eprintln!("   MISSING {target}   (from {path_in_tag})"); }
+                }
+            }
+            eprintln!("   {present} reference(s) resolve, {missing} do not");
+        }
+    }
+
+    fn collect_refs(
+        value: &TagStruct<'_>,
+        at: &str,
+        out: &mut Vec<(String, String, bool)>,
+        reach: &Path,
+        depth: usize,
+    ) {
+        if depth > 8 { return }
+        for name in value.field_names() {
+            let here = if at.is_empty() { name.to_string() } else { format!("{at}/{name}") };
+            let Some(field) = value.field(&name) else { continue };
+            if let Some((group, target)) = value.read_tag_ref_with_group(&name) {
+                if target.is_empty() { continue }
+                let extension = crate::paths::group_tag_to_extension(group).unwrap_or("");
+                let file = reach.join(format!("{}.{extension}", target.replace('\\', "/")));
+                out.push((here, format!("{target}.{extension}"), file.is_file()));
+                continue;
+            }
+            if let Some(block) = field.as_block() {
+                for i in 0..block.len() {
+                    if let Some(e) = block.element(i) {
+                        collect_refs(&e, &format!("{here}[{i}]"), out, reach, depth + 1);
+                    }
+                }
+                continue;
+            }
+            if let Some(nested) = field.as_struct() {
+                collect_refs(&nested, &here, out, reach, depth + 1);
+            }
+        }
+    }
+
+    /// Which levels the build kept lightmap data for.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_levels_with_lightmaps() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let group = u32::from_be_bytes(*b"Lbsp");
+        let mut ready: Vec<String> = Vec::new();
+        for entry in cache.iter_tags().filter(|e| e.group_tag == group) {
+            if cache.resolve_tag_block(entry).is_some() {
+                ready.push(entry.name.clone());
+            }
+        }
+        ready.sort();
+        eprintln!("{} lightmap BSP data tag(s) the build actually holds", ready.len());
+        // Group by level folder.
+        let mut folders: std::collections::BTreeMap<String, usize> = Default::default();
+        for name in &ready {
+            let folder = name.rsplit_once('\\').map(|(f, _)| f.to_owned()).unwrap_or_default();
+            *folders.entry(folder).or_default() += 1;
+        }
+        for (folder, count) in folders.iter() {
+            eprintln!("  {count:>3}  {folder}");
         }
     }
 
