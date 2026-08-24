@@ -21,6 +21,7 @@ use crate::render_geometry::{
     decode_vertex_buffer, AuthorVertex, MeshVertexType, RenderGeometryResource,
 };
 use crate::TagFile;
+use crate::TagOptions;
 
 /// Failure modes when populating author-format blocks from a GPU
 /// resource. The hydration step never panics — every recoverable
@@ -181,6 +182,9 @@ struct MeshPlanItem {
     vertices: Vec<AuthorVertex>,
     indices: Vec<u32>,
     is_index32: bool,
+    /// The mesh's `index buffer type`, carried so the author-format block can
+    /// say how to read the indices it is about to be given.
+    index_kind: Option<String>,
 }
 
 fn build_plan(
@@ -276,7 +280,12 @@ fn decode_mesh(
     // Mesh has no primary vertex buffer — empty mesh / instance
     // imposter / etc. Soft skip without checking vertex type.
     if vbi0 < 0 {
-        return Ok(MeshPlanItem { vertices: Vec::new(), indices: Vec::new(), is_index32: false });
+        return Ok(MeshPlanItem {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            is_index32: false,
+            index_kind: mesh.read_enum_name("index buffer type"),
+        });
     }
 
     // Vertex type — a schema enum resolved to a decoder through the option
@@ -357,7 +366,12 @@ fn decode_mesh(
         (raw, ib.is_index32)
     };
 
-    Ok(MeshPlanItem { vertices, indices, is_index32 })
+    Ok(MeshPlanItem {
+        vertices,
+        indices,
+        is_index32,
+        index_kind: mesh.read_enum_name("index buffer type"),
+    })
 }
 
 fn read_vbi_slot(mesh: &TagStruct<'_>, slot: usize) -> i64 {
@@ -405,6 +419,7 @@ fn apply_plan(tag: &mut TagFile, plan: &GeometryPlan) -> Result<usize, HydrateEr
         let mut pmt_elem = pmt.element_mut(i).unwrap();
         write_raw_vertices(&mut pmt_elem, &item.vertices);
         write_raw_indices(&mut pmt_elem, &item.indices, item.is_index32);
+        write_index_kind(&mut pmt_elem, item.index_kind.as_deref());
         if !item.vertices.is_empty() {
             hydrated += 1;
         }
@@ -444,6 +459,44 @@ fn write_raw_indices(pmt_elem: &mut TagStructMut<'_>, indices: &[u32], is_index3
         };
         let _ = f.set(value);
     }
+}
+
+/// Say how the indices just written are laid out.
+///
+/// The author-format block carries its own flag for this, separate from the
+/// mesh's `index buffer type`, and a reader trusts the flag. A kit's own tags
+/// set it every time -- lists on a structure BSP, strips on a render model --
+/// and left at zero the indices read as strips whatever they are. A list read
+/// as a strip is not a subtle fault: every triangle after the first joins the
+/// wrong three vertices, and the mesh comes out as shredded as it sounds.
+fn write_index_kind(pmt_elem: &mut TagStructMut<'_>, index_kind: Option<&str>) {
+    let wanted = match index_kind {
+        Some("triangle list") => "indices are triangle lists",
+        Some("triangle strip") => "indices are triangle strips",
+        Some("quad list") => "indices are quad lists",
+        // `DEFAULT`, the line and fan types, or a mesh that declares nothing:
+        // there is no flag that says any of those, and inventing one would be
+        // worse than leaving the field as the tag had it.
+        _ => return,
+    };
+    let Some(mut field) = pmt_elem.field_mut("flags") else { return };
+    let Some(TagOptions::Flags(bits)) = field.as_ref().options() else { return };
+    let Some(bit) = bits.iter().find(|bit| bit.name == wanted).map(|bit| bit.bit) else {
+        return;
+    };
+    let replacement = match field.as_ref().value() {
+        Some(TagFieldData::LongFlags { value, names }) => {
+            TagFieldData::LongFlags { value: value | (1i32 << bit), names }
+        }
+        Some(TagFieldData::WordFlags { value, names }) => {
+            TagFieldData::WordFlags { value: value | (1u16 << bit), names }
+        }
+        Some(TagFieldData::ByteFlags { value, names }) => {
+            TagFieldData::ByteFlags { value: value | (1u8 << bit), names }
+        }
+        _ => return,
+    };
+    let _ = field.set(replacement);
 }
 
 fn write_vertex(elem: &mut TagStructMut<'_>, v: &AuthorVertex) {
