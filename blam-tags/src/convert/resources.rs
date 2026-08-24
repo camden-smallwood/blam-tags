@@ -453,6 +453,77 @@ fn clear_all_resources(value: &mut TagStructMut<'_>) {
     }
 }
 
+/// Put every curve in a converted tag into the destination's byte order.
+///
+/// A `mapping_function` is a byte blob, so the field walk carries it across
+/// verbatim and every value inside it stays in the source's order: the clamp
+/// range, the control points, and the compact size the engine uses to find the
+/// end of it. That last one is why this is not a cosmetic problem. The engine
+/// reads a nonsense length and walks off the end of the tag, and what the mod
+/// tools report is an access violation inside `tag_load` with nothing to say
+/// about which field caused it.
+///
+/// Curves are everywhere -- animated shader parameters, particle properties,
+/// light fades, weapon rates -- so this walks the whole tag rather than a list
+/// of known fields. What makes that safe is that
+/// [`swap_function_definition`] identifies a curve by walking its structure and
+/// refuses anything that does not add up exactly.
+///
+/// Only for a byte-order upgrade. Between two little-endian profiles a curve is
+/// already in the right order and swapping it would be the bug.
+pub(super) fn swap_function_curves(
+    byte_order_upgrade: bool,
+    target: &mut TagFile,
+    context: &mut ConversionContext<'_>,
+) {
+    if !byte_order_upgrade {
+        return;
+    }
+    let mut swapped = 0usize;
+    swap_curves_in(&mut target.root_mut(), &mut swapped);
+    if swapped > 0 {
+        context.report.issues.push(ConversionIssue {
+            kind: ConversionIssueKind::Warning,
+            path: String::new(),
+            message: format!("{swapped} function curve(s) were byte-swapped for the target"),
+        });
+    }
+}
+
+fn swap_curves_in(value: &mut TagStructMut<'_>, swapped: &mut usize) {
+    for index in 0..value.as_ref().fields().count() {
+        let Some(mut field) = value.field_at_mut(index) else {
+            continue;
+        };
+        if let Some(bytes) = field.as_ref().as_data()
+            && let Some(fixed) = crate::tag_function::swap_function_definition(bytes)
+        {
+            let _ = field.set(TagFieldData::Data(fixed));
+            *swapped += 1;
+            continue;
+        }
+        if let Some(mut nested) = field.as_struct_mut() {
+            swap_curves_in(&mut nested, swapped);
+            continue;
+        }
+        if let Some(mut block) = field.as_block_mut() {
+            for element in 0..block.len() {
+                if let Some(mut element) = block.element_mut(element) {
+                    swap_curves_in(&mut element, swapped);
+                }
+            }
+            continue;
+        }
+        if let Some(mut array) = field.as_array_mut() {
+            for element in 0..array.len() {
+                if let Some(mut element) = array.element_mut(element) {
+                    swap_curves_in(&mut element, swapped);
+                }
+            }
+        }
+    }
+}
+
 /// Set an integer field at whatever width the schema declares it.
 ///
 /// The same field is a `char_integer` in one profile and a `short_integer` in

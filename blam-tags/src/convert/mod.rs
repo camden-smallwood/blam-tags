@@ -1985,6 +1985,22 @@ fn analyze_conversion_inner(
     // case that started this: it is a fallback, not a preference.
     let prefer_definitions = std::env::var_os("BLAM_BUILD_FROM_DEFINITIONS").is_some();
     let mut built_without_a_template_body = false;
+    // A byte-order upgrade will not fall back to the schema.
+    //
+    // Everywhere else the schema is a legitimate fallback: somebody converting
+    // into an empty kit has nothing to start from, and a partial tag beats no
+    // tag. Here the destination is the *same engine* as the source, so a class
+    // it ships none of is a class its own tools have never written — and,
+    // measured against Halo Reach's ManagedBlam, a schema-built tag of such a
+    // class is one the loader takes down the process over rather than reports.
+    //
+    // It costs almost nothing to refuse. Of the 103,182 tags in the July 2011
+    // Reach build, 14 are in a class HREK ships no example of.
+    if byte_order_upgrade && native_target.is_none() {
+        return Err(format!(
+            "{target_game} ships no {target_group_name} to start from, and one built from the              schema is a tag its own tools refuse to load. Nothing was written."
+        ));
+    }
     let (mut target, target_template) = match (from_definitions, native_target) {
         (Some(target), None) => (target, None),
         (Some(target), Some(_)) if prefer_definitions => (target, None),
@@ -2203,6 +2219,7 @@ fn analyze_conversion_inner(
     forgive_hydrated_geometry(&target, &mut context);
     convert_x360_bitmap_pixels(source, &mut target, &mut context);
     forgive_externally_stored_payload(byte_order_upgrade, &mut target, &mut context);
+    swap_function_curves(byte_order_upgrade, &mut target, &mut context);
     let fail_closed_losses = validate_critical_runtime_safety(source, &context, policy)?;
     if !fail_closed_losses.is_empty() {
         context.report.issues.push(ConversionIssue {
@@ -13563,5 +13580,72 @@ mod x360_cache_conversion {
             }
         }
         assert!(starved.is_empty(), "{starved:#?}");
+    }
+
+    /// Convert the tags a file names, into a folder, keeping their own paths.
+    ///
+    /// The other half of `tools/managedblam-probe`: that asks a kit whether it
+    /// will load a tag, and this produces the tags to ask about. Kept in the
+    /// tree because the pair is the only way to answer "does the kit accept
+    /// what we write", and reinventing the producer each time is how a
+    /// comparison ends up measuring two different builds.
+    ///
+    /// `PROBE_LIST` names a file of `<tag path>|<extension>` lines, `PROBE_OUT`
+    /// the folder to write under.
+    #[test]
+    #[ignore = "produces tags for the ManagedBlam probe"]
+    fn convert_the_tags_a_probe_list_names() {
+        let (Some(cache), Some(reach), Ok(list), Ok(out)) = (
+            reach_x360_cache(),
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            std::env::var("PROBE_LIST"),
+            std::env::var("PROBE_OUT"),
+        ) else {
+            eprintln!("skipping: needs the cache, HREK, PROBE_LIST and PROBE_OUT");
+            return;
+        };
+        let out = PathBuf::from(out);
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        for line in std::fs::read_to_string(list).unwrap().lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((relative, extension)) = line.rsplit_once('|') else { continue };
+            let Some(group) = groups.by_name.get(&extension.to_ascii_lowercase()) else {
+                eprintln!("NOGROUP\t{line}");
+                continue;
+            };
+            let name = relative.replace('/', "\\");
+            let Ok(source) = cache.read_tag_by_name(*group, &name) else {
+                eprintln!("NOTINCACHE\t{line}");
+                continue;
+            };
+            match analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "haloreach_mcc",
+                &definitions,
+                Some(&templates),
+            ) {
+                Ok(draft) => {
+                    let path = out.join(format!(
+                        "{}.{}",
+                        name.replace('\\', "/"),
+                        draft.target_extension
+                    ));
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    match draft.tag.write_atomic(&path) {
+                        Ok(()) => eprintln!("WROTE\t{line}"),
+                        Err(error) => eprintln!("WRITEFAIL\t{line}\t{error}"),
+                    }
+                }
+                Err(error) => eprintln!("REFUSED\t{line}\t{error}"),
+            }
+        }
     }
 }
