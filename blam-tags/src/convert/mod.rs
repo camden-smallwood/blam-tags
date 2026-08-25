@@ -13870,15 +13870,24 @@ mod x360_cache_conversion {
         false
     }
 
-    /// A graph converts even when the build kept no data for some animations.
+    /// A graph the build kept no data for is refused, and says so.
     ///
     /// The tag cache holds what was resident when the build was captured, not
     /// an archive, so a member can arrive with its sizes filled in and nothing
-    /// where its stream should be. One vehicle has two like that out of
-    /// twenty-three, and the whole graph was being refused over them -- the
-    /// twenty-one that did come across thrown away with the two that could not.
+    /// where its stream should be. Ten graphs of the 3,212 in the build are
+    /// like that -- 37 members of 23,513.
+    ///
+    /// Both ways of writing one anyway are wrong, and the second was tried on a
+    /// live kit: dropping the member moves every member after it, and a member
+    /// is found by its position, so Sapien halts with `#5 is not a valid
+    /// model_animation_tag_resource_member index in [#0, #4)`. Emptying it in
+    /// place keeps the indices but invents a member with no stream, and no
+    /// member of the 1,429 in a shipped kit graph looks like that.
+    ///
+    /// So it refuses -- and the refusal has to carry the reason, or it reads as
+    /// the generic "could not be translated" that says nothing.
     #[test]
-    fn a_360_graph_carries_the_animations_the_build_kept() {
+    fn a_360_graph_missing_its_data_refuses_and_says_why() {
         let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
         else {
             eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and an HREK");
@@ -13891,52 +13900,143 @@ mod x360_cache_conversion {
         };
         let templates = NativeTemplateIndex::build(&reach, &groups);
         let group = u32::from_be_bytes(*b"jmad");
-        let Some(entry) = cache
-            .iter_tags()
-            .filter(|entry| entry.group_tag == group)
-            .find(|entry| entry.name.ends_with("reach_moah"))
-        else {
-            eprintln!("skipping: the build has no reach_moah graph");
-            return;
-        };
-        let Ok(source) = cache.read_tag(entry) else {
-            eprintln!("skipping: {} would not read", entry.name);
-            return;
-        };
-        let draft = match analyze_conversion_with_templates(
-            &source,
-            "haloreach_mcc",
-            "haloreach_mcc",
-            &definitions,
-            Some(&templates),
-        ) {
-            Ok(draft) => draft,
-            Err(why) => panic!("{} would not convert: {why}", entry.name),
+        let convert = |source: &TagFile| {
+            analyze_conversion_with_templates(
+                source,
+                "haloreach_mcc",
+                "haloreach_mcc",
+                &definitions,
+                Some(&templates),
+            )
         };
 
-        // The ones that did come across are written as the inline members a
-        // loose tag carries, and the ones that did not are said out loud.
-        let members = count_animation_members(&draft.tag, false);
-        assert!(
-            members >= 20,
-            "only {members} animation(s) came across, which is fewer than the build kept",
-        );
-        assert!(
-            draft
-                .report
-                .issues
+        let mut refused = 0usize;
+        let mut carried = 0usize;
+        // The affected graphs are ten of 3,212, so they are looked up rather
+        // than searched for -- scanning until one turns up is three minutes.
+        let affected = ["reach_moah", "ghost", "cargo_truck"];
+        for entry in cache.iter_tags().filter(|entry| entry.group_tag == group) {
+            if refused > 0 && carried > 0 {
+                break;
+            }
+            let named = affected
                 .iter()
-                .any(|issue| issue.message.contains("the build kept no data for them")),
-            "animations were dropped without saying so",
-        );
-        // And nothing empty was written: no member of the 1,429 in a shipped
-        // kit graph carries an empty blob, so one here would be a shape the
-        // engine has never been handed.
-        assert_eq!(
-            count_animation_members(&draft.tag, true),
-            0,
-            "an animation was written with no data",
-        );
+                .any(|want| entry.name.ends_with(want));
+            if !named && carried > 0 {
+                continue;
+            }
+            if cache.resolve_tag_block(entry).is_none() {
+                continue;
+            }
+            let Ok(source) = cache.read_tag(entry) else { continue };
+            let declared = source_animation_members(&source);
+            if declared == 0 {
+                continue;
+            }
+            let missing = source_members_without_data(&source);
+            match (missing > 0, convert(&source)) {
+                // Missing data: refused, and the refusal names the reason.
+                (true, Err(why)) => {
+                    assert!(
+                        why.contains("kept no data"),
+                        "{} was refused without saying why: {why}",
+                        entry.name,
+                    );
+                    refused += 1;
+                }
+                (true, Ok(_)) => panic!(
+                    "{} was written even though the build kept no data for {missing} of its \
+                     animations",
+                    entry.name,
+                ),
+                // Everything present: every member comes across, in its place.
+                (false, Ok(draft)) => {
+                    if carried > 0 {
+                        continue;
+                    }
+                    let written = count_animation_members(&draft.tag, false);
+                    assert_eq!(
+                        written, declared,
+                        "{} came across with {written} member(s) where the build has {declared}; \
+                         a member is indexed by its position, so losing one moves all the rest",
+                        entry.name,
+                    );
+                    carried += 1;
+                }
+                // A graph can be refused for reasons that have nothing to do
+                // with its resource -- an audited field loss, most often -- and
+                // those are somebody else's test.
+                (false, Err(why)) => assert!(
+                    !why.contains("pageable resource"),
+                    "{} has all its animation data and still lost its resource: {why}",
+                    entry.name,
+                ),
+            }
+        }
+        if refused == 0 {
+            eprintln!("note: no readable graph in the build is missing animation data");
+        }
+        assert!(carried > 0, "no graph carried its animations at all");
+    }
+
+    /// Members whose sizes promise a stream the build did not keep.
+    fn source_members_without_data(tag: &TagFile) -> usize {
+        let mut total = 0usize;
+        let Some(groups) = tag
+            .root()
+            .field_path("tag resource groups")
+            .and_then(|field| field.as_block())
+        else {
+            return 0;
+        };
+        for index in 0..groups.len() {
+            let Some(resource) = groups
+                .element(index)
+                .and_then(|group| group.field("tag_resource"))
+                .and_then(|field| field.as_resource())
+            else {
+                continue;
+            };
+            let Some(state) = resource.xsync_state() else { continue };
+            let primary = resource.exploded_payload().unwrap_or(&[]);
+            let Some(members) = crate::animation::resource::read_members(&state, primary) else {
+                continue;
+            };
+            for member in &members {
+                let declared: i64 = member.data_sizes.iter().map(|size| *size as i64).sum();
+                if member.animation_data.is_empty() && declared > 0 {
+                    total += 1;
+                }
+            }
+        }
+        total
+    }
+
+    /// How many members the build's own resource holds.
+    fn source_animation_members(tag: &TagFile) -> usize {
+        let mut total = 0usize;
+        let Some(groups) = tag
+            .root()
+            .field_path("tag resource groups")
+            .and_then(|field| field.as_block())
+        else {
+            return 0;
+        };
+        for index in 0..groups.len() {
+            let Some(resource) = groups
+                .element(index)
+                .and_then(|group| group.field("tag_resource"))
+                .and_then(|field| field.as_resource())
+            else {
+                continue;
+            };
+            let Some(state) = resource.xsync_state() else { continue };
+            let primary = resource.exploded_payload().unwrap_or(&[]);
+            if let Some(members) = crate::animation::resource::read_members(&state, primary) {
+                total += members.len();
+            }
+        }
+        total
     }
 
     /// Every `group_members` element a converted graph carries, or only the
@@ -18867,6 +18967,71 @@ mod x360_cache_conversion {
                 "   size {size:>5}  head {head:?}  head[2]*8 = {tail}  middle would be {}",
                 size.saturating_sub(4 + tail),
             );
+        }
+    }
+
+    /// How many graphs in the build describe an animation and keep no data.
+    ///
+    /// Decides what to do about them. Rare enough and refusing those graphs
+    /// costs almost nothing and is provably safe; common enough and refusing
+    /// throws away most of the corpus, and an emptied member -- a shape no
+    /// shipped kit graph has -- is the lesser risk.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_animations_without_data() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let group = u32::from_be_bytes(*b"jmad");
+        let (mut graphs, mut affected, mut members, mut absent) = (0usize, 0usize, 0usize, 0usize);
+        let mut names: Vec<String> = Vec::new();
+        for entry in cache.iter_tags().filter(|entry| entry.group_tag == group) {
+            if cache.resolve_tag_block(entry).is_none() {
+                continue;
+            }
+            let Ok(tag) = cache.read_tag(entry) else { continue };
+            let Some(groups) = tag
+                .root()
+                .field_path("tag resource groups")
+                .and_then(|field| field.as_block())
+            else {
+                continue;
+            };
+            graphs += 1;
+            let mut hit = false;
+            for index in 0..groups.len() {
+                let Some(resource) = groups
+                    .element(index)
+                    .and_then(|group| group.field("tag_resource"))
+                    .and_then(|field| field.as_resource())
+                else {
+                    continue;
+                };
+                let Some(state) = resource.xsync_state() else { continue };
+                let primary = resource.exploded_payload().unwrap_or(&[]);
+                let Some(held) = crate::animation::resource::read_members(&state, primary) else {
+                    continue;
+                };
+                for member in &held {
+                    members += 1;
+                    let declared: i64 = member.data_sizes.iter().map(|s| *s as i64).sum();
+                    if member.animation_data.is_empty() && declared > 0 {
+                        absent += 1;
+                        hit = true;
+                    }
+                }
+            }
+            if hit {
+                affected += 1;
+                if names.len() < 10 {
+                    names.push(entry.name.clone());
+                }
+            }
+        }
+        eprintln!(
+            "{graphs} readable graph(s), {members} member(s): {affected} graph(s) and \
+             {absent} member(s) have no data"
+        );
+        for name in &names {
+            eprintln!("   {name}");
         }
     }
 
