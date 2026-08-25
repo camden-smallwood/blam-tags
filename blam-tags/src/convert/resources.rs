@@ -684,6 +684,31 @@ pub(super) fn carry_animation_resources(
     );
 }
 
+
+/// Formats the destination engine ships none of, and what to write instead.
+///
+/// A 360 tag carries a PC mirror saying what a PC blob should hold, and for
+/// the single-channel formats it asks for `y8`, `ay8` or `a8y8`. MCC's own
+/// importer did not agree: across 2,500 shipped kit bitmaps there is not one
+/// image in any of these, and the kit's copy of a build bitmap that asks for
+/// `y8` is `a8r8g8b8` -- four times the bytes, same size, same mip count.
+///
+/// So the mirror is believed about everything except this. A format the
+/// engine has never been handed is one it renders wrong rather than refusing,
+/// which is what an artifact is.
+///
+/// `v8u8` is deliberately not here: the kit ships one, so it is supported,
+/// and promoting a supported format would quadruple a texture for nothing.
+fn promote_unshipped_format(
+    target: crate::bitmap::BitmapFormat,
+) -> crate::bitmap::BitmapFormat {
+    use crate::bitmap::BitmapFormat::*;
+    match target {
+        Y8 | Ay8 | A8y8 | L16 | Dxt5a | Dxt3a1111 => A8r8g8b8,
+        other => other,
+    }
+}
+
 /// Move an Xbox 360 bitmap's pixels into the shape a PC tag keeps them in.
 ///
 /// The two builds disagree about where a bitmap's pixels live. A PC tag puts
@@ -784,6 +809,10 @@ pub(super) fn convert_x360_bitmap_pixels(
     let mut blob: Vec<u8> = Vec::new();
     let mut slices: Vec<(i32, i32)> = Vec::with_capacity(bitmap.len());
     let mut mip_counts: Vec<i64> = Vec::with_capacity(bitmap.len());
+    // The format each image was actually packed as, where that is not the
+    // one its own block asked for.
+    let mut written_formats: Vec<Option<crate::bitmap::BitmapFormat>> =
+        Vec::with_capacity(bitmap.len());
     for index in 0..bitmap.len() {
         let Some(image) = bitmap.image(index) else {
             record_unsupported(
@@ -820,52 +849,75 @@ pub(super) fn convert_x360_bitmap_pixels(
         // block asks for `v8u8`, `a8y8` or `y8` where the 360 stored blocks.
         // Believe it: it is the destination's own statement of what it holds,
         // and its `pixels size` is computed from it.
-        let target_format = target_formats
-            .get(index)
-            .copied()
-            .flatten()
-            .filter(|target| Some(*target) != source_format);
-        let pixels = match target_format {
-            None => pixels.to_vec(),
-            Some(target) => {
-                let Some(source) = source_format else {
+        // Through the format the mirror asked for, then on to whatever the
+        // engine can actually sample.
+        //
+        // The middle step is not a detour. The mirror asking for `y8` says the
+        // one channel is *luminance*; asking for `a8` would say it is alpha.
+        // Going straight from a 360 block format to `a8r8g8b8` throws that away
+        // and packs the channel wherever the source happened to keep it -- a
+        // `dxt5a_alpha` block became `(0, 0, 0, alpha)` where the kit's own copy
+        // of the same image is `(y, y, y, 255)`, which is a texture that renders
+        // fully transparent.
+        let asked = target_formats.get(index).copied().flatten();
+        let mut chain: Vec<crate::bitmap::BitmapFormat> = Vec::new();
+        if let Some(asked) = asked {
+            if Some(asked) != source_format {
+                chain.push(asked);
+            }
+            let promoted = promote_unshipped_format(asked);
+            if promoted != asked {
+                chain.push(promoted);
+            }
+        }
+        let mut carried = pixels.to_vec();
+        let mut carried_format = source_format;
+        for step in &chain {
+            let Some(from) = carried_format else {
+                record_unsupported(
+                    context,
+                    format!("bitmaps[{index}]"),
+                    "The Xbox 360 image's format could not be resolved".to_owned(),
+                );
+                return;
+            };
+            match crate::bitmap::encode::transcode_levels(
+                from,
+                *step,
+                image.width(),
+                image.height(),
+                image.mipmap_levels(),
+                image.layer_count(),
+                &carried,
+                crate::bitmap::P8Palette::Halo2,
+            ) {
+                Ok(packed) => {
+                    carried = packed;
+                    carried_format = Some(*step);
+                }
+                Err(error) => {
                     record_unsupported(
                         context,
                         format!("bitmaps[{index}]"),
-                        "The Xbox 360 image's format could not be resolved".to_owned(),
+                        format!(
+                            "The Xbox 360 image is {from:?} and the target asks for {step:?}, \
+                             which could not be produced: {error}"
+                        ),
                     );
                     return;
-                };
-                match crate::bitmap::encode::transcode_levels(
-                    source,
-                    target,
-                    image.width(),
-                    image.height(),
-                    image.mipmap_levels(),
-                    image.layer_count(),
-                    pixels,
-                    crate::bitmap::P8Palette::Halo2,
-                ) {
-                    Ok(packed) => packed,
-                    Err(error) => {
-                        record_unsupported(
-                            context,
-                            format!("bitmaps[{index}]"),
-                            format!(
-                                "The Xbox 360 image is {source:?} and the target asks for \
-                                 {target:?}, which could not be produced: {error}"
-                            ),
-                        );
-                        return;
-                    }
                 }
             }
-        };
+        }
+        let pixels = carried;
+        let target_format = chain.last().copied();
 
         // Levels beyond the base, which is what the field counts. Taken from
         // the image the detiler actually produced rather than from the source,
         // so the number and the bytes can never disagree.
         mip_counts.push(image.mipmap_levels().saturating_sub(1) as i64);
+        written_formats.push(target_format.filter(|packed| {
+            target_formats.get(index).copied().flatten() != Some(*packed)
+        }));
         slices.push((blob.len() as i32, pixels.len() as i32));
         blob.extend_from_slice(&pixels);
     }
@@ -909,6 +961,12 @@ pub(super) fn convert_x360_bitmap_pixels(
         set_int_field(&mut elem, "pixels offset", i64::from(*offset));
         set_int_field(&mut elem, "pixels size", i64::from(*size));
         set_int_field(&mut elem, "mipmap count", mip_counts[index]);
+        // The bytes were packed as whatever the format was promoted to, so the
+        // image has to say that rather than what the 360's own PC mirror asked
+        // for. Left disagreeing, the tag reads as a quarter of its own pixels.
+        if let Some(promoted) = written_formats[index] {
+            set_enum_option(&mut elem, "format", promoted);
+        }
         set_int_field(&mut elem, "high res pixels offset offset", 0);
         set_int_field(&mut elem, "high res pixels size", 0);
         // Two handles the 360 build filled in at run time and a kit tag ships
@@ -1257,6 +1315,35 @@ fn clear_flags_by_name(elem: &mut TagStructMut<'_>, field_name: &str, bits: &[&s
 /// are integer-shaped too -- [`TagStruct::read_int_any`] reads all of them --
 /// and a setter that handled only the plain widths would silently drop half of
 /// what a caller copying a struct by name hands it.
+
+/// Point an enum field at the option with this format's name.
+///
+/// By name rather than by number: the option list is the schema's business
+/// and its order is not something this should be repeating.
+fn set_enum_option(
+    elem: &mut TagStructMut<'_>,
+    field: &str,
+    format: crate::bitmap::BitmapFormat,
+) {
+    let Some(wanted) = elem
+        .as_ref()
+        .field(field)
+        .and_then(|found| found.options())
+        .and_then(|options| match options {
+            TagOptions::Enum { names, .. } => names
+                .iter()
+                .position(|name| {
+                    crate::bitmap::BitmapFormat::from_schema_name(name) == Some(format)
+                })
+                .map(|at| at as i64),
+            TagOptions::Flags(_) => None,
+        })
+    else {
+        return;
+    };
+    set_int_field(elem, field, wanted);
+}
+
 fn set_int_field(elem: &mut TagStructMut<'_>, name: &str, value: i64) {
     let Some(mut field) = elem.field_mut(name) else {
         return;
