@@ -153,7 +153,6 @@ fn settle_geometry_in(value: &mut TagStructMut<'_>, settled: &mut usize) {
     };
     if is_geometry {
         clear_processed_flag(value);
-        clear_per_instance_lightmap_buffers(value);
         if let Some(mut field) = value.field_mut("meshes")
             && let Some(mut meshes) = field.as_block_mut()
         {
@@ -165,6 +164,7 @@ fn settle_geometry_in(value: &mut TagStructMut<'_>, settled: &mut usize) {
             }
         }
     }
+    clear_compiled_buffer_blocks(value);
     for index in 0..value.as_ref().fields().count() {
         let Some(mut field) = value.field_at_mut(index) else {
             continue;
@@ -183,25 +183,35 @@ fn settle_geometry_in(value: &mut TagStructMut<'_>, settled: &mut usize) {
     }
 }
 
-/// Empty the per-instance lightmap texcoord buffer list.
+/// Blocks whose whole substance is a pointer into the compiled geometry
+/// buffers, and which therefore cannot survive an import that carries none.
 ///
-/// It is one `short` per instance naming a compiled vertex buffer, and it is
-/// the same kind of thing as a mesh's `vertex buffer indices`: a pointer into
-/// a list this tag no longer carries. A kit's own lightmap keeps it empty --
-/// checked on a shipped `scenario_lightmap_bsp_data`, which has none at all
-/// where a 360 one has thousands.
+/// Both were found the same way and neither sits where the first was looked
+/// for: `per_instance_lightmap_texcoords_vertex_buffer` hangs off a geometry
+/// struct, `bsp per-vertex run-time data` off the lightmap's own block, so a
+/// walk that only visits geometry sees one of them. Hence a table consulted at
+/// every node rather than a line inside the geometry case.
 ///
-/// Left as the build wrote it, the engine reads an index past the end of the
-/// buffers it built and asserts inside `tag_groups.cpp`: *#3885 is not a valid
-/// vertex_buffers_block index in [#0, #815)*, naming no tag, which is a long
-/// way from anything a reader could act on.
-fn clear_per_instance_lightmap_buffers(geometry: &mut TagStructMut<'_>) {
-    let Some(mut field) = geometry.field_mut("per_instance_lightmap_texcoords_vertex_buffer")
-    else {
-        return;
-    };
-    if let Some(mut block) = field.as_block_mut() {
-        block.clear();
+/// A shipped `scenario_lightmap_bsp_data` has both of these empty -- measured
+/// on 20_sword_slayer, which carries 4,456 mesh buffer indices all zero and not
+/// one entry in either block. A 360 build fills them, and the engine then reads
+/// past the end of the buffers it built and asserts inside `tag_groups.cpp`:
+/// *#3885 is not a valid vertex_buffers_block index in [#0, #815)*, naming no
+/// tag, which is a long way from anything a reader could act on.
+const COMPILED_BUFFER_BLOCKS: [&str; 2] = [
+    "per_instance_lightmap_texcoords_vertex_buffer",
+    "bsp per-vertex run-time data",
+];
+
+/// Empty every block that only names compiled buffers.
+fn clear_compiled_buffer_blocks(value: &mut TagStructMut<'_>) {
+    for name in COMPILED_BUFFER_BLOCKS {
+        let Some(mut field) = value.field_mut(name) else {
+            continue;
+        };
+        if let Some(mut block) = field.as_block_mut() {
+            block.clear();
+        }
     }
 }
 

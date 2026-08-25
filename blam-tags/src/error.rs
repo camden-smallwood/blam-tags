@@ -202,7 +202,7 @@ impl fmt::Display for TagReadError {
             ),
             Self::TagHasNoDataInCache { name, group } => write!(
                 f,
-                "the build's tag cache lists {} {name} but holds no data for it, so there is                  nothing to read",
+                "the build lists {} {name} but kept none of its bytes to read",
                 show_sig(group),
             ),
             Self::InvalidUtf8 { context } => {
