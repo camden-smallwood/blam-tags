@@ -494,6 +494,7 @@ pub(super) fn carry_animation_resources(
     };
     let mut carried: Vec<Vec<crate::animation::resource::AnimationResourceMember>> =
         Vec::with_capacity(groups.len());
+    let mut animations_without_data: Vec<usize> = Vec::new();
     for index in 0..groups.len() {
         let Some(resource) = groups
             .element(index)
@@ -517,6 +518,24 @@ pub(super) fn carry_animation_resources(
             );
             return;
         };
+        // An animation the build described and kept no bytes for. The cache is
+        // an LRU of what was resident when it was captured, not an archive, so
+        // a member can arrive with its sizes filled in and a null pointer where
+        // its stream should be -- one vehicle has two of twenty-three like that,
+        // and the whole graph was being refused over them.
+        //
+        // Dropped rather than written empty: no member of the 1,429 in a
+        // shipped kit graph carries an empty blob, so an empty one is a shape
+        // the engine has never been handed, while a *missing* one is ordinary --
+        // members are found by their own `animation_index`, not by position.
+        members.retain(|member| {
+            let declared: i64 = member.data_sizes.iter().map(|size| *size as i64).sum();
+            let absent = member.animation_data.is_empty() && declared > 0;
+            if absent {
+                animations_without_data.push(index);
+            }
+            !absent
+        });
         for (member_index, member) in members.iter_mut().enumerate() {
             let frames = member.frame_count.max(1) as u16;
             if let Err(why) = crate::animation::byte_order::swap_animation_blob(
@@ -597,6 +616,31 @@ pub(super) fn carry_animation_resources(
                 written += 1;
             }
         }
+    }
+
+    if !animations_without_data.is_empty() {
+        // Named by the group they sit in, not by their own `animation_index`:
+        // that field reads 0 on exactly the members the build did not load, so
+        // it identifies nothing here.
+        let mut per_group: std::collections::BTreeMap<usize, usize> = Default::default();
+        for group in &animations_without_data {
+            *per_group.entry(*group).or_default() += 1;
+        }
+        let named = per_group
+            .iter()
+            .map(|(group, count)| format!("{count} in group {group}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        context.report.issues.push(ConversionIssue {
+            kind: ConversionIssueKind::Truncated,
+            path: "tag resource groups".to_owned(),
+            message: format!(
+                "{} animation(s) were left out because the build kept no data for them, only \
+                 their description ({named}). Nothing recovers those -- the tag cache holds \
+                 what was resident when it was captured, not everything the build had",
+                animations_without_data.len(),
+            ),
+        });
     }
 
     forgive_resources(

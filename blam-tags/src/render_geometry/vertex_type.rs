@@ -58,6 +58,11 @@ pub enum MeshVertexType {
     /// vertex (position + normal + tangent + uv in compressed form).
     /// Dominant format in the H4 X360 corpus.
     RigidCompressed,
+    /// "skinned compressed" -- a `RigidCompressed` vertex with four
+    /// bone indices and four weights appended, 24 bytes. Reach's
+    /// vehicles and bipeds use it where MCC's own tags use `skinned`.
+    /// Measured, not derived: the build's own buffer descriptors say 24.
+    SkinnedCompressed,
     SkinnedUncompressed,
     LightVolumePrecompiled,
     BlendshapeRigid,
@@ -124,6 +129,7 @@ impl MeshVertexType {
             "structure_instance_imposter" => Self::StructureInstanceImposter,
             "object_instance_imposter" => Self::ObjectInstanceImposter,
             "rigid compressed" => Self::RigidCompressed,
+            "skinned compressed" => Self::SkinnedCompressed,
             "skinned uncompressed" => Self::SkinnedUncompressed,
             "light volume precompiled" => Self::LightVolumePrecompiled,
             "blendshape_rigid" => Self::BlendshapeRigid,
@@ -187,6 +193,7 @@ impl MeshVertexType {
             Self::StructureInstanceImposter => "structure_instance_imposter",
             Self::ObjectInstanceImposter => "object_instance_imposter",
             Self::RigidCompressed => "rigid compressed",
+            Self::SkinnedCompressed => "skinned compressed",
             Self::SkinnedUncompressed => "skinned uncompressed",
             Self::LightVolumePrecompiled => "light volume precompiled",
             Self::BlendshapeRigid => "blendshape_rigid",

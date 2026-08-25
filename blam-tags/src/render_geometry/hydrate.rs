@@ -45,7 +45,11 @@ pub enum HydrateError {
     /// from `MonolithicCache::read_tag`, so one unrecognised format in one
     /// mesh took down whatever was walking the cache. Every build spells its
     /// own enum, and a corpus this old will always have one more.
-    UnknownVertexType { name: String },
+    ///
+    /// Carries the buffer's stride, because that is the one measurement the
+    /// layout of an undecoded format has to be worked out from, and going back
+    /// for it means finding the tag again.
+    UnknownVertexType { name: String, stride: u16 },
 }
 
 impl std::fmt::Display for HydrateError {
@@ -58,9 +62,10 @@ impl std::fmt::Display for HydrateError {
             Self::InvalidBufferIndex { kind, index, len } => write!(
                 f, "{kind} buffer index {index} out of range (len={len})",
             ),
-            Self::UnknownVertexType { name } => write!(
+            Self::UnknownVertexType { name, stride } => write!(
                 f,
-                "unsupported mesh vertex type {name:?}; register it in MeshVertexType or                  extend the schema-name table",
+                "unsupported mesh vertex type {name:?} at {stride} bytes a vertex; \
+                 register it in MeshVertexType and give it a decoder",
             ),
         }
     }
@@ -288,12 +293,6 @@ fn decode_mesh(
         });
     }
 
-    // Vertex type — a schema enum resolved to a decoder through the option
-    // name. A name nothing knows is reported, not fatal: the caller decides
-    // whether a mesh it cannot read is worth failing the whole tag over.
-    let vt_name = mesh.read_enum_name("vertex type").unwrap_or_default();
-    let vertex_type = MeshVertexType::from_schema_name(&vt_name)
-        .ok_or_else(|| HydrateError::UnknownVertexType { name: vt_name.clone() })?;
     let _ = ibi;
 
     let vb = resource
@@ -304,6 +303,18 @@ fn decode_mesh(
             index: vbi0 as i128,
             len: resource.xenon_vertex_buffers.len(),
         })?;
+
+    // Vertex type — a schema enum resolved to a decoder through the option
+    // name. A name nothing knows is reported, not fatal: the caller decides
+    // whether a mesh it cannot read is worth failing the whole tag over.
+    // Resolved after the buffer is in hand so the report can name the stride.
+    let vt_name = mesh.read_enum_name("vertex type").unwrap_or_default();
+    let vertex_type = MeshVertexType::from_schema_name(&vt_name).ok_or_else(|| {
+        HydrateError::UnknownVertexType {
+            name: vt_name.clone(),
+            stride: vb.stride,
+        }
+    })?;
     let vbo = vb.data_address.offset() as usize;
     let vbsz = vb.data_size as usize;
     let vbytes = primary
@@ -324,7 +335,11 @@ fn decode_mesh(
     // skeleton indices via per_mesh_node_map. JMS / MCC PC tags carry
     // global indices in raw_vertices; doing the remap here keeps
     // downstream consumers unaware of the X360 indirection.
-    if matches!(vertex_type, MeshVertexType::Skinned) && !node_map.is_empty() {
+    if matches!(
+        vertex_type,
+        MeshVertexType::Skinned | MeshVertexType::SkinnedCompressed
+    ) && !node_map.is_empty()
+    {
         for v in vertices.iter_mut() {
             for (local, _) in v.node_sets.iter_mut() {
                 let li = *local as usize;

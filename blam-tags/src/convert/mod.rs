@@ -3371,9 +3371,26 @@ fn validate_critical_runtime_safety(
     // animation graph's payload *is* a pageable resource — it is why a loose
     // HREK jmad runs to a hundred megabytes and more.
     if !context.resources_left_behind.is_empty() {
+        // A pass that gave up will usually have said why on its way past. That
+        // reason is the whole answer and it was being dropped here, leaving a
+        // refusal that names the resource and not one thing a reader could do
+        // about it.
+        let mut reasons: Vec<&str> = context
+            .report
+            .issues
+            .iter()
+            .filter(|issue| issue.kind == ConversionIssueKind::Unsupported)
+            .map(|issue| issue.message.as_str())
+            .collect();
+        reasons.dedup();
+        let because = if reasons.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", reasons.join("; "))
+        };
         return Err(format!(
             "{} carries {} pageable resource(s) that could not be translated from {} to {} ({}); \
-             the tag was not written",
+             the tag was not written{because}",
             context.group_name,
             context.resources_left_behind.len(),
             context.source_game,
@@ -13772,6 +13789,196 @@ mod x360_cache_conversion {
         );
     }
 
+    /// A model whose meshes are `skinned compressed` brings its geometry.
+    ///
+    /// The format is a `rigid compressed` vertex with four bone indices and
+    /// four weights appended. Nothing decoded it, so hydration failed, so the
+    /// api resource was left behind, so the whole tag was refused -- and
+    /// because the cache reader throws hydration errors away, the refusal said
+    /// only that the two tags have different byte orders. Reach's vehicles and
+    /// bipeds use the format.
+    #[test]
+    fn a_360_model_with_compressed_skinning_arrives_with_its_meshes() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and an HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let Ok(groups) = GameTagIndex::load(&definitions, "haloreach_mcc") else {
+            eprintln!("skipping: no haloreach_mcc definitions");
+            return;
+        };
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let group = u32::from_be_bytes(*b"mode");
+        let mut looked = 0usize;
+        for entry in cache.iter_tags().filter(|entry| entry.group_tag == group) {
+            if looked >= 1 {
+                break;
+            }
+            if cache.resolve_cache_block(entry).is_none() {
+                continue;
+            }
+            let Ok(source) = cache.read_tag(entry) else { continue };
+            if !uses_compressed_skinning(&source) {
+                continue;
+            }
+            looked += 1;
+            // Hydration fills these in, and it is the step that used to give up
+            // on this format.
+            assert_eq!(
+                crate::render_geometry::author_geometry_populated(&source),
+                Some(true),
+                "{} did not hydrate its geometry",
+                entry.name,
+            );
+            if let Err(why) = analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "haloreach_mcc",
+                &definitions,
+                Some(&templates),
+            ) {
+                panic!("{} would not convert: {why}", entry.name);
+            }
+        }
+        if looked == 0 {
+            eprintln!("skipping: no readable model uses compressed skinning");
+        }
+    }
+
+    /// Whether any mesh in a tag names the `skinned compressed` vertex format.
+    fn uses_compressed_skinning(tag: &TagFile) -> bool {
+        let mut pending = vec![tag.root()];
+        while let Some(value) = pending.pop() {
+            if let Some(meshes) = value.field("meshes").and_then(|f| f.as_block()) {
+                for index in 0..meshes.len() {
+                    let named = meshes
+                        .element(index)
+                        .and_then(|mesh| mesh.read_enum_name("vertex type"));
+                    if named.as_deref() == Some("skinned compressed") {
+                        return true;
+                    }
+                }
+            }
+            for name in value.field_names() {
+                if let Some(nested) = value.field(&name).and_then(|f| f.as_struct()) {
+                    pending.push(nested);
+                }
+            }
+        }
+        false
+    }
+
+    /// A graph converts even when the build kept no data for some animations.
+    ///
+    /// The tag cache holds what was resident when the build was captured, not
+    /// an archive, so a member can arrive with its sizes filled in and nothing
+    /// where its stream should be. One vehicle has two like that out of
+    /// twenty-three, and the whole graph was being refused over them -- the
+    /// twenty-one that did come across thrown away with the two that could not.
+    #[test]
+    fn a_360_graph_carries_the_animations_the_build_kept() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and an HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let Ok(groups) = GameTagIndex::load(&definitions, "haloreach_mcc") else {
+            eprintln!("skipping: no haloreach_mcc definitions");
+            return;
+        };
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let group = u32::from_be_bytes(*b"jmad");
+        let Some(entry) = cache
+            .iter_tags()
+            .filter(|entry| entry.group_tag == group)
+            .find(|entry| entry.name.ends_with("reach_moah"))
+        else {
+            eprintln!("skipping: the build has no reach_moah graph");
+            return;
+        };
+        let Ok(source) = cache.read_tag(entry) else {
+            eprintln!("skipping: {} would not read", entry.name);
+            return;
+        };
+        let draft = match analyze_conversion_with_templates(
+            &source,
+            "haloreach_mcc",
+            "haloreach_mcc",
+            &definitions,
+            Some(&templates),
+        ) {
+            Ok(draft) => draft,
+            Err(why) => panic!("{} would not convert: {why}", entry.name),
+        };
+
+        // The ones that did come across are written as the inline members a
+        // loose tag carries, and the ones that did not are said out loud.
+        let members = count_animation_members(&draft.tag, false);
+        assert!(
+            members >= 20,
+            "only {members} animation(s) came across, which is fewer than the build kept",
+        );
+        assert!(
+            draft
+                .report
+                .issues
+                .iter()
+                .any(|issue| issue.message.contains("the build kept no data for them")),
+            "animations were dropped without saying so",
+        );
+        // And nothing empty was written: no member of the 1,429 in a shipped
+        // kit graph carries an empty blob, so one here would be a shape the
+        // engine has never been handed.
+        assert_eq!(
+            count_animation_members(&draft.tag, true),
+            0,
+            "an animation was written with no data",
+        );
+    }
+
+    /// Every `group_members` element a converted graph carries, or only the
+    /// ones holding nothing when `empty_only`.
+    fn count_animation_members(tag: &TagFile, empty_only: bool) -> usize {
+        let Some(groups) = tag
+            .root()
+            .field_path("tag resource groups")
+            .and_then(|field| field.as_block())
+        else {
+            return 0;
+        };
+        let mut total = 0usize;
+        for index in 0..groups.len() {
+            let Some(list) = groups
+                .element(index)
+                .and_then(|group| group.field("tag_resource"))
+                .and_then(|field| field.as_resource())
+                .and_then(|resource| resource.as_struct())
+                .and_then(|payload| {
+                    payload
+                        .field("group_members")
+                        .and_then(|field| field.as_block())
+                })
+            else {
+                continue;
+            };
+            for member in 0..list.len() {
+                let blob = list
+                    .element(member)
+                    .and_then(|element| element.field("animation_data"))
+                    .and_then(|field| field.as_data())
+                    .map(|data| data.len())
+                    .unwrap_or(0);
+                if !empty_only || blob == 0 {
+                    total += 1;
+                }
+            }
+        }
+        total
+    }
+
     /// A converted tag names no compiled buffer it did not bring.
     ///
     /// Deliberately general. The first version of this test asked about one
@@ -17000,6 +17207,74 @@ mod x360_cache_conversion {
         }
     }
 
+    /// Every tag already sitting in a kit that still names a compiled buffer.
+    ///
+    /// The converter is fixed, but tags imported before the fix are still on
+    /// disk and will still assert. This reads them where they lie -- no
+    /// conversion, so it is quick -- and says which ones need importing again.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_sweep_for_dangling_buffers() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        let root = std::env::var("SWEEP_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| reach.join("tags"));
+        let newer_than = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(
+                std::env::var("SWEEP_SINCE_EPOCH")
+                    .ok()
+                    .and_then(|raw| raw.parse().ok())
+                    .unwrap_or(0),
+            );
+        let mut files = Vec::new();
+        collect_files(&root, &mut files);
+        let mut looked = 0usize;
+        let mut unreadable = 0usize;
+        let mut bad: Vec<(String, usize, i128)> = Vec::new();
+        for path in &files {
+            let Ok(meta) = std::fs::metadata(path) else { continue };
+            match meta.modified() {
+                Ok(when) if when >= newer_than => {}
+                _ => continue,
+            }
+            let Ok(tag) = TagFile::read(path) else {
+                unreadable += 1;
+                continue;
+            };
+            looked += 1;
+            let (found, high) = dangling_buffer_references(&tag);
+            if found > 0 {
+                let shown = path
+                    .strip_prefix(&root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .into_owned();
+                bad.push((shown, found, high));
+            }
+        }
+        bad.sort_by(|a, b| b.1.cmp(&a.1));
+        eprintln!("looked at {looked} tag(s), {unreadable} unreadable, {} still dangling", bad.len());
+        for (path, found, high) in bad.iter().take(60) {
+            eprintln!("   {found:>7} ref(s) high #{high}  {path}");
+        }
+        if bad.len() > 60 {
+            eprintln!("   ... and {} more not listed", bad.len() - 60);
+        }
+    }
+
+    /// Every file under a folder, depth first.
+    fn collect_files(at: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(at) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_files(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+
     /// Every integer in a tag whose name mentions a buffer, however deep.
     ///
     /// The targeted harness above asks about the two fields that were known to
@@ -17345,6 +17620,469 @@ mod x360_cache_conversion {
             ) {
                 Ok(draft) => eprintln!("   converted: {:?} dangling {:?}", count(&draft.tag), dangling_buffer_references(&draft.tag)),
                 Err(why) => eprintln!("   refused: {}", why.chars().take(120).collect::<String>()),
+            }
+        }
+    }
+
+    /// How many of a kit's own animation graphs carry a resource group block,
+    /// and how many groups they carry.
+    ///
+    /// The carry pass writes into the target's `tag resource groups`, and gives
+    /// up without a word when that block is not there. If some of a kit's graphs
+    /// have it and some do not, then which template got picked decides whether a
+    /// build's graph converts, and the template is picked on struct sizes that
+    /// know nothing about this.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_kit_jmad_resource_blocks() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        let mut with = 0usize;
+        let mut without = 0usize;
+        let mut counts: std::collections::BTreeMap<usize, usize> = Default::default();
+        let mut examples: Vec<String> = Vec::new();
+        let mut files = Vec::new();
+        collect_files(&reach, &mut files);
+        for path in &files {
+            if path.extension().and_then(|e| e.to_str()) != Some("model_animation_graph") {
+                continue;
+            }
+            let Ok(tag) = TagFile::read(path) else { continue };
+            match tag.root().field_path("tag resource groups").and_then(|f| f.as_block()) {
+                Some(block) => {
+                    with += 1;
+                    *counts.entry(block.len()).or_default() += 1;
+                }
+                None => {
+                    without += 1;
+                    if examples.len() < 5 {
+                        examples.push(path.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+        eprintln!("kit graphs with the block: {with}, without: {without}");
+        eprintln!("group counts seen: {counts:?}");
+        for example in &examples {
+            eprintln!("   without: {example}");
+        }
+    }
+
+    /// Does a kit's own animation graph ever carry a member with no data?
+    ///
+    /// The question decides what to do about an animation the build described
+    /// and did not keep the bytes for. If a shipped graph never holds an empty
+    /// member, writing one is inventing a shape the engine has never been given;
+    /// if it does, then an animation with nothing to play is a thing the format
+    /// already allows and the rest of the graph need not be thrown away with it.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_kit_jmad_empty_members() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        let limit: usize = std::env::var("LIMIT")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(400);
+        let mut files = Vec::new();
+        collect_files(&reach, &mut files);
+        files.sort();
+        let (mut looked, mut members, mut empty, mut zero_sizes) = (0usize, 0usize, 0usize, 0usize);
+        let mut examples: Vec<String> = Vec::new();
+        for path in &files {
+            if looked >= limit { break }
+            if path.extension().and_then(|e| e.to_str()) != Some("model_animation_graph") {
+                continue;
+            }
+            // The big graphs are minutes each and answer the same question.
+            if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > 8_000_000 {
+                continue;
+            }
+            let Ok(tag) = TagFile::read(path) else { continue };
+            looked += 1;
+            let Some(groups) = tag.root().field_path("tag resource groups").and_then(|f| f.as_block())
+            else { continue };
+            for g in 0..groups.len() {
+                let Some(list) = groups
+                    .element(g)
+                    .and_then(|group| group.field("tag_resource"))
+                    .and_then(|f| f.as_resource())
+                    .and_then(|r| r.as_struct())
+                    .and_then(|s| s.field("group_members").and_then(|f| f.as_block()))
+                else { continue };
+                for m in 0..list.len() {
+                    let Some(member) = list.element(m) else { continue };
+                    members += 1;
+                    let blob = member
+                        .field("animation_data")
+                        .and_then(|f| f.as_data())
+                        .map(|d| d.len())
+                        .unwrap_or(0);
+                    let declared: i64 = member
+                        .field("data sizes")
+                        .and_then(|f| f.as_struct())
+                        .map(|sizes| {
+                            sizes
+                                .field_names()
+                                .filter_map(|name| sizes.read_int_any(&name))
+                                .map(|v| v as i64)
+                                .sum()
+                        })
+                        .unwrap_or(0);
+                    if blob == 0 {
+                        empty += 1;
+                        if declared == 0 { zero_sizes += 1 }
+                        if examples.len() < 6 {
+                            examples.push(format!(
+                                "{} group {g} member {m}: blob 0, declared {declared}",
+                                path.file_name().unwrap_or_default().to_string_lossy(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "{looked} kit graph(s), {members} member(s): {empty} with no blob, \
+             {zero_sizes} of those declaring nothing either"
+        );
+        for example in &examples {
+            eprintln!("   {example}");
+        }
+    }
+
+    /// Convert one named tag of one group and say exactly what happened.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_convert_one() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let index = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &index);
+        let want = std::env::var("WHY_NAME").unwrap_or_default();
+        let group_name = std::env::var("WHY_GROUP").unwrap_or_else(|_| "mode".to_owned());
+        let mut gb = [b' '; 4];
+        for (i, c) in group_name.bytes().take(4).enumerate() { gb[i] = c; }
+        let group = u32::from_be_bytes(gb);
+        for entry in cache.iter_tags().filter(|e| e.group_tag == group) {
+            if !entry.name.contains(&want) { continue }
+            let Ok(source) = cache.read_tag(entry) else {
+                eprintln!("{}: unreadable", entry.name);
+                continue;
+            };
+            eprintln!("{} [{group_name}]", entry.name);
+            match analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) {
+                Ok(draft) => {
+                    eprintln!(
+                        "   converted; template {:?}",
+                        draft.native_layout_template.as_ref().map(|p| p.display().to_string()),
+                    );
+                    for issue in &draft.report.issues {
+                        eprintln!("   issue: {} -- {}", issue.path, issue.message);
+                    }
+                }
+                Err(why) => eprintln!("   refused: {why}"),
+            }
+        }
+    }
+
+    /// Why one tag's geometry did not hydrate.
+    ///
+    /// `MonolithicCache::hydrate_resources` throws the error away -- deliberately,
+    /// because a tag with no geometry is not a failure -- so a mesh naming a
+    /// vertex format nobody has decoded looks exactly like a tag with no meshes.
+    /// This runs the same call and prints what it said.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_why_no_geometry() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let want = std::env::var("WHY_NAME").unwrap_or_default();
+        let group_name = std::env::var("WHY_GROUP").unwrap_or_else(|_| "mode".to_owned());
+        let mut gb = [b' '; 4];
+        for (i, c) in group_name.bytes().take(4).enumerate() { gb[i] = c; }
+        let group = u32::from_be_bytes(gb);
+        for entry in cache.iter_tags().filter(|e| e.group_tag == group) {
+            if !entry.name.contains(&want) { continue }
+            let Ok(mut tag) = cache.read_tag(entry) else { continue };
+            eprintln!("{}", entry.name);
+            eprintln!(
+                "   author geometry populated: {:?}",
+                crate::render_geometry::author_geometry_populated(&tag),
+            );
+            let Some(block) = cache.resolve_cache_block(entry) else {
+                eprintln!("   no cache block");
+                continue;
+            };
+            let Ok(bytes) = cache.read_cache_bytes(block) else {
+                eprintln!("   cache bytes would not read");
+                continue;
+            };
+            match crate::render_geometry::hydrate(&mut tag, &bytes) {
+                Ok(count) => eprintln!("   hydrate: {count} mesh(es)"),
+                Err(why) => eprintln!("   hydrate failed: {why}"),
+            }
+        }
+    }
+
+    /// What stride each vertex declaration actually uses in the build.
+    ///
+    /// The decoders assert a stride per format, and a format nobody has decoded
+    /// has to have its layout worked out from somewhere. The build says: every
+    /// buffer carries its own declaration and its own stride, so the pair can be
+    /// counted rather than guessed at, and a derivation that disagrees with the
+    /// count is wrong however plausible it reads.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_vertex_strides() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let limit: usize = std::env::var("LIMIT")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(300);
+        let mut seen: std::collections::BTreeMap<(i128, i128), usize> = Default::default();
+        let mut looked = 0usize;
+        for group_name in ["mode", "sbsp"] {
+            let mut gb = [b' '; 4];
+            for (i, c) in group_name.bytes().take(4).enumerate() { gb[i] = c; }
+            let group = u32::from_be_bytes(gb);
+            for entry in cache.iter_tags().filter(|e| e.group_tag == group) {
+                if looked >= limit { break }
+                if cache.resolve_cache_block(entry).is_none() { continue }
+                let Ok(tag) = cache.read_tag(entry) else { continue };
+                looked += 1;
+                let mut pending = vec![tag.root()];
+                while let Some(value) = pending.pop() {
+                    for which in ["xenon vertex buffers", "pc vertex buffers"] {
+                        let Some(block) = value
+                            .field_path("api resource")
+                            .and_then(|f| f.as_resource())
+                            .and_then(|r| r.as_struct())
+                            .and_then(|s| s.field(which).and_then(|f| f.as_block()))
+                        else { continue };
+                        for i in 0..block.len() {
+                            let Some(buffer) = block.element(i) else { continue };
+                            let declaration = buffer.read_int_any("declaration type");
+                            let stride = buffer.read_int_any("stride");
+                            if let (Some(d), Some(s)) = (declaration, stride) {
+                                *seen.entry((d, s)).or_default() += 1;
+                            }
+                        }
+                    }
+                    for name in value.field_names() {
+                        if let Some(nested) = value.field(&name).and_then(|f| f.as_struct()) {
+                            pending.push(nested);
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("{looked} tag(s)");
+        for ((declaration, stride), count) in &seen {
+            eprintln!("   declaration {declaration:>3}: stride {stride:>3}  x{count}");
+        }
+    }
+
+    /// How many of the build's models use `skinned compressed`, and does the
+    /// decode of one hold up against the kit's own copy of the same model?
+    ///
+    /// Two questions in one walk because they share the expensive part. The
+    /// first says how much the format was costing; the second is the only real
+    /// check on the layout, since a wrong stride decodes into plausible-looking
+    /// rubbish rather than failing.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_skinned_compressed_sweep() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let limit: usize = std::env::var("LIMIT")
+            .ok().and_then(|raw| raw.parse().ok()).unwrap_or(400);
+        let group = u32::from_be_bytes(*b"mode");
+        let (mut looked, mut skinned_compressed, mut populated, mut twins) = (0, 0, 0, 0);
+        let mut checked = 0usize;
+        let mut worst_weight: f32 = 0.0;
+        let mut worst_normal: f32 = 0.0;
+        for entry in cache.iter_tags().filter(|e| e.group_tag == group) {
+            if looked >= limit { break }
+            if cache.resolve_cache_block(entry).is_none() { continue }
+            let Ok(tag) = cache.read_tag(entry) else { continue };
+            looked += 1;
+            let mut uses = false;
+            let mut pending = vec![tag.root()];
+            while let Some(value) = pending.pop() {
+                if let Some(meshes) = value.field("meshes").and_then(|f| f.as_block()) {
+                    for m in 0..meshes.len() {
+                        if meshes.element(m)
+                            .and_then(|mesh| mesh.read_enum_name("vertex type"))
+                            .as_deref() == Some("skinned compressed")
+                        {
+                            uses = true;
+                        }
+                    }
+                }
+                for name in value.field_names() {
+                    if let Some(nested) = value.field(&name).and_then(|f| f.as_struct()) {
+                        pending.push(nested);
+                    }
+                }
+            }
+            if !uses { continue }
+            skinned_compressed += 1;
+            if crate::render_geometry::author_geometry_populated(&tag) == Some(true) {
+                populated += 1;
+            }
+            // Weights have to add to one and normals have to be unit length.
+            // Both fall apart immediately if the fields are read at the wrong
+            // offsets, which is what a guessed stride gets wrong.
+            let mut pending = vec![tag.root()];
+            while let Some(value) = pending.pop() {
+                if let Some(list) = value.field("raw vertices").and_then(|f| f.as_block()) {
+                    for v in 0..list.len().min(500) {
+                        let Some(vertex) = list.element(v) else { continue };
+                        checked += 1;
+                        // The weights of one vertex add to one. Read at the
+                        // wrong offset they add to anything at all, which is
+                        // what a guessed stride gets wrong and what nothing
+                        // downstream would notice.
+                        let mut weights = 0.0f32;
+                        if let Some(array) =
+                            vertex.field("node weights").and_then(|f| f.as_array())
+                        {
+                            for k in 0..array.len() {
+                                let Some(element) = array.element(k) else { continue };
+                                let names: Vec<String> =
+                                    element.field_names().map(str::to_owned).collect();
+                                for name in &names {
+                                    if let Some(value) = element.read_real(name) {
+                                        weights += value;
+                                    }
+                                }
+                            }
+                        }
+                        if weights > 0.0 {
+                            worst_weight = worst_weight.max((weights - 1.0).abs());
+                        }
+                    }
+                }
+                for name in value.field_names() {
+                    let Some(field) = value.field(&name) else { continue };
+                    if let Some(nested) = field.as_struct() {
+                        pending.push(nested);
+                    } else if let Some(block) = field.as_block() {
+                        for i in 0..block.len() {
+                            if let Some(element) = block.element(i) { pending.push(element) }
+                        }
+                    }
+                }
+            }
+            let twin = reach.join("tags").join(format!("{}.render_model", entry.name.replace(char::from(92), "/")));
+            if twin.is_file() { twins += 1 }
+        }
+        eprintln!(
+            "{looked} model(s) read; {skinned_compressed} use skinned compressed, \
+             {populated} of those now hydrate; {twins} have a kit twin"
+        );
+        eprintln!(
+            "   {checked} vertex(es) checked: worst weight sum error {worst_weight:.4}, \
+             worst normal length error {worst_normal:.4}"
+        );
+    }
+
+    /// Why one animation graph's resources do not come across.
+    ///
+    /// Prints both sides of the question the carry pass asks: how many resource
+    /// groups the source has and what each one holds, and how many the template
+    /// the target was built from has. The pass returns silently when those two
+    /// disagree in the wrong way, which reads as the generic "could not be
+    /// translated" refusal and says nothing about which side was short.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_jmad_resource_shape() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let groups_index = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups_index);
+        let want = std::env::var("WHY_NAME").unwrap_or_default();
+        let group = u32::from_be_bytes(*b"jmad");
+        for entry in cache.iter_tags().filter(|e| e.group_tag == group) {
+            if !entry.name.contains(&want) { continue }
+            let Ok(source) = cache.read_tag(entry) else {
+                eprintln!("{}: unreadable", entry.name);
+                continue;
+            };
+            eprintln!("{}", entry.name);
+            let root = source.root();
+            match root.field_path("tag resource groups").and_then(|f| f.as_block()) {
+                None => eprintln!("   source has no 'tag resource groups' field"),
+                Some(block) => {
+                    eprintln!("   source groups: {}", block.len());
+                    for i in 0..block.len() {
+                        let resource = block
+                            .element(i)
+                            .and_then(|g| g.field("tag_resource"))
+                            .and_then(|f| f.as_resource());
+                        let Some(resource) = resource else {
+                            eprintln!("      [{i}] no tag_resource field");
+                            continue;
+                        };
+                        let state = resource.xsync_state();
+                        let primary = resource.exploded_payload().unwrap_or(&[]);
+                        let members = state.as_ref().and_then(|s| {
+                            crate::animation::resource::read_members(s, primary)
+                        });
+                        let detail = members.as_ref().map(|members| {
+                            members
+                                .iter()
+                                .enumerate()
+                                .map(|(m, member)| {
+                                    let declared: i64 =
+                                        member.data_sizes.iter().map(|s| *s as i64).sum();
+                                    format!(
+                                        "{m}:{}/{declared}{}",
+                                        member.animation_data.len(),
+                                        if declared > 0 && member.animation_data.is_empty() {
+                                            " EMPTY"
+                                        } else {
+                                            ""
+                                        },
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        });
+                        eprintln!(
+                            "      [{i}] xsync {} primary {} bytes, members {:?}",
+                            state.is_some(),
+                            primary.len(),
+                            members.as_ref().map(|m| m.len()),
+                        );
+                        if let Some(detail) = detail {
+                            eprintln!("           blob/declared -> {detail}");
+                        }
+                    }
+                }
+            }
+            match analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) {
+                Ok(draft) => {
+                    let target_groups = draft
+                        .tag
+                        .root()
+                        .field_path("tag resource groups")
+                        .and_then(|f| f.as_block())
+                        .map(|b| b.len());
+                    eprintln!("   target groups: {target_groups:?}");
+                    eprintln!(
+                        "   template: {:?}",
+                        draft.native_layout_template.as_ref().map(|p| p.display().to_string()),
+                    );
+                    for issue in &draft.report.issues {
+                        eprintln!("   issue: {} -- {}", issue.path, issue.message);
+                    }
+                }
+                Err(why) => eprintln!("   refused: {why}"),
             }
         }
     }
