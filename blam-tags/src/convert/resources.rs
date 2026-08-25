@@ -494,6 +494,7 @@ pub(super) fn carry_animation_resources(
     };
     let mut carried: Vec<Vec<crate::animation::resource::AnimationResourceMember>> =
         Vec::with_capacity(groups.len());
+    let mut animations_without_data: Vec<usize> = Vec::new();
     for index in 0..groups.len() {
         let Some(resource) = groups
             .element(index)
@@ -537,26 +538,29 @@ pub(super) fn carry_animation_resources(
         //
         // It costs ten graphs of the 3,212 in the build -- 37 members of 23,513
         // -- and the alternative is a tag that loads and halts later.
-        let absent = members
-            .iter()
-            .filter(|member| {
-                let declared: i64 = member.data_sizes.iter().map(|size| *size as i64).sum();
-                member.animation_data.is_empty() && declared > 0
-            })
-            .count();
-        if absent > 0 {
-            record_unsupported(
-                context,
-                format!("tag resource groups[{index}]/tag_resource"),
-                format!(
-                    "The build kept no data for {absent} of this group's {} animation(s), only \
-                     their description. Nothing recovers those -- the tag cache holds what was \
-                     resident when it was captured -- and a graph missing one cannot be written \
-                     without either moving every animation after it or inventing an empty one",
-                    members.len(),
-                ),
-            );
-            return;
+        // Emptied where it stands, never dropped. A member is found by its
+        // position in the group -- the `animation_index` it also carries is not
+        // what indexes it -- so removing one moves every member after it and
+        // the engine reads off the end of the block: `#5 is not a valid
+        // model_animation_tag_resource_member index in [#0, #4)`.
+        //
+        // Emptied means its sizes agree with the nothing it carries, rather
+        // than promising five kilobytes of stream that are not there. The frame
+        // count goes with them, so the member says it has no frames rather than
+        // claiming frames it cannot produce.
+        //
+        // This is the one shape here that no shipped kit graph vouches for --
+        // none of the 1,429 members in one is empty. It is written because the
+        // alternatives are worse: dropping it halts the engine outright, and
+        // refusing the graph loses a vehicle over two of its twenty-three
+        // animations.
+        for member in members.iter_mut() {
+            let declared: i64 = member.data_sizes.iter().map(|size| *size as i64).sum();
+            if member.animation_data.is_empty() && declared > 0 {
+                animations_without_data.push(index);
+                member.data_sizes = [0; 17];
+                member.frame_count = 0;
+            }
         }
         for (member_index, member) in members.iter_mut().enumerate() {
             let frames = member.frame_count.max(1) as u16;
@@ -640,6 +644,32 @@ pub(super) fn carry_animation_resources(
         }
     }
 
+
+    if !animations_without_data.is_empty() {
+        // Named by the group they sit in, not by their own
+        // `animation_index`: that field reads 0 on exactly the members the
+        // build did not load, so it identifies nothing here.
+        let mut per_group: std::collections::BTreeMap<usize, usize> = Default::default();
+        for group in &animations_without_data {
+            *per_group.entry(*group).or_default() += 1;
+        }
+        let named = per_group
+            .iter()
+            .map(|(group, count)| format!("{count} in group {group}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        context.report.issues.push(ConversionIssue {
+            kind: ConversionIssueKind::Truncated,
+            path: "tag resource groups".to_owned(),
+            message: format!(
+                "{} animation(s) are present but empty, because the build kept no data \
+                 for them, only their description ({named}). They keep their places so the \
+                 rest are still found by theirs; nothing recovers what they held -- the \
+                 tag cache holds what was resident when it was captured",
+                animations_without_data.len(),
+            ),
+        });
+    }
 
     forgive_resources(
         context,

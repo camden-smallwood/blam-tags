@@ -13870,7 +13870,7 @@ mod x360_cache_conversion {
         false
     }
 
-    /// A graph the build kept no data for is refused, and says so.
+    /// A graph the build kept no data for keeps every member in its place.
     ///
     /// The tag cache holds what was resident when the build was captured, not
     /// an archive, so a member can arrive with its sizes filled in and nothing
@@ -13887,7 +13887,7 @@ mod x360_cache_conversion {
     /// So it refuses -- and the refusal has to carry the reason, or it reads as
     /// the generic "could not be translated" that says nothing.
     #[test]
-    fn a_360_graph_missing_its_data_refuses_and_says_why() {
+    fn a_360_graph_missing_its_data_keeps_every_member_in_place() {
         let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
         else {
             eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and an HREK");
@@ -13935,18 +13935,32 @@ mod x360_cache_conversion {
             }
             let missing = source_members_without_data(&source);
             match (missing > 0, convert(&source)) {
-                // Missing data: refused, and the refusal names the reason.
-                (true, Err(why)) => {
+                // Missing data: the member stays where it is, emptied, and the
+                // report says so. Every member the build described is still
+                // there -- one removed moves all the rest, and a member is
+                // found by its position.
+                (true, Ok(draft)) => {
+                    let written = count_animation_members(&draft.tag, false);
+                    assert_eq!(
+                        written, declared,
+                        "{} came across with {written} member(s) where the build has {declared}; \
+                         a member is indexed by its position, so losing one moves all the rest",
+                        entry.name,
+                    );
                     assert!(
-                        why.contains("kept no data"),
-                        "{} was refused without saying why: {why}",
+                        draft
+                            .report
+                            .issues
+                            .iter()
+                            .any(|issue| issue.message.contains("present but empty")),
+                        "{} emptied {missing} animation(s) without saying so",
                         entry.name,
                     );
                     refused += 1;
                 }
-                (true, Ok(_)) => panic!(
-                    "{} was written even though the build kept no data for {missing} of its \
-                     animations",
+                (true, Err(why)) => panic!(
+                    "{} would not convert, though only {missing} of its animation(s) are \
+                     missing data: {why}",
                     entry.name,
                 ),
                 // Everything present: every member comes across, in its place.
