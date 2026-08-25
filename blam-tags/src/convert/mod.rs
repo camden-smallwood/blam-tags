@@ -1998,7 +1998,30 @@ fn analyze_conversion_inner(
     // Reach build, 14 are in a class HREK ships no example of.
     if byte_order_upgrade && native_target.is_none() {
         return Err(format!(
-            "{target_game} ships no {target_group_name} to start from, and one built from the              schema is a tag its own tools refuse to load. Nothing was written."
+            "{target_game} ships no {target_group_name} to start from, and one built from the \
+             schema is a tag its own tools refuse to load. Nothing was written."
+        ));
+    }
+    // A compiled shader does not change byte order, it changes instruction set.
+    //
+    // The build's tags carry Xenon microcode -- the Xbox 360 GPU's own -- and
+    // the kit's carry DX9 bytecode: a `pixel_shader` here begins `FF FF 03 00`,
+    // which is `ps_3_0`, where the build's begins `10 2A 11 00`. No byte order
+    // relates the two, and turning one into the other is a shader compiler.
+    //
+    // Worse than useless to try: these are the rasterizer's own shared tables,
+    // and the build's are *shorter* than the kit's -- 24 entry points against
+    // 27, 31 vertex types against 32. Written over the kit's, every lookup past
+    // the end of the shorter list finds the wrong shader, which is an artifact
+    // on a model whose own tags converted perfectly.
+    //
+    // The kit already ships its DX9 build of the same shaders, so refusing
+    // leaves the right thing in place rather than losing anything.
+    if byte_order_upgrade && is_compiled_shader_group(&target_group_name) {
+        return Err(format!(
+            "a {target_group_name} holds compiled Xbox 360 shader microcode, and this engine \
+             runs DX9 bytecode -- no byte order relates them, and {target_game} already ships \
+             its own build of these shaders. Nothing was written."
         ));
     }
     let (mut target, target_template) = match (from_definitions, native_target) {
@@ -3355,6 +3378,30 @@ fn strip_cross_engine_scripts(target: &mut TagFile, context: &mut ConversionCont
             context.target_game, context.source_game
         ),
     });
+}
+
+
+/// Groups whose payload is compiled GPU code rather than data.
+///
+/// Named rather than detected, because the thing that makes them different
+/// is not visible in the schema: the field is a `data` blob either way, and
+/// both sides call it a shader. What differs is the instruction set inside.
+fn is_compiled_shader_group(group_name: &str) -> bool {
+    matches!(
+        group_name,
+        "pixel_shader"
+            | "vertex_shader"
+            | "global_pixel_shader"
+            | "global_vertex_shader"
+            // Not code itself, but the thing that names it: a
+            // template points at the pixel and vertex shaders and
+            // declares which entry points they were built with. The
+            // kit ships its own set, paired with its own DX9
+            // shaders, and the build's declares different entry
+            // points -- 1 where the kit has 0 -- so importing one
+            // pairs the kit's shaders with the build's idea of them.
+            | "render_method_template"
+    )
 }
 
 /// Refuse, or record, a conversion that loses audited data.
@@ -19389,6 +19436,121 @@ mod x360_cache_conversion {
             );
             let flag = if k == 0 && b > 0 { "  <== the kit ships none" } else { "" };
             eprintln!("   {name:<22} {k:>7} {b:>9}{flag}");
+        }
+    }
+
+    /// Every shader-family group: what converts, and what matches the kit.
+    ///
+    /// "Artifacts from imported shaders" could be any of a dozen groups -- the
+    /// render methods themselves, the templates they point at, the compiled
+    /// pixel and vertex shaders, the global shader tables. Which one is wrong
+    /// is not guessable, so this asks all of them the same two questions:
+    /// does it convert, and is it the kit's own tag afterwards.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_shader_survey() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let Ok(groups) = GameTagIndex::load(&definitions, "haloreach_mcc") else { return };
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let cutoff =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        let per_group: usize = std::env::var("PER_GROUP")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(12);
+
+        // group -> (seen, converted, comparable, identical, worst field count)
+        let mut tally: std::collections::BTreeMap<String, [usize; 5]> = Default::default();
+        let mut notes: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        let mut counted: std::collections::BTreeMap<String, usize> = Default::default();
+
+        for entry in cache.iter_tags() {
+            let Some(group_name) = groups.by_tag.get(&entry.group_tag) else { continue };
+            // The render methods, what they point at, and what those compile to.
+            let is_shader = group_name.starts_with("render_method")
+                || group_name.starts_with("shader")
+                || group_name.ends_with("_shader")
+                || group_name == "global_pixel_shader"
+                || group_name == "global_vertex_shader";
+            if !is_shader {
+                continue;
+            }
+            let seen = counted.entry(group_name.to_owned()).or_insert(0);
+            if *seen >= per_group {
+                continue;
+            }
+            *seen += 1;
+            if cache.resolve_tag_block(entry).is_none() {
+                continue;
+            }
+            let Ok(source) = cache.read_tag(entry) else { continue };
+            let slot = tally.entry(group_name.to_owned()).or_insert([0; 5]);
+            slot[0] += 1;
+            let draft = match analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) {
+                Ok(draft) => {
+                    slot[1] += 1;
+                    draft
+                }
+                Err(why) => {
+                    let list = notes.entry(format!("{group_name} refused")).or_default();
+                    if list.len() < 2 {
+                        list.push(format!(
+                            "{}: {}",
+                            entry.name,
+                            why.chars().take(160).collect::<String>(),
+                        ));
+                    }
+                    continue;
+                }
+            };
+            let twin = reach.join(format!(
+                "{}.{group_name}",
+                entry.name.replace(char::from(92), "/"),
+            ));
+            let Ok(meta) = std::fs::metadata(&twin) else { continue };
+            if meta.modified().map(|when| when >= cutoff).unwrap_or(true) {
+                continue;
+            }
+            let Ok(stock) = TagFile::read(&twin) else { continue };
+            let slot = tally.entry(group_name.to_owned()).or_insert([0; 5]);
+            slot[2] += 1;
+            let mut differences = Vec::new();
+            diff_structs("", &draft.tag.root(), &stock.root(), &mut differences, 0);
+            if differences.is_empty() {
+                slot[3] += 1;
+            } else {
+                slot[4] = slot[4].max(differences.len());
+                let list = notes.entry(format!("{group_name} differs")).or_default();
+                if list.len() < 3 {
+                    list.push(format!(
+                        "{}: {} field(s), e.g. {}",
+                        entry.name,
+                        differences.len(),
+                        differences
+                            .iter()
+                            .take(2)
+                            .map(|d| d.chars().take(110).collect::<String>())
+                            .collect::<Vec<_>>()
+                            .join(" | "),
+                    ));
+                }
+            }
+        }
+        eprintln!("   group                          seen  converted  comparable  identical  worst");
+        for (group, [seen, converted, comparable, identical, worst]) in &tally {
+            eprintln!(
+                "   {group:<28} {seen:>6} {converted:>10} {comparable:>11} {identical:>10} {worst:>6}"
+            );
+        }
+        for (what, examples) in &notes {
+            eprintln!("   {what}:");
+            for example in examples {
+                eprintln!("      {example}");
+            }
         }
     }
 
