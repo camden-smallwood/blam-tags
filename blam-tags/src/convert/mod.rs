@@ -13772,6 +13772,97 @@ mod x360_cache_conversion {
         );
     }
 
+    /// A converted lightmap names no compiled buffer it does not carry.
+    ///
+    /// `per_instance_lightmap_texcoords_vertex_buffer` is one `short` per
+    /// instance pointing into the compiled vertex buffers, and a 360 lightmap
+    /// has thousands of them -- 8,061 reaching index 5,826 on one level. The
+    /// buffers do not come across, so a kit's own lightmap carries none of
+    /// these, and one that carries them is one the engine reads off the end of:
+    /// `#3885 is not a valid vertex_buffers_block index in [#0, #815)`, thrown
+    /// from `tag_groups.cpp` against a tag it does not name.
+    ///
+    /// Worth its own test rather than folding into the BSP one, because a
+    /// structure BSP has none of these to begin with. The lightmap is where it
+    /// bites, and the lightmap is the tag that was not being checked.
+    #[test]
+    fn a_360_lightmap_names_no_buffer_it_did_not_bring() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and an HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let Ok(groups) = GameTagIndex::load(&definitions, "haloreach_mcc") else {
+            eprintln!("skipping: no haloreach_mcc definitions");
+            return;
+        };
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let group = u32::from_be_bytes(*b"Lbsp");
+        // The build kept bytes for 150 of its 1,020 lightmaps; the rest cannot
+        // be read at all, let alone converted.
+        let Some(entry) = cache
+            .iter_tags()
+            .filter(|entry| entry.group_tag == group)
+            .find(|entry| cache.resolve_tag_block(entry).is_some())
+        else {
+            eprintln!("skipping: the build holds no lightmap data");
+            return;
+        };
+        let Ok(source) = cache.read_tag(entry) else {
+            eprintln!("skipping: {} would not read", entry.name);
+            return;
+        };
+        let draft = match analyze_conversion_with_templates(
+            &source,
+            "haloreach_mcc",
+            "haloreach_mcc",
+            &definitions,
+            Some(&templates),
+        ) {
+            Ok(draft) => draft,
+            Err(why) => {
+                eprintln!("skipping: {} would not convert: {why}", entry.name);
+                return;
+            }
+        };
+
+        let named: usize = per_instance_lightmap_buffers(&draft.tag);
+        assert_eq!(
+            named, 0,
+            "{} kept {named} per-instance lightmap buffer index(es), which point into \
+             compiled buffers this tag does not carry",
+            entry.name,
+        );
+        // And the source really did have some, so a pass that quietly stopped
+        // running would fail here rather than look like a success.
+        let before = per_instance_lightmap_buffers(&source);
+        if before == 0 {
+            eprintln!("note: {} had none to clear", entry.name);
+        }
+    }
+
+    /// How many per-instance lightmap texcoord buffers a tag names, over every
+    /// geometry struct in it.
+    fn per_instance_lightmap_buffers(tag: &TagFile) -> usize {
+        let mut total = 0;
+        let mut pending = vec![tag.root()];
+        while let Some(value) = pending.pop() {
+            if let Some(block) = value
+                .field("per_instance_lightmap_texcoords_vertex_buffer")
+                .and_then(|field| field.as_block())
+            {
+                total += block.len();
+            }
+            for name in value.field_names() {
+                if let Some(nested) = value.field(&name).and_then(|field| field.as_struct()) {
+                    pending.push(nested);
+                }
+            }
+        }
+        total
+    }
+
     /// A converted 360 BSP must describe itself as uncompiled.
     ///
     /// The GPU buffers do not come across -- they are Xenos-shaped and this
@@ -16852,6 +16943,288 @@ mod x360_cache_conversion {
         }
         for (folder, count) in folders.iter() {
             eprintln!("  {count:>3}  {folder}");
+        }
+    }
+
+    /// Every geometry struct in a kit tag: its meshes' buffer indices, and how
+    /// many buffers there are to index.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_vertex_buffer_indices() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        for relative in std::env::var("INSPECT").unwrap_or_default().split(';') {
+            if relative.is_empty() { continue }
+            let path = reach.join(relative);
+            let Ok(tag) = TagFile::read(&path) else { eprintln!("{relative}: unreadable"); continue };
+            eprintln!("{relative}");
+            let mut found = 0usize;
+            walk_geometry(&tag.root(), "", &mut found, 0);
+        }
+    }
+
+    fn walk_geometry(value: &TagStruct<'_>, at: &str, found: &mut usize, depth: usize) {
+        if depth > 6 { return }
+        let is_geometry = value.field("meshes").and_then(|f| f.as_block()).is_some()
+            && value.field("runtime flags").is_some();
+        if is_geometry {
+            *found += 1;
+            let meshes = value.field("meshes").and_then(|f| f.as_block());
+            let count = meshes.as_ref().map(|b| b.len()).unwrap_or(0);
+            let buffers = value
+                .field_path("api resource")
+                .and_then(|f| f.as_resource())
+                .and_then(|r| r.as_struct())
+                .and_then(|s| s.field("pc vertex buffers").and_then(|f| f.as_block()))
+                .map(|b| b.len());
+            let xenon = value
+                .field_path("api resource")
+                .and_then(|f| f.as_resource())
+                .and_then(|r| r.as_struct())
+                .and_then(|s| s.field("xenon vertex buffers").and_then(|f| f.as_block()))
+                .map(|b| b.len());
+            let mut worst: i128 = -1;
+            let mut nonzero = 0usize;
+            if let Some(block) = meshes.as_ref() {
+                for i in 0..block.len() {
+                    let Some(mesh) = block.element(i) else { continue };
+                    if let Some(array) = mesh.field("vertex buffer indices").and_then(|f| f.as_array()) {
+                        for k in 0..array.len() {
+                            if let Some(v) = array.element(k).and_then(|e| e.read_int_any("vertex buffer index")) {
+                                if v != 0 { nonzero += 1 }
+                                worst = worst.max(v);
+                            }
+                        }
+                    }
+                }
+            }
+            let per_instance = value
+                .field("per_instance_lightmap_texcoords_vertex_buffer")
+                .and_then(|f| f.as_block());
+            let mut per_worst: i128 = -1;
+            let mut per_count = 0usize;
+            if let Some(block) = per_instance.as_ref() {
+                per_count = block.len();
+                for i in 0..block.len() {
+                    if let Some(v) =
+                        block.element(i).and_then(|e| e.read_int_any("vertex buffer index"))
+                    {
+                        per_worst = per_worst.max(v);
+                    }
+                }
+            }
+            eprintln!(
+                "   [{at}] {count} mesh(es); buffers pc {buffers:?} xenon {xenon:?}; mesh index high {worst} ({nonzero} non-zero); per-instance lightmap buffers {per_count} high {per_worst}"
+            );
+        }
+        for name in value.field_names() {
+            let here = if at.is_empty() { name.to_string() } else { format!("{at}/{name}") };
+            let Some(field) = value.field(&name) else { continue };
+            if let Some(nested) = field.as_struct() {
+                walk_geometry(&nested, &here, found, depth + 1);
+            } else if let Some(block) = field.as_block() {
+                for i in 0..block.len().min(4) {
+                    if let Some(e) = block.element(i) {
+                        walk_geometry(&e, &format!("{here}[{i}]"), found, depth + 1);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Kit tags whose meshes name a vertex buffer that is not there.
+    ///
+    /// The engine asserts on this by index and does not say which tag, so the
+    /// only way to find it is to ask every tag the same question.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_scan_vertex_buffer_indices() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        let after = std::env::var("SCAN_AFTER")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1_577_836_800);
+        let cutoff = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(after);
+        let wanted: Vec<String> = std::env::var("SCAN_EXT")
+            .unwrap_or_else(|_| "scenario_structure_bsp,scenario_lightmap_bsp_data,render_model".to_owned())
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        let (mut checked, mut flagged) = (0usize, 0usize);
+        for path in walk_files(&reach) {
+            let Some(extension) = path.extension().and_then(|e| e.to_str()) else { continue };
+            if !wanted.iter().any(|w| w == extension) { continue }
+            if std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .map(|when| when < cutoff)
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            let Ok(tag) = TagFile::read(&path) else { continue };
+            checked += 1;
+            let mut worst: i128 = 0;
+            let mut buffers = 0usize;
+            scan_geometry(&tag.root(), &mut worst, &mut buffers, 0);
+            if worst as usize >= buffers.max(1) && worst > 0 {
+                flagged += 1;
+                if flagged <= 12 {
+                    eprintln!(
+                        "  index {worst} but {buffers} buffer(s): {}",
+                        path.strip_prefix(&reach).unwrap_or(&path).display()
+                    );
+                }
+            }
+        }
+        eprintln!("{checked} imported tag(s) checked, {flagged} name a buffer that is not there");
+    }
+
+    fn scan_geometry(value: &TagStruct<'_>, worst: &mut i128, buffers: &mut usize, depth: usize) {
+        if depth > 6 { return }
+        if let Some(meshes) = value.field("meshes").and_then(|f| f.as_block())
+            && value.field("runtime flags").is_some()
+        {
+            if let Some(resource) = value
+                .field_path("api resource")
+                .and_then(|f| f.as_resource())
+                .and_then(|r| r.as_struct())
+            {
+                for name in ["pc vertex buffers", "xenon vertex buffers"] {
+                    if let Some(block) = resource.field(name).and_then(|f| f.as_block()) {
+                        *buffers = (*buffers).max(block.len());
+                    }
+                }
+            }
+            for i in 0..meshes.len() {
+                let Some(mesh) = meshes.element(i) else { continue };
+                if let Some(array) = mesh.field("vertex buffer indices").and_then(|f| f.as_array()) {
+                    for k in 0..array.len() {
+                        if let Some(v) = array.element(k).and_then(|e| e.read_int_any("vertex buffer index")) {
+                            *worst = (*worst).max(v);
+                        }
+                    }
+                }
+            }
+        }
+        for name in value.field_names() {
+            let Some(field) = value.field(&name) else { continue };
+            if let Some(nested) = field.as_struct() {
+                scan_geometry(&nested, worst, buffers, depth + 1);
+            } else if let Some(block) = field.as_block() {
+                for i in 0..block.len().min(8) {
+                    if let Some(e) = block.element(i) {
+                        scan_geometry(&e, worst, buffers, depth + 1);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every field that names a compiled buffer, ours beside the kit's.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_compiled_buffer_fields() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        for relative in std::env::var("INSPECT").unwrap_or_default().split(';') {
+            if relative.is_empty() { continue }
+            let Ok(tag) = TagFile::read(&reach.join(relative)) else {
+                eprintln!("{relative}: unreadable");
+                continue;
+            };
+            let root = tag.root();
+            let block_len = |path: &str| {
+                root.field_path(path).and_then(|f| f.as_block()).map(|b| b.len())
+            };
+            // Decorator clusters, which name a compiled instance buffer.
+            let mut decorator_high: i128 = -1;
+            let mut decorator_count = 0usize;
+            if let Some(block) = root.field_path("clusters").and_then(|f| f.as_block()) {
+                for i in 0..block.len() {
+                    let Some(cluster) = block.element(i) else { continue };
+                    if let Some(v) = cluster.read_int_any("decorator instance buffer index") {
+                        decorator_count += 1;
+                        decorator_high = decorator_high.max(v);
+                    }
+                }
+            }
+            // The lightmap's per-vertex runtime buffer index.
+            let mut pervertex_high: i128 = -1;
+            let mut pervertex_count = 0usize;
+            for path in ["lightmap per vertex data", "per vertex lighting data"] {
+                if let Some(block) = root.field_path(path).and_then(|f| f.as_block()) {
+                    for i in 0..block.len() {
+                        let Some(e) = block.element(i) else { continue };
+                        if let Some(v) = e.read_int_any("vertex buffer index") {
+                            pervertex_count += 1;
+                            pervertex_high = pervertex_high.max(v);
+                        }
+                    }
+                }
+            }
+            eprintln!(
+                "{relative}\n   clusters {:?}; decorator instance buffer index: {decorator_count} field(s), high {decorator_high}; per-vertex buffer index: {pervertex_count} field(s), high {pervertex_high}",
+                block_len("clusters"),
+            );
+        }
+    }
+
+    /// A converted lightmap must not name compiled buffers it does not carry.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_lbsp_settled() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let want = std::env::var("LBSP_NAME").unwrap_or_default();
+        for group_name in ["Lbsp", "sbsp"] {
+            let mut gb = [b' '; 4];
+            for (i, c) in group_name.bytes().take(4).enumerate() { gb[i] = c; }
+            let group = u32::from_be_bytes(gb);
+            let Some(entry) = cache
+                .iter_tags()
+                .filter(|e| e.group_tag == group)
+                .find(|e| e.name == want)
+            else { eprintln!("{group_name}: no {want}"); continue };
+            let Ok(source) = cache.read_tag(entry) else {
+                eprintln!("{group_name}: unreadable");
+                continue;
+            };
+            let count = |tag: &TagFile| -> Vec<(String, usize, i128)> {
+                let mut out = Vec::new();
+                let mut pending = vec![(String::new(), tag.root())];
+                while let Some((at, value)) = pending.pop() {
+                    if let Some(block) = value
+                        .field("per_instance_lightmap_texcoords_vertex_buffer")
+                        .and_then(|f| f.as_block())
+                    {
+                        let mut high: i128 = -1;
+                        for i in 0..block.len() {
+                            if let Some(v) =
+                                block.element(i).and_then(|e| e.read_int_any("vertex buffer index"))
+                            {
+                                high = high.max(v);
+                            }
+                        }
+                        out.push((at.clone(), block.len(), high));
+                    }
+                    for name in value.field_names() {
+                        let Some(field) = value.field(&name) else { continue };
+                        if let Some(nested) = field.as_struct() {
+                            pending.push((format!("{at}/{name}"), nested));
+                        }
+                    }
+                }
+                out
+            };
+            eprintln!("{group_name} {want}");
+            eprintln!("   source:    {:?}", count(&source));
+            match analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) {
+                Ok(draft) => eprintln!("   converted: {:?}", count(&draft.tag)),
+                Err(why) => eprintln!("   refused: {}", why.chars().take(120).collect::<String>()),
+            }
         }
     }
 
