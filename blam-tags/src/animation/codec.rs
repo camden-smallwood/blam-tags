@@ -972,7 +972,14 @@ impl<'a> Cursor<'a> {
         let v = *self.data.get(self.pos).ok_or(AnimationError::TruncatedPayload {
             codec: Codec::Curve, want_end: self.pos + 1, blob_size: self.data.len(),
         })?;
-        self.pos += 1; Ok(v)
+        let at = self.pos;
+        self.pos += 1;
+        // Noted even though a single byte never needs turning round --
+        // `swap_one` ignores a width below two. What it buys is the ability to
+        // ask what the walk never touched at all, which is the only way to
+        // know whether a recorded swap covered the stream.
+        self.note(at, 1);
+        Ok(v)
     }
     fn read_u16(&mut self) -> Result<u16, AnimationError> {
         let bs = self.data.get(self.pos..self.pos + 2).ok_or(AnimationError::TruncatedPayload {
@@ -1017,7 +1024,7 @@ impl<'a> Cursor<'a> {
 /// frames are stored directly -- so the only reliable way to find its words is
 /// to read it the way the decoder does. `None` when the stream will not walk,
 /// which is the honest answer for a stream this cannot convert.
-pub(super) fn curve_word_offsets(
+pub(crate) fn curve_word_offsets(
     blob: &[u8],
     codec: Codec,
     frame_count: u16,
@@ -1070,9 +1077,15 @@ fn decode_curve_inner(
     if blob.len() < 32 {
         return Err(AnimationError::TruncatedHeader { codec, want: 32, have: blob.len() });
     }
-    // 12-byte base header (we already validated codec_byte before
-    // dispatching here — just consume).
-    c.skip(12);
+    // The codec byte and the three node counts are single bytes and stay as
+    // they are. The two words after them this decoder has no use for, but they
+    // are read rather than skipped on purpose: a recording cursor turns a 360
+    // stream round by noting the words it reads, so a word stepped over is a
+    // word left big-endian for the engine to choke on. Sapien halts inside
+    // `curve_codec.cpp` the moment such an animation plays.
+    c.skip(4);
+    c.read_u32()?; // unused here, not unused to the engine
+    c.read_u32()?; // likewise
     let translation_data_offset = c.read_u32()? as usize;
     let scale_data_offset = c.read_u32()? as usize;
     let payload_data_offset = c.read_u32()? as usize;

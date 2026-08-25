@@ -13979,6 +13979,125 @@ mod x360_cache_conversion {
         total
     }
 
+    /// Turning a Curve stream round leaves no byte behind.
+    ///
+    /// Curve is swapped by walking rather than by a map: the ordinary decoder
+    /// runs over the big-endian stream and the words it read are the words to
+    /// turn round. That is only correct while the decoder reads everything the
+    /// engine reads, and it did not -- it stepped over two header words it had
+    /// no use for, in every stream in the build. They stayed big-endian, and
+    /// Sapien halted inside `curve_codec.cpp` the moment such an animation
+    /// played.
+    ///
+    /// The decode tests cannot catch that, because the decoder is correct about
+    /// everything it looks at. The only question that catches it is this one:
+    /// which bytes did the walk never touch at all.
+    ///
+    /// Runs of `0xFF` are excused -- they read the same either way, so leaving
+    /// one alone costs nothing, and the streams end with them.
+    #[test]
+    fn a_360_curve_stream_is_turned_round_whole() {
+        let Some(cache) = reach_x360_cache() else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE");
+            return;
+        };
+        let group = u32::from_be_bytes(*b"jmad");
+        let (mut streams, mut gappy) = (0usize, 0usize);
+        let mut first: Option<String> = None;
+        for entry in cache.iter_tags().filter(|entry| entry.group_tag == group) {
+            // A sample: the answer is a property of the format, not of any one
+            // graph, and reading the whole corpus is minutes.
+            if streams >= 200 {
+                break;
+            }
+            if cache.resolve_tag_block(entry).is_none() {
+                continue;
+            }
+            let Ok(tag) = cache.read_tag(entry) else { continue };
+            let Some(groups) = tag
+                .root()
+                .field_path("tag resource groups")
+                .and_then(|field| field.as_block())
+            else {
+                continue;
+            };
+            for index in 0..groups.len() {
+                let Some(resource) = groups
+                    .element(index)
+                    .and_then(|group| group.field("tag_resource"))
+                    .and_then(|field| field.as_resource())
+                else {
+                    continue;
+                };
+                let Some(state) = resource.xsync_state() else { continue };
+                let primary = resource.exploded_payload().unwrap_or(&[]);
+                let Some(members) = crate::animation::resource::read_members(&state, primary)
+                else {
+                    continue;
+                };
+                for member in &members {
+                    let mut at = 0usize;
+                    for section in 0..2usize {
+                        let size = member.data_sizes[section].max(0) as usize;
+                        let start = at;
+                        at += size;
+                        let Some(stream) = member.animation_data.get(start..start + size) else {
+                            continue;
+                        };
+                        let Some(codec) = stream
+                            .first()
+                            .and_then(|byte| crate::animation::codec::Codec::from_byte(*byte))
+                        else {
+                            continue;
+                        };
+                        let revised = codec == crate::animation::codec::Codec::RevisedCurve;
+                        if !revised && codec != crate::animation::codec::Codec::Curve {
+                            continue;
+                        }
+                        let frames = if section == 0 { 1 } else { member.frame_count.max(1) as u16 };
+                        let Some(words) = crate::animation::codec::curve_word_offsets(
+                            stream, codec, frames, revised,
+                        ) else {
+                            continue;
+                        };
+                        streams += 1;
+                        let mut painted = vec![false; size];
+                        // The codec byte and the three node counts are single
+                        // bytes and stay as they are.
+                        for byte in painted.iter_mut().take(4) {
+                            *byte = true;
+                        }
+                        for (offset, width) in &words {
+                            for byte in *offset..(*offset + *width as usize).min(size) {
+                                painted[byte] = true;
+                            }
+                        }
+                        let missed = (0..size)
+                            .filter(|byte| !painted[*byte] && stream[*byte] != 0xFF)
+                            .count();
+                        if missed > 0 {
+                            gappy += 1;
+                            first.get_or_insert_with(|| {
+                                format!("{} group {index}: {missed} byte(s)", entry.name)
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        if streams == 0 {
+            eprintln!("skipping: the build holds no readable curve streams");
+            return;
+        }
+        assert_eq!(
+            gappy,
+            0,
+            "{gappy} of {streams} curve stream(s) keep bytes the swap never turns round, \
+             first at {}",
+            first.unwrap_or_default(),
+        );
+    }
+
     /// A converted tag names no compiled buffer it did not bring.
     ///
     /// Deliberately general. The first version of this test asked about one
@@ -17986,6 +18105,172 @@ mod x360_cache_conversion {
             "   {checked} vertex(es) checked: worst weight sum error {worst_weight:.4}, \
              worst normal length error {worst_normal:.4}"
         );
+    }
+
+    /// Which bytes of a Curve codec stream the swap actually turns round.
+    ///
+    /// Curve is walked rather than mapped: the ordinary decoder runs over the
+    /// big-endian stream and the words it reads are the words to swap. That is
+    /// only correct if the decoder reads everything the engine reads. Anything
+    /// it steps over stays big-endian, and the engine finds it -- Sapien halts
+    /// inside `curve_codec.cpp` the moment such an animation plays.
+    ///
+    /// So: run the recorder, paint the bytes it touched, and report the gaps.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_curve_coverage() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let limit: usize = std::env::var("LIMIT")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(80);
+        let want = std::env::var("WHY_NAME").unwrap_or_default();
+        let group = u32::from_be_bytes(*b"jmad");
+        let (mut looked, mut streams, mut clean, mut gappy) = (0usize, 0usize, 0usize, 0usize);
+        let mut worst: Vec<(String, usize, usize, Vec<(usize, usize, Vec<u8>)>)> = Vec::new();
+        for entry in cache.iter_tags().filter(|entry| entry.group_tag == group) {
+            if looked >= limit {
+                break;
+            }
+            if !entry.name.contains(&want) {
+                continue;
+            }
+            if cache.resolve_tag_block(entry).is_none() {
+                continue;
+            }
+            let Ok(tag) = cache.read_tag(entry) else { continue };
+            let Some(groups) = tag
+                .root()
+                .field_path("tag resource groups")
+                .and_then(|field| field.as_block())
+            else {
+                continue;
+            };
+            looked += 1;
+            for index in 0..groups.len() {
+                let Some(resource) = groups
+                    .element(index)
+                    .and_then(|group| group.field("tag_resource"))
+                    .and_then(|field| field.as_resource())
+                else {
+                    continue;
+                };
+                let Some(state) = resource.xsync_state() else { continue };
+                let primary = resource.exploded_payload().unwrap_or(&[]);
+                let Some(members) = crate::animation::resource::read_members(&state, primary)
+                else {
+                    continue;
+                };
+                for (member_index, member) in members.iter().enumerate() {
+                    // Sections laid end to end in the order `data sizes` gives.
+                    let mut at = 0usize;
+                    for section in 0..2usize {
+                        let size = member.data_sizes[section].max(0) as usize;
+                        let start = at;
+                        at += size;
+                        if size == 0 {
+                            continue;
+                        }
+                        let Some(stream) = member.animation_data.get(start..start + size) else {
+                            continue;
+                        };
+                        let Some(codec) =
+                            stream.first().and_then(|byte| crate::animation::codec::Codec::from_byte(*byte))
+                        else {
+                            continue;
+                        };
+                        if !matches!(codec, crate::animation::codec::Codec::Curve | crate::animation::codec::Codec::RevisedCurve) {
+                            continue;
+                        }
+                        streams += 1;
+                        let frames = if section == 0 {
+                            1
+                        } else {
+                            (member.frame_count.max(1)) as u16
+                        };
+                        let Some(words) = crate::animation::codec::curve_word_offsets(
+                            stream,
+                            codec,
+                            frames,
+                            codec == crate::animation::codec::Codec::RevisedCurve,
+                        ) else {
+                            continue;
+                        };
+                        let mut painted = vec![false; size];
+                        for (offset, width) in &words {
+                            for byte in *offset..(*offset + *width as usize).min(size) {
+                                if byte < size {
+                                    painted[byte] = true;
+                                }
+                            }
+                        }
+                        // The first four bytes are the codec byte and node
+                        // counts, which are single bytes and correctly untouched.
+                        for byte in painted.iter_mut().take(4) {
+                            *byte = true;
+                        }
+                        let mut gaps: Vec<(usize, usize)> = Vec::new();
+                        let mut run: Option<usize> = None;
+                        for (byte, hit) in painted.iter().enumerate() {
+                            match (hit, run) {
+                                (false, None) => run = Some(byte),
+                                (true, Some(from)) => {
+                                    gaps.push((from, byte - from));
+                                    run = None;
+                                }
+                                _ => {}
+                            }
+                        }
+                        if let Some(from) = run {
+                            gaps.push((from, size - from));
+                        }
+                        // A run of 0xFF reads the same either way, so an
+                        // untouched one costs nothing. Only a gap that
+                        // would actually change is a gap that matters.
+                        gaps.retain(|(from, len)| {
+                            stream[*from..*from + *len].iter().any(|b| *b != 0xFF)
+                        });
+                        if gaps.is_empty() {
+                            clean += 1;
+                        } else {
+                            gappy += 1;
+                            if worst.len() < 8 {
+                                let word = |at: usize| {
+                                    stream
+                                        .get(at..at + 4)
+                                        .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
+                                        .unwrap_or(0)
+                                };
+                                eprintln!(
+                                    "      header: nodes {}/{}/{}, words {} {} {} {} {} {}",
+                                    stream[1], stream[2], stream[3],
+                                    word(4), word(8), word(12), word(16), word(20), word(24),
+                                );
+                                worst.push((
+                                    format!("{} group {index} member {member_index}", entry.name),
+                                    size,
+                                    gaps.iter().map(|(_, len)| len).sum(),
+                                    gaps
+                                        .into_iter()
+                                        .take(6)
+                                        .map(|(from, len)| {
+                                            (from, len, stream[from..from + len].to_vec())
+                                        })
+                                        .collect(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "{looked} graph(s): {streams} curve stream(s), {clean} fully covered, \
+             {gappy} with bytes the swap never touches"
+        );
+        for (who, size, missed, gaps) in &worst {
+            eprintln!("   {who}: {missed} of {size} byte(s) missed at {gaps:?}");
+        }
     }
 
     /// Why one animation graph's resources do not come across.
