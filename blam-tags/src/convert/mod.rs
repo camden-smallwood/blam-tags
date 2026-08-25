@@ -14098,6 +14098,175 @@ mod x360_cache_conversion {
         );
     }
 
+    /// A turned-round animation blob is the kit's own bytes.
+    ///
+    /// The strongest check available, and the one that found four separate
+    /// faults nothing else could see. Decoding tests cannot: the decoder is
+    /// correct about everything it looks at, and every one of these was a field
+    /// it either never looked at or looked at through the wrong width.
+    ///
+    ///  * two header words the walk stepped over, so they were never swapped;
+    ///  * a keyframe's `p2`, read twice because the walk backs up to make it the
+    ///    next `p1` -- and swapped twice, which is not swapped at all;
+    ///  * the two fields a node header calls unused, which are byte pairs;
+    ///  * the tail of `uncompressed_data`, which is node indices, one byte each,
+    ///    inside a section that was being swept as words.
+    ///
+    /// HREK ships graphs the 2011 build also has. The kit tag must be dated
+    /// before 2020 or it is this converter's own output, which proves nothing --
+    /// `camera.model_animation_graph` is exactly that trap.
+    #[test]
+    fn a_360_animation_blob_matches_the_kits_own_bytes() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and an HREK");
+            return;
+        };
+        let group = u32::from_be_bytes(*b"jmad");
+        let (mut compared, mut identical) = (0usize, 0usize);
+        let mut first_bad: Option<String> = None;
+        for entry in cache.iter_tags().filter(|entry| entry.group_tag == group) {
+            if compared >= 60 {
+                break;
+            }
+            if cache.resolve_tag_block(entry).is_none() {
+                continue;
+            }
+            let twin = reach.join("tags").join(format!(
+                "{}.model_animation_graph",
+                entry.name.replace(char::from(92), "/"),
+            ));
+            let Ok(meta) = std::fs::metadata(&twin) else { continue };
+            let shipped = meta
+                .modified()
+                .ok()
+                .and_then(|when| when.duration_since(std::time::UNIX_EPOCH).ok())
+                .is_some_and(|age| age.as_secs() < 1_577_836_800);
+            if !shipped {
+                continue;
+            }
+            let (Ok(source), Ok(kit)) = (cache.read_tag(entry), TagFile::read(&twin)) else {
+                continue;
+            };
+            let theirs = kit_animation_blobs(&kit);
+            if theirs.is_empty() {
+                continue;
+            }
+            for (key, (mut blob, sizes, frames)) in build_animation_blobs(&source) {
+                let Some(yours) = theirs.get(&key) else { continue };
+                if blob.len() != yours.len() {
+                    continue;
+                }
+                if crate::animation::byte_order::swap_animation_blob(&mut blob, &sizes, frames)
+                    .is_err()
+                {
+                    continue;
+                }
+                compared += 1;
+                if blob == *yours {
+                    identical += 1;
+                } else {
+                    let at = blob
+                        .iter()
+                        .zip(yours.iter())
+                        .position(|(a, b)| a != b)
+                        .unwrap_or(0);
+                    first_bad.get_or_insert_with(|| {
+                        format!("{} {key:?} differs from byte {at}", entry.name)
+                    });
+                }
+            }
+        }
+        if compared == 0 {
+            eprintln!("skipping: the kit and the build share no untouched animation blobs");
+            return;
+        }
+        assert_eq!(
+            identical,
+            compared,
+            "{} of {compared} blob(s) are not the kit's own bytes; {}",
+            compared - identical,
+            first_bad.unwrap_or_default(),
+        );
+    }
+
+    /// `(group, member)` -> the 360 blob, its section sizes and frame count.
+    fn build_animation_blobs(
+        tag: &TagFile,
+    ) -> Vec<((usize, usize), (Vec<u8>, [i32; 17], u16))> {
+        let mut out = Vec::new();
+        let Some(groups) = tag
+            .root()
+            .field_path("tag resource groups")
+            .and_then(|field| field.as_block())
+        else {
+            return out;
+        };
+        for index in 0..groups.len() {
+            let Some(resource) = groups
+                .element(index)
+                .and_then(|group| group.field("tag_resource"))
+                .and_then(|field| field.as_resource())
+            else {
+                continue;
+            };
+            let Some(state) = resource.xsync_state() else { continue };
+            let primary = resource.exploded_payload().unwrap_or(&[]);
+            let Some(members) = crate::animation::resource::read_members(&state, primary) else {
+                continue;
+            };
+            for (member, held) in members.iter().enumerate() {
+                out.push((
+                    (index, member),
+                    (
+                        held.animation_data.clone(),
+                        held.data_sizes,
+                        held.frame_count.max(1) as u16,
+                    ),
+                ));
+            }
+        }
+        out
+    }
+
+    /// `(group, member)` -> the kit's inline blob.
+    fn kit_animation_blobs(tag: &TagFile) -> std::collections::BTreeMap<(usize, usize), Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        let Some(groups) = tag
+            .root()
+            .field_path("tag resource groups")
+            .and_then(|field| field.as_block())
+        else {
+            return out;
+        };
+        for index in 0..groups.len() {
+            let Some(list) = groups
+                .element(index)
+                .and_then(|group| group.field("tag_resource"))
+                .and_then(|field| field.as_resource())
+                .and_then(|resource| resource.as_struct())
+                .and_then(|payload| {
+                    payload
+                        .field("group_members")
+                        .and_then(|field| field.as_block())
+                })
+            else {
+                continue;
+            };
+            for member in 0..list.len() {
+                let Some(blob) = list
+                    .element(member)
+                    .and_then(|element| element.field("animation_data"))
+                    .and_then(|field| field.as_data())
+                else {
+                    continue;
+                };
+                out.insert((index, member), blob.to_vec());
+            }
+        }
+        out
+    }
+
     /// A converted tag names no compiled buffer it did not bring.
     ///
     /// Deliberately general. The first version of this test asked about one
@@ -18183,6 +18352,13 @@ mod x360_cache_conversion {
                             continue;
                         }
                         streams += 1;
+                        if streams == 1 {
+                            eprintln!("      build curve head: {:?}", &stream[..size.min(48)]);
+                            eprintln!(
+                                "      bytes 28..32 as text: {:?}",
+                                stream.get(28..32).map(|b| String::from_utf8_lossy(b).into_owned()),
+                            );
+                        }
                         let frames = if section == 0 {
                             1
                         } else {
@@ -18270,6 +18446,427 @@ mod x360_cache_conversion {
         );
         for (who, size, missed, gaps) in &worst {
             eprintln!("   {who}: {missed} of {size} byte(s) missed at {gaps:?}");
+        }
+    }
+
+    /// Which codecs a kit's own animation graphs actually use.
+    ///
+    /// If a shipped graph ever uses Curve then the kit holds little-endian
+    /// curve streams, and a little-endian stream of a format is the only thing
+    /// that can settle what width each of its fields is. Without one, the
+    /// layout is only ever as good as the decoder's guesses, and a wrong guess
+    /// swaps a pair of bytes that should have been left alone.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_kit_animation_codecs() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        let limit: usize = std::env::var("LIMIT")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(600);
+        let mut files = Vec::new();
+        collect_files(&reach, &mut files);
+        files.sort();
+        let mut codecs: std::collections::BTreeMap<u8, usize> = Default::default();
+        let mut curve_example: Option<(String, Vec<u8>)> = None;
+        let mut looked = 0usize;
+        for path in &files {
+            if looked >= limit {
+                break;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("model_animation_graph") {
+                continue;
+            }
+            let Ok(meta) = std::fs::metadata(path) else { continue };
+            if meta.len() > 8_000_000 {
+                continue;
+            }
+            // Shipped only. A tag dated today is this converter's own output,
+            // and comparing against it proves nothing at all.
+            let shipped = meta
+                .modified()
+                .ok()
+                .and_then(|when| when.duration_since(std::time::UNIX_EPOCH).ok())
+                .is_some_and(|age| age.as_secs() < 1_577_836_800);
+            if !shipped {
+                continue;
+            }
+            let Ok(tag) = TagFile::read(path) else { continue };
+            looked += 1;
+            let Some(groups) = tag
+                .root()
+                .field_path("tag resource groups")
+                .and_then(|field| field.as_block())
+            else {
+                continue;
+            };
+            for index in 0..groups.len() {
+                let Some(list) = groups
+                    .element(index)
+                    .and_then(|group| group.field("tag_resource"))
+                    .and_then(|field| field.as_resource())
+                    .and_then(|resource| resource.as_struct())
+                    .and_then(|payload| {
+                        payload
+                            .field("group_members")
+                            .and_then(|field| field.as_block())
+                    })
+                else {
+                    continue;
+                };
+                for member in 0..list.len() {
+                    let Some(element) = list.element(member) else { continue };
+                    let Some(blob) = element
+                        .field("animation_data")
+                        .and_then(|field| field.as_data())
+                    else {
+                        continue;
+                    };
+                    // Sections laid end to end in the order `data sizes` gives;
+                    // the first two are the codec streams.
+                    let sizes: Vec<i64> = element
+                        .field("data sizes")
+                        .and_then(|field| field.as_struct())
+                        .map(|sizes| {
+                            sizes
+                                .field_names()
+                                .filter_map(|name| sizes.read_int_any(&name))
+                                .map(|value| value as i64)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let mut at = 0usize;
+                    for section in 0..2usize {
+                        let size = sizes.get(section).copied().unwrap_or(0).max(0) as usize;
+                        let start = at;
+                        at += size;
+                        if size == 0 {
+                            continue;
+                        }
+                        let Some(stream) = blob.get(start..start + size) else { continue };
+                        let byte = stream[0];
+                        *codecs.entry(byte).or_default() += 1;
+                        if (byte == 9 || byte == 10) && curve_example.is_none() {
+                            curve_example = Some((
+                                format!(
+                                    "{} group {index} member {member}",
+                                    path.file_name().unwrap_or_default().to_string_lossy(),
+                                ),
+                                stream[..size.min(48)].to_vec(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("{looked} kit graph(s); codec byte -> stream count:");
+        for (byte, count) in &codecs {
+            eprintln!("   {byte:>3}: {count}");
+        }
+        if let Some((who, head)) = &curve_example {
+            eprintln!("   a curve stream at {who}:");
+            eprintln!("      {head:?}");
+        } else {
+            eprintln!("   no kit graph uses a curve codec");
+        }
+    }
+
+    /// Compare a turned-round curve stream against the kit's own copy of it.
+    ///
+    /// The only real check there is. Coverage says every byte was read; it
+    /// cannot say each was read at the width the engine reads it at, and a
+    /// value swapped as one word where the engine wants two is a stream that
+    /// decodes to plausible rubbish and halts `curve_codec.cpp` when played.
+    ///
+    /// HREK ships graphs the 2011 build also has, some using the curve codec.
+    /// Byte-for-byte against those is the answer -- and the kit tag has to be
+    /// dated before 2020, or it is this converter's own output and proves
+    /// nothing.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_curve_against_kit() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let group = u32::from_be_bytes(*b"jmad");
+        let mut compared = 0usize;
+        let mut identical = 0usize;
+        let mut shown = 0usize;
+        for entry in cache.iter_tags().filter(|entry| entry.group_tag == group) {
+            if compared >= 400 {
+                break;
+            }
+            if cache.resolve_tag_block(entry).is_none() {
+                continue;
+            }
+            let twin = reach.join("tags").join(format!(
+                "{}.model_animation_graph",
+                entry.name.replace(char::from(92), "/"),
+            ));
+            let Ok(meta) = std::fs::metadata(&twin) else { continue };
+            let shipped = meta
+                .modified()
+                .ok()
+                .and_then(|when| when.duration_since(std::time::UNIX_EPOCH).ok())
+                .is_some_and(|age| age.as_secs() < 1_577_836_800);
+            if !shipped {
+                continue;
+            }
+            let (Ok(source), Ok(kit)) = (cache.read_tag(entry), TagFile::read(&twin)) else {
+                continue;
+            };
+            let ours = curve_streams_from_360(&source);
+            let theirs = curve_streams_from_kit(&kit);
+            if ours.is_empty() || theirs.is_empty() {
+                continue;
+            }
+            for (key, mut mine) in ours {
+                let Some(yours) = theirs.get(&key) else { continue };
+                if mine.0.len() != yours.len() {
+                    continue;
+                }
+                let original = mine.0.clone();
+                // Turn it round exactly as the converter does.
+                if crate::animation::byte_order::swap_animation_blob(
+                    &mut mine.0,
+                    &mine.1,
+                    mine.2,
+                )
+                .is_err()
+                {
+                    continue;
+                }
+                compared += 1;
+                if mine.0 == *yours {
+                    identical += 1;
+                } else if shown < 4 {
+                    shown += 1;
+                    let first = mine
+                        .0
+                        .iter()
+                        .zip(yours.iter())
+                        .position(|(a, b)| a != b)
+                        .unwrap_or(0);
+                    let from = first.saturating_sub(8);
+                    let to = (first + 40).min(mine.0.len());
+                    let differing = mine
+                        .0
+                        .iter()
+                        .zip(yours.iter())
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    eprintln!(
+                        "{} {key:?}: {} byte(s), codec {}, {differing} differ",
+                        entry.name, mine.0.len(), mine.0[0],
+                    );
+                    eprintln!("   first difference at {first}");
+                    // Which recorded read covers each differing byte, and
+                    // at what width. A pair that should have been left
+                    // alone shows up as a width-2 read over bytes the kit
+                    // and the build agree about.
+                    let mut at = 0usize;
+                    for section in 0..17usize {
+                        {
+                            let size = mine.1[section].max(0) as usize;
+                            if first >= at && first < at + size {
+                                eprintln!("   in section {section} (size {size}) at {}", first - at);
+                            }
+                        }
+                        let size = mine.1[section].max(0) as usize;
+                        let start = at;
+                        at += size;
+                        if first < start || first >= start + size {
+                            continue;
+                        }
+                        let Some(bytes) = original.get(start..start + size) else {
+                            continue;
+                        };
+                        let Some(codec) = bytes
+                            .first()
+                            .and_then(|b| crate::animation::codec::Codec::from_byte(*b))
+                        else { continue };
+                        let frames = if section == 0 { 1 } else { mine.2 };
+                        let revised =
+                            codec == crate::animation::codec::Codec::RevisedCurve;
+                        let Some(words) = crate::animation::codec::curve_word_offsets(
+                            bytes, codec, frames, revised,
+                        ) else { continue };
+                        let want = first - start;
+                        let covering: Vec<_> = words
+                            .iter()
+                            .filter(|(off, width)| {
+                                *off <= want && want < off + *width as usize
+                            })
+                            .collect();
+                        eprintln!(
+                            "   section {section} offset {want}: covered by {covering:?}",
+                        );
+                    }
+                    eprintln!("   ours  {:?}", &mine.0[from..to]);
+                    eprintln!("   kit   {:?}", &yours[from..to]);
+                }
+            }
+        }
+        eprintln!("{identical} of {compared} curve stream(s) match the kit byte for byte");
+    }
+
+    /// `(group, member, section)` -> the raw section, its sizes and frame count.
+    type CurveKey = (usize, usize, usize);
+
+    fn curve_streams_from_360(
+        tag: &TagFile,
+    ) -> Vec<(CurveKey, (Vec<u8>, [i32; 17], u16))> {
+        let mut out = Vec::new();
+        let Some(groups) = tag
+            .root()
+            .field_path("tag resource groups")
+            .and_then(|field| field.as_block())
+        else {
+            return out;
+        };
+        for index in 0..groups.len() {
+            let Some(resource) = groups
+                .element(index)
+                .and_then(|group| group.field("tag_resource"))
+                .and_then(|field| field.as_resource())
+            else {
+                continue;
+            };
+            let Some(state) = resource.xsync_state() else { continue };
+            let primary = resource.exploded_payload().unwrap_or(&[]);
+            let Some(members) = crate::animation::resource::read_members(&state, primary) else {
+                continue;
+            };
+            for (member_index, member) in members.iter().enumerate() {
+                out.push((
+                    (index, member_index, 0),
+                    (
+                        member.animation_data.clone(),
+                        member.data_sizes,
+                        member.frame_count.max(1) as u16,
+                    ),
+                ));
+            }
+        }
+        out
+    }
+
+    fn curve_streams_from_kit(tag: &TagFile) -> std::collections::BTreeMap<CurveKey, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        let Some(groups) = tag
+            .root()
+            .field_path("tag resource groups")
+            .and_then(|field| field.as_block())
+        else {
+            return out;
+        };
+        for index in 0..groups.len() {
+            let Some(list) = groups
+                .element(index)
+                .and_then(|group| group.field("tag_resource"))
+                .and_then(|field| field.as_resource())
+                .and_then(|resource| resource.as_struct())
+                .and_then(|payload| {
+                    payload
+                        .field("group_members")
+                        .and_then(|field| field.as_block())
+                })
+            else {
+                continue;
+            };
+            for member in 0..list.len() {
+                let Some(element) = list.element(member) else { continue };
+                let Some(blob) = element
+                    .field("animation_data")
+                    .and_then(|field| field.as_data())
+                else {
+                    continue;
+                };
+                out.insert((index, member, 0), blob.to_vec());
+            }
+        }
+        out
+    }
+
+    /// The shape of `uncompressed_data`, section 7, across the whole build.
+    ///
+    /// It is not the flat word array it was being swapped as: it opens with
+    /// four single bytes and ends with a run of single bytes, and only the
+    /// middle is words. The question is where the middle stops, and one sample
+    /// cannot answer it -- so count them all and see whether the four opening
+    /// bytes predict the size.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_uncompressed_data_shape() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let group = u32::from_be_bytes(*b"jmad");
+        let mut seen = 0usize;
+        let mut fits_times_eight = 0usize;
+        let mut rows: Vec<(usize, [u8; 4])> = Vec::new();
+        for entry in cache.iter_tags().filter(|entry| entry.group_tag == group) {
+            if seen >= 400 {
+                break;
+            }
+            if cache.resolve_tag_block(entry).is_none() {
+                continue;
+            }
+            let Ok(tag) = cache.read_tag(entry) else { continue };
+            let Some(groups) = tag
+                .root()
+                .field_path("tag resource groups")
+                .and_then(|field| field.as_block())
+            else {
+                continue;
+            };
+            for index in 0..groups.len() {
+                let Some(resource) = groups
+                    .element(index)
+                    .and_then(|group| group.field("tag_resource"))
+                    .and_then(|field| field.as_resource())
+                else {
+                    continue;
+                };
+                let Some(state) = resource.xsync_state() else { continue };
+                let primary = resource.exploded_payload().unwrap_or(&[]);
+                let Some(members) = crate::animation::resource::read_members(&state, primary)
+                else {
+                    continue;
+                };
+                for member in &members {
+                    let mut at = 0usize;
+                    for section in 0..17usize {
+                        let size = member.data_sizes[section].max(0) as usize;
+                        let start = at;
+                        at += size;
+                        if section != 7 || size == 0 {
+                            continue;
+                        }
+                        let Some(bytes) = member.animation_data.get(start..start + size) else {
+                            continue;
+                        };
+                        if bytes.len() < 4 {
+                            continue;
+                        }
+                        seen += 1;
+                        let head = [bytes[0], bytes[1], bytes[2], bytes[3]];
+                        // The guess from one sample: the section ends with
+                        // `head[2] * 8` single bytes.
+                        if 4 + (head[2] as usize) * 8 <= size {
+                            fits_times_eight += 1;
+                        }
+                        if rows.len() < 14 {
+                            rows.push((size, head));
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("{seen} section-7 run(s); {fits_times_eight} where 4 + head[2]*8 fits");
+        for (size, head) in &rows {
+            let tail = (head[2] as usize) * 8;
+            eprintln!(
+                "   size {size:>5}  head {head:?}  head[2]*8 = {tail}  middle would be {}",
+                size.saturating_sub(4 + tail),
+            );
         }
     }
 

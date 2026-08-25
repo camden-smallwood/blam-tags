@@ -65,6 +65,9 @@ const ANIMATED_FLAGS: usize = 3;
 const MOVEMENT: usize = 4;
 const PILL_OFFSET: usize = 5;
 
+/// `uncompressed_data`, which is four single bytes and then words.
+const UNCOMPRESSED_DATA: usize = 7;
+
 /// Sections that are flat arrays of 32-bit values -- floats or flag words,
 /// which swap the same way. Everything from `default_data` on is one of these:
 /// per-node offsets, object-space transforms, IK chain data, anchor points.
@@ -110,6 +113,8 @@ pub fn swap_animation_blob(
         let section = blob.get_mut(at..end).ok_or(SwapRefusal::Truncated { section: index })?;
         if index == STATIC_CODEC || index == ANIMATED_CODEC {
             swap_codec_stream(section, frame_count, index == STATIC_CODEC)?;
+        } else if index == UNCOMPRESSED_DATA && size > 4 {
+            swap_uncompressed_data(section);
         } else if WORD_ARRAY_SECTIONS.contains(&index) {
             swap_words(section, 4);
         } else {
@@ -118,6 +123,32 @@ pub fn swap_animation_blob(
         at = end;
     }
     Ok(())
+}
+
+/// Turn `uncompressed_data` round.
+///
+/// Not the flat word array it was being swapped as. Four counts open it, a run
+/// of words follows, and it ends with `counts[2] * 8` single bytes -- small
+/// values, 0 to 15, which are node indices. Swept as words those come out
+/// reversed in groups of four, which is how they were found: the kit's own copy
+/// of the same animation agrees with the 360 build about them and disagrees
+/// about everything before them, exactly as a byte and a word should.
+///
+/// The split is measured. Across all 540 runs in the build the section is
+/// always `4 + 4 * (2 * counts[1] + 2) + 8 * counts[2]` bytes long, so the tail
+/// is taken from the end and whatever lies between it and the counts is words.
+/// Taking it from the end rather than by the formula means a run that disagrees
+/// with the formula still splits somewhere sane.
+fn swap_uncompressed_data(section: &mut [u8]) {
+    const HEADER: usize = 4;
+    let tail = section[2] as usize * 8;
+    let Some(middle) = section.len().checked_sub(tail) else {
+        return;
+    };
+    if middle < HEADER {
+        return;
+    }
+    swap_words(&mut section[HEADER..middle], 4);
 }
 
 /// Turn one codec stream round.

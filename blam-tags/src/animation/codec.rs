@@ -1032,7 +1032,17 @@ pub(crate) fn curve_word_offsets(
 ) -> Option<Vec<(usize, u8)>> {
     let mut cursor = Cursor::recording_be(blob);
     decode_curve_inner(&mut cursor, codec, frame_count, revised).ok()?;
-    cursor.reads.take()
+    let mut reads = cursor.reads.take()?;
+    // The set of words to turn round, not the list of reads that were made.
+    //
+    // A keyframe segment ends by backing up six bytes so its `p2` becomes the
+    // next segment's `p1`, so those words are read twice -- and a word swapped
+    // twice is a word not swapped at all. It cost 18 of 83 streams measured
+    // against the kit's own copies, and the engine halts in `curve_codec.cpp`
+    // on the ones it hit.
+    reads.sort_unstable();
+    reads.dedup();
+    Some(reads)
 }
 
 /// Slot 9 — Curve codec. Per-component (rotation/translation/scale),
@@ -1140,11 +1150,17 @@ fn decode_curve_inner(
 }
 
 fn read_curve_rotation_node(c: &mut Cursor<'_>, frames: usize, revised: bool) -> Result<Vec<RealQuaternion>, AnimationError> {
-    c.read_u16()?; // unused
+    // Two bytes, not a word. The decoder has no use for either, so nothing
+    // ever checked their width -- and the kit's own copy of the same
+    // animation keeps them in the order the build wrote them, which a swap
+    // undoes. `key_count` on the next line is a real word and does swap.
+    c.read_u8()?;
+    c.read_u8()?;
     let key_count = c.read_u16()? as usize;
     let flags = c.read_u8()?;
     c.read_u8()?; // unused
-    c.read_s16()?; // unused
+    c.read_u8()?; // likewise two bytes rather than a word
+    c.read_u8()?;
     let keyframes = if flags & 1 == 0 { read_curve_keyframe_deltas(c, key_count)? } else { Vec::new() };
 
     let read_quat = |c: &mut Cursor<'_>| -> Result<RealQuaternion, AnimationError> {
@@ -1209,11 +1225,17 @@ fn read_curve_rotation_node(c: &mut Cursor<'_>, frames: usize, revised: bool) ->
 }
 
 fn read_curve_translation_node(c: &mut Cursor<'_>, frames: usize) -> Result<Vec<RealPoint3d>, AnimationError> {
-    c.read_u16()?; // unused
+    // Two bytes, not a word. The decoder has no use for either, so nothing
+    // ever checked their width -- and the kit's own copy of the same
+    // animation keeps them in the order the build wrote them, which a swap
+    // undoes. `key_count` on the next line is a real word and does swap.
+    c.read_u8()?;
+    c.read_u8()?;
     let key_count = c.read_u16()? as usize;
     let flags = c.read_u8()?;
     c.read_u8()?; // unused
-    c.read_u16()?; // unused
+    c.read_u8()?; // likewise two bytes rather than a word
+    c.read_u8()?;
     let offset_x = c.read_f32()?;
     let offset_y = c.read_f32()?;
     let offset_z = c.read_f32()?;
@@ -1279,11 +1301,17 @@ fn read_curve_translation_node(c: &mut Cursor<'_>, frames: usize) -> Result<Vec<
 }
 
 fn read_curve_scale_node(c: &mut Cursor<'_>, frames: usize) -> Result<Vec<f32>, AnimationError> {
-    c.read_u16()?;
+    // Two bytes, not a word. The decoder has no use for either, so nothing
+    // ever checked their width -- and the kit's own copy of the same
+    // animation keeps them in the order the build wrote them, which a swap
+    // undoes. `key_count` on the next line is a real word and does swap.
+    c.read_u8()?;
+    c.read_u8()?;
     let key_count = c.read_u16()? as usize;
     let flags = c.read_u8()?;
     c.read_u8()?;
-    c.read_u16()?;
+    c.read_u8()?; // likewise two bytes rather than a word
+    c.read_u8()?;
     let offset = c.read_f32()?;
     let scale = c.read_f32()?;
     let keyframes = if flags & 1 == 0 { read_curve_keyframe_deltas(c, key_count)? } else { Vec::new() };
