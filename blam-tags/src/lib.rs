@@ -107,6 +107,9 @@ pub mod audio;
 #[cfg(feature = "iostore")]
 pub mod iostore;
 
+#[cfg(all(feature = "shader-compile", windows))]
+pub mod shader_compile;
+
 // Facade re-exports — the recommended surface for editing tags.
 pub use api::{
     TagArray, TagArrayMut, TagBlock, TagBlockElement, TagBlockMut, TagField, TagFieldMut, TagFlag,

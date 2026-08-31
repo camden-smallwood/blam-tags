@@ -1826,6 +1826,7 @@ pub fn analyze_conversion_with_policy(
         definitions_root,
         native_templates,
         policy,
+        None,
     )
 }
 
@@ -1843,6 +1844,46 @@ pub fn analyze_conversion_with_templates(
         definitions_root,
         native_templates,
         LossPolicy::default(),
+        None,
+    )
+}
+
+/// A hook that can regenerate a compiled-shader tag from source instead of
+/// letting the conversion refuse it.
+///
+/// A `pixel_shader` / `vertex_shader` / `render_method_template` cannot cross a
+/// byte-order upgrade (Xbox 360 build → editing kit): the payload is compiled
+/// GPU code, not byte-swappable data, and the two engines' builds are different
+/// instruction sets entirely (see the refusal in [`analyze_conversion_inner`]).
+/// The only faithful conversion is to *recompile* from the kit's own HLSL, which
+/// needs a shader compiler — out of scope for this always-built module, so it is
+/// injected. The `shader-compile` feature provides an implementation
+/// (`shader_compile::RawShaderRecompiler`); without it, callers pass `None` and
+/// the refusal stands.
+pub trait ShaderRecompiler {
+    /// Regenerate `target` — a clone of a kit template of `group_name` — from the
+    /// kit's HLSL. `Ok(true)` = filled it (use it as the conversion result);
+    /// `Ok(false)` = decline for this shader (fall back to refusing);
+    /// `Err` = a compile failure worth surfacing.
+    fn recompile(&self, target: &mut TagFile, group_name: &str) -> Result<bool, String>;
+}
+
+pub fn analyze_conversion_with_shader_recompiler(
+    source: &TagFile,
+    source_game: &str,
+    target_game: &str,
+    definitions_root: &Path,
+    native_templates: Option<&NativeTemplateIndex>,
+    recompiler: &dyn ShaderRecompiler,
+) -> Result<TagConversionDraft, String> {
+    analyze_conversion_inner(
+        source,
+        source_game,
+        target_game,
+        definitions_root,
+        native_templates,
+        LossPolicy::default(),
+        Some(recompiler),
     )
 }
 
@@ -1853,6 +1894,7 @@ fn analyze_conversion_inner(
     definitions_root: &Path,
     native_templates: Option<&NativeTemplateIndex>,
     policy: LossPolicy,
+    recompiler: Option<&dyn ShaderRecompiler>,
 ) -> Result<TagConversionDraft, String> {
     // Byte order is not a barrier in either container. Reading dispatches on
     // `TagFile::endian` all the way down (see `crate::fields`), and the target is
@@ -2017,7 +2059,11 @@ fn analyze_conversion_inner(
     //
     // The kit already ships its DX9 build of the same shaders, so refusing
     // leaves the right thing in place rather than losing anything.
-    if byte_order_upgrade && is_compiled_shader_group(&target_group_name) {
+    // A compiled shader on a byte-order upgrade is refused UNLESS a recompiler is
+    // supplied, in which case we regenerate it from the kit's HLSL after the kit
+    // template is in hand (below).
+    let recompile_shader = byte_order_upgrade && is_compiled_shader_group(&target_group_name);
+    if recompile_shader && recompiler.is_none() {
         return Err(format!(
             "a {target_group_name} holds compiled Xbox 360 shader microcode, and this engine \
              runs DX9 bytecode -- no byte order relates them, and {target_game} already ships \
@@ -2062,6 +2108,51 @@ fn analyze_conversion_inner(
         },
     };
     apply_editing_kit_mcc_header(&mut target, target_game)?;
+
+    // Regenerate a compiled shader from the kit's HLSL rather than walk the
+    // source's incompatible microcode into it. `target` is the kit's own
+    // template, so its layout and version are already right; the recompiler
+    // fills the bytecode + constant tables. On success this IS the conversion —
+    // there are no authored fields to carry across.
+    if recompile_shader {
+        let recompiler = recompiler.expect("recompile_shader implies a recompiler");
+        match recompiler.recompile(&mut target, &target_group_name) {
+            Ok(true) => {
+                let mut report = TagConversionReport::default();
+                report.issues.push(ConversionIssue {
+                    kind: ConversionIssueKind::Warning,
+                    path: target_group_name.clone(),
+                    message: format!(
+                        "Regenerated this {target_group_name} by recompiling {target_game}'s own \
+                         HLSL to PC bytecode; the source's compiled shader code was not carried \
+                         across (no byte order relates the two instruction sets)."
+                    ),
+                });
+                let target_extension = group_tag_to_extension(target_group_tag)
+                    .unwrap_or(&target_group_name)
+                    .to_owned();
+                return Ok(TagConversionDraft {
+                    tag: target,
+                    companion_tags: Vec::new(),
+                    report,
+                    target_group_name,
+                    target_extension,
+                    native_layout_template: target_template,
+                    route: Vec::new(),
+                });
+            }
+            Ok(false) => {
+                return Err(format!(
+                    "a {target_group_name} holds compiled shader code that must be recompiled \
+                     from source to cross engines, and the recompiler declined this one \
+                     (no matching HLSL source, or a group it does not handle yet). Nothing was written."
+                ));
+            }
+            Err(error) => {
+                return Err(format!("recompiling {target_group_name} from HLSL failed: {error}"));
+            }
+        }
+    }
     // From the template as the kit wrote it, not from `target`: the reset clears
     // every block on the way to a blank starting point, so by now the count is
     // gone. One extra read of a tag already on disk, and only when a native
@@ -16857,7 +16948,7 @@ mod x360_cache_conversion {
         eprintln!("{}", entry.name);
         let draft = match analyze_conversion_inner(
             &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
-            LossPolicy::Accept,
+            LossPolicy::Accept, None,
         ) {
             Ok(d) => d,
             Err(e) => { eprintln!("refused even with Accept: {e}"); return }
