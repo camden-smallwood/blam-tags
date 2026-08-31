@@ -46,6 +46,13 @@ ruzstd = { version = "0.7", optional = true }
 audio = ["dep:lewton", "dep:log", "dep:opus", "dep:vorbis_rs"]
 iostore = ["dep:oozextract", "dep:memmap2", "dep:blake3", "dep:anyhow", "dep:byteorder", "dep:sha1", "dep:ruzstd"]
 
+# `shader-compile`: rebuild the rasterizer's compiled-shader tags (pixel_shader,
+# vertex_shader, compute_shader, global_pixel_shader, global_vertex_shader) from
+# HLSL, matching what the H3EK/MCC `tool.exe` does. It loads `d3dcompiler_47.dll`
+# and calls `D3DCompile`/`D3DReflect` through hand-rolled FFI (no `windows`
+# crate), so it is Windows-only and off by default.
+shader-compile = []
+
 
 # Each of these mounts a Campaign Evolved IoStore container, so they only build
 # with the feature that provides one. Without this, `cargo test --all-targets`
@@ -61,3 +68,19 @@ required-features = ["iostore"]
 [[example]]
 name = "ce_synth_bytes"
 required-features = ["iostore"]
+
+[[example]]
+name = "shader_compile_add"
+required-features = ["shader-compile"]
+
+[[example]]
+name = "shader_compile_census"
+required-features = ["shader-compile"]
+
+[[example]]
+name = "shader_recompile"
+required-features = ["shader-compile"]
+
+[[example]]
+name = "convert_shader_e2e"
+required-features = ["shader-compile"]
