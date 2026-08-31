@@ -17,7 +17,9 @@
 //! engine-specific blob layouts (H3 hardcoded vs Reach cumulative-sum)
 //! and the binary references they were verified against.
 
+pub mod byte_order;
 pub mod classic;
+pub mod resource;
 pub mod codec;
 pub mod graph;
 pub mod jma;
@@ -221,6 +223,43 @@ pub struct AnimationGroup<'a> {
     /// across all groups of one tag; `None` for non-H4 / tags without it.
     /// See [`AnimationGroup::decode`]'s shared-static path.
     pub shared_static: Option<std::rc::Rc<SharedStaticPool>>,
+}
+
+impl<'a> AnimationGroup<'a> {
+    /// A group standing for nothing but a blob, so it can be decoded on its own.
+    ///
+    /// The converter uses this to read a 360 animation back after turning it
+    /// round: a blob that decodes into the tracks its header promises is the
+    /// only check on the byte order short of playing it. Every field the
+    /// decoder does not consult is left at nothing.
+    pub fn for_blob(
+        blob: &'a [u8],
+        data_sizes: Option<PackedDataSizes>,
+        frame_count: i16,
+        node_count: i8,
+        movement_type: Option<String>,
+    ) -> Self {
+        Self {
+            index: 0,
+            name: None,
+            animation_type: None,
+            frame_info_type: movement_type.clone(),
+            frame_count,
+            node_count,
+            node_list_checksum: 0,
+            resource_group: -1,
+            resource_group_member: -1,
+            checksum: None,
+            codec_frame_count: Some(frame_count),
+            movement_type,
+            data_sizes,
+            codec_byte: blob.first().copied(),
+            blob,
+            world_relative: false,
+            object_space_parents: Vec::new(),
+            shared_static: None,
+        }
+    }
 }
 
 /// Halo 4's graph-level shared-static value pool — decoded once from

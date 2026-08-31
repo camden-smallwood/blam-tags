@@ -186,9 +186,9 @@ impl MonolithicCache {
     /// be opened.
     pub fn read_tag_bytes(&self, entry: &TagFileEntry) -> Result<Vec<u8>, TagReadError> {
         let block = self.resolve_tag_block(entry).ok_or_else(|| {
-            TagReadError::UnknownSubChunkSignature {
-                context: "monolithic tag has no tag-heap block",
-                signature: entry.group_tag.to_be_bytes(),
+            TagReadError::TagHasNoDataInCache {
+                name: entry.name.clone(),
+                group: entry.group_tag.to_be_bytes(),
             }
         })?;
 
@@ -451,33 +451,29 @@ fn hydrate_resource_chunk(
 
     let state = XSyncState::parse(&payload, version)?;
 
-    // The xsync state's four (offset, size) words are interleaved in
-    // a non-obvious way: each named pair (`cache_location_*`,
-    // `optional_location_*`) is split across the TWO regions stored
-    // in the cache_block. The cache_block layout is:
+    // Each named pair is one region: its own offset with its own size. The
+    // cache_block holds them back to back, the second page-aligned after the
+    // first:
     //
-    //   [primary buffer : cache_location_size]
-    //   [alignment padding to 0x100]
-    //   [secondary buffer : optional_location_size]
+    //   [cache_location   : the mip chain, at cache_location_offset]
+    //   [alignment padding]
+    //   [optional_location: the high-resolution base, at optional_location_offset]
     //
-    // where the secondary buffer starts at byte
-    // `cache_location_offset` and the primary buffer at byte
-    // `optional_location_offset` (which is always `0` in observed
-    // corpora). Empirically verified against Halo 4 monolithic
-    // bitmaps: for DXT1 / DXT5 the secondary buffer contains the
-    // high-res mip 0 (`optional_location_size` bytes) and the
-    // primary buffer contains the smaller mip chain
-    // (`cache_location_size` bytes). See
-    // [`XSyncStateHeader`]'s field docs for the actual semantics.
-    let secondary = slice_or_revert(
-        cache_bytes,
-        state.header.cache_location_offset,
-        state.header.optional_location_size,
-    );
+    // A Reach bitmap with mips reads, for example, cache_location (0, 25408)
+    // and optional_location (28672, 32768) -- 28672 being 25408 rounded up to a
+    // page, and 32768 being exactly one 256x256 DXT1 level. Pairing an offset
+    // with the other pair's size lands both reads inside the wrong region,
+    // which is invisible on a bitmap with no mips (optional_location is then
+    // 0/0) and scrambles every level of one that has them.
     let primary = slice_or_revert(
         cache_bytes,
-        state.header.optional_location_offset,
+        state.header.cache_location_offset,
         state.header.cache_location_size,
+    );
+    let secondary = slice_or_revert(
+        cache_bytes,
+        state.header.optional_location_offset,
+        state.header.optional_location_size,
     );
 
     let (secondary, primary) = match (secondary, primary) {

@@ -170,6 +170,24 @@ pub struct TagStruct<'a> {
 }
 
 impl<'a> TagStruct<'a> {
+    /// A view of the same struct type over somebody else's bytes.
+    ///
+    /// For reading a struct that is not part of a tag's chunk tree -- a
+    /// monolithic build's control data holds the engine's own memory image,
+    /// where the bytes are the schema's struct laid out in the source's byte
+    /// order and every pointer is an address rather than a sub-chunk. Fields
+    /// that live in the bytes read normally; fields that would need a sub-chunk
+    /// read as absent, which is the honest answer, because in that image they
+    /// are somewhere else entirely.
+    pub fn over_raw(&self, raw: &'a [u8]) -> TagStruct<'a> {
+        TagStruct {
+            layout: self.layout,
+            struct_data: self.struct_data,
+            struct_raw: raw,
+            endian: Endian::Be,
+        }
+    }
+
     /// The schema side of this instance — the struct definition it
     /// conforms to. Bridges to the [`crate::definition`] facade.
     pub fn definition(&self) -> crate::TagStructDefinition<'a> {
@@ -1788,6 +1806,32 @@ impl<'a> TagFieldMut<'a> {
             struct_raw: &mut exploded[..struct_size],
             endian: self.endian,
         })
+    }
+
+    /// Give this resource field an empty payload of its own declared shape,
+    /// ready to be filled in through [`Self::as_resource_struct_mut`].
+    ///
+    /// For a resource being built rather than copied. A 360 monolithic build
+    /// keeps an animation graph's payload as a flat control-data buffer, so
+    /// there is no exploded resource to copy from -- the members have to be read
+    /// out of it and written into a payload made here.
+    pub fn init_resource(&mut self) -> Result<(), TagResourceCopyError> {
+        let field = &self.layout.fields[self.field_index];
+        if field.field_type != TagFieldType::PageableResource {
+            return Err(TagResourceCopyError::NotAResourceField);
+        }
+        let resource_layout_index = field.definition as usize;
+        let struct_index =
+            self.layout.resource_layouts[resource_layout_index].struct_index as usize;
+        let struct_size = self.layout.struct_layouts[struct_index].size as usize;
+        let struct_data =
+            crate::data::TagStructData::new_default(self.layout, struct_index, Endian::Le);
+        self.set_sub_chunk(TagSubChunkContent::Resource(TagResourceChunk::Exploded {
+            exploded: vec![0u8; struct_size],
+            struct_data,
+            xsync_state: None,
+        }));
+        Ok(())
     }
 
     /// Reset this resource field to the null shape.

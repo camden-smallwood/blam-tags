@@ -21,6 +21,7 @@ use crate::render_geometry::{
     decode_vertex_buffer, AuthorVertex, MeshVertexType, RenderGeometryResource,
 };
 use crate::TagFile;
+use crate::TagOptions;
 
 /// Failure modes when populating author-format blocks from a GPU
 /// resource. The hydration step never panics — every recoverable
@@ -38,6 +39,17 @@ pub enum HydrateError {
     /// Mesh referenced a vertex / index buffer index outside the
     /// resource's table.
     InvalidBufferIndex { kind: &'static str, index: i128, len: usize },
+    /// The mesh names a vertex format `MeshVertexType` does not know.
+    ///
+    /// Was a panic, which is the wrong shape for a reader: this is reached
+    /// from `MonolithicCache::read_tag`, so one unrecognised format in one
+    /// mesh took down whatever was walking the cache. Every build spells its
+    /// own enum, and a corpus this old will always have one more.
+    ///
+    /// Carries the buffer's stride, because that is the one measurement the
+    /// layout of an undecoded format has to be worked out from, and going back
+    /// for it means finding the tag again.
+    UnknownVertexType { name: String, stride: u16 },
 }
 
 impl std::fmt::Display for HydrateError {
@@ -49,6 +61,11 @@ impl std::fmt::Display for HydrateError {
             ),
             Self::InvalidBufferIndex { kind, index, len } => write!(
                 f, "{kind} buffer index {index} out of range (len={len})",
+            ),
+            Self::UnknownVertexType { name, stride } => write!(
+                f,
+                "unsupported mesh vertex type {name:?} at {stride} bytes a vertex; \
+                 register it in MeshVertexType and give it a decoder",
             ),
         }
     }
@@ -109,6 +126,56 @@ pub fn hydrate(tag: &mut TagFile, cache_bytes: &[u8]) -> Result<usize, HydrateEr
     Ok(hydrated)
 }
 
+/// The field every geometry struct keeps its GPU buffers behind.
+///
+/// Named here rather than spelled out at each call site because the converter
+/// has to recognise a left-behind resource by it, and a literal in two modules
+/// is a literal that drifts.
+pub const API_RESOURCE_FIELD: &str = "api resource";
+
+/// Whether every geometry struct this tag's group declares already carries
+/// author-format vertex data.
+///
+/// `None` when the group declares no geometry struct, so a caller can tell
+/// "this tag has no geometry" apart from "this tag's geometry went missing".
+///
+/// The question matters to anything moving a 360 tag to PC. There the buffers
+/// arrive in the pageable cache and the inline blocks are empty; [`hydrate`]
+/// fills them in on read, which is the shape an MCC PC tag stores natively. A
+/// tag that answers `Some(true)` therefore has its geometry in hand, and its
+/// api resource is only a description of where the 360 kept its copy.
+///
+/// Deliberately all-or-nothing: `Lbsp` declares three geometry structs, and
+/// forgiving one struct's missing resource because a *different* struct
+/// hydrated is exactly the silent loss this exists to catch.
+pub fn author_geometry_populated(tag: &TagFile) -> Option<bool> {
+    let paths = geometry_struct_paths(tag.header.group_tag);
+    if paths.is_empty() {
+        return None;
+    }
+    let root = tag.root();
+    let mut seen = false;
+    let mut all = true;
+    for path in paths {
+        let Some(rg) = root.field_path(path).and_then(|f| f.as_struct()) else {
+            continue;
+        };
+        seen = true;
+        let populated = rg
+            .field("per mesh temporary")
+            .and_then(|f| f.as_block())
+            .is_some_and(|pmt| {
+                (0..pmt.len()).filter_map(|i| pmt.element(i)).any(|elem| {
+                    elem.field("raw vertices")
+                        .and_then(|f| f.as_block())
+                        .is_some_and(|rv| rv.len() > 0)
+                })
+            });
+        all &= populated;
+    }
+    if seen { Some(all) } else { None }
+}
+
 /// Decoded geometry for one geometry struct.
 struct GeometryPlan {
     path: &'static str,
@@ -120,6 +187,9 @@ struct MeshPlanItem {
     vertices: Vec<AuthorVertex>,
     indices: Vec<u32>,
     is_index32: bool,
+    /// The mesh's `index buffer type`, carried so the author-format block can
+    /// say how to read the indices it is about to be given.
+    index_kind: Option<String>,
 }
 
 fn build_plan(
@@ -144,11 +214,12 @@ fn build_plan(
         return Ok(None);
     };
 
-    // Primary buffer = `[optional_location_offset ..
-    // optional_location_offset + cache_location_size]`. The xsync
-    // header field-name pairing is non-obvious — see
-    // [`crate::monolithic::XSyncStateHeader`].
-    let primary_offset = state.header.optional_location_offset as usize;
+    // The GPU buffers are the resource's `cache_location` region: its own
+    // offset with its own size. A geometry resource has no `optional_location`
+    // -- that is the slot a bitmap keeps its high-resolution level in -- so the
+    // two offsets are both zero here and the distinction only shows up on
+    // bitmaps. See [`crate::monolithic::XSyncStateHeader`].
+    let primary_offset = state.header.cache_location_offset as usize;
     let primary_size = state.header.cache_location_size as usize;
     let primary = cache_bytes
         .get(primary_offset..primary_offset + primary_size)
@@ -214,19 +285,15 @@ fn decode_mesh(
     // Mesh has no primary vertex buffer — empty mesh / instance
     // imposter / etc. Soft skip without checking vertex type.
     if vbi0 < 0 {
-        return Ok(MeshPlanItem { vertices: Vec::new(), indices: Vec::new(), is_index32: false });
+        return Ok(MeshPlanItem {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            is_index32: false,
+            index_kind: mesh.read_enum_name("index buffer type"),
+        });
     }
 
-    // Vertex type — schema enum → Rust enum via the option name. If
-    // we have a buffer but can't resolve a decoder, panic so the
-    // missing case surfaces loudly.
-    let vt_name = mesh.read_enum_name("vertex type").unwrap_or_default();
-    let vertex_type = MeshVertexType::from_schema_name(&vt_name).unwrap_or_else(|| {
-        panic!(
-            "unsupported mesh vertex type {vt_name:?} (vbi[0]={vbi0}, ibi={ibi}); \
-             register it in MeshVertexType or extend the schema-name table",
-        )
-    });
+    let _ = ibi;
 
     let vb = resource
         .xenon_vertex_buffers
@@ -236,6 +303,18 @@ fn decode_mesh(
             index: vbi0 as i128,
             len: resource.xenon_vertex_buffers.len(),
         })?;
+
+    // Vertex type — a schema enum resolved to a decoder through the option
+    // name. A name nothing knows is reported, not fatal: the caller decides
+    // whether a mesh it cannot read is worth failing the whole tag over.
+    // Resolved after the buffer is in hand so the report can name the stride.
+    let vt_name = mesh.read_enum_name("vertex type").unwrap_or_default();
+    let vertex_type = MeshVertexType::from_schema_name(&vt_name).ok_or_else(|| {
+        HydrateError::UnknownVertexType {
+            name: vt_name.clone(),
+            stride: vb.stride,
+        }
+    })?;
     let vbo = vb.data_address.offset() as usize;
     let vbsz = vb.data_size as usize;
     let vbytes = primary
@@ -256,7 +335,11 @@ fn decode_mesh(
     // skeleton indices via per_mesh_node_map. JMS / MCC PC tags carry
     // global indices in raw_vertices; doing the remap here keeps
     // downstream consumers unaware of the X360 indirection.
-    if matches!(vertex_type, MeshVertexType::Skinned) && !node_map.is_empty() {
+    if matches!(
+        vertex_type,
+        MeshVertexType::Skinned | MeshVertexType::SkinnedCompressed
+    ) && !node_map.is_empty()
+    {
         for v in vertices.iter_mut() {
             for (local, _) in v.node_sets.iter_mut() {
                 let li = *local as usize;
@@ -298,7 +381,12 @@ fn decode_mesh(
         (raw, ib.is_index32)
     };
 
-    Ok(MeshPlanItem { vertices, indices, is_index32 })
+    Ok(MeshPlanItem {
+        vertices,
+        indices,
+        is_index32,
+        index_kind: mesh.read_enum_name("index buffer type"),
+    })
 }
 
 fn read_vbi_slot(mesh: &TagStruct<'_>, slot: usize) -> i64 {
@@ -346,6 +434,7 @@ fn apply_plan(tag: &mut TagFile, plan: &GeometryPlan) -> Result<usize, HydrateEr
         let mut pmt_elem = pmt.element_mut(i).unwrap();
         write_raw_vertices(&mut pmt_elem, &item.vertices);
         write_raw_indices(&mut pmt_elem, &item.indices, item.is_index32);
+        write_index_kind(&mut pmt_elem, item.index_kind.as_deref());
         if !item.vertices.is_empty() {
             hydrated += 1;
         }
@@ -385,6 +474,44 @@ fn write_raw_indices(pmt_elem: &mut TagStructMut<'_>, indices: &[u32], is_index3
         };
         let _ = f.set(value);
     }
+}
+
+/// Say how the indices just written are laid out.
+///
+/// The author-format block carries its own flag for this, separate from the
+/// mesh's `index buffer type`, and a reader trusts the flag. A kit's own tags
+/// set it every time -- lists on a structure BSP, strips on a render model --
+/// and left at zero the indices read as strips whatever they are. A list read
+/// as a strip is not a subtle fault: every triangle after the first joins the
+/// wrong three vertices, and the mesh comes out as shredded as it sounds.
+fn write_index_kind(pmt_elem: &mut TagStructMut<'_>, index_kind: Option<&str>) {
+    let wanted = match index_kind {
+        Some("triangle list") => "indices are triangle lists",
+        Some("triangle strip") => "indices are triangle strips",
+        Some("quad list") => "indices are quad lists",
+        // `DEFAULT`, the line and fan types, or a mesh that declares nothing:
+        // there is no flag that says any of those, and inventing one would be
+        // worse than leaving the field as the tag had it.
+        _ => return,
+    };
+    let Some(mut field) = pmt_elem.field_mut("flags") else { return };
+    let Some(TagOptions::Flags(bits)) = field.as_ref().options() else { return };
+    let Some(bit) = bits.iter().find(|bit| bit.name == wanted).map(|bit| bit.bit) else {
+        return;
+    };
+    let replacement = match field.as_ref().value() {
+        Some(TagFieldData::LongFlags { value, names }) => {
+            TagFieldData::LongFlags { value: value | (1i32 << bit), names }
+        }
+        Some(TagFieldData::WordFlags { value, names }) => {
+            TagFieldData::WordFlags { value: value | (1u16 << bit), names }
+        }
+        Some(TagFieldData::ByteFlags { value, names }) => {
+            TagFieldData::ByteFlags { value: value | (1u8 << bit), names }
+        }
+        _ => return,
+    };
+    let _ = field.set(replacement);
 }
 
 fn write_vertex(elem: &mut TagStructMut<'_>, v: &AuthorVertex) {

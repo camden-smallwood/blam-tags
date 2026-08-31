@@ -140,6 +140,9 @@ pub fn decode_vertex_buffer(
 
     match vertex_type {
         MeshVertexType::RigidCompressed => decode_rigid_compressed(vertex_count, stride, bytes),
+        MeshVertexType::SkinnedCompressed => {
+            decode_skinned_compressed(vertex_count, stride, bytes)
+        }
         MeshVertexType::Rigid => decode_rigid(vertex_count, stride, bytes),
         MeshVertexType::Skinned => decode_skinned(vertex_count, stride, bytes),
         MeshVertexType::World => decode_world(vertex_count, stride, bytes),
@@ -176,6 +179,48 @@ fn decode_rigid_compressed(
             binormal: cross(normal, tangent),
             texcoord: [u, v],
             node_sets: Vec::new(),
+        });
+    }
+    Ok(out)
+}
+
+/// `skinned compressed` (24 B): a `rigid compressed` vertex with four bone
+/// indices and four weights appended.
+///
+/// Derived from the two formats either side of it and then checked against the
+/// build rather than assumed: `rigid compressed` is 16 bytes and a skinned
+/// vertex adds one byte per index and one per weight, which is 24, and 24 is
+/// what every buffer descriptor naming this format actually declares. The
+/// indices are mesh-local here exactly as they are in `skinned`, so the caller
+/// remaps them through `per_mesh_node_map` the same way.
+fn decode_skinned_compressed(
+    count: u32, stride: u16, bytes: &[u8],
+) -> Result<Vec<AuthorVertex>, VertexDecodeError> {
+    expect_stride(24, stride)?;
+    let mut out = Vec::with_capacity(count as usize);
+    for i in 0..count as usize {
+        let off = i * 24;
+        let pos = read_udec4n(&bytes[off..off + 4]);
+        let u = read_ushortn(&bytes[off + 4..off + 6]);
+        let v = read_ushortn(&bytes[off + 6..off + 8]);
+        let normal = read_dhen3n(&bytes[off + 8..off + 12]);
+        let tangent = read_dec3n(&bytes[off + 12..off + 16]);
+        let idx = &bytes[off + 16..off + 20];
+        let wts = &bytes[off + 20..off + 24];
+        let mut node_sets = Vec::with_capacity(4);
+        for k in 0..4 {
+            let w = wts[k] as f32 / 255.0;
+            if w > 0.0 {
+                node_sets.push((idx[k] as i16, w));
+            }
+        }
+        out.push(AuthorVertex {
+            position: [pos[0], pos[1], pos[2]],
+            normal,
+            tangent,
+            binormal: cross(normal, tangent),
+            texcoord: [u, v],
+            node_sets,
         });
     }
     Ok(out)
@@ -498,6 +543,43 @@ mod tests {
         // one shift (the largest subnormal, which always worked).
         assert_eq!(half_to_f32(0x0001), scale);
         assert_eq!(half_to_f32(0x03FF), 1023.0 * scale);
+    }
+
+    /// `skinned compressed` reads its bones where the build puts them.
+    ///
+    /// The format is a `rigid compressed` vertex with four bone indices and
+    /// four weights appended -- 16 + 4 + 4 -- and the build's own buffer
+    /// descriptors declare 24, which is what pins it. The check that matters is
+    /// the weights: read one byte off and they stop adding to one, and nothing
+    /// downstream of here would notice a skeleton weighted to the wrong bones.
+    #[test]
+    fn skinned_compressed_reads_bones_after_the_compressed_vertex() {
+        let mut bytes = vec![0u8; 24];
+        // Four bones at 16..20, and weights at 20..24 that add to 255.
+        bytes[16..20].copy_from_slice(&[7, 11, 13, 17]);
+        bytes[20..24].copy_from_slice(&[128, 64, 63, 0]);
+        let decoded =
+            decode_vertex_buffer(MeshVertexType::SkinnedCompressed, 1, 24, &bytes).unwrap();
+        assert_eq!(decoded.len(), 1);
+        let vertex = &decoded[0];
+
+        // The fourth weight is zero, so it is not a bone this vertex uses.
+        assert_eq!(
+            vertex.node_sets.iter().map(|(node, _)| *node).collect::<Vec<_>>(),
+            vec![7, 11, 13],
+        );
+        let total: f32 = vertex.node_sets.iter().map(|(_, weight)| *weight).sum();
+        assert!(
+            (total - 1.0).abs() < 1e-6,
+            "weights add to {total}, not one -- the fields are being read at the wrong offset",
+        );
+
+        // And a buffer that is not 24 bytes a vertex is refused rather than
+        // read as though it were.
+        assert!(
+            decode_vertex_buffer(MeshVertexType::SkinnedCompressed, 1, 16, &bytes).is_err(),
+            "a 16-byte stride was accepted for a 24-byte format",
+        );
     }
 
     #[test]

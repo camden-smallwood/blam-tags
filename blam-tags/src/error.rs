@@ -105,6 +105,19 @@ pub enum TagReadError {
         signature: [u8; 4],
     },
 
+    /// A monolithic cache's index names a tag it holds no bytes for.
+    ///
+    /// A `tag_cache` is a build's working store, not an archive: an entry can
+    /// name a tag whose data was never written into a partition. Most of a 2011
+    /// Reach build's `scenario_lightmap_bsp_data` entries are like this. It is
+    /// not a parse failure and nothing on this side can recover the bytes.
+    TagHasNoDataInCache {
+        /// The tag's name as the index records it.
+        name: String,
+        /// Its group, as ASCII (e.g. `Lbsp`).
+        group: [u8; 4],
+    },
+
     /// A string read from `string_data` (or a tag-reference path)
     /// wasn't valid UTF-8.
     InvalidUtf8 {
@@ -186,6 +199,11 @@ impl fmt::Display for TagReadError {
                 f,
                 "unknown sub-chunk signature {} in {context}",
                 show_sig(signature),
+            ),
+            Self::TagHasNoDataInCache { name, group } => write!(
+                f,
+                "the build lists {} {name} but kept none of its bytes to read",
+                show_sig(group),
             ),
             Self::InvalidUtf8 { context } => {
                 write!(f, "invalid UTF-8 in {context}")

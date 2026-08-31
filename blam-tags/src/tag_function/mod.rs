@@ -231,6 +231,176 @@ pub mod editor;
 /// derived on-disk form (20 bytes); the editor is the 148-byte rich form
 /// (control points + corner flags), matching
 /// `c_multi_part_function_editor::convert_old_function_identity @0x82e9c3b8`.
+// ---------------------------------------------------------------------------
+// Byte order
+// ---------------------------------------------------------------------------
+
+/// The largest blob worth testing as a function definition.
+///
+/// A `mapping_function` is a curve descriptor: a 32-byte header, a compact of
+/// tens of bytes, and at most a few editor structs. Anything larger is some
+/// other `data` field that happens to sit nearby, and refusing to look at it is
+/// cheaper than proving it is not a curve.
+const LARGEST_PLAUSIBLE_FUNCTION: usize = 4096;
+
+/// Reverse every 4-byte word in `bytes`. Length must be a multiple of four.
+fn swap_words(bytes: &mut [u8]) {
+    for word in bytes.chunks_exact_mut(4) {
+        word.reverse();
+    }
+}
+
+/// Rewrite a big-endian `mapping_function` blob as a little-endian one.
+///
+/// `None` when `data` is not a function definition, and the test is the
+/// structure itself: the header has to name a type, the compact has to walk to
+/// exactly the size the header declares, and the editor trailer has to be a
+/// whole number of editor structs for that type. A blob that satisfies all
+/// three and is not a curve would be a remarkable coincidence, which is what
+/// makes this safe to point at every `data` field in a tag rather than only at
+/// fields called `function`.
+///
+/// Needed because a function blob is opaque to the field walk: it crosses a
+/// conversion verbatim, and every multi-byte value inside it -- the clamp
+/// range, the compact size, every control point -- is still in the source's
+/// byte order. The engine then reads `size_of_compact_data` as a nonsense
+/// number and walks off the end of the tag, which is an access violation
+/// inside `tag_load` rather than anything it can report.
+pub fn swap_function_definition(data: &[u8]) -> Option<Vec<u8>> {
+    if data.len() < 32 || data.len() > LARGEST_PLAUSIBLE_FUNCTION || data.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = data.to_vec();
+    // Bytes 0..4 are four independent bytes -- type, flags, colour graph type,
+    // unused -- and have no order to swap.
+    swap_words(&mut out[4..32]);
+
+    let ftype = FunctionType::from_byte(out[0])?;
+    let flags = FunctionFlags(out[1]);
+    let compact_total = i32::from_le_bytes(out[28..32].try_into().unwrap());
+    if compact_total < 0 {
+        return None;
+    }
+    let compact_total = compact_total as usize;
+    let compact_end = 32usize.checked_add(compact_total)?;
+    if compact_end > out.len() || compact_total % 4 != 0 {
+        return None;
+    }
+
+    if ftype == FunctionType::MultiSpline {
+        swap_multipart_compacts(&mut out, compact_end)?;
+    } else {
+        swap_words(&mut out[32..compact_end]);
+    }
+
+    // What follows the compact is the editor trailer: one fixed-size struct per
+    // graph, and a ranged function carries two of everything.
+    //
+    // The 2011 build over-allocates it. A blob there is whatever the editor's
+    // buffer happened to be, tail-filled with 0xcd, and the meaningful bytes
+    // stop at the end of the structs -- so the trailer is cut to the size the
+    // type declares rather than carried at whatever length it arrived. Anything
+    // shorter than one struct is not a function definition.
+    if out.len() > compact_end {
+        let graphs = if flags.is_ranged()
+            && ftype != FunctionType::Constant
+            && ftype != FunctionType::Identity
+        {
+            2
+        } else {
+            1
+        };
+        let each = editor_struct_size(ftype)?;
+        if each == 0 {
+            return None;
+        }
+        let wanted = each.checked_mul(graphs)?;
+        if out.len() - compact_end < wanted {
+            return None;
+        }
+        out.truncate(compact_end + wanted);
+        for chunk in out[compact_end..].chunks_exact_mut(each) {
+            if ftype == FunctionType::MultiSpline {
+                swap_multipart_editor(chunk)?;
+            } else {
+                swap_words(chunk);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Bytes of editor trailer one graph of `ftype` carries.
+///
+/// For transition, periodic and exponent the editor mirrors the compact; the
+/// multi_part editor is its own richer 148-byte structure. A type with no
+/// editor data returns zero and is rejected by the caller if a trailer is
+/// nonetheless present, because that means the blob is not what it claims.
+fn editor_struct_size(ftype: FunctionType) -> Option<usize> {
+    Some(match ftype {
+        FunctionType::Transition => 12,
+        FunctionType::Periodic => 20,
+        FunctionType::Exponent => 12,
+        FunctionType::MultiSpline => 148,
+        _ => 0,
+    })
+}
+
+/// Walk a multi_part compact, swapping everything except the per-part type
+/// byte.
+///
+/// `[function_count: i32]` then, per part, `[type, pad, pad, pad][ending_x: f32]`
+/// and a body whose size the type decides. The first word of a part is four
+/// independent bytes and must be left alone; everything else is a float.
+fn swap_multipart_compacts(out: &mut [u8], compact_end: usize) -> Option<()> {
+    let mut offset = 32usize;
+    while offset + 4 <= compact_end {
+        out[offset..offset + 4].reverse();
+        let count = i32::from_le_bytes(out[offset..offset + 4].try_into().unwrap());
+        if count <= 0 || count > 16 {
+            return None;
+        }
+        offset += 4;
+        for _ in 0..count {
+            if offset + 8 > compact_end {
+                return None;
+            }
+            let part_type = out[offset];
+            out[offset + 4..offset + 8].reverse();
+            let body = offset + 8;
+            let body_len = match part_type {
+                4 => 8,   // Linear: slope, offset
+                7 => 16,  // Spline: four coefficients
+                10 => 28, // Spline2: seven
+                _ => return None,
+            };
+            let end = body.checked_add(body_len)?;
+            if end > compact_end {
+                return None;
+            }
+            swap_words(&mut out[body..end]);
+            offset = end;
+        }
+    }
+    (offset == compact_end).then_some(())
+}
+
+/// Swap one 148-byte multi_part editor struct.
+///
+/// `[count: i32][4 x 36-byte parts]`, each part `[type, corner_l, corner_r, pad]`
+/// followed by four `real_point2d`. Only that first word of each part is bytes.
+fn swap_multipart_editor(chunk: &mut [u8]) -> Option<()> {
+    if chunk.len() != 148 {
+        return None;
+    }
+    chunk[0..4].reverse();
+    for part in 0..4 {
+        let base = 4 + part * 36;
+        swap_words(&mut chunk[base + 4..base + 36]);
+    }
+    Some(())
+}
+
 pub(crate) fn build_identity_multipart_bytes() -> (Vec<u8>, Vec<u8>) {
     // Compact: count=1, one Linear part (type 4), ending_x = FLT_MAX,
     // slope=1, offset=0.
@@ -2215,5 +2385,128 @@ mod tests {
         assert!((f.evaluate(0.42, 0.0) - 0.0).abs() < 1e-5);
         assert!((f.evaluate(0.42, 1.0) - 1.0).abs() < 1e-5);
         assert!((f.evaluate(0.42, 0.5) - 0.5).abs() < 1e-5);
+    }
+}
+
+#[cfg(test)]
+mod byte_order_tests {
+    use super::*;
+
+    /// The blob a real multi_part curve is, in the byte order a 360 build wrote
+    /// it. Built by hand rather than from `build_identity_multipart_bytes`,
+    /// which emits little-endian -- feeding that to a big-endian swap is the
+    /// mistake this test exists to not make.
+    fn big_endian_multipart_blob() -> Vec<u8> {
+        let mut blob = vec![0u8; 32];
+        blob[0] = FunctionType::MultiSpline as u8;
+        blob[4..8].copy_from_slice(&0.0f32.to_be_bytes()); // clamp min
+        blob[8..12].copy_from_slice(&1.0f32.to_be_bytes()); // clamp max
+        blob[28..32].copy_from_slice(&20i32.to_be_bytes()); // compact size
+
+        // Compact: one Linear part running to the end of the curve.
+        blob.extend_from_slice(&1i32.to_be_bytes());
+        blob.push(4); // part type
+        blob.extend_from_slice(&[0, 0, 0]); // padding beside it
+        blob.extend_from_slice(&f32::MAX.to_be_bytes()); // ending x
+        blob.extend_from_slice(&1.0f32.to_be_bytes()); // slope
+        blob.extend_from_slice(&0.0f32.to_be_bytes()); // offset
+
+        // Editor: count, then four 36-byte parts of which only the first is
+        // used -- a Linear from (0,0) to (1,1).
+        let mut editor = vec![0u8; 148];
+        editor[0..4].copy_from_slice(&1i32.to_be_bytes());
+        editor[4] = 4;
+        editor[16..20].copy_from_slice(&1.0f32.to_be_bytes()); // p1.x
+        editor[20..24].copy_from_slice(&1.0f32.to_be_bytes()); // p1.y
+        blob.extend_from_slice(&editor);
+        blob
+    }
+
+    /// A swapped curve is one this crate's own reader accepts.
+    ///
+    /// The stronger claim than "some bytes moved": the reader is little-endian
+    /// throughout, so parsing the result proves the header, the compact and the
+    /// trailer all ended up in the destination's order together. Getting only
+    /// two of the three right is exactly the failure that reaches the engine as
+    /// an access violation rather than as an error.
+    ///
+    /// Not a byte-for-byte round trip, because the swap is one-directional by
+    /// construction -- it reads the size fields *after* swapping them, which is
+    /// only correct for a big-endian input.
+    #[test]
+    fn a_swapped_curve_parses_as_a_little_endian_curve() {
+        let original = big_endian_multipart_blob();
+        // Read little-endian, the untouched blob describes a curve whose
+        // compact runs to 335 megabytes. That number is the crash: the engine
+        // takes it as the offset of the editor trailer and reads there.
+        let misread = TagFunctionHeader::parse(&original).expect("the header is 32 bytes either way");
+        assert_ne!(misread.compact_size, 20, "the source is not little-endian");
+        let swapped = swap_function_definition(&original).expect("a real curve swaps");
+        let parsed = TagFunction::parse(&swapped).expect("and then reads");
+        let header = parsed.header();
+        assert_eq!(header.function_type, FunctionType::MultiSpline);
+        assert_eq!(header.compact_size, 20);
+        assert_eq!(header.clamp_range_max, 1.0);
+    }
+
+    /// The per-part type byte survives, and the floats really do move.
+    #[test]
+    fn a_swapped_curve_keeps_its_part_types_and_moves_its_floats() {
+        let original = big_endian_multipart_blob();
+        let swapped = swap_function_definition(&original).unwrap();
+        // Header: the first four bytes are flags and enums, not a word.
+        assert_eq!(&swapped[0..4], &original[0..4]);
+        // `compact_size` is a word and must have moved.
+        assert_eq!(
+            i32::from_le_bytes(swapped[28..32].try_into().unwrap()),
+            i32::from_be_bytes(original[28..32].try_into().unwrap()),
+        );
+        // The compact's part-type byte stays where it is: it is one of four
+        // independent bytes sharing a word with padding.
+        assert_eq!(swapped[36], original[36], "the part type moved");
+        // Its `ending_x` is a float and must have moved.
+        assert_eq!(
+            f32::from_le_bytes(swapped[40..44].try_into().unwrap()),
+            f32::from_be_bytes(original[40..44].try_into().unwrap()),
+        );
+    }
+
+    /// Anything that is not a curve is left alone.
+    ///
+    /// The conversion offers every `data` field in a tag to this, so a blob it
+    /// misidentifies is a blob it corrupts. The structure has to add up: a type
+    /// it knows, a compact that walks to exactly the declared size, and a
+    /// trailer long enough for the editor structs that type carries.
+    #[test]
+    fn a_blob_that_is_not_a_curve_is_refused() {
+        assert!(swap_function_definition(&[]).is_none(), "empty");
+        assert!(swap_function_definition(&[0u8; 16]).is_none(), "too short");
+        // A plausible length, but byte 0 names no function type.
+        let mut nonsense = vec![0u8; 64];
+        nonsense[0] = 200;
+        assert!(swap_function_definition(&nonsense).is_none(), "unknown type");
+        // A real header whose declared compact runs past the end.
+        let mut lying = big_endian_multipart_blob();
+        let overrun = lying.len() as i32 * 4;
+        lying[28..32].copy_from_slice(&overrun.to_be_bytes());
+        assert!(swap_function_definition(&lying).is_none(), "compact overruns");
+        // Pixel data: large, and nothing about it walks as a curve.
+        let pixels: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        assert!(swap_function_definition(&pixels).is_none(), "pixel data");
+    }
+
+    /// A 2011-build curve arrives with its editor trailer over-allocated and
+    /// tail-filled with `0xcd`; the swap cuts it to the size the type declares.
+    #[test]
+    fn an_over_allocated_trailer_is_cut_to_size() {
+        let original = big_endian_multipart_blob();
+        let mut padded = original.clone();
+        padded.extend(std::iter::repeat_n(0xcd, 672));
+        let swapped = swap_function_definition(&padded).expect("still a curve");
+        assert_eq!(
+            swapped.len(),
+            original.len(),
+            "the padding should not have come with it"
+        );
     }
 }
