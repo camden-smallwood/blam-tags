@@ -181,17 +181,19 @@ fn h3ek_ships_particles_at_several_root_sizes_and_the_dump_matches_one() {
         "expected H3EK to ship more than one particle layout revision, saw {sizes:?}"
     );
 }
-/// The layout now says *which* template a hole stands for, not just how wide.
+/// The layout says *which* template a hole stands for, and how wide it is left.
 ///
-/// This is the metadata half of the problem this file records: the bytes stay an
-/// anonymous range in the layout a tag is built with — no kit divergence — but a
-/// comparison or a converter can finally ask what fills them.
+/// This is the metadata half of the problem this file records: a comparison or a
+/// converter can ask what fills a hole and whether anything is still opaque.
 ///
-/// Halo 3 and Reach resolve the **same** template, `?rmp`, at **different**
-/// widths: 64 bytes against 100. That is the fact worth having. Without it a
-/// comparison skipped the hole entirely and reported Halo 3's whole render method
-/// as absent from Reach; with it, the two are visibly the same body at two sizes,
-/// which is a reinterpretation problem rather than a missing-data one.
+/// The width is what the layout could *not* describe, not the template's natural
+/// size. `fold_template_bases` folds a template's inherited base into the struct
+/// that carries it, turning those bytes into real fields; once folded the hole
+/// names its template but is zero bytes wide, because nothing anonymous is left.
+/// Halo 3 is the one case here that stays unfolded — it dumps the shader fields
+/// straight into the struct, so its `?rmp` hole is a genuine 64-byte range —
+/// while Reach folds the same `?rmp` down to a named, zero-width marker. The
+/// identity is the durable fact across both; the width is a fold artifact.
 #[test]
 fn a_tmpl_hole_records_which_template_fills_it() {
     let holes = |game: &str, group: &str| {
@@ -206,20 +208,23 @@ fn a_tmpl_hole_records_which_template_fills_it() {
     };
 
     assert_eq!(holes("halo3_mcc", "particle"), vec![("?rmp".to_owned(), 64)]);
-    assert_eq!(holes("haloreach_mcc", "particle"), vec![("?rmp".to_owned(), 100)]);
+    assert_eq!(holes("haloreach_mcc", "particle"), vec![("?rmp".to_owned(), 0)]);
     // Each fx group has its own render-method template, so the identity really
-    // does distinguish them rather than being one constant wearing three hats.
-    assert_eq!(holes("haloreach_mcc", "beam_system"), vec![("rmb".to_owned(), 100)]);
-    assert_eq!(holes("haloreach_mcc", "decal_system"), vec![("rmd".to_owned(), 100)]);
+    // does distinguish them rather than being one constant wearing three hats —
+    // and it survives the fold that zeroes the width.
+    assert_eq!(holes("haloreach_mcc", "beam_system"), vec![("rmb".to_owned(), 0)]);
+    assert_eq!(holes("haloreach_mcc", "decal_system"), vec![("rmd".to_owned(), 0)]);
 }
 
-/// A template that expands to nothing is still recorded.
+/// A zero-width template hole is still recorded.
 ///
-/// Halo 4's `particle` carries two holes: `mat` at zero bytes and `?rmp` at 100.
-/// A zero-width hole occupies no space and so cannot be found by arithmetic, but
-/// it names a template, and "no such template" and "a template with no inherited
-/// body" are different claims. Recording only the non-zero ones would have made
-/// them indistinguishable.
+/// Halo 4's `particle` carries two holes, both zero bytes wide for different
+/// reasons: `mat` has no inherited base to fold, and `?rmp`'s base *was* folded
+/// into the struct that follows, so neither leaves anonymous bytes behind. A
+/// zero-width hole occupies no space and so cannot be found by arithmetic, but it
+/// names a template, and "no such template", "a template with no inherited body",
+/// and "a template already folded away" are different claims. Recording only the
+/// non-zero ones would have made them indistinguishable.
 #[test]
 fn a_zero_width_template_hole_is_still_named() {
     let path = definitions().join("halo4_mcc/particle.json");
@@ -229,7 +234,7 @@ fn a_zero_width_template_hole_is_still_named() {
         .iter()
         .map(|hole| (blam_tags::format_group_tag(hole.group_tag), hole.size))
         .collect::<Vec<_>>();
-    assert_eq!(named, vec![("mat".to_owned(), 0), ("?rmp".to_owned(), 100)]);
+    assert_eq!(named, vec![("mat".to_owned(), 0), ("?rmp".to_owned(), 0)]);
 }
 
 /// A layout parsed from a shipped tag's own `blay` has no template metadata.
