@@ -297,10 +297,24 @@ impl TagFile {
                 version: tag_chunk_header.version,
             });
         }
-        let tag_chunk_payload = reader.stream_position()?;
-        reader.seek(SeekFrom::Start(
-            tag_chunk_payload + u64::from(tag_chunk_header.size),
-        ))?;
+        // Skip the tag stream by its INNER chunk sizes, not the outer size:
+        // MCC's current tool.exe leaves recompiled render_method_definitions
+        // with an outer size short of the content it wrote (see the tolerant
+        // check in `TagStream::read`), and a stale-size seek here lands
+        // mid-`tgst` and misreads the next stream's signature.
+        for expected in [*b"blay", *b"bdat"] {
+            let offset = reader.stream_position()?;
+            let header = read_chunk_header(&mut reader, endian)?;
+            if header.signature != u32::from_be_bytes(expected) {
+                return Err(TagReadError::BadChunkSignature {
+                    offset,
+                    expected,
+                    got: header.signature.to_be_bytes(),
+                });
+            }
+            let payload = reader.stream_position()?;
+            reader.seek(SeekFrom::Start(payload + u64::from(header.size)))?;
+        }
 
         while reader.stream_position()? != tag_file_size {
             let chunk_header_offset = reader.stream_position()?;

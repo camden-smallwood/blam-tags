@@ -91,7 +91,20 @@ impl TagStream {
         let tag_block_data = TagBlockData::read(&layout, root_block_layout, reader, endian)?;
 
         check_chunk_end(reader, "bdat", block_data_offset, block_data_header.size)?;
-        check_chunk_end(reader, "tag stream", chunk_offset, chunk_header.size)?;
+
+        // The outer stream size is deliberately NOT validated. MCC's current
+        // tool.exe rewrites a recompiled tag's inner chunk sizes — blay,
+        // tgbl, tgst, bdat — but leaves this outer one stale, and it drifts
+        // in BOTH directions: a render_method_definition it injects
+        // material-model options into (`two_lobe_ggx`; on Reach also
+        // `pbr_metallic_roughness`) declares less than it holds, while a
+        // recompiled render_method_option that shrank declares more, reaching
+        // into the middle of the `want` stream that follows. In both shipped
+        // failure cases the next stream's header sits exactly at the walked
+        // position, so the strictly-validated inner chunks above are the
+        // truth and the callers all continue from the reader's position, not
+        // from this size.
+        let _ = (chunk_offset, chunk_header.size);
 
         Ok(Self {
             layout,
