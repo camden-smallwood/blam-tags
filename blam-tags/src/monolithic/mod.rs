@@ -40,12 +40,14 @@
 //! (Phase 4).
 
 mod cache;
+mod control;
 mod chunk;
 mod heap;
 mod index;
 mod xsync;
 
 pub use cache::{MonolithicCache, SessionGuid};
+pub use control::{ControlReadError, ControlReadTally, read_struct_into};
 pub use chunk::{read_be_chunk_header, MonolithicChunk};
 pub use heap::{
     DataArrayHeader, DatumHandle, LruvBlock, LruvCache, LruvPersistHeader, PartitionBlock,

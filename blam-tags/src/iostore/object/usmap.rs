@@ -322,12 +322,45 @@ impl Usmap {
             structs.push(UsmapStruct { name, super_name, prop_count, properties });
         }
 
+        if c.position() as usize != body.len() {
+            skip_extensions(&mut c)?;
+        }
         let consumed = c.position() as usize;
         if consumed != body.len() {
             bail!("usmap body under/over-read: consumed {consumed} of {}", body.len());
         }
         Ok(Self { names, enums, structs, by_name })
     }
+}
+
+/// Skip the optional UE4SS custom-extension container appended after the core
+/// mappings. PPTH carries object paths and EATR carries reflected attributes;
+/// neither changes the property schemas consumed by this reader, but current
+/// FModel-compatible dumps include both and must still be accepted.
+fn skip_extensions(c: &mut Cursor<&[u8]>) -> Result<()> {
+    const CEXT_MAGIC: u32 = u32::from_le_bytes(*b"CEXT");
+    let magic = c.read_u32::<LittleEndian>()?;
+    if magic != CEXT_MAGIC {
+        bail!("unexpected trailing usmap data (magic {magic:#010x})");
+    }
+    let version = c.read_u8()?;
+    if version != 0 {
+        bail!("unsupported usmap extension container version {version}");
+    }
+    let extension_count = c.read_u32::<LittleEndian>()? as usize;
+    for _ in 0..extension_count {
+        let _id = c.read_u32::<LittleEndian>()?;
+        let size = c.read_u32::<LittleEndian>()? as u64;
+        let end = c
+            .position()
+            .checked_add(size)
+            .ok_or_else(|| anyhow::anyhow!("usmap extension size overflow"))?;
+        if end > c.get_ref().len() as u64 {
+            bail!("truncated usmap extension payload");
+        }
+        c.set_position(end);
+    }
+    Ok(())
 }
 
 fn decompress(method: u8, payload: &[u8], decomp_size: usize) -> Result<Vec<u8>> {
@@ -404,10 +437,21 @@ mod tests {
     #[test]
     fn parses_bundled_meteorite_usmap() {
         let m = Usmap::meteorite().expect("parse bundled usmap");
-        // Validated byte-exact against the Python reference parser.
-        assert_eq!(m.names.len(), 50346, "name count");
-        assert_eq!(m.enums.len(), 2407, "enum count");
-        assert_eq!(m.structs.len(), 12679, "struct count");
+        // Fingerprint of the bundled asset, so replacing it is a deliberate act
+        // rather than a silent one. These move whenever the mappings are
+        // re-dumped for a game update — they are not an invariant, and
+        // `bundled_mappings_still_cover_the_tag_classes` below is what actually
+        // guards against a bad dump.
+        //
+        // Last updated for CU3 (asset commit "Update bundled Meteorite mappings
+        // for CU3"). That dump is native-reflection only: it dropped the 315
+        // Blueprint-generated `*_C` classes the previous one carried, which
+        // costs nothing because a Blueprint class is never looked up by name —
+        // see `World::class_key`, which resolves it as a PackageImport/Export
+        // through a synthetic `pkg#hash` key instead.
+        assert_eq!(m.names.len(), 54443, "name count");
+        assert_eq!(m.enums.len(), 2394, "enum count");
+        assert_eq!(m.structs.len(), 12462, "struct count");
 
         let sk = m.get("SkeletalMesh").expect("SkeletalMesh schema");
         assert_eq!(sk.super_name.as_deref(), Some("SkinnedAsset"));
@@ -426,6 +470,56 @@ mod tests {
         // Flattened schema walks the super chain past SkinnedAsset.
         let flat = m.flattened_properties("SkeletalMesh").expect("flatten");
         assert!(flat.len() > sk.properties.len(), "flattened includes ancestors");
+    }
+
+    /// What a re-dump must not lose.
+    ///
+    /// The three counts above are a fingerprint, not a check: they go stale on
+    /// every game update, and the failure they produce ("name count") says
+    /// nothing about whether the new mappings are any good. This is the part
+    /// worth failing on — the tag bridge reads Halo's own classes out of the
+    /// `.usmap`, so a dump that dropped them would break decoding while the
+    /// counts merely looked different.
+    ///
+    /// 462 `Blam*` classes, measured across both the pre-CU3 and CU3 dumps —
+    /// unchanged by that update, which only shed Blueprint-generated ones.
+    #[test]
+    fn bundled_mappings_still_cover_the_tag_classes() {
+        let m = Usmap::meteorite().expect("parse bundled usmap");
+        let blam = m.structs.iter().filter(|s| s.name.starts_with("Blam")).count();
+        assert_eq!(blam, 462, "Blam* class count");
+
+        // The root every tag wrapper derives from, and the classes the asset
+        // readers key on. A dump missing any of these is unusable regardless of
+        // how many names it has.
+        for class in [
+            "BlamTagDataAssetBase",
+            "StaticMesh",
+            "SkeletalMesh",
+            "Texture2D",
+            "MaterialInstanceConstant",
+            "DataTable",
+        ] {
+            assert!(m.get(class).is_some(), "{class} missing from the mappings");
+        }
+    }
+
+    #[test]
+    fn skips_current_ue4ss_extension_container() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"CEXT");
+        bytes.push(0);
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(b"PPTH");
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(b"abc");
+        bytes.extend_from_slice(b"EATR");
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(b"defg");
+
+        let mut cursor = Cursor::new(bytes.as_slice());
+        skip_extensions(&mut cursor).expect("extension container");
+        assert_eq!(cursor.position() as usize, bytes.len());
     }
 }
 

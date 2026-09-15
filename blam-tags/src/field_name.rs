@@ -17,7 +17,7 @@
 //! | `#`    | description / tooltip |
 //! | `:`    | units |
 //! | `[…]`  | numeric range hint (e.g. `[0,1]`, `[0,+inf]`) |
-//! | `{…}`  | alias annotation (dropped) |
+//! | `{…}`  | alias annotation: the field's former name (dropped from the clean name, kept as [`FieldNameInfo::alias`]) |
 //! | `*`    | read-only (presence-tested, anywhere) |
 //! | `!`    | hidden / invisible (presence-tested, anywhere) |
 //! | `^`    | trailing-only: this field labels its block's elements |
@@ -63,6 +63,15 @@ pub struct FieldNameInfo<'a> {
     pub units: Option<&'a str>,
     /// `[…]` range hint, **with** its brackets (e.g. `"[0,1]"`).
     pub range: Option<&'a str>,
+    /// `{…}` alias annotation — the name this field used to carry.
+    ///
+    /// Dropped from [`Self::clean_name`], because the *current* name is what
+    /// addresses the field. Kept here because it is the toolset's own record of
+    /// a rename, and the only machine-readable one there is: Campaign Evolved
+    /// writes `primary weight source{weight source}`, naming the Halo Reach
+    /// field it replaced. Cross-game field matching would otherwise have to
+    /// guess at that, or be told by hand.
+    pub alias: Option<&'a str>,
     /// `*` present anywhere — the field is read-only.
     pub read_only: bool,
     /// `!` present anywhere — the field is hidden / invisible.
@@ -115,6 +124,9 @@ pub fn parse_field_name(raw: &str) -> FieldNameInfo<'_> {
         // `:units` runs from `:` to the end of head, with the range excised.
         units: units_slot(head, range),
         range,
+        // `{alias}` is delimited on both sides, so it is read from the raw name
+        // rather than the head: an alias may sit after a `#help` marker.
+        alias: between(raw, '{', &['}']),
         description,
         read_only,
         hidden,
@@ -298,6 +310,49 @@ mod tests {
         assert_eq!(clean("acoustics palette{background sound palette}"), "acoustics palette");
         // Alias containing a colon — clean name cuts at '{', not the inner ':'.
         assert_eq!(clean("durango compiled shader{..:durango compiled shader}"), "durango compiled shader");
+    }
+
+    #[test]
+    fn alias_is_captured() {
+        let info = parse_field_name("acoustics{background sounds}*");
+        assert_eq!(info.clean_name, "acoustics");
+        assert_eq!(info.alias, Some("background sounds"));
+        assert!(info.read_only);
+
+        // No braces, no alias.
+        assert!(parse_field_name("jump velocity").alias.is_none());
+        // Empty braces are not an alias.
+        assert!(parse_field_name("weird{}").alias.is_none());
+    }
+
+    /// The rename these fields exist to record. Campaign Evolved split Halo
+    /// Reach's single blend-screen weight source into a primary/secondary pair
+    /// and wrote Reach's old names into the aliases, which is the only
+    /// machine-readable evidence that the two are the same field.
+    #[test]
+    fn campaign_evolved_blend_screen_aliases_name_the_reach_fields() {
+        let primary = parse_field_name("primary weight source{weight source}");
+        assert_eq!(primary.clean_name, "primary weight source");
+        assert_eq!(primary.alias, Some("weight source"));
+
+        let function =
+            parse_field_name("primary weight source object function{weight source object function}");
+        assert_eq!(function.clean_name, "primary weight source object function");
+        assert_eq!(function.alias, Some("weight source object function"));
+
+        // The secondary half is genuinely new: no alias, nothing in Reach to
+        // map it to, so it stays at its default on the way across.
+        assert!(parse_field_name("secondary weight source").alias.is_none());
+    }
+
+    /// An alias can sit after a `#help` marker, so it is read from the whole raw
+    /// name rather than the pre-`#` head.
+    #[test]
+    fn alias_after_a_description_is_still_found() {
+        let info = parse_field_name("air reverb gain{reverb gain}:dB#how much reverb");
+        assert_eq!(info.clean_name, "air reverb gain");
+        assert_eq!(info.alias, Some("reverb gain"));
+        assert_eq!(info.units.as_deref(), Some("dB"));
     }
 
     #[test]

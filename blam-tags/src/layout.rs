@@ -15,7 +15,7 @@ use crate::io::*;
 
 /// An `sz[]` entry: a named list of strings, represented as a slice
 /// into [`TagLayout::string_offsets`]. Used for enum/flags value names.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct TagStringList {
     /// `name_offset`-style index into [`TagLayout::string_data`] — the
     /// display name of this list (e.g. an enum type name).
@@ -31,7 +31,7 @@ pub struct TagStringList {
 /// elements have no wrapping `tgst` — their raw bytes live inline in
 /// the parent struct's `raw_data`, and their sub-chunks flow inline
 /// into the parent's `tgst` content.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct TagArrayLayout {
     /// Offset into [`TagLayout::string_data`] of the array's name.
     pub name_offset: u32,
@@ -43,7 +43,7 @@ pub struct TagArrayLayout {
 
 /// A `tgft` entry: a field-type registry record. Indexed by
 /// [`TagFieldLayout::type_index`].
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct TagFieldTypeLayout {
     /// Offset into [`TagLayout::string_data`] of the canonical type name
     /// (e.g. `"real point 3d"`), resolved at read time via
@@ -62,7 +62,7 @@ pub struct TagFieldTypeLayout {
 /// form is 12 bytes (`name_offset` + `type_index` + `definition`); the
 /// derived `field_type` and `offset` are computed at read time and are
 /// not on the wire.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct TagFieldLayout {
     /// Offset into [`TagLayout::string_data`] of the field name.
     pub name_offset: u32,
@@ -83,7 +83,7 @@ pub struct TagFieldLayout {
 
 /// A `blv2` entry (v2/v3) or half of a v1 `agro` record: names a block
 /// whose elements are instances of a struct.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct TagBlockLayout {
     /// Position in [`TagLayout::block_layouts`]. Tracked so
     /// `crate::data::TagBlockData` can remember which block it came from.
@@ -98,7 +98,7 @@ pub struct TagBlockLayout {
 }
 
 /// An `rcv2` entry: declares a pageable-resource field's shape.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct TagResourceLayout {
     /// Offset into [`TagLayout::string_data`] of the resource name.
     pub name_offset: u32,
@@ -112,7 +112,7 @@ pub struct TagResourceLayout {
 
 /// A `]==[` entry (v3 only): declares an api-interop field — an opaque
 /// runtime-only pointer slot. Not parsed.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct TagInteropLayout {
     pub name_offset: u32,
     pub struct_index: u32,
@@ -124,7 +124,7 @@ pub struct TagInteropLayout {
 /// struct and points at its first field. Size is derived at read time
 /// by [`TagLayout::compute_struct_layout`] walking fields until the
 /// terminator.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct TagStructLayout {
     /// Position in [`TagLayout::struct_layouts`]. Tracked so
     /// `crate::data::TagStructData` can remember which struct it came from.
@@ -243,9 +243,48 @@ pub struct TagLayout {
     /// Empty for MCC layouts. The classic decoder reads a block/struct
     /// header's version field and resolves the matching FieldSet variant.
     pub struct_version_table: Vec<Option<Vec<u32>>>,
+    /// Which template group each `tmpl` custom field stands in for.
+    ///
+    /// A `custom` field tagged `tmpl` is a fixed-size *hole* in a struct: the
+    /// bytes of another group's render method, inlined without a field list.
+    /// Halo 3 spells that method out by name; Reach onward hide the same ~100
+    /// bytes behind the hole. The size already reaches
+    /// [`TagFieldLayout::definition`] because the layout arithmetic needs it —
+    /// what it does not say is *which* template those bytes belong to, and
+    /// without that a comparison can only skip them and a converter can only
+    /// guess whether two holes hold the same thing.
+    ///
+    /// Sparse and sorted by `field_index`, in the manner of [`Self::struct_tags`].
+    /// **Empty for a layout parsed from a tag's own `blay`**: a shipped layout
+    /// records the hole but not its provenance, so this is populated only by
+    /// [`TagLayout::from_json`], which can read the template name out of the
+    /// schema. Deliberately additive — it changes no size, field list or offset,
+    /// so a tag still builds byte-for-byte the way the kits write it.
+    pub tmpl_holes: Vec<TagTemplateHole>,
+}
+
+/// One `tmpl` custom hole: where it sits, what template fills it, how wide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TagTemplateHole {
+    /// Index into [`TagLayout::fields`].
+    pub field_index: u32,
+    /// Group tag of the template the hole resolves to (e.g. `?rmp`).
+    pub group_tag: u32,
+    /// Bytes the hole occupies — the template's inherited root-struct chain.
+    /// Zero for a template that resolves to nothing, which is still worth
+    /// recording: the hole has an identity even when it has no width.
+    pub size: u32,
 }
 
 impl TagLayout {
+    /// The template hole at `field_index`, if that field is one.
+    pub fn template_hole(&self, field_index: usize) -> Option<&TagTemplateHole> {
+        self.tmpl_holes
+            .binary_search_by_key(&(field_index as u32), |hole| hole.field_index)
+            .ok()
+            .map(|position| &self.tmpl_holes[position])
+    }
+
     /// Resolve a `name_offset` into the UTF-8 string at that position
     /// in [`Self::string_data`] (the stored data is null-terminated).
     /// Returns `None` for an out-of-range offset.
@@ -388,7 +427,7 @@ impl TagLayout {
         let blay_offset = reader.stream_position()?;
 
         let root_data_size = read_u32(reader, endian)?;
-        let guid = read_u8_array(reader)?;
+        let guid = read_guid(reader, endian)?;
         let version = read_u32(reader, endian)?;
         let block_layout_version = version;
 
@@ -626,7 +665,7 @@ impl TagLayout {
                 // Convert v1 agro records (28 bytes: guid[16] + name_offset + max_count + first_field_index)
                 // into stv2 (24 bytes: guid[16] + name_offset + first_field_index)
                 // and blv2 (12 bytes: name_offset + max_count + struct_index) format.
-                let guid = read_u8_array(reader)?;
+                let guid = read_guid(reader, endian)?;
                 let name_offset = read_u32(reader, endian)?;
                 let max_count = read_u32(reader, endian)?;
                 let first_field_index = read_u32(reader, endian)?;
@@ -703,7 +742,7 @@ impl TagLayout {
                     interop_layouts.push(TagInteropLayout {
                         name_offset: read_u32(reader, endian)?,
                         struct_index: read_u32(reader, endian)?,
-                        guid: read_u8_array(reader)?,
+                        guid: read_guid(reader, endian)?,
                     });
                 }
             }
@@ -732,7 +771,7 @@ impl TagLayout {
             struct_layouts = Vec::with_capacity(header.struct_layout_count as usize);
 
             for i in 0..header.struct_layout_count {
-                let guid = read_u8_array(reader)?;
+                let guid = read_guid(reader, endian)?;
                 let name_offset = read_u32(reader, endian)?;
                 let first_field_index = read_u32(reader, endian)?;
                 let version = if block_layout_version == 4 { read_u32(reader, endian)? } else { 0 };
@@ -776,6 +815,9 @@ impl TagLayout {
             interop_layouts,
             // MCC tags carry no classic inline-struct headers.
             struct_tags: Vec::new(),
+            // A shipped `blay` records the hole but never says which template
+            // it stands in for, so there is nothing honest to put here.
+            tmpl_holes: Vec::new(),
             // MCC tags are single-version (no on-disk FieldSet selection).
             struct_version_table: Vec::new(),
         };

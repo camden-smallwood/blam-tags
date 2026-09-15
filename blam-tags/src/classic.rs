@@ -127,6 +127,20 @@ pub enum ClassicError {
     },
     /// Body had trailing bytes the layout-driven walk never consumed.
     TrailingBytes { consumed: usize, total: usize },
+    /// A block declared more element bytes than the body had left. Carries the
+    /// block's name and the header's own `count`/`element_size`, because the
+    /// product alone cannot say which of the two is wrong.
+    ShortBlock {
+        block: String,
+        count: usize,
+        elem_size: usize,
+        need: usize,
+        have: usize,
+        /// Body offset the elements were to be read from. The value that makes
+        /// this diagnosable: a plausible `count`/`elem_size` pair read a byte or
+        /// two off yields an implausible one, so the offset says where to look.
+        at: usize,
+    },
     /// A block/struct header's `count`/`element_size` pair is implausible
     /// (count*size overflows, or a nonzero count with a zero element
     /// size). Almost always a cursor desync that read garbage as a
@@ -146,6 +160,10 @@ impl std::fmt::Display for ClassicError {
             ClassicError::TrailingBytes { consumed, total } => {
                 write!(f, "layout walk consumed {consumed} of {total} body bytes")
             }
+            ClassicError::ShortBlock { block, count, elem_size, need, have, at } => write!(
+                f,
+                "block {block:?} at body offset {at} wants {count} x {elem_size} = {need} bytes but only {have} remain",
+            ),
             ClassicError::CorruptBlockHeader { count, elem_size } => {
                 write!(f, "corrupt block header: count={count} element_size={elem_size}")
             }
@@ -443,6 +461,62 @@ fn classic_struct_size(layout: &TagLayout, struct_index: u32, engine: ClassicEng
     size
 }
 
+/// Rewrite a layout's precomputed field offsets, struct sizes, and
+/// `old_string_id` width to the ones `engine` actually uses on disk.
+///
+/// The decoder and encoder already walk per engine — they advance by
+/// [`classic_field_size`] and never consult `field.offset`. Everything that
+/// *reads a value*, though, addresses the field at `layout.fields[i].offset`,
+/// which is precomputed for the modern form. On a legacy-width tag the element
+/// stride is therefore right and every field inside it is at the wrong place:
+/// `LAMB` stores an `old_string_id` as 32 inline bytes rather than a 4-byte
+/// slot, so everything after a name is read 28 bytes early. A Halo 2
+/// `render_model` node is 124 bytes there against the layout's 96, and its
+/// `parent node` was read out of the middle of the name.
+///
+/// Adjusting the layout once, here, fixes every reader and every editor at the
+/// same time, because they all go through those two numbers. The width of the
+/// `old_string_id` field *type* is updated too: it is what tells a reader with
+/// no engine in hand that the string is inline rather than in a sub-chunk.
+fn adjust_layout_for_engine(layout: &mut TagLayout, engine: ClassicEngine) {
+    if !engine.legacy_strings() && !engine.legacy_padding() {
+        return;
+    }
+    if engine.legacy_strings() {
+        for field in &layout.fields {
+            if field.field_type == TagFieldType::OldStringId {
+                layout.field_types[field.type_index as usize].size = 32;
+            }
+        }
+    }
+    // Computed first, applied after: `classic_field_size` reads the layout, and
+    // recursing into an inline struct would otherwise see a half-adjusted one.
+    // It never reads `offset` or `size`, so the order it sees does not matter —
+    // but keeping the passes separate makes that independence explicit.
+    let mut offsets: Vec<(usize, u32)> = Vec::new();
+    let mut sizes: Vec<(usize, usize)> = Vec::new();
+    for (struct_index, struct_layout) in layout.struct_layouts.iter().enumerate() {
+        let mut offset = 0usize;
+        let mut field_index = struct_layout.first_field_index as usize;
+        loop {
+            let field = &layout.fields[field_index];
+            if field.field_type == TagFieldType::Terminator {
+                break;
+            }
+            offsets.push((field_index, offset as u32));
+            offset += classic_field_size(layout, field, engine);
+            field_index += 1;
+        }
+        sizes.push((struct_index, offset));
+    }
+    for (field_index, offset) in offsets {
+        layout.fields[field_index].offset = offset;
+    }
+    for (struct_index, size) in sizes {
+        layout.struct_layouts[struct_index].size = size;
+    }
+}
+
 /// Decode then re-encode a classic tag body, returning the re-encoded
 /// bytes. The byte-exact roundtrip gate: `classic_roundtrip(body, ..) ==
 /// body` for a well-formed tag. Keeps the internal
@@ -464,8 +538,11 @@ pub fn classic_roundtrip(
 ///
 /// Returns [`ClassicError::NotClassic`] if the offset-60 engine word
 /// isn't a known classic engine (caller should route to the MCC reader).
-pub fn read_classic_tag_file(bytes: &[u8], layout: TagLayout) -> Result<TagFile, ClassicError> {
+pub fn read_classic_tag_file(bytes: &[u8], mut layout: TagLayout) -> Result<TagFile, ClassicError> {
     let (header, engine) = ClassicHeader::parse(bytes).ok_or(ClassicError::NotClassic)?;
+    // Point the layout at the widths this engine actually uses before anything
+    // reads a field through it.
+    adjust_layout_for_engine(&mut layout, engine);
     let body = &bytes[64..];
     let root = read_classic_body(body, &layout, engine)?;
 
@@ -909,7 +986,28 @@ fn decode_block(
     let struct_index = resolve_version_variant(layout, struct_index, version);
 
     let total = checked_block_extent(count, elem_size)?;
-    let raw_data = cur.take(total, "block elements")?.to_vec();
+    // Name the block and quote the header's own numbers. A bare "need N bytes,
+    // have M" cannot be acted on: N is `count * element_size`, so the interesting
+    // question is always which of the two is wrong and for which block, and
+    // recovering that from the product alone is guesswork.
+    let elements_at = cur.pos;
+    let raw_data = cur
+        .take(total, "block elements")
+        .map_err(|error| match error {
+            ClassicError::UnexpectedEof { need, have, .. } => ClassicError::ShortBlock {
+                block: layout
+                    .get_string(layout.block_layouts[block_index as usize].name_offset)
+                    .unwrap_or("?")
+                    .to_owned(),
+                count,
+                elem_size,
+                need,
+                have,
+                at: elements_at,
+            },
+            other => other,
+        })?
+        .to_vec();
 
     let mut elements = Vec::with_capacity(count);
     for i in 0..count {
@@ -1046,18 +1144,20 @@ fn sync_fixed_counts(
                 // 16-byte inline header: group(4) + ptr(4) + length(4) +
                 // tag_id(4). Payload is `group(4) + path + NUL`. Sync the
                 // group + the path length (excluding the NUL).
-                if p.len() >= 4 {
+                if p.len() > 5 {
+                    // group + path + NUL.
                     raw[*off..*off + 4].copy_from_slice(&p[0..4]);
-                    // Only rewrite the length when a path is present; a null
-                    // reference read from disk keeps its 4-byte (group-only)
-                    // payload and its original length field (H2 stores -1
-                    // there, not 0), so leave the inline word alone.
-                    if p.len() > 4 {
-                        let path_len = p.len() - 5; // minus 4 group + 1 NUL
-                        wr_u32(raw, *off + 8, path_len as u32, endian);
-                    }
+                    let path_len = p.len() - 5; // minus 4 group + 1 NUL
+                    wr_u32(raw, *off + 8, path_len as u32, endian);
+                } else if p.len() == 4 {
+                    // A null reference read from disk keeps its 4-byte
+                    // (group-only) payload and its original length field (H2
+                    // stores -1 there, not 0), so leave the inline word alone.
+                    raw[*off..*off + 4].copy_from_slice(&p[0..4]);
                 } else if *off + 12 <= raw.len() {
-                    // Empty payload: the reference was *edited* to null
+                    // Two cases reach here, and both mean "no path".
+                    //
+                    // An **empty payload**: the reference was edited to null
                     // (`TagReferenceData::to_bytes(None)` yields no bytes),
                     // unlike an originally-null ref whose decoded payload is
                     // the 4 group bytes. Neither the group nor the length was
@@ -1065,17 +1165,40 @@ fn sync_fixed_counts(
                     // would survive while no trailing path is emitted — the
                     // decoder then tries to read a phantom path and hits EOF
                     // ("need N bytes, have M"), corrupting the saved tag.
+                    //
+                    // A **5-byte payload** — group plus a bare NUL — is a
+                    // reference edited to the empty *string*, which a read can
+                    // never produce (a real path decodes to `4 + len + 1`
+                    // bytes). It used to take the path branch above, which
+                    // wrote `len = 5 - 5 = 0` while
+                    // `encode_struct_trailing` still emitted the NUL. The
+                    // decoder reads `len == 0` as "no path" and consumes
+                    // nothing, so every empty-path reference shifted the rest
+                    // of the body one byte and the next block header was read
+                    // off by one.
+                    //
                     // Write a canonical null: group = -1 and length = 0, which
                     // the decoder treats as NONE for both CE and H2.
                     raw[*off..*off + 4].copy_from_slice(&[0xFF; 4]);
                     wr_u32(raw, *off + 8, 0, endian);
                 }
             }
-            (TagFieldType::StringId, Some(TagSubChunkContent::StringId(s)))
-            | (TagFieldType::OldStringId, Some(TagSubChunkContent::OldStringId(s))) => {
+            (
+                TagFieldType::StringId | TagFieldType::OldStringId,
+                Some(TagSubChunkContent::StringId(s) | TagSubChunkContent::OldStringId(s)),
+            ) => {
                 // Inline (pad:u16, length:u16) big-endian. Sync length.
                 // (Legacy 32-byte inline old_string_id has no sub-chunk and
                 // is preserved verbatim, so it never reaches this arm.)
+                //
+                // Both field types accept either content variant on purpose.
+                // `encode_struct_trailing` already emits the bytes for either,
+                // so requiring the variant to match the field type left the
+                // inline length stale whenever a writer set a `string_id` value
+                // on an `old_string_id` field — the trailing bytes were the new
+                // string's while the length word was still the old string's, and
+                // the decoder then read the following block header off by the
+                // difference.
                 raw[*off + 2..*off + 4].copy_from_slice(&(s.len() as u16).to_be_bytes());
             }
             _ => {}
@@ -1121,7 +1244,12 @@ fn encode_struct_trailing(
                     // already lives in raw_data, so only `path + NUL`
                     // (payload[4..]) is trailing on disk.
                     TagSubChunkContent::TagReference(p) => {
-                        if p.len() > 4 {
+                        // `> 5`, not `> 4`: a 5-byte payload is group + a bare
+                        // NUL, i.e. an empty path, which `sync_fixed_counts`
+                        // encodes as a canonical null. Emitting its NUL here
+                        // would put a byte on disk that the decoder does not
+                        // read, desyncing everything after it.
+                        if p.len() > 5 {
                             out.extend_from_slice(&p[4..]);
                         }
                     }
@@ -1161,6 +1289,88 @@ fn encode_struct_trailing(
 #[cfg(test)]
 mod tests {
     use super::classic_checksum;
+
+    /// A `LAMB` tag stores every `old_string_id` as 32 inline bytes, not the
+    /// modern 4-byte slot, so each one shifts everything after it by 28. The
+    /// layout's precomputed offsets describe the modern form, and every reader
+    /// and editor addresses fields through them — so on the Halo 2 banshee the
+    /// names came back empty and `parent node` was read out of the middle of
+    /// the name. 458 of the 1,095 Halo 2 render_models are `LAMB`.
+    ///
+    /// The two halves of the fix are both load-bearing and this checks both:
+    /// the adjusted offsets (node parents, and section indices that are in
+    /// range — 5 distinct with 17 out of range before, 35 with 0 after), and
+    /// the inline read that makes a name resolve at all.
+    ///
+    /// Ignored by default — it needs a loose Halo 2 tag tree.
+    ///
+    /// Run with:
+    ///   H2_TAGS=~/Halo/halo2_mcc/tags H2_DEFS=<definitions>/halo2_mcc \
+    ///     cargo test legacy_string_tag -- --ignored
+    #[test]
+    #[ignore = "requires a loose Halo 2 tag tree; set H2_TAGS and H2_DEFS"]
+    fn legacy_string_tag_reads_its_names_and_the_fields_after_them() {
+        let (Ok(tags), Ok(defs)) = (std::env::var("H2_TAGS"), std::env::var("H2_DEFS")) else {
+            eprintln!("skipping: set H2_TAGS and H2_DEFS");
+            return;
+        };
+        let path = std::path::PathBuf::from(tags)
+            .join("objects/vehicles/banshee/banshee.render_model");
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        // The premise: this tag is one of the legacy-string ones.
+        assert_eq!(&bytes[60..64], b"BMAL", "banshee is supposed to be a LAMB tag");
+
+        let layout = crate::TagLayout::from_json(
+            std::path::PathBuf::from(defs).join("render_model.json"),
+        )
+        .expect("render_model layout");
+        let tag = super::read_classic_tag_file(&bytes, layout).expect("decode banshee");
+        let root = tag.root();
+
+        assert_eq!(root.read_string_id("name").as_deref(), Some("banshee"));
+
+        let nodes = root.field("nodes").and_then(|f| f.as_block()).expect("nodes");
+        let first = nodes.element(0).expect("a node");
+        assert_eq!(first.read_string_id("name").as_deref(), Some("hull"));
+        assert_eq!(
+            first.read_block_index("parent node"),
+            -1,
+            "the first node is the root; reading it out of the name gives garbage"
+        );
+
+        // Every permutation's section index has to address a real section —
+        // this is what the preview draws, and it is a field after the name.
+        let sections = root
+            .field("sections")
+            .and_then(|f| f.as_block())
+            .expect("sections")
+            .len();
+        let regions = root.field("regions").and_then(|f| f.as_block()).expect("regions");
+        assert!(regions.len() > 1, "banshee has several regions");
+        let mut named = 0usize;
+        let mut checked = 0usize;
+        for ri in 0..regions.len() {
+            let region = regions.element(ri).expect("region");
+            if !region.read_string_id("name").unwrap_or_default().is_empty() {
+                named += 1;
+            }
+            let Some(perms) = region.field("permutations").and_then(|f| f.as_block()) else {
+                continue;
+            };
+            for pi in 0..perms.len() {
+                let perm = perms.element(pi).expect("permutation");
+                let index = perm.read_int_any("L1 section index").unwrap_or(-1);
+                assert!(
+                    index >= 0 && (index as usize) < sections,
+                    "region {ri} permutation {pi} names section {index} of {sections}"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(named, regions.len(), "every region is named");
+        assert!(checked > 30, "only {checked} permutations checked");
+    }
 
     #[test]
     fn checksum_matches_crc32_without_final_xor() {

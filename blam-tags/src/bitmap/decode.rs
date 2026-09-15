@@ -96,7 +96,8 @@ pub fn decode_to_rgba8(
         Dxt5a => decode_bc4_rgba(&input[..need], width, height, &mut out, ChannelMask::ALL),
         Dxt5aMono => decode_bc4_rgba(&input[..need], width, height, &mut out, ChannelMask::RGB_ONLY),
         Dxt5aAlpha => decode_bc4_rgba(&input[..need], width, height, &mut out, ChannelMask::ALPHA_ONLY),
-        Dxn => decode_bc5(&input[..need], width, height, &mut out),
+        Dxn => decode_bc5(&input[..need], width, height, &mut out, false),
+        DxnSnorm => decode_bc5(&input[..need], width, height, &mut out, true),
         Dxt3a => decode_dxt3a(&input[..need], width, height, &mut out, ChannelMask::ALL),
         Dxt3aMono => decode_dxt3a(&input[..need], width, height, &mut out, ChannelMask::RGB_ONLY),
         Dxt3aAlpha => decode_dxt3a(&input[..need], width, height, &mut out, ChannelMask::ALPHA_ONLY),
@@ -315,15 +316,17 @@ fn decode_a4r4g4b4(input: &[u8], out: &mut [u8]) {
 /// `v8u8`: 16-bit signed normalmap. u16 packed `V<<8 | U` → memory
 /// `[U, V]` (V is the high byte). Maps to `(V, U)` in `(R, G)` per
 /// the existing DDS pixelformat. Bias by `+128` so signed bytes
-/// display as unsigned.
+/// display as unsigned, then reconstruct Z from X and Y.
 fn decode_v8u8(input: &[u8], out: &mut [u8]) {
     for (i, chunk) in input.chunks_exact(2).enumerate() {
         let u = chunk[0] as i8;
         let v = chunk[1] as i8;
         let p = i * 4;
-        out[p] = (v as i16 + 128) as u8;       // R = V
-        out[p + 1] = (u as i16 + 128) as u8;   // G = U
-        out[p + 2] = 128;                      // B = 0.5 (z implied)
+        let r = (v as i16 + 128) as u8;        // R = V
+        let g = (u as i16 + 128) as u8;        // G = U
+        out[p] = r;
+        out[p + 1] = g;
+        out[p + 2] = calculate_normal_z(r, g);
         out[p + 3] = 255;
     }
 }
@@ -589,9 +592,19 @@ fn decode_bc4_rgba(
     }
 }
 
-/// `dxn` → BC5 (two-channel). Output `(R, G, 128, 255)` matching the
-/// normalmap convention V8U8 already uses (B = z = 0.5 implied).
-fn decode_bc5(input: &[u8], width: u32, height: u32, out: &mut [u8]) {
+/// `dxn` → BC5 (two-channel normal map). Output `(X, Y, Z, 255)` with
+/// Z reconstructed from X and Y, as `ctx1` and `dxt5nm` already do —
+/// the two channels are a unit normal's tangent components, so the
+/// third is derivable rather than a constant.
+///
+/// `signed` selects how the block's endpoints are read. PC/MCC tags
+/// store SNORM endpoints and X360 tags store UNORM ones; the schema
+/// spells both `dxn`, so [`super::BitmapImage::format`] resolves which
+/// is which and routes here through [`BitmapFormat::DxnSnorm`] or
+/// [`BitmapFormat::Dxn`]. `bcdec_rs` hands back the signed values as
+/// two's-complement bytes, so they take the same `+128` bias that
+/// [`decode_v8u8`] applies.
+fn decode_bc5(input: &[u8], width: u32, height: u32, out: &mut [u8], signed: bool) {
     let blocks_w = ((width + 3) / 4).max(1);
     let blocks_h = ((height + 3) / 4).max(1);
     for by in 0..blocks_h {
@@ -599,7 +612,7 @@ fn decode_bc5(input: &[u8], width: u32, height: u32, out: &mut [u8]) {
             let block_idx = (by * blocks_w + bx) as usize;
             let block = &input[block_idx * 16..(block_idx + 1) * 16];
             let mut staging = [0u8; 32]; // 4×4 RG8
-            bcdec_rs::bc5(block, &mut staging, 8, false);
+            bcdec_rs::bc5(block, &mut staging, 8, signed);
             let w = width as usize;
             for j in 0..4u32 {
                 let py = by * 4 + j;
@@ -608,17 +621,26 @@ fn decode_bc5(input: &[u8], width: u32, height: u32, out: &mut [u8]) {
                     let px = bx * 4 + i;
                     if px >= width { break; }
                     let src = ((j * 4 + i) * 2) as usize;
-                    let r = staging[src];
-                    let g = staging[src + 1];
+                    let (r, g) = if signed {
+                        (bias_signed(staging[src]), bias_signed(staging[src + 1]))
+                    } else {
+                        (staging[src], staging[src + 1])
+                    };
                     let dst = (py as usize * w + px as usize) * 4;
                     out[dst] = r;
                     out[dst + 1] = g;
-                    out[dst + 2] = 128;
+                    out[dst + 2] = calculate_normal_z(r, g);
                     out[dst + 3] = 255;
                 }
             }
         }
     }
+}
+
+/// Re-bias one two's-complement signed byte (`-127..=127`) into the
+/// unsigned `1..=255` range the RGBA8 output uses.
+fn bias_signed(v: u8) -> u8 {
+    ((v as i8) as i16 + 128) as u8
 }
 
 /// `dxn_mono_alpha` → custom Halo codec. Each 16-byte block is two
@@ -788,15 +810,17 @@ fn decode_a2r10g10b10(input: &[u8], out: &mut [u8]) {
 
 /// `v16u16`: signed 32-bit two-channel normalmap. Memory `[U_lo, U_hi,
 /// V_lo, V_hi]` as two i16s. Bias by `+32768` and truncate to high
-/// byte; output `(V, U, 128, 255)` matching the V8U8 convention.
+/// byte; output `(V, U, z, 255)` matching the V8U8 convention.
 fn decode_v16u16(input: &[u8], out: &mut [u8]) {
     for (i, chunk) in input.chunks_exact(4).enumerate() {
         let u = i16::from_le_bytes([chunk[0], chunk[1]]) as i32 + 32768;
         let v = i16::from_le_bytes([chunk[2], chunk[3]]) as i32 + 32768;
         let p = i * 4;
-        out[p] = (v >> 8) as u8;
-        out[p + 1] = (u >> 8) as u8;
-        out[p + 2] = 128;
+        let r = (v >> 8) as u8;
+        let g = (u >> 8) as u8;
+        out[p] = r;
+        out[p + 1] = g;
+        out[p + 2] = calculate_normal_z(r, g);
         out[p + 3] = 255;
     }
 }
@@ -1124,13 +1148,30 @@ mod tests {
 
     #[test]
     fn v8u8_signed_bias_to_unsigned() {
-        // Memory [U, V] = [-1, 0] → expected (V+128, U+128, 128, 255) = (128, 127, 128, 255)
+        // Memory [U, V] = [-1, 0] → expected (V+128, U+128, z, 255) = (128, 127, z, 255)
         let out = decode_to_rgba8(BitmapFormat::V8u8, 1, 1, &[0xFF, 0x00], crate::bitmap::p8::P8Palette::Halo2).unwrap();
-        assert_eq!(&out, &rgba(128, 127, 128, 255));
+        assert_eq!(&out, &rgba(128, 127, calculate_normal_z(128, 127), 255));
 
-        // Memory [U=+127, V=-128] → (0, 255, 128, 255)
+        // Memory [U=+127, V=-128] → (0, 255, z, 255)
         let out = decode_to_rgba8(BitmapFormat::V8u8, 1, 1, &[0x7F, 0x80], crate::bitmap::p8::P8Palette::Halo2).unwrap();
-        assert_eq!(&out, &rgba(0, 255, 128, 255));
+        assert_eq!(&out, &rgba(0, 255, calculate_normal_z(0, 255), 255));
+    }
+
+    /// A flat normal — both tangent components at zero — must come back
+    /// pointing straight out of the surface, not sideways. `(128, 128)`
+    /// is x = y = 0, so z = 1 and blue saturates.
+    #[test]
+    fn v8u8_flat_normal_reconstructs_full_z() {
+        let out = decode_to_rgba8(BitmapFormat::V8u8, 1, 1, &[0x00, 0x00], crate::bitmap::p8::P8Palette::Halo2).unwrap();
+        assert_eq!(&out, &rgba(128, 128, 255, 255));
+    }
+
+    /// `v16u16` follows the same convention one channel width up:
+    /// signed zero in both channels is the flat normal.
+    #[test]
+    fn v16u16_flat_normal_reconstructs_full_z() {
+        let out = decode_to_rgba8(BitmapFormat::V16u16, 1, 1, &[0, 0, 0, 0], crate::bitmap::p8::P8Palette::Halo2).unwrap();
+        assert_eq!(&out, &rgba(128, 128, 255, 255));
     }
 
     #[test]
@@ -1308,10 +1349,11 @@ mod tests {
         }
     }
 
-    /// BC5 block (DXN) with red sub-block = 0x40 and green sub-block
-    /// = 0xC0. Expect (R=0x40, G=0xC0, B=128, A=255) at every pixel.
+    /// Unsigned BC5 (`dxn`, the X360 spelling) with red sub-block =
+    /// 0x40 and green sub-block = 0xC0. The two channels pass through
+    /// untouched and Z is derived from them.
     #[test]
-    fn bc5_dxn_two_channel_with_neutral_blue() {
+    fn bc5_dxn_two_channel_with_reconstructed_z() {
         let mut block = [0u8; 16];
         // Red sub-block: both endpoints = 0x40
         block[0] = 0x40;
@@ -1320,8 +1362,47 @@ mod tests {
         block[8] = 0xC0;
         block[9] = 0xC0;
         let out = decode_to_rgba8(BitmapFormat::Dxn, 4, 4, &block, crate::bitmap::p8::P8Palette::Halo2).unwrap();
+        let z = calculate_normal_z(0x40, 0xC0);
         for i in 0..16 {
-            assert_eq!(&out[i * 4..i * 4 + 4], &[0x40, 0xC0, 0x80, 0xFF]);
+            assert_eq!(&out[i * 4..i * 4 + 4], &[0x40, 0xC0, z, 0xFF]);
+        }
+    }
+
+    /// The bug this variant exists for: PC/MCC `dxn` endpoints are
+    /// signed, so a flat normal is stored as 0x00, not 0x80. Read as
+    /// unsigned it decodes to black with a dead blue channel; read as
+    /// signed it is the neutral normal `(128, 128, 255)`.
+    #[test]
+    fn bc5_dxn_snorm_flat_normal_points_out_of_the_surface() {
+        // Both sub-blocks: endpoints = 0 (signed zero).
+        let block = [0u8; 16];
+        let out = decode_to_rgba8(BitmapFormat::DxnSnorm, 4, 4, &block, crate::bitmap::p8::P8Palette::Halo2).unwrap();
+        for i in 0..16 {
+            assert_eq!(&out[i * 4..i * 4 + 4], &[128, 128, 255, 0xFF]);
+        }
+
+        // The same bytes read as unsigned are what the old decoder
+        // produced — kept here so the two can't silently converge.
+        let out = decode_to_rgba8(BitmapFormat::Dxn, 4, 4, &block, crate::bitmap::p8::P8Palette::Halo2).unwrap();
+        assert_eq!(&out[0..2], &[0, 0]);
+    }
+
+    /// Signed endpoints span `-127..=127`, which biases to `1..=255`
+    /// with 128 at zero. Guards the `as i8` round-trip in `bias_signed`.
+    #[test]
+    fn bc5_dxn_snorm_maps_the_full_signed_range() {
+        let mut block = [0u8; 16];
+        // Red sub-block: both endpoints = -127 (0x81).
+        block[0] = 0x81;
+        block[1] = 0x81;
+        // Green sub-block: both endpoints = +127 (0x7F).
+        block[8] = 0x7F;
+        block[9] = 0x7F;
+        let out = decode_to_rgba8(BitmapFormat::DxnSnorm, 4, 4, &block, crate::bitmap::p8::P8Palette::Halo2).unwrap();
+        for i in 0..16 {
+            // x ≈ -1 and y ≈ +1 overshoots the unit circle, so the
+            // clamp in `calculate_normal_z` pins z to 0 → 128.
+            assert_eq!(&out[i * 4..i * 4 + 4], &[1, 255, 128, 0xFF]);
         }
     }
 

@@ -59,6 +59,9 @@ pub enum JmsError {
     /// either the schema doesn't have it or the tag instance left it
     /// empty. Carries the dotted field path for diagnosis.
     MissingField(&'static str),
+    /// The tag isn't one this builder knows how to read (wrong group,
+    /// or an engine variant with no reader).
+    Unsupported(String),
     /// Io error from the JMS writer.
     Io(io::Error),
 }
@@ -67,6 +70,7 @@ impl std::fmt::Display for JmsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingField(p) => write!(f, "render_model is missing required field: {p}"),
+            Self::Unsupported(m) => write!(f, "{m}"),
             Self::Io(e) => write!(f, "JMS write failed: {e}"),
         }
     }
@@ -373,7 +377,10 @@ impl JmsFile {
     /// the same skeleton the animations and collision use. UE's extra
     /// `World` root (and any UE bone absent from the tag) falls back to the
     /// tag's root node. UE is left-handed (Y right); the classic pipeline is
-    /// right-handed (Y left), so positions and normals are Y-negated.
+    /// right-handed (Y left), so positions and normals are Y-negated. Texture
+    /// V is flipped for the same reason every other JMS writer here flips it:
+    /// UE and the Halo engines both run V downward from a top-left origin, and
+    /// JMS is the one format that doesn't.
     #[cfg(feature = "iostore")]
     pub fn from_ue_skeletal_mesh(
         mesh: &crate::iostore::skeletal_mesh::SkeletalMesh,
@@ -439,7 +446,7 @@ impl JmsFile {
                     tangent: None,
                     binormal: None,
                     node_sets,
-                    uvs: vec![crate::math::RealPoint2d { x: v.uv[0], y: v.uv[1] }],
+                    uvs: vec![crate::math::RealPoint2d { x: v.uv[0], y: 1.0 - v.uv[1] }],
                 }
             })
             .collect();
@@ -584,7 +591,7 @@ impl JmsFile {
                     tangent: None,
                     binormal: None,
                     node_sets,
-                    uvs: vec![crate::math::RealPoint2d { x: v.uv[0], y: v.uv[1] }],
+                    uvs: vec![crate::math::RealPoint2d { x: v.uv[0], y: 1.0 - v.uv[1] }],
                 });
             }
             for sec in &part.mesh.sections {
@@ -675,7 +682,7 @@ impl JmsFile {
                     tangent: None,
                     binormal: None,
                     node_sets: vec![(bone, 1.0)],
-                    uvs: vec![crate::math::RealPoint2d { x: v.uv[0], y: v.uv[1] }],
+                    uvs: vec![crate::math::RealPoint2d { x: v.uv[0], y: 1.0 - v.uv[1] }],
                 });
             }
             let matname = part
@@ -732,7 +739,7 @@ impl JmsFile {
                     tangent: None,
                     binormal: None,
                     node_sets: vec![(node, 1.0)],
-                    uvs: vec![crate::math::RealPoint2d { x: v.uv[0], y: v.uv[1] }],
+                    uvs: vec![crate::math::RealPoint2d { x: v.uv[0], y: 1.0 - v.uv[1] }],
                 });
             }
             for sec in &part.mesh.sections {
@@ -2046,7 +2053,7 @@ impl JmsFile {
 /// Read a 3-component field that may be declared as either
 /// `real_point_3d` or `real_vector_3d` (the classic engines differ from
 /// gen3+ on several geometry fields).
-fn read_point_or_vec(s: &TagStruct<'_>, name: &str) -> RealPoint3d {
+pub(crate) fn read_point_or_vec(s: &TagStruct<'_>, name: &str) -> RealPoint3d {
     match s.field(name).and_then(|f| f.value()) {
         Some(TagFieldData::RealPoint3d(p)) => p,
         Some(TagFieldData::RealVector3d(v)) => RealPoint3d { x: v.i, y: v.j, z: v.k },
@@ -2298,15 +2305,28 @@ fn overlay_skeleton(nodes: &mut [JmsNode], skeleton: &[JmsNode]) {
     }
 }
 
+/// Read the node list a `physics_model` or `collision_model` carries.
+///
+/// The two groups spell the parent link differently — a physics node calls it
+/// `parent`, a collision node `parent node` — in every game from Halo 2 to
+/// Campaign Evolved. Reading only `parent` gave every collision node the
+/// missing-field default of -1, so the emitted armature was a flat pile of
+/// root bones with no hierarchy at all. Neither group stores transforms; a
+/// caller with a skeleton overlays them by name.
 fn read_phmo_nodes(root: &TagStruct<'_>) -> Result<Vec<JmsNode>, JmsError> {
     let block = root.field_path("nodes").and_then(|f| f.as_block())
         .ok_or(JmsError::MissingField("nodes"))?;
     let mut out = Vec::with_capacity(block.len());
     for i in 0..block.len() {
         let n = block.element(i).unwrap();
+        let parent = if n.field("parent").is_some() {
+            n.read_block_index("parent")
+        } else {
+            n.read_block_index("parent node")
+        };
         out.push(JmsNode {
             name: n.read_string_id("name").unwrap_or_default(),
-            parent: n.read_block_index("parent"),
+            parent,
             rotation: RealQuaternion::IDENTITY,
             translation: RealPoint3d::ZERO,
         });
@@ -2509,16 +2529,26 @@ fn read_phmo_pills(root: &TagStruct<'_>, parents: &std::collections::HashMap<(i6
             .unwrap_or(0.0);
         let bottom = p.read_vec3("bottom");
         let top = p.read_vec3("top");
-        // TagTool pill anchor: translation = bottom + normalized(bottom - top) * radius
+        // A pill is stored as its two end centres. JMS gives it an origin and an
+        // orientation instead: the origin is the tip of the bottom cap, one
+        // radius beyond `bottom` along the axis, and the body runs from there
+        // for `height + 2 * radius`.
         let dir = bottom - top;
         let unit = dir.normalized();
         let anchor = bottom + unit * radius;
         let height = (top - bottom).length() * SCALE;
-        // Orientation from the `top - bottom` axis (TagTool's
-        // `QuaternionFromVector` with reference up = (0, 0, -1)).
+        // The consumer builds the pill along its own local +Z from that origin
+        // — both the Blender toolset and Foundry create a depth-2 cylinder,
+        // push it to z = 0..2, and scale z by `radius + height / 2`. So the
+        // rotation has to carry local +Z onto `top - bottom`. Carrying -Z onto
+        // it instead (which is what reading TagTool's `QuaternionFromVector`
+        // as a +Z alignment amounts to) points every pill backwards out of its
+        // own anchor, displacing it by its full length: the flood tank's legs
+        // and lower arm ended up below the floor and its upper arm out beside
+        // the body.
         let axis = top - bottom;
         let rot = RealQuaternion::shortest_arc(
-            RealVector3d { i: 0.0, j: 0.0, k: -1.0 },
+            RealVector3d { i: 0.0, j: 0.0, k: 1.0 },
             axis,
         );
         out.push(JmsCapsule {
@@ -2687,12 +2717,13 @@ fn read_phmo_h2_pills(root: &TagStruct<'_>, parent_map: &std::collections::HashM
         let radius = p.read_real("radius").unwrap_or(0.0);
         let bottom = p.read_vec3("bottom");
         let top = p.read_vec3("top");
-        // Same anchor/orientation math as the H3 pill reader.
+        // Same anchor/orientation math as the H3 pill reader — local +Z runs
+        // from the bottom cap's tip toward `top`.
         let dir = bottom - top;
         let anchor = bottom + dir.normalized() * radius;
         let height = (top - bottom).length() * SCALE;
         let rot = RealQuaternion::shortest_arc(
-            RealVector3d { i: 0.0, j: 0.0, k: -1.0 },
+            RealVector3d { i: 0.0, j: 0.0, k: 1.0 },
             top - bottom,
         );
         out.push(JmsCapsule {
@@ -3452,6 +3483,119 @@ mod tests {
         assert_eq!(nodes[0].translation.x, 24.0);
         assert_eq!(nodes[1].translation.x, 0.0);
         assert_eq!(nodes[2].translation.x, 80.0);
+    }
+
+    /// A pill is stored as two end centres, but JMS gives it an origin and an
+    /// orientation and leaves the consumer to build the body along its own
+    /// local +Z. So the emitted rotation has to carry +Z onto `top - bottom`:
+    /// reconstructing both ends from what we write must land back on the tag's
+    /// own `bottom` and `top`, each pushed out by one radius.
+    ///
+    /// Carrying -Z instead points every pill backwards out of its own anchor
+    /// and displaces it by its whole length — the flood tank's legs and lower
+    /// arm ended up below the floor and its upper arm out beside the body.
+    /// Across Halo 3 and Halo Reach that was 639 of 639 pills wrong, every far
+    /// tip off by exactly twice the pill's length.
+    ///
+    /// Ignored by default — it needs a loose Halo 3 tag tree.
+    ///
+    /// Run with:
+    ///   H3_TAGS=~/Halo/halo3_mcc/tags cargo test pill_runs_from -- --ignored
+    #[test]
+    #[ignore = "requires a loose Halo 3 tag tree; set H3_TAGS"]
+    fn pill_runs_from_its_anchor_toward_the_far_end() {
+        let Ok(root) = std::env::var("H3_TAGS") else {
+            eprintln!("skipping: set H3_TAGS to a loose Halo 3 tags directory");
+            return;
+        };
+        let path = std::path::PathBuf::from(root)
+            .join("objects/characters/flood_tank/flood_tank.physics_model");
+        let tag = crate::TagFile::read(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let jms = super::JmsFile::from_physics_model(&tag).expect("physics jms");
+        let block = tag
+            .root()
+            .field_path("pills")
+            .and_then(|f| f.as_block())
+            .expect("pills block");
+        assert!(!jms.capsules.is_empty(), "this model has no pills to check");
+
+        const SCALE: f32 = 100.0;
+        let up = crate::math::RealVector3d { i: 0.0, j: 0.0, k: 1.0 };
+        for (i, capsule) in jms.capsules.iter().enumerate() {
+            let element = block.element(i).expect("pill element");
+            let bottom = element.read_vec3("bottom") * SCALE;
+            let top = element.read_vec3("top") * SCALE;
+            let unit = (top - bottom).normalized();
+            let length = capsule.height + 2.0 * capsule.radius;
+            let tolerance = 0.01 * length;
+
+            let origin = capsule.translation.as_vector();
+            assert!(
+                (origin - (bottom - unit * capsule.radius)).length() < tolerance,
+                "pill '{}' starts at {origin:?}, not at the bottom cap's tip",
+                capsule.name,
+            );
+            let tip = origin + capsule.rotation.rotate(up) * length;
+            let want = top + unit * capsule.radius;
+            assert!(
+                (tip - want).length() < tolerance,
+                "pill '{}' reaches {tip:?} instead of {want:?} — off by {:.0}% of its \
+                 own length, which at ~200% is the pill pointing out of its anchor",
+                capsule.name,
+                100.0 * (tip - want).length() / length,
+            );
+        }
+    }
+
+    /// A collision node spells its parent link `parent node`, not `parent` —
+    /// reading only the physics spelling gave every collision bone the
+    /// missing-field default of -1, so the emitted armature was a flat pile of
+    /// roots. Checked against the render_model, which is where that hierarchy
+    /// really comes from: across the 1,347 Halo 3 models carrying both, this
+    /// went from 1,341 bone parents agreeing (307 armatures entirely
+    /// parentless) to 4,464 of 4,464.
+    ///
+    /// Ignored by default — it needs a loose Halo 3 tag tree.
+    ///
+    /// Run with:
+    ///   H3_TAGS=~/Halo/halo3_mcc/tags cargo test collision_armature -- --ignored
+    #[test]
+    #[ignore = "requires a loose Halo 3 tag tree; set H3_TAGS"]
+    fn collision_armature_matches_the_render_models_hierarchy() {
+        let Ok(root) = std::env::var("H3_TAGS") else {
+            eprintln!("skipping: set H3_TAGS to a loose Halo 3 tags directory");
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let open = |relative: &str| {
+            crate::TagFile::read(root.join(relative))
+                .unwrap_or_else(|e| panic!("read {relative}: {e}"))
+        };
+        let stem = "objects/characters/flood_tank/flood_tank";
+        let render = super::JmsFile::from_render_model(&open(&format!("{stem}.render_model")))
+            .expect("render jms");
+        let collision =
+            super::JmsFile::from_collision_model(&open(&format!("{stem}.collision_model")))
+                .expect("collision jms");
+
+        assert!(collision.nodes.len() > 1, "this model has no rig to check");
+        assert!(
+            collision.nodes.iter().any(|n| n.parent >= 0),
+            "every collision bone came out parentless"
+        );
+        for node in &collision.nodes {
+            let Some(source) = render.nodes.iter().find(|n| n.name == node.name) else {
+                continue;
+            };
+            let expected = (source.parent >= 0).then(|| &render.nodes[source.parent as usize].name);
+            let actual = (node.parent >= 0).then(|| &collision.nodes[node.parent as usize].name);
+            assert_eq!(
+                expected, actual,
+                "collision bone {} names the wrong parent",
+                node.name
+            );
+        }
     }
 
 

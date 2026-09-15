@@ -140,6 +140,9 @@ pub fn decode_vertex_buffer(
 
     match vertex_type {
         MeshVertexType::RigidCompressed => decode_rigid_compressed(vertex_count, stride, bytes),
+        MeshVertexType::SkinnedCompressed => {
+            decode_skinned_compressed(vertex_count, stride, bytes)
+        }
         MeshVertexType::Rigid => decode_rigid(vertex_count, stride, bytes),
         MeshVertexType::Skinned => decode_skinned(vertex_count, stride, bytes),
         MeshVertexType::World => decode_world(vertex_count, stride, bytes),
@@ -176,6 +179,48 @@ fn decode_rigid_compressed(
             binormal: cross(normal, tangent),
             texcoord: [u, v],
             node_sets: Vec::new(),
+        });
+    }
+    Ok(out)
+}
+
+/// `skinned compressed` (24 B): a `rigid compressed` vertex with four bone
+/// indices and four weights appended.
+///
+/// Derived from the two formats either side of it and then checked against the
+/// build rather than assumed: `rigid compressed` is 16 bytes and a skinned
+/// vertex adds one byte per index and one per weight, which is 24, and 24 is
+/// what every buffer descriptor naming this format actually declares. The
+/// indices are mesh-local here exactly as they are in `skinned`, so the caller
+/// remaps them through `per_mesh_node_map` the same way.
+fn decode_skinned_compressed(
+    count: u32, stride: u16, bytes: &[u8],
+) -> Result<Vec<AuthorVertex>, VertexDecodeError> {
+    expect_stride(24, stride)?;
+    let mut out = Vec::with_capacity(count as usize);
+    for i in 0..count as usize {
+        let off = i * 24;
+        let pos = read_udec4n(&bytes[off..off + 4]);
+        let u = read_ushortn(&bytes[off + 4..off + 6]);
+        let v = read_ushortn(&bytes[off + 6..off + 8]);
+        let normal = read_dhen3n(&bytes[off + 8..off + 12]);
+        let tangent = read_dec3n(&bytes[off + 12..off + 16]);
+        let idx = &bytes[off + 16..off + 20];
+        let wts = &bytes[off + 20..off + 24];
+        let mut node_sets = Vec::with_capacity(4);
+        for k in 0..4 {
+            let w = wts[k] as f32 / 255.0;
+            if w > 0.0 {
+                node_sets.push((idx[k] as i16, w));
+            }
+        }
+        out.push(AuthorVertex {
+            position: [pos[0], pos[1], pos[2]],
+            normal,
+            tangent,
+            binormal: cross(normal, tangent),
+            texcoord: [u, v],
+            node_sets,
         });
     }
     Ok(out)
@@ -406,10 +451,20 @@ fn half_to_f32(h: u16) -> f32 {
         0 => {
             if mant == 0 { sign }
             else {
+                // Subnormal: shift the mantissa up until it is normalized, and
+                // let the exponent walk DOWN with it — one step per leading
+                // zero, so it goes negative for all but the largest subnormals.
+                //
+                // Signed because it is signed: as a `u32` this counted down
+                // through `wrapping_sub`, and `e + 127` then overflowed for any
+                // half needing two or more shifts. Release builds wrapped
+                // straight back to the intended value and never noticed;
+                // overflow-checked (dev/test) builds panicked. Reading a Halo 4
+                // monolithic build's render geometry is what found it.
                 let mut m = mant;
-                let mut e = 1u32;
-                while (m & 0x400) == 0 { m <<= 1; e = e.wrapping_sub(1); }
-                sign | ((e + 127 - 15) << 23) | ((m & 0x3FF) << 13)
+                let mut e = 1i32;
+                while (m & 0x400) == 0 { m <<= 1; e -= 1; }
+                sign | (((e + 127 - 15) as u32) << 23) | ((m & 0x3FF) << 13)
             }
         }
         0x1F => sign | 0x7F800000 | (mant << 13),
@@ -460,6 +515,71 @@ mod tests {
         assert!((half_to_f32(0x3C00) - 1.0).abs() < 1e-6);
         assert!((half_to_f32(0xBC00) + 1.0).abs() < 1e-6);
         assert_eq!(half_to_f32(0x0000), 0.0);
+    }
+
+    /// Every subnormal half, against the closed form `mantissa * 2^-24`.
+    ///
+    /// The old exponent accumulator was unsigned and counted downwards, so any
+    /// half needing two or more normalizing shifts — 0x01FF and below, three
+    /// quarters of the subnormal range — overflowed `e + 127` and panicked
+    /// under `debug-assertions`. Reading a Halo 4 monolithic build's render
+    /// geometry hit it; release builds wrapped back to the right answer, which
+    /// is exactly why it survived. Exhaustive because the range is 1023 values
+    /// wide and the failure was a function of the shift count, not of any one
+    /// value.
+    #[test]
+    fn every_subnormal_half_converts() {
+        let scale = 2f32.powi(-24);
+        for mant in 1..=0x3FFu16 {
+            let expected = mant as f32 * scale;
+            assert_eq!(half_to_f32(mant), expected, "half 0x{mant:04X}");
+            assert_eq!(
+                half_to_f32(mant | 0x8000),
+                -expected,
+                "negative half 0x{mant:04X}"
+            );
+        }
+        // The extremes: ten shifts (the deepest, and the first to panic) and
+        // one shift (the largest subnormal, which always worked).
+        assert_eq!(half_to_f32(0x0001), scale);
+        assert_eq!(half_to_f32(0x03FF), 1023.0 * scale);
+    }
+
+    /// `skinned compressed` reads its bones where the build puts them.
+    ///
+    /// The format is a `rigid compressed` vertex with four bone indices and
+    /// four weights appended -- 16 + 4 + 4 -- and the build's own buffer
+    /// descriptors declare 24, which is what pins it. The check that matters is
+    /// the weights: read one byte off and they stop adding to one, and nothing
+    /// downstream of here would notice a skeleton weighted to the wrong bones.
+    #[test]
+    fn skinned_compressed_reads_bones_after_the_compressed_vertex() {
+        let mut bytes = vec![0u8; 24];
+        // Four bones at 16..20, and weights at 20..24 that add to 255.
+        bytes[16..20].copy_from_slice(&[7, 11, 13, 17]);
+        bytes[20..24].copy_from_slice(&[128, 64, 63, 0]);
+        let decoded =
+            decode_vertex_buffer(MeshVertexType::SkinnedCompressed, 1, 24, &bytes).unwrap();
+        assert_eq!(decoded.len(), 1);
+        let vertex = &decoded[0];
+
+        // The fourth weight is zero, so it is not a bone this vertex uses.
+        assert_eq!(
+            vertex.node_sets.iter().map(|(node, _)| *node).collect::<Vec<_>>(),
+            vec![7, 11, 13],
+        );
+        let total: f32 = vertex.node_sets.iter().map(|(_, weight)| *weight).sum();
+        assert!(
+            (total - 1.0).abs() < 1e-6,
+            "weights add to {total}, not one -- the fields are being read at the wrong offset",
+        );
+
+        // And a buffer that is not 24 bytes a vertex is refused rather than
+        // read as though it were.
+        assert!(
+            decode_vertex_buffer(MeshVertexType::SkinnedCompressed, 1, 16, &bytes).is_err(),
+            "a 16-byte stride was accepted for a 24-byte format",
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use crate::error::TagReadError;
 use crate::fields::{deserialize_field, serialize_field, TagFieldData, TagFieldType};
 use crate::io::*;
-use crate::layout::{TagBlockLayout, TagLayout, TagStructLayout};
+use crate::layout::{TagBlockLayout, TagFieldLayout, TagLayout, TagStructLayout};
 use crate::monolithic::XSyncState;
 
 /// A struct within a tag's data tree. Owns its `sub_chunks` (nested
@@ -140,6 +140,134 @@ pub(crate) enum TagResourceChunk {
     /// monolithic-hydration pass in [`crate::monolithic`] can pick
     /// the right xsync-state shape.
     Xsync { version: u32, payload: Vec<u8> },
+}
+
+/// Rebuild `source`'s struct tree against `target_layout`, translating every
+/// layout-table index through `map` and leaving every byte alone.
+///
+/// Layout table indices are layout-local: `struct_index`, `field_index` and
+/// `block_index` are positions in the tag's *own* tables, so a tree parsed
+/// against one layout describes different fields when read against another.
+/// This is what makes moving a parsed subtree between two tags expressible —
+/// and it is only sound because [`crate::schema_compat`] has already proven the
+/// two layouts describe the same shape, which is why `map` is the proof's
+/// return value rather than something a caller can assemble.
+///
+/// Entry order in `sub_chunks` is preserved exactly, including
+/// [`TagSubChunkContent::EmptyPlaceholder`]. That is what keeps the write
+/// byte-exact: `write_sub_chunks` dispatches on the variant and on position and
+/// never reads `field_index`, so remapping indices while holding order emits an
+/// identical byte stream. Placeholders survive at their original positions for
+/// the same reason they can: the identity proof established that both sides
+/// declare the same field sequence, so a placeholder emitted before field *k*
+/// on one side belongs before field *k* on the other.
+pub(crate) fn retarget_struct_data(
+    source: &TagStructData,
+    map: &crate::schema_compat::StructIndexMap,
+    target_layout: &TagLayout,
+) -> Result<TagStructData, crate::api::TagResourceCopyError> {
+    use crate::api::TagResourceCopyError as Refusal;
+
+    // A Halo 2 struct carries a 16-byte on-disk header describing itself.
+    // Classic tags have no pageable resources, so this is a can't-happen guard
+    // rather than a gap: refuse rather than emit a header describing the wrong
+    // struct.
+    if source.classic_struct_header.is_some() {
+        return Err(Refusal::ClassicContainer);
+    }
+    let struct_index = map
+        .struct_index(source.struct_index as usize)
+        .ok_or(Refusal::UnmappedStruct)? as u32;
+
+    let mut sub_chunks = Vec::with_capacity(source.sub_chunks.len());
+    for entry in &source.sub_chunks {
+        let field_index = match entry.field_index {
+            Some(index) => Some(map.field_index(index as usize).ok_or(Refusal::UnmappedField)? as u32),
+            None => None,
+        };
+        let content = match &entry.content {
+            TagSubChunkContent::Struct(nested) => {
+                TagSubChunkContent::Struct(retarget_struct_data(nested, map, target_layout)?)
+            }
+            TagSubChunkContent::Block(block) => {
+                TagSubChunkContent::Block(retarget_block_data(block, map, target_layout)?)
+            }
+            TagSubChunkContent::Array(elements) => TagSubChunkContent::Array(
+                elements
+                    .iter()
+                    .map(|element| retarget_struct_data(element, map, target_layout))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            // Layout-independent payloads: a tag reference is a group tag plus a
+            // path, string ids are utf-8, and a `data` payload is opaque bytes
+            // whose definition name the identity proof already compared.
+            TagSubChunkContent::TagReference(bytes) => {
+                TagSubChunkContent::TagReference(bytes.clone())
+            }
+            TagSubChunkContent::StringId(bytes) => TagSubChunkContent::StringId(bytes.clone()),
+            TagSubChunkContent::OldStringId(bytes) => TagSubChunkContent::OldStringId(bytes.clone()),
+            TagSubChunkContent::Data(bytes) => TagSubChunkContent::Data(bytes.clone()),
+            TagSubChunkContent::EmptyPlaceholder => TagSubChunkContent::EmptyPlaceholder,
+            // A runtime pointer into the process that wrote it. Matching
+            // schemas do not make one meaningful anywhere else.
+            TagSubChunkContent::ApiInterop(_) => return Err(Refusal::ApiInterop),
+            // Not seen in the shipped corpora. Refuse rather than guess at what
+            // a resource inside a resource means.
+            TagSubChunkContent::Resource(_) => return Err(Refusal::NestedResource),
+        };
+        sub_chunks.push(TagSubChunkEntry { field_index, content });
+    }
+
+    Ok(TagStructData { struct_index, classic_struct_header: None, sub_chunks })
+}
+
+fn retarget_block_data(
+    source: &TagBlockData,
+    map: &crate::schema_compat::StructIndexMap,
+    target_layout: &TagLayout,
+) -> Result<TagBlockData, crate::api::TagResourceCopyError> {
+    use crate::api::TagResourceCopyError as Refusal;
+
+    if source.classic_block_header.is_some() || source.classic_trailing.is_some() {
+        return Err(Refusal::ClassicContainer);
+    }
+    let block_index = map
+        .block_index(source.block_index as usize)
+        .ok_or(Refusal::UnmappedStruct)? as u32;
+
+    // `block_element_size` infers an element's size from
+    // `raw_data.len() / elements.len()`, so a block whose bytes disagree with
+    // the target's declared struct size would not fail loudly — it would
+    // silently change how every later read slices this block. Check here,
+    // where the expected size is known.
+    let element_size =
+        target_layout.struct_layouts[target_layout.block_layouts[block_index as usize].struct_index as usize].size;
+    let expected = element_size * source.elements.len();
+    if source.raw_data.len() != expected {
+        return Err(Refusal::ElementSizeMismatch {
+            block: target_layout
+                .get_string(target_layout.block_layouts[block_index as usize].name_offset)
+                .unwrap_or("")
+                .to_owned(),
+            expected,
+            got: source.raw_data.len(),
+        });
+    }
+
+    Ok(TagBlockData {
+        block_index,
+        flags: source.flags,
+        raw_data: source.raw_data.clone(),
+        endian: source.endian,
+        elements: source
+            .elements
+            .iter()
+            .map(|element| retarget_struct_data(element, map, target_layout))
+            .collect::<Result<Vec<_>, _>>()?,
+        classic_block_header: None,
+        classic_structural_dirty: false,
+        classic_trailing: None,
+    })
 }
 
 /// Match a struct field's stored name against a lookup query, comparing the
@@ -445,6 +573,11 @@ impl TagStructData {
     /// and friends to initialize a new element's struct tree. Does
     /// not allocate any raw bytes — the caller (the block) provides
     /// them by growing its own `raw_data`.
+    ///
+    /// This is the engine's `tag_placement_new` — the callback the tag system
+    /// runs over a newly created element — so a field whose definition has a
+    /// non-empty initial value gets it here rather than starting as garbage or,
+    /// in our case, as nothing at all. See [`default_data_bytes`].
     pub(crate) fn new_default(layout: &TagLayout, struct_index: usize, endian: Endian) -> Self {
         let struct_layout = &layout.struct_layouts[struct_index];
         let mut sub_chunks = Vec::new();
@@ -493,7 +626,9 @@ impl TagStructData {
                 TagFieldType::TagReference => Some(TagSubChunkContent::TagReference(Vec::new())),
                 TagFieldType::StringId => Some(TagSubChunkContent::StringId(Vec::new())),
                 TagFieldType::OldStringId => Some(TagSubChunkContent::OldStringId(Vec::new())),
-                TagFieldType::Data => Some(TagSubChunkContent::Data(Vec::new())),
+                TagFieldType::Data => {
+                    Some(TagSubChunkContent::Data(Self::default_data_bytes(layout, field, endian)))
+                }
                 TagFieldType::ApiInterop => {
                     // 12 zero bytes matches BCS's reset pattern except
                     // for `address` (which BCS sets to `UINT_MAX`). A
@@ -521,6 +656,38 @@ impl TagStructData {
             struct_index: struct_layout.index,
             sub_chunks,
             classic_struct_header: None,
+        }
+    }
+
+    /// The bytes a newly created `data` field starts with.
+    ///
+    /// Almost every data definition starts empty, which is what a zeroed
+    /// `s_tag_data` means and what this returns. `function_definition_data` is
+    /// the exception: the engine hands a fresh `mapping_function` a real
+    /// 32-byte Identity function through
+    /// `c_function_definition::tag_placement_new`, and treats a blob under 32
+    /// bytes as invalid — `ensure_valid` resizes and zeroes one on sight.
+    /// Leaving it empty produced a function no shipped tag has (0 empty out of
+    /// 361,707 across Reach, Halo 3 and Halo 4) and, in the editor, a field that
+    /// fell back to a raw byte row with no function UI at all.
+    ///
+    /// Keyed on the definition *name* rather than a struct- or field-name
+    /// heuristic, because the name is exact: all 248 uses of
+    /// `function_definition_data` are `mapping_function*` structs, and no other
+    /// data definition in any game is named anything like it. Halo 2 and classic
+    /// Halo CE have no such definition — their functions are typed structs
+    /// (`MAPP`, `functions_block_struct`), not blobs — so they get `Vec::new()`
+    /// here, which is correct: there is no blob to seed.
+    fn default_data_bytes(layout: &TagLayout, field: &TagFieldLayout, endian: Endian) -> Vec<u8> {
+        let name = layout
+            .data_definition_name_offsets
+            .get(field.definition as usize)
+            .and_then(|offset| layout.get_string(*offset));
+        match name {
+            Some("function_definition_data") => {
+                crate::tag_function::default_function_definition_bytes(endian)
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -788,8 +955,26 @@ fn read_sub_chunks<R: Seek + Read>(
             }
 
             TagFieldType::PageableResource => {
-                let resource_layout = &layout.resource_layouts[field.definition as usize];
-                let resource_struct_definition = &layout.struct_layouts[resource_layout.struct_index as usize];
+                // A shipped tag can carry a pageable-resource field whose
+                // `definition` indexes past its own `resource_layouts` table.
+                // Report it instead of indexing out of bounds: a reader that
+                // panics takes the whole app down on one bad tag.
+                let resource_layout = layout
+                    .resource_layouts
+                    .get(field.definition as usize)
+                    .ok_or(TagReadError::LayoutIndexOutOfBounds {
+                        table: "resource_layouts",
+                        index: field.definition,
+                        len: layout.resource_layouts.len(),
+                    })?;
+                let resource_struct_definition = layout
+                    .struct_layouts
+                    .get(resource_layout.struct_index as usize)
+                    .ok_or(TagReadError::LayoutIndexOutOfBounds {
+                        table: "struct_layouts",
+                        index: resource_layout.struct_index,
+                        len: layout.struct_layouts.len(),
+                    })?;
 
                 let outer_header = read_chunk_header(reader, endian)?;
                 let outer_content_offset = reader.stream_position()?;
@@ -1313,6 +1498,130 @@ impl TagBlockData {
             classic_block_header: None,
             classic_structural_dirty: false,
             classic_trailing: None,
+        }
+    }
+}
+
+/// A freshly created `mapping_function` has to arrive as a real function, not as
+/// zero bytes. This is the reported defect: adding an element to a block that
+/// contains one left `data [0 bytes]`, which no shipped tag has and which the
+/// editor cannot draw a function UI for.
+#[cfg(test)]
+mod new_function_default_tests {
+    use crate::{TagFieldType, TagFile, TagStruct};
+
+    fn definition(game: &str, group: &str) -> String {
+        format!("../definitions/{game}/{group}.json")
+    }
+
+    /// Add one element to the hologram block of a fresh `equipment` tag — the
+    /// exact case from the report — and return the tag.
+    fn equipment_with_a_hologram() -> TagFile {
+        let mut tag = TagFile::new(definition("haloreach_mcc", "equipment")).expect("CE schema");
+        let mut root = tag.root_mut();
+        let mut field = root
+            .field_path_mut("hologram")
+            .expect("hologram field resolves");
+        let mut hologram = field.as_block_mut().expect("hologram is a block");
+        hologram.add_element();
+        drop(field);
+        drop(root);
+        tag
+    }
+
+    /// Every `data` field living inside a struct whose owning field is named like
+    /// a function — the same shape the editor keys its function row off.
+    fn function_data(s: TagStruct<'_>, owner: &str, trail: &str, out: &mut Vec<(String, Vec<u8>)>) {
+        for field in s.fields_all() {
+            let here = if trail.is_empty() {
+                field.name().to_owned()
+            } else {
+                format!("{trail}/{}", field.name())
+            };
+            if field.field_type() == TagFieldType::Data
+                && owner.to_ascii_lowercase().contains("function")
+                && let Some(data) = field.as_data()
+            {
+                out.push((here.clone(), data.to_vec()));
+            }
+            if let Some(nested) = field.as_struct() {
+                function_data(nested, field.name(), &here, out);
+            } else if let Some(block) = field.as_block() {
+                for (i, element) in block.iter().enumerate() {
+                    function_data(element, field.name(), &format!("{here}[{i}]"), out);
+                }
+            } else if let Some(array) = field.as_array() {
+                for (i, element) in array.iter().enumerate() {
+                    function_data(element, field.name(), &format!("{here}[{i}]"), out);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_block_element_carries_a_real_function() {
+        let tag = equipment_with_a_hologram();
+        let mut found = Vec::new();
+        function_data(tag.root(), "", "", &mut found);
+        let holo: Vec<_> = found
+            .iter()
+            .filter(|(path, _)| path.contains("hologram"))
+            .collect();
+        assert!(
+            !holo.is_empty(),
+            "the added hologram element should expose a function; found {:?}",
+            found.iter().map(|(p, _)| p).collect::<Vec<_>>()
+        );
+        for (path, bytes) in &holo {
+            assert_eq!(bytes.len(), 32, "{path}: expected a 32-byte function");
+            assert_eq!(bytes[0], 0, "{path}: function type should be Identity");
+            assert_eq!(bytes[1], 0x24, "{path}: flags should be CLAMPED | GPU");
+            assert_eq!(
+                f32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+                1.0,
+                "{path}: clamp_range_max should be 1.0"
+            );
+        }
+    }
+
+    /// And it has to be a function the parser accepts and evaluates — the byte
+    /// assertions above would pass on a blob the editor still could not draw.
+    #[test]
+    fn the_seeded_function_parses_and_evaluates_as_identity() {
+        let tag = equipment_with_a_hologram();
+        let mut found = Vec::new();
+        function_data(tag.root(), "", "", &mut found);
+        let (path, bytes) = found
+            .iter()
+            .find(|(p, _)| p.contains("hologram"))
+            .expect("a hologram function");
+        let function = crate::TagFunction::parse(bytes)
+            .unwrap_or_else(|e| panic!("{path} should parse as a function: {e:?}"));
+        for input in [0.0f32, 0.25, 0.5, 1.0] {
+            let got = function.evaluate(input, 0.0);
+            assert!(
+                (got - input).abs() < 1e-6,
+                "{path}: identity should map {input} to itself, got {got}"
+            );
+        }
+    }
+
+    /// Halo 2 and classic Halo CE model a function as a typed struct, not as a
+    /// `data` blob, so there is nothing to seed and seeding anything would be
+    /// wrong. Pinned because the seeding keys on a definition name: a name that
+    /// started matching here would corrupt those two games silently.
+    #[test]
+    fn the_classic_games_have_no_function_blob_to_seed() {
+        for (game, group) in [("halo2_mcc", "weapon"), ("haloce_mcc", "weapon")] {
+            let tag = TagFile::new(definition(game, group))
+                .unwrap_or_else(|e| panic!("{game}/{group}: {e}"));
+            let mut found = Vec::new();
+            function_data(tag.root(), "", "", &mut found);
+            assert!(
+                found.is_empty(),
+                "{game} models functions as typed structs, but found blobs: {:?}",
+                found.iter().map(|(p, b)| (p, b.len())).collect::<Vec<_>>()
+            );
         }
     }
 }

@@ -70,6 +70,8 @@ pub mod field_name;
 pub mod layout;
 pub mod schema;
 pub mod schema_compare;
+pub mod schema_compat;
+pub mod convert;
 pub mod data;
 pub mod path;
 pub mod field_path;
@@ -83,7 +85,9 @@ pub mod animation;
 pub mod geometry;
 pub mod game;
 pub mod jms;
+pub mod jmi;
 pub mod ass;
+pub mod particle_model;
 pub mod extract;
 pub mod render_geometry;
 pub mod render_model;
@@ -107,7 +111,7 @@ pub mod iostore;
 pub use api::{
     TagArray, TagArrayMut, TagBlock, TagBlockElement, TagBlockMut, TagField, TagFieldMut, TagFlag,
     TagFlagMut, TagFlagOption, TagGroup, TagIndexError, TagOptions, TagPasteError, TagResource,
-    TagResourceKind, TagSetError, TagStruct, TagStructMut,
+    TagResourceCopyError, TagResourceKind, TagSetError, TagStruct, TagStructMut,
 };
 pub use definition::{
     TagApiInteropDefinition, TagArrayDefinition, TagBlockDefinition, TagDefinitions,
@@ -121,17 +125,27 @@ pub use field_name::{clean_field_name, parse_field_name, FieldNameInfo};
 pub use field_path::{TagFieldPath, TagFieldPathSegment};
 pub use error::TagReadError;
 pub use typed_enums::{Enum, Flags, SchemaEnum, TagInt};
-pub use file::TagFile;
+pub use file::{TagFile, TagFileHeader};
 pub use io::Endian;
-pub use layout::TagLayout;
+pub use layout::{TagLayout, TagTemplateHole};
 pub use schema::{TagGroupMeta, TagSchemaError};
 pub use schema_compare::{
     compare_root_layout, field_key, FieldDiff, FieldKey, LayoutComparison, LayoutSeverity,
+};
+pub use schema_compat::{
+    compare_group_layouts, struct_trees_are_wire_identical, AliasIndex, BlockReason,
+    CompatSeverity, FieldComparison, FieldFacts, FieldVerdict, GroupComparison, StructComparison,
+    StructIndexMap, StructPairId, TypeEquivalence, WireMismatch,
 };
 pub use bitmap::{Bitmap, BitmapError, BitmapFormat, BitmapImage};
 pub use jms::{
     JmsBox, JmsCapsule, JmsConvex, JmsError, JmsFile, JmsHinge, JmsMarker, JmsMaterial,
     JmsNode, JmsRagdoll, JmsSphere, JmsTriangle, JmsVertex,
+};
+pub use jmi::{JmiError, JmiFile, JMI_MIN_VERSION, JMI_VERSION};
+pub use particle_model::{
+    is_particle_model_group, particle_model_meshes, read_particle_model, ParticleModelObject,
+    ParticleModelSource, ParticleObjectMesh, ParticleVertex,
 };
 pub use ass::{
     AssError, AssFile, AssInstance, AssLight, AssLightKind, AssMaterial, AssObject,
@@ -144,7 +158,7 @@ pub use render_model::{
 };
 pub use tag_function::{
     ColorGraphType, FunctionFlags, FunctionKind, FunctionType, TagFunction, TagFunctionError,
-    TagFunctionHeader,
+    TagFunctionHeader, default_function_definition_bytes,
 };
 pub use tag_function::curve::{CurvePointMode, CurveSegmentType};
 pub use tag_function::editor::{

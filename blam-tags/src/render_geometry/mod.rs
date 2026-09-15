@@ -23,6 +23,6 @@ pub mod resource;
 pub mod vertex_type;
 
 pub use decode::{decode_vertex_buffer, AuthorVertex, VertexDecodeError};
-pub use hydrate::{hydrate, HydrateError};
+pub use hydrate::{author_geometry_populated, hydrate, HydrateError, API_RESOURCE_FIELD};
 pub use resource::{IndexBufferDescriptor, RenderGeometryResource, VertexBufferDescriptor};
 pub use vertex_type::{MeshPrtVertexType, MeshVertexType};

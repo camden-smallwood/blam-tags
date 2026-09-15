@@ -105,6 +105,19 @@ pub enum TagReadError {
         signature: [u8; 4],
     },
 
+    /// A monolithic cache's index names a tag it holds no bytes for.
+    ///
+    /// A `tag_cache` is a build's working store, not an archive: an entry can
+    /// name a tag whose data was never written into a partition. Most of a 2011
+    /// Reach build's `scenario_lightmap_bsp_data` entries are like this. It is
+    /// not a parse failure and nothing on this side can recover the bytes.
+    TagHasNoDataInCache {
+        /// The tag's name as the index records it.
+        name: String,
+        /// Its group, as ASCII (e.g. `Lbsp`).
+        group: [u8; 4],
+    },
+
     /// A string read from `string_data` (or a tag-reference path)
     /// wasn't valid UTF-8.
     InvalidUtf8 {
@@ -119,6 +132,19 @@ pub enum TagReadError {
         offset: u32,
         /// Size of the `string_data` table.
         table_size: usize,
+    },
+
+    /// A field's `definition` slot indexed past the end of the layout table it
+    /// names. The tag's own layout is internally inconsistent, so the field
+    /// cannot be resolved — reported rather than panicking, because a shipped tag
+    /// really does hit this and a reader must not take the process down.
+    LayoutIndexOutOfBounds {
+        /// Which layout table was indexed (e.g. `"resource_layouts"`).
+        table: &'static str,
+        /// Index the field asked for.
+        index: u32,
+        /// Number of entries the table actually has.
+        len: usize,
     },
 
     /// Two streams of the same kind were found in one tag file.
@@ -174,12 +200,21 @@ impl fmt::Display for TagReadError {
                 "unknown sub-chunk signature {} in {context}",
                 show_sig(signature),
             ),
+            Self::TagHasNoDataInCache { name, group } => write!(
+                f,
+                "the build lists {} {name} but kept none of its bytes to read",
+                show_sig(group),
+            ),
             Self::InvalidUtf8 { context } => {
                 write!(f, "invalid UTF-8 in {context}")
             }
             Self::StringOffsetOutOfBounds { offset, table_size } => write!(
                 f,
                 "string offset {offset} is past end of string table (size {table_size})",
+            ),
+            Self::LayoutIndexOutOfBounds { table, index, len } => write!(
+                f,
+                "layout {table} has {len} entries but a field asked for index {index}",
             ),
             Self::DuplicateOptionalStream { signature } => write!(
                 f,

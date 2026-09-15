@@ -1,0 +1,19897 @@
+//! Cross-game tag conversion: what a tag becomes when it moves to another engine.
+//!
+//! Owns group routing, struct pairing, field matching, value translation,
+//! companion-tag synthesis and the conversion report. Presentation, kit mounting,
+//! dialog state and the bulk-conversion worker belong to the editor, not here.
+
+use crate::classic::{ClassicHeader, read_classic_tag_file};
+use crate::file::TagFileHeader;
+use crate::paths::group_tag_to_extension;
+use crate::{
+    ApiInteropData, Endian, FunctionFlags, FunctionType, StringIdData, TagBlock, TagField,
+    TagFieldData, TagFieldMut, TagFieldPath, TagFieldType, TagFile, TagLayout, TagOptions,
+    TagReferenceData, TagResourceKind, TagStruct, TagStructMut, format_group_tag, parse_group_tag,
+};
+use serde::Deserialize;
+use serde_json::Value;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+mod companions;
+pub use companions::*;
+mod resources;
+pub use resources::*;
+
+/// A field name reduced to the key the matcher compares on.
+///
+/// Element indices and field ordinals come off, the markup grammar's annotations
+/// are already gone by the time a tag carries the name, and the result is
+/// lowercased so two schemas that disagree only on capitalisation still pair. The
+/// editor has its own copy for display purposes; this one is the converter's, and
+/// every alias table in here is keyed with it — keying with anything else silently
+/// loses every rename whose name carries a capital, an underscore or a hyphen.
+pub fn clean_field_key(name: &str) -> String {
+    TagFieldPath::parse(name)
+        .strip_node_indices()
+        .to_string()
+        .to_ascii_lowercase()
+}
+
+/// The `definitions/` tree the conversion tests read their schemas from.
+///
+/// The editor ships its copy beside the executable so schemas stay editable without
+/// a rebuild; the engine only ever needs the submodule checkout in its own repo, and
+/// both repos pin the same revision.
+#[cfg(test)]
+fn locate_definitions_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("definitions")
+}
+
+/// Every file beneath `root`, symlinks not followed.
+///
+/// Stands in for the editor's `walkdir` dependency, which the engine has no other
+/// use for. An unreadable directory is skipped rather than fatal: a kit walk is a
+/// best-effort survey of someone else's install, and one locked folder should not
+/// fail a conversion.
+pub fn walk_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            // `DirEntry::file_type` does not follow the link, which is what
+            // `follow_links(false)` bought.
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                out.push(entry.path());
+            }
+        }
+    }
+    out
+}
+
+/// Read a tag from disk, honoring the classic (Halo CE / Halo 2) formats.
+///
+/// Classic containers carry no embedded `blay` layout, so **`TagFile::read` cannot
+/// parse them** — the per-game JSON schema has to be supplied out of band. Reaching
+/// for `TagFile::read` here fails silently and in a way that never points at the
+/// reader: it has variously looked like a missing kit template, a tag that would not
+/// reopen after writing, and a dropped byte cache. Anything in the converter that
+/// opens a tag from a kit goes through this.
+pub fn read_tag_for_conversion(
+    path: &Path,
+    game: Option<&str>,
+    definitions_root: Option<&Path>,
+    group_tag: u32,
+) -> Result<TagFile, String> {
+    let bytes =
+        fs::read(path).map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+    if ClassicHeader::parse(&bytes).is_some() {
+        let game = game.ok_or("classic tag requires a detected game profile")?;
+        let definitions_root = definitions_root.ok_or("classic tag requires a definitions root")?;
+        let group_name =
+            group_tag_to_extension(group_tag).ok_or("unknown group for classic tag layout")?;
+        let definition = definitions_root.join(game).join(format!("{group_name}.json"));
+        let layout = TagLayout::from_json(&definition).map_err(|error| {
+            format!("failed to load classic layout {}: {error}", definition.display())
+        })?;
+        return read_classic_tag_file(&bytes, layout)
+            .map_err(|error| format!("failed to decode classic tag: {error}"));
+    }
+    TagFile::read(path).map_err(|error| format!("Could not read {}: {error}", path.display()))
+}
+
+pub const CONVERSION_GAMES: &[&str] = &[
+    "halo3_mcc",
+    "halo3odst_mcc",
+    "haloreach_mcc",
+    "halo4_mcc",
+    "halo2amp_mcc",
+];
+
+/// Every profile a tag may be recognized as, or converted to or from.
+///
+/// Campaign Evolved is here and deliberately not in [`CONVERSION_GAMES`].
+/// That list is the reviewed *common base*, and the catalog's coverage
+/// denominator is the intersection of its members: the five share 125 groups,
+/// but adding Campaign Evolved drops the intersection to 68. Folding it in
+/// would not add a profile — it would delete 57 reviewed groups from
+/// `conversion_mappings.json`.
+pub const CONVERSION_PROFILES: &[&str] = &[
+    "haloce_mcc",
+    "halo2_mcc",
+    "halo3_mcc",
+    "halo3odst_mcc",
+    "haloreach_mcc",
+    "halo4_mcc",
+    "halo2amp_mcc",
+    CAMPAIGN_EVOLVED_GAME,
+];
+
+/// The classic-container profiles: Halo CE and Halo 2.
+///
+/// Kept apart from [`CONVERSION_GAMES`] because that list is the *reviewed*
+/// common base and its intersection is the catalog's coverage denominator —
+/// folding these in would drop it from 125 groups to 51. These convert on the
+/// strength of schema-derived matching plus whatever reviewed rules name them,
+/// and their coverage is reported per pair rather than counted against the base.
+///
+/// They differ from the MCC profiles in ways the converter has to respect: Halo
+/// CE bodies are big-endian, every struct GUID is all-zero (see
+/// [`schema_struct_key`]), Halo 2 carries versioned structs, and neither has an
+/// MCC generation header (see [`apply_editing_kit_mcc_header`]). A classic
+/// *target* also cannot be built by `TagFile::new`, so it needs a kit-authored
+/// template to start from.
+pub const CLASSIC_CONVERSION_GAMES: &[&str] = &["haloce_mcc", "halo2_mcc"];
+
+/// The profile Campaign Evolved's schemas descend from, and the only one it
+/// converts with.
+pub const CAMPAIGN_EVOLVED_PARENT: &str = "haloreach_mcc";
+
+/// Whether the converter will attempt this ordered pair.
+///
+/// The five MCC profiles convert to each other in any direction: their mutual
+/// surface is the reviewed common base the catalog covers. Campaign Evolved
+/// pairs only with Halo Reach, both ways — a Campaign Evolved tag *is* a
+/// Reach-format tag at a different schema revision, and no other profile has
+/// that relationship. Refusing the rest by name beats converting a Halo 3 tag
+/// into Campaign Evolved through a Reach-shaped hole nobody reviewed.
+pub fn conversion_pair_supported(source_game: &str, target_game: &str) -> bool {
+    if source_game == target_game {
+        return false;
+    }
+    let mcc = |game: &str| CONVERSION_GAMES.contains(&game);
+    let classic = |game: &str| CLASSIC_CONVERSION_GAMES.contains(&game);
+    match (source_game, target_game) {
+        (CAMPAIGN_EVOLVED_GAME, other) | (other, CAMPAIGN_EVOLVED_GAME) => {
+            other == CAMPAIGN_EVOLVED_PARENT
+        }
+        // Halo CE and Halo 2 convert with each other and with the MCC base, in
+        // both directions. They are deliberately not paired with Campaign
+        // Evolved: it shares 28 groups with Halo CE and 62 with Halo 2, and its
+        // schemas descend from Reach's, so there is nothing reviewed to lean on.
+        (source, target) => {
+            (classic(source) || mcc(source)) && (classic(target) || mcc(target))
+        }
+    }
+}
+
+/// The profiles a conversion from `source_game` may target, in menu order.
+pub fn conversion_targets_for(source_game: &str) -> Vec<&'static str> {
+    CONVERSION_PROFILES
+        .iter()
+        .copied()
+        .filter(|target| conversion_pair_supported(source_game, target))
+        .collect()
+}
+
+/// The engine generations in order, as the tag formats actually descend.
+///
+/// This is the order the reviewed rules were authored along: every mapping in the
+/// catalog names an adjacent pair or a set of them, because that is where one
+/// engine's designers were looking at the previous one's tags. A route between
+/// distant profiles therefore walks this list rather than jumping, which is what
+/// makes each hop a conversion somebody has checked.
+///
+/// Campaign Evolved is deliberately absent. It is not a generation — it is a UE5
+/// remake whose schemas descend from Reach's, so it hangs off Reach and pairs
+/// with nothing else (see [`conversion_pair_supported`]). Routing *through* it
+/// would mean passing a tag through a game that has no such tag class.
+pub const CONVERSION_CHAIN: &[&str] = &[
+    "haloce_mcc",
+    "halo2_mcc",
+    "halo3_mcc",
+    "halo3odst_mcc",
+    "haloreach_mcc",
+    "halo4_mcc",
+    "halo2amp_mcc",
+];
+
+/// Routes from `source_game` to `target_game`, shortest first.
+///
+/// The first entry is always the direct pair, when it is allowed at all — a
+/// caller tries these in order and stops at the first that carries the tag, so
+/// routing never happens to a conversion that worked. Later entries add one
+/// intermediate at a time, taken from [`CONVERSION_CHAIN`] *between* the two
+/// endpoints: converting Halo 2 to Reach may pass through Halo 3 and ODST, but
+/// never out to Halo 4 and back.
+///
+/// Campaign Evolved has exactly one partner, so it never routes: a Halo 3 tag
+/// cannot reach it via Reach, because the reviewed relationship is between
+/// Reach's schemas and its own, not between anything else's.
+pub fn conversion_routes(source_game: &str, target_game: &str) -> Vec<Vec<String>> {
+    let mut routes = Vec::new();
+    if conversion_pair_supported(source_game, target_game) {
+        routes.push(vec![source_game.to_owned(), target_game.to_owned()]);
+    }
+    if source_game == CAMPAIGN_EVOLVED_GAME || target_game == CAMPAIGN_EVOLVED_GAME {
+        return routes;
+    }
+    // A profile has nothing between it and itself. Asked anyway by the
+    // byte-order upgrade, which is a real conversion at a pair that is otherwise
+    // meaningless — and by anything that enumerates pairs. Answering before the
+    // slice below is what stops `CONVERSION_CHAIN[to + 1..from]` being asked for
+    // a range that runs backwards.
+    if source_game == target_game {
+        return routes;
+    }
+    let position = |game: &str| CONVERSION_CHAIN.iter().position(|entry| *entry == game);
+    let (Some(from), Some(to)) = (position(source_game), position(target_game)) else {
+        return routes;
+    };
+    // Only the profiles strictly between the endpoints, in travel order. A route
+    // that doubled back would be transcoding through a generation the tag has no
+    // business visiting.
+    let between: Vec<&str> = if from < to {
+        CONVERSION_CHAIN[from + 1..to].to_vec()
+    } else {
+        CONVERSION_CHAIN[to + 1..from].iter().rev().copied().collect()
+    };
+    // Shortest first: one intermediate, then two, and so on. Subsets keep their
+    // travel order, so a route is always a walk along the chain.
+    for count in 1..=between.len() {
+        for stops in subsequences(&between, count) {
+            let mut route = vec![source_game.to_owned()];
+            route.extend(stops.iter().map(|game| (*game).to_string()));
+            route.push(target_game.to_owned());
+            // Every hop still has to be a pair the converter will attempt.
+            if route
+                .windows(2)
+                .all(|hop| conversion_pair_supported(&hop[0], &hop[1]))
+            {
+                routes.push(route);
+            }
+        }
+    }
+    routes
+}
+
+/// Order-preserving subsequences of `items` of exactly `count` elements.
+fn subsequences<'a>(items: &[&'a str], count: usize) -> Vec<Vec<&'a str>> {
+    if count == 0 {
+        return vec![Vec::new()];
+    }
+    let mut out = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        if items.len() - index < count {
+            break;
+        }
+        for mut rest in subsequences(&items[index + 1..], count - 1) {
+            let mut one = vec![*item];
+            one.append(&mut rest);
+            out.push(one);
+        }
+    }
+    out
+}
+
+/// Why a pair is refused, in a sentence that says what to do instead.
+fn unsupported_pair_message(source_game: &str, target_game: &str) -> String {
+    if source_game == target_game {
+        return "Choose a different target game profile".to_owned();
+    }
+    if source_game == CAMPAIGN_EVOLVED_GAME || target_game == CAMPAIGN_EVOLVED_GAME {
+        let other =
+            if source_game == CAMPAIGN_EVOLVED_GAME { target_game } else { source_game };
+        return format!(
+            "Campaign Evolved converts only to and from {CAMPAIGN_EVOLVED_PARENT}, because its \
+             schemas descend from Reach's and no other profile's do. Convert to \
+             {CAMPAIGN_EVOLVED_PARENT} first, then to {other}."
+        );
+    }
+    "The selected source or target profile is not supported by this converter".to_owned()
+}
+
+const CONVERSION_MAPPING_CATALOG: &str = include_str!("conversion_mappings.json");
+
+
+#[cfg(test)]
+
+/// Whether this target needs a tag from its editing kit to start from.
+///
+/// Derived rather than listed, by asking the same question
+/// [`build_target_from_definitions`] answers, so the two cannot drift apart. The
+/// old hardcoded trio - particle, model, biped - was a per-group approximation of
+/// a per-*target* fact: Halo 4's `decal_system` keeps a material in a named struct
+/// and builds from its schema, while Halo 3's expands a render method inline and
+/// cannot. Measured over the definitions, `model` and `biped` declare no template
+/// hole at all.
+#[cfg(test)]
+fn target_needs_kit_template(definitions_root: &Path, target_game: &str, group_name: &str) -> bool {
+    if CLASSIC_CONVERSION_GAMES.contains(&target_game) {
+        return true;
+    }
+    let schema = definitions_root
+        .join(target_game)
+        .join(format!("{group_name}.json"));
+    schema.is_file() && build_target_from_definitions(&schema, false).is_none()
+}
+
+/// Stamp a freshly-created MCC tag with the file-header generation expected by
+/// the corresponding editing kit. `TagFile::new` deliberately initializes
+/// these fields to zero, which is sufficient for the library's own parser but
+/// is rejected (and can crash) in the native editing-kit tools.
+///
+/// Campaign Evolved rides along despite having no editing kit: it is the same
+/// question — which generation does a freshly created tag claim — and answering
+/// it in two places is how the CE case came to be missing in the first place.
+pub fn apply_editing_kit_mcc_header(tag: &mut TagFile, game: &str) -> Result<(), String> {
+    // A classic tag has no MCC generation to stamp: `write_classic_tag` copies
+    // the original 64-byte header through verbatim and patches only the
+    // checksum, so the three fields below are not part of its format. Writing
+    // them would corrupt the header bytes the kit reads.
+    if CLASSIC_CONVERSION_GAMES.contains(&game) {
+        return Ok(());
+    }
+    let build_number = match game {
+        "halo3_mcc" | "halo3odst_mcc" => 1,
+        // Campaign Evolved carries Reach's generation exactly, because its
+        // `.ubulk` blobs *are* Reach-format tags — the UE5 package around them
+        // is a wrapper, and the simulation reads the blob. Measured, not
+        // assumed: all 12,289 shipped tag blobs across all 101 groups read
+        // `1 / 2 / 0xffffffff`, with no per-group variation. The gate is
+        // `the_shipped_tag_header_generation` in blam-tags.
+        "haloreach_mcc" | "halo4_mcc" | "halo2amp_mcc" | "haloce_evolved" => 2,
+        _ => return Err(format!("No MCC tag-header defaults are known for {game}")),
+    };
+    tag.header.build_version = 1;
+    tag.header.build_number = build_number;
+    // Stock/tool-created tags use -1 when no per-file source revision is known.
+    tag.header.version = u32::MAX;
+    Ok(())
+}
+
+/// The definitions-directory name for Campaign Evolved. Defined here rather
+/// than shared because the two other copies (`controller::tools`,
+/// `source::loading`) are equally local and the string is the on-disk folder
+/// name, not a value anything derives.
+pub const CAMPAIGN_EVOLVED_GAME: &str = "haloce_evolved";
+
+/// The generation every shipped Campaign Evolved tag blob carries:
+/// `(build_version, build_number, version)`.
+///
+/// Identical to Halo Reach's, which is the point — a CE `.ubulk` is a
+/// Reach-format tag. `TagFile::new` leaves all three at zero, which is the one
+/// value nothing shipped has, so an unstamped tag is one the simulation has
+/// never seen the like of.
+pub const CAMPAIGN_EVOLVED_GENERATION: (i32, i32, u32) = (1, 2, u32::MAX);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConversionIssueKind {
+    Unsupported,
+    Truncated,
+    Warning,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConversionIssue {
+    pub kind: ConversionIssueKind,
+    pub path: String,
+    pub message: String,
+}
+
+/// Whether a conversion may write a tag that loses audited data.
+///
+/// Some groups were audited field by field for one engine step, and for those a
+/// dropped field is a defect rather than a fact of life. The default refuses
+/// them, because an unattended run has nobody to ask.
+///
+/// It is still the user's call. Somebody who has been shown exactly which fields
+/// go missing and wants the tag anyway is not making a mistake — a Halo 3 light
+/// without Reach's `percent spherical` is still most of a light. What must not
+/// happen is the loss going unmentioned, which is why [`Accept`] records it on
+/// the report rather than simply allowing it through.
+///
+/// [`Accept`]: LossPolicy::Accept
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LossPolicy {
+    /// Refuse to write a tag that would lose audited data.
+    #[default]
+    FailClosed,
+    /// Write it, and record what was lost on the report.
+    Accept,
+}
+
+#[derive(Default)]
+pub struct TagConversionReport {
+    pub copied_exact: usize,
+    pub converted_semantic: usize,
+    pub mapped_aliases: usize,
+    pub defaulted_target: usize,
+    pub unsupported_source: usize,
+    pub truncated: usize,
+    /// Pageable resources carried across whole. Worth counting separately from
+    /// ordinary fields: one of these can be the bulk of the tag, and a reader
+    /// comparing an animation graph's before and after wants to see that its
+    /// payload went with it.
+    pub transferred_resources: usize,
+    /// References left empty because the target game has no such tag class.
+    ///
+    /// Counted apart from `unsupported_source` because it is a different kind
+    /// of fact: not a field the conversion failed to carry, but one the
+    /// destination has no home for by design. It is also the count a user acts
+    /// on — each one is something to reconnect by hand.
+    pub dropped_references: usize,
+    /// Field paths that would have refused this conversion under
+    /// [`LossPolicy::FailClosed`], populated only under [`LossPolicy::Accept`].
+    ///
+    /// Machine-readable on purpose. A caller offering the user the choice has to
+    /// tell "held back for audited loss" apart from "failed" without matching on
+    /// the text of an error message, and has to be able to list what goes.
+    pub fail_closed_losses: Vec<String>,
+    pub issues: Vec<ConversionIssue>,
+}
+
+pub struct TagConversionDraft {
+    pub tag: TagFile,
+    pub companion_tags: Vec<CompanionTagDraft>,
+    pub report: TagConversionReport,
+    pub target_group_name: String,
+    pub target_extension: String,
+    pub native_layout_template: Option<PathBuf>,
+    /// Every profile the tag passed through, source first and destination last,
+    /// when the direct pair could not carry it. Empty for a direct conversion.
+    ///
+    /// Worth carrying rather than reporting and forgetting: a routed conversion
+    /// has been through two or more engines' worth of loss, and a reader deciding
+    /// whether to trust the result needs to know that before they look at the
+    /// numbers.
+    pub route: Vec<String>,
+}
+
+pub struct CompanionTagDraft {
+    pub key: String,
+    pub file_suffix: String,
+    pub group_name: String,
+    pub extension: String,
+    pub tag: TagFile,
+    pub native_layout_template: Option<PathBuf>,
+}
+
+#[derive(Default)]
+pub struct GameTagIndex {
+    pub by_tag: HashMap<u32, String>,
+    pub by_name: HashMap<String, u32>,
+}
+
+#[derive(Default)]
+pub struct NativeTemplateIndex {
+    by_group: HashMap<u32, Vec<PathBuf>>,
+    cached: RefCell<HashMap<u32, Option<(Vec<u8>, PathBuf)>>>,
+    /// What each `.material_shader` in the kit declares its inputs to be, keyed
+    /// by the tag path a material names. A folder run converts hundreds of
+    /// particles that between them name a handful of shaders.
+    material_parameters: RefCell<HashMap<String, Vec<DeclaredParameter>>>,
+}
+
+impl NativeTemplateIndex {
+    pub fn build(tags_root: &Path, groups: &GameTagIndex) -> Self {
+        let mut by_extension = HashMap::new();
+        for (group_tag, group_name) in &groups.by_tag {
+            let extension = group_tag_to_extension(*group_tag).unwrap_or(group_name);
+            by_extension.insert(extension.to_ascii_lowercase(), *group_tag);
+        }
+        let mut result = Self::default();
+        for item in walk_files(tags_root) {
+            let Some(extension) = item.extension().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let Some(group_tag) = by_extension.get(&extension.to_ascii_lowercase()).copied() else {
+                continue;
+            };
+            result
+                .by_group
+                .entry(group_tag)
+                .or_default()
+                .push(item);
+        }
+        for paths in result.by_group.values_mut() {
+            paths.sort();
+        }
+        result
+    }
+}
+
+impl GameTagIndex {
+    pub fn load(definitions_root: &Path, game: &str) -> Result<Self, String> {
+        let path = definitions_root.join(game).join("_meta.json");
+        let bytes = fs::read(&path)
+            .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("Could not parse {}: {error}", path.display()))?;
+        let entries = value
+            .get("tag_index")
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("{} is missing tag_index", path.display()))?;
+        let mut index = Self::default();
+        for (fourcc, name) in entries {
+            let (Some(tag), Some(name)) = (parse_group_tag(fourcc), name.as_str()) else {
+                continue;
+            };
+            index.by_tag.insert(tag, name.to_owned());
+            index.by_name.insert(name.to_ascii_lowercase(), tag);
+        }
+        Ok(index)
+    }
+}
+
+struct ConversionContext<'a> {
+    source_groups: &'a GameTagIndex,
+    target_groups: &'a GameTagIndex,
+    source_field_aliases: &'a SchemaFieldAliases,
+    target_field_aliases: &'a SchemaFieldAliases,
+    mapping_catalog: &'a ConversionMappingCatalog,
+    definitions_root: &'a Path,
+    native_templates: Option<&'a NativeTemplateIndex>,
+    source_game: &'a str,
+    target_game: &'a str,
+    group_name: &'a str,
+    report: TagConversionReport,
+    companion_tags: Vec<CompanionTagDraft>,
+    fatal_error: Option<String>,
+    root_matches: usize,
+    /// Paths of non-empty `data` blobs the conversion could not carry.
+    ///
+    /// Separate from `resources_left_behind` because the two fail differently: a
+    /// pageable resource is a whole payload chunk, a `data` field is an inline
+    /// blob. Both are the substance of the tag rather than a property of it.
+    payloads_left_behind: Vec<String>,
+    /// Paths of non-null pageable resources the conversion could not carry.
+    ///
+    /// A resource holds the bulk of what some tags are — an animation graph's
+    /// entire compressed payload is one — so leaving one behind silently would
+    /// produce a tag that looks converted and plays nothing. The safety check
+    /// reads this rather than asking whether the source had any resources at
+    /// all, which is what it used to do and what made every animation graph
+    /// unconvertible.
+    resources_left_behind: Vec<String>,
+    /// Memo of `(source struct index, target struct index) -> wire-identical`.
+    ///
+    /// `struct_trees_are_wire_identical` walks a whole struct tree, and
+    /// `convert_struct` runs once per struct *instance* — including once per block
+    /// element — so an uncached call would rewalk the same pair thousands of times
+    /// for one tag.
+    wire_identical: HashMap<(u32, u32), bool>,
+}
+
+#[derive(serde::Deserialize)]
+struct ConversionMappingCatalog {
+    version: u32,
+    coverage: String,
+    /// Canonical groups whose five-game mapping surface has been reviewed.
+    /// Most fields in these groups deliberately remain schema-derived; this
+    /// list makes that coverage explicit and machine-checkable without
+    /// duplicating thousands of identical field names in the JSON catalog.
+    #[serde(default)]
+    covered_groups: Vec<String>,
+    #[serde(default)]
+    struct_mappings: Vec<StructMappingRule>,
+    #[serde(default)]
+    incompatible_pairs: Vec<IncompatiblePairRule>,
+    #[serde(default)]
+    unusable_schemas: Vec<UnusableSchemaRule>,
+    #[serde(default)]
+    reference_drops: Vec<ReferenceDropRule>,
+    /// Source fields the target profile does not define at all, reviewed and
+    /// accepted as dropped.
+    ///
+    /// `reference_drops` answers the same question for tag references only.
+    /// This covers everything else, and exists because the fail-closed groups
+    /// cannot otherwise distinguish "the destination has no such field, and we
+    /// have checked that is fine" from "something went wrong". Without it every
+    /// Halo Reach animation graph refuses on the two node-flag bytes Campaign
+    /// Evolved does not carry.
+    #[serde(default)]
+    accepted_field_drops: Vec<ReferenceDropRule>,
+    /// Inline `data` blobs both profiles declare but neither can hand to the
+    /// other, reviewed and accepted as lost.
+    ///
+    /// Distinct from `accepted_field_drops`, which is for fields the target does
+    /// not declare *at all*. Here both sides have the field and the blob still
+    /// cannot cross, because the opaque copy path pairs on the data definition's
+    /// name and the two disagree. Keeping the two apart is what lets each be
+    /// checked for the invariant that actually applies to it — an accepted field
+    /// drop must be absent on the far side, and one of these must be present.
+    #[serde(default)]
+    accepted_payload_drops: Vec<ReferenceDropRule>,
+    #[serde(default)]
+    field_aliases: Vec<FieldAliasRule>,
+    #[serde(default)]
+    option_aliases: Vec<OptionAliasRule>,
+    /// Groups the same tag class is called by in different profiles.
+    ///
+    /// Every other rule kind maps *within* a group; this one decides which group
+    /// a conversion even lands in. Without it a renamed class is simply absent:
+    /// an H2 projectile's attachment points at a `contrail`, Halo 3 calls that
+    /// class `contrail_system`, so the canonical-name lookup finds nothing and
+    /// the reference is dropped. Measured on
+    /// `battle_rifle_bullet.projectile` — one lost reference, reported as
+    /// `dropped_refs=1`.
+    #[serde(default)]
+    group_aliases: Vec<GroupAliasRule>,
+    #[serde(default)]
+    payload_aliases: Vec<PayloadAliasRule>,
+}
+
+#[derive(serde::Deserialize)]
+struct GroupAliasRule {
+    source: String,
+    target: String,
+    #[serde(default)]
+    source_games: Vec<String>,
+    #[serde(default)]
+    target_games: Vec<String>,
+    reason: String,
+}
+
+#[derive(serde::Deserialize)]
+struct FieldAliasRule {
+    group: String,
+    #[serde(default)]
+    source_games: Vec<String>,
+    #[serde(default)]
+    target_games: Vec<String>,
+    source_struct_guid: Option<String>,
+    target_struct_guid: Option<String>,
+    source: String,
+    target: String,
+}
+
+/// A reviewed pair of `data` definition names that hold the same kind of payload.
+///
+/// The derived rule — carry a blob when both sides declare the *same* data
+/// definition name — covers Halo 1 to Halo 2, where both say
+/// `processed_pixel_data_data`. It cannot cover Halo 2 to Halo 3, which renamed the
+/// definition to `bitmap_group_pixel_data_def` while keeping the same field name and
+/// the same bytes. Renames are judgement, so they are declared here.
+#[derive(serde::Deserialize)]
+struct PayloadAliasRule {
+    group: String,
+    #[serde(default)]
+    source_games: Vec<String>,
+    #[serde(default)]
+    target_games: Vec<String>,
+    source_definition: String,
+    target_definition: String,
+}
+
+#[derive(serde::Deserialize)]
+struct StructMappingRule {
+    group: String,
+    source_games: Vec<String>,
+    target_games: Vec<String>,
+    source_path: String,
+    target_path: String,
+    /// Whether swapping the two paths is also a valid reparent.
+    ///
+    /// True for a pair that merely nests the same body at different depths, which
+    /// is every rule here except one. It is *false* for `shader` -> `material`,
+    /// because the reparent is only correct when the target group is `material`:
+    /// going the other way the source is Halo 4's vestigial `shader`, whose root
+    /// has the same shape as Reach's, so reparenting it into Reach's
+    /// `render_method` finds nothing while plain root-to-root matches both
+    /// `render_method` and `material name`.
+    #[serde(default = "yes")]
+    bidirectional: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(serde::Deserialize)]
+struct IncompatiblePairRule {
+    group: String,
+    source_games: Vec<String>,
+    target_games: Vec<String>,
+    reason: String,
+}
+
+#[derive(serde::Deserialize)]
+struct UnusableSchemaRule {
+    group: String,
+    games: Vec<String>,
+    reason: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ReferenceDropRule {
+    group: String,
+    source_games: Vec<String>,
+    target_games: Vec<String>,
+    source_path: String,
+    reason: String,
+}
+
+#[derive(serde::Deserialize)]
+struct OptionAliasRule {
+    group: String,
+    field: String,
+    #[serde(default)]
+    source_games: Vec<String>,
+    #[serde(default)]
+    target_games: Vec<String>,
+    source: String,
+    target: String,
+}
+
+impl ConversionMappingCatalog {
+    fn load() -> Result<Self, String> {
+        let catalog: Self = serde_json::from_str(CONVERSION_MAPPING_CATALOG)
+            .map_err(|error| format!("Could not parse conversion_mappings.json: {error}"))?;
+        if catalog.version != 1 {
+            return Err(format!(
+                "Unsupported conversion mapping catalog version {}",
+                catalog.version
+            ));
+        }
+        if catalog.coverage != "all_supported_groups" {
+            return Err(format!(
+                "Unsupported conversion mapping coverage policy {}",
+                catalog.coverage
+            ));
+        }
+        let mut covered_groups = HashSet::new();
+        for (index, group) in catalog.covered_groups.iter().enumerate() {
+            let normalized = group.trim().to_ascii_lowercase();
+            if normalized.is_empty() {
+                return Err(format!(
+                    "conversion_mappings.json covered_groups[{index}] is empty"
+                ));
+            }
+            if !covered_groups.insert(normalized) {
+                return Err(format!(
+                    "conversion_mappings.json covered_groups[{index}] duplicates {group}"
+                ));
+            }
+        }
+        for (index, rule) in catalog.field_aliases.iter().enumerate() {
+            validate_mapping_rule_scope(
+                "field_aliases",
+                index,
+                &rule.group,
+                &rule.source_games,
+                &rule.target_games,
+                &rule.source,
+                &rule.target,
+            )?;
+            for (label, guid) in [
+                ("source_struct_guid", rule.source_struct_guid.as_deref()),
+                ("target_struct_guid", rule.target_struct_guid.as_deref()),
+            ] {
+                if guid.is_some_and(|guid| parse_schema_guid(guid).is_none()) {
+                    return Err(format!(
+                        "conversion_mappings.json field_aliases[{index}] has an invalid {label}"
+                    ));
+                }
+            }
+        }
+        for (index, rule) in catalog.group_aliases.iter().enumerate() {
+            validate_mapping_rule_scope(
+                "group_aliases",
+                index,
+                &rule.source,
+                &rule.source_games,
+                &rule.target_games,
+                &rule.source,
+                &rule.target,
+            )?;
+            // A group alias decides which tag class a conversion lands in, so an
+            // unscoped one would rename a class in every direction at once.
+            if rule.source_games.is_empty() || rule.target_games.is_empty() {
+                return Err(format!(
+                    "conversion_mappings.json group_aliases[{index}] must name both \
+                     source_games and target_games"
+                ));
+            }
+            if normalized_names_equal(&rule.source, &rule.target) {
+                return Err(format!(
+                    "conversion_mappings.json group_aliases[{index}] renames a group to itself"
+                ));
+            }
+            if rule.reason.trim().is_empty() {
+                return Err(format!(
+                    "conversion_mappings.json group_aliases[{index}] needs a reason"
+                ));
+            }
+        }
+        for (index, rule) in catalog.struct_mappings.iter().enumerate() {
+            validate_game_scopes(
+                "struct_mappings",
+                index,
+                &rule.group,
+                &rule.source_games,
+                &rule.target_games,
+            )?;
+            if rule.source_path.split('/').any(str::is_empty) && !rule.source_path.is_empty()
+                || rule.target_path.split('/').any(str::is_empty) && !rule.target_path.is_empty()
+            {
+                return Err(format!(
+                    "conversion_mappings.json struct_mappings[{index}] has an invalid path"
+                ));
+            }
+        }
+        for (index, rule) in catalog.incompatible_pairs.iter().enumerate() {
+            validate_game_scopes(
+                "incompatible_pairs",
+                index,
+                &rule.group,
+                &rule.source_games,
+                &rule.target_games,
+            )?;
+            if rule.reason.trim().is_empty() {
+                return Err(format!(
+                    "conversion_mappings.json incompatible_pairs[{index}] has no reason"
+                ));
+            }
+        }
+        for (index, rule) in catalog.unusable_schemas.iter().enumerate() {
+            validate_game_scopes(
+                "unusable_schemas",
+                index,
+                &rule.group,
+                &rule.games,
+                &rule.games,
+            )?;
+            if rule.reason.trim().is_empty() {
+                return Err(format!(
+                    "conversion_mappings.json unusable_schemas[{index}] has no reason"
+                ));
+            }
+        }
+        for (index, rule) in catalog.reference_drops.iter().enumerate() {
+            validate_game_scopes(
+                "reference_drops",
+                index,
+                &rule.group,
+                &rule.source_games,
+                &rule.target_games,
+            )?;
+            if clean_field_key(&rule.source_path).is_empty() || rule.reason.trim().is_empty() {
+                return Err(format!(
+                    "conversion_mappings.json reference_drops[{index}] has an empty path or reason"
+                ));
+            }
+        }
+        for (index, rule) in catalog.accepted_field_drops.iter().enumerate() {
+            validate_game_scopes(
+                "accepted_field_drops",
+                index,
+                &rule.group,
+                &rule.source_games,
+                &rule.target_games,
+            )?;
+            if clean_field_key(&rule.source_path).is_empty() || rule.reason.trim().is_empty() {
+                return Err(format!(
+                    "conversion_mappings.json accepted_field_drops[{index}] has an empty path or reason"
+                ));
+            }
+        }
+        for (index, rule) in catalog.accepted_payload_drops.iter().enumerate() {
+            validate_game_scopes(
+                "accepted_payload_drops",
+                index,
+                &rule.group,
+                &rule.source_games,
+                &rule.target_games,
+            )?;
+            if clean_field_key(&rule.source_path).is_empty() || rule.reason.trim().is_empty() {
+                return Err(format!(
+                    "conversion_mappings.json accepted_payload_drops[{index}] has an empty path or reason"
+                ));
+            }
+        }
+        for (index, rule) in catalog.option_aliases.iter().enumerate() {
+            validate_mapping_rule_scope(
+                "option_aliases",
+                index,
+                &rule.group,
+                &rule.source_games,
+                &rule.target_games,
+                &rule.source,
+                &rule.target,
+            )?;
+            if normalize_option_name(&rule.field).is_empty() {
+                return Err(format!(
+                    "conversion_mappings.json option_aliases[{index}] has an empty field"
+                ));
+            }
+        }
+        Ok(catalog)
+    }
+
+    fn field_names_match(&self, request: FieldMappingRequest<'_>) -> bool {
+        self.field_aliases.iter().any(|rule| {
+            if !rule.group.eq_ignore_ascii_case(request.group) {
+                return false;
+            }
+            mapping_rule_direction_matches(
+                &rule.source_games,
+                &rule.target_games,
+                request.source_game,
+                request.target_game,
+                &rule.source,
+                &rule.target,
+                request.source_name,
+                request.target_name,
+            ) && guid_rule_matches(
+                rule.source_struct_guid.as_deref(),
+                rule.target_struct_guid.as_deref(),
+                request.source_guid,
+                request.target_guid,
+                request.source_game,
+                request.target_game,
+                &rule.source_games,
+                &rule.target_games,
+            )
+        })
+    }
+
+    fn option_names_match(
+        &self,
+        group: &str,
+        field_path: &str,
+        source_game: &str,
+        target_game: &str,
+        source_name: &str,
+        target_name: &str,
+    ) -> bool {
+        let field = field_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(field_path)
+            .split('[')
+            .next()
+            .unwrap_or(field_path);
+        self.option_aliases.iter().any(|rule| {
+            rule.group.eq_ignore_ascii_case(group)
+                && normalize_option_name(&rule.field) == normalize_option_name(field)
+                && mapping_rule_direction_matches(
+                    &rule.source_games,
+                    &rule.target_games,
+                    source_game,
+                    target_game,
+                    &rule.source,
+                    &rule.target,
+                    source_name,
+                    target_name,
+                )
+        })
+    }
+
+    /// Whether a reviewed rule says these two `data` definitions hold the same kind
+    /// of payload, so the bytes may be carried verbatim. Bidirectional, like every
+    /// other section.
+    fn payload_alias_allows(
+        &self,
+        group: &str,
+        source_game: &str,
+        target_game: &str,
+        source_definition: &str,
+        target_definition: &str,
+    ) -> bool {
+        self.payload_aliases.iter().any(|rule| {
+            if !rule.group.eq_ignore_ascii_case(group) {
+                return false;
+            }
+            let forward = game_scope_matches(&rule.source_games, source_game)
+                && game_scope_matches(&rule.target_games, target_game)
+                && rule.source_definition == source_definition
+                && rule.target_definition == target_definition;
+            let reverse = game_scope_matches(&rule.source_games, target_game)
+                && game_scope_matches(&rule.target_games, source_game)
+                && rule.source_definition == target_definition
+                && rule.target_definition == source_definition;
+            forward || reverse
+        })
+    }
+
+    fn struct_mapping<'a>(
+        &'a self,
+        group: &str,
+        source_game: &str,
+        target_game: &str,
+    ) -> Option<(&'a str, &'a str)> {
+        self.struct_mappings.iter().find_map(|rule| {
+            if !rule.group.eq_ignore_ascii_case(group) {
+                return None;
+            }
+            if game_scope_matches(&rule.source_games, source_game)
+                && game_scope_matches(&rule.target_games, target_game)
+            {
+                Some((rule.source_path.as_str(), rule.target_path.as_str()))
+            } else if rule.bidirectional
+                && game_scope_matches(&rule.source_games, target_game)
+                && game_scope_matches(&rule.target_games, source_game)
+            {
+                Some((rule.target_path.as_str(), rule.source_path.as_str()))
+            } else {
+                None
+            }
+        })
+    }
+
+    fn incompatibility_reason<'a>(
+        &'a self,
+        group: &str,
+        source_game: &str,
+        target_game: &str,
+    ) -> Option<&'a str> {
+        self.incompatible_pairs.iter().find_map(|rule| {
+            (rule.group.eq_ignore_ascii_case(group)
+                && ((game_scope_matches(&rule.source_games, source_game)
+                    && game_scope_matches(&rule.target_games, target_game))
+                    || (game_scope_matches(&rule.source_games, target_game)
+                        && game_scope_matches(&rule.target_games, source_game))))
+            .then_some(rule.reason.as_str())
+        })
+    }
+
+    fn unusable_schema_reason<'a>(&'a self, group: &str, game: &str) -> Option<&'a str> {
+        self.unusable_schemas.iter().find_map(|rule| {
+            (rule.group.eq_ignore_ascii_case(group) && game_scope_matches(&rule.games, game))
+                .then_some(rule.reason.as_str())
+        })
+    }
+
+    fn reference_drop_reason<'a>(
+        &'a self,
+        group: &str,
+        source_game: &str,
+        target_game: &str,
+        source_path: &str,
+    ) -> Option<&'a str> {
+        self.reference_drops.iter().find_map(|rule| {
+            (rule.group.eq_ignore_ascii_case(group)
+                && game_scope_matches(&rule.source_games, source_game)
+                && game_scope_matches(&rule.target_games, target_game)
+                && clean_field_key(&rule.source_path) == clean_field_key(source_path))
+            .then_some(rule.reason.as_str())
+        })
+    }
+
+    /// Why a source field with no target counterpart is an accepted loss.
+    ///
+    /// Checks both sections: a reference and an ordinary field are the same
+    /// question to a caller asking "was this drop reviewed?", and splitting the
+    /// lookup would let a rule filed in the wrong one silently stop working.
+    fn accepted_drop_reason<'a>(
+        &'a self,
+        group: &str,
+        source_game: &str,
+        target_game: &str,
+        source_path: &str,
+    ) -> Option<&'a str> {
+        // A rule covers its own path *and* everything beneath it. When the
+        // target has no `facial wrinkle events` block at all, it has none of
+        // the fields inside one either, and the converter reports those
+        // children individually — 85 of HREK's cinematic head graphs refused on
+        // `.../facial wrinkle events[0]/wrinkle name` while the rule named the
+        // block. Matching by ancestry is what a dropped container means.
+        //
+        // `is_ancestor_of` compares segment by segment and ignores element
+        // indices, so this cannot match a differently-named sibling and one
+        // rule covers every element of a repeated block.
+        let matches = |rule: &'a ReferenceDropRule| {
+            if !rule.group.eq_ignore_ascii_case(group)
+                || !game_scope_matches(&rule.source_games, source_game)
+                || !game_scope_matches(&rule.target_games, target_game)
+            {
+                return None;
+            }
+            let covered = crate::TagFieldPath::parse(&clean_field_key(&rule.source_path));
+            let reported = crate::TagFieldPath::parse(&clean_field_key(source_path));
+            covered.is_ancestor_of(&reported).then_some(rule.reason.as_str())
+        };
+        self.accepted_field_drops
+            .iter()
+            .find_map(matches)
+            .or_else(|| self.reference_drops.iter().find_map(matches))
+    }
+
+    /// Why an inline `data` blob is reviewed as safe to lose.
+    ///
+    /// Only consulted by the payload check. A blob the target declares but
+    /// cannot be handed is a different situation from a field it does not have,
+    /// and answering both from one list would mean neither could be validated.
+    fn accepted_payload_drop_reason<'a>(
+        &'a self,
+        group: &str,
+        source_game: &str,
+        target_game: &str,
+        source_path: &str,
+    ) -> Option<&'a str> {
+        self.accepted_payload_drops.iter().find_map(|rule| {
+            if !rule.group.eq_ignore_ascii_case(group)
+                || !game_scope_matches(&rule.source_games, source_game)
+                || !game_scope_matches(&rule.target_games, target_game)
+            {
+                return None;
+            }
+            let covered = crate::TagFieldPath::parse(&clean_field_key(&rule.source_path));
+            let reported = crate::TagFieldPath::parse(&clean_field_key(source_path));
+            covered.is_ancestor_of(&reported).then_some(rule.reason.as_str())
+        })
+    }
+}
+
+fn validate_game_scopes(
+    section: &str,
+    index: usize,
+    group: &str,
+    source_games: &[String],
+    target_games: &[String],
+) -> Result<(), String> {
+    if group.trim().is_empty() || source_games.is_empty() || target_games.is_empty() {
+        return Err(format!(
+            "conversion_mappings.json {section}[{index}] has an empty group or game scope"
+        ));
+    }
+    for game in source_games.iter().chain(target_games) {
+        if !CONVERSION_PROFILES.contains(&game.as_str()) {
+            return Err(format!(
+                "conversion_mappings.json {section}[{index}] uses unsupported game {game}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_mapping_rule_scope(
+    section: &str,
+    index: usize,
+    group: &str,
+    source_games: &[String],
+    target_games: &[String],
+    source: &str,
+    target: &str,
+) -> Result<(), String> {
+    if group.trim().is_empty()
+        || normalize_option_name(source).is_empty()
+        || normalize_option_name(target).is_empty()
+    {
+        return Err(format!(
+            "conversion_mappings.json {section}[{index}] has an empty group or name"
+        ));
+    }
+    for game in source_games.iter().chain(target_games) {
+        if !CONVERSION_PROFILES.contains(&game.as_str()) {
+            return Err(format!(
+                "conversion_mappings.json {section}[{index}] uses unsupported game {game}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+struct FieldMappingRequest<'a> {
+    group: &'a str,
+    source_game: &'a str,
+    target_game: &'a str,
+    source_guid: [u8; 16],
+    target_guid: [u8; 16],
+    source_name: &'a str,
+    target_name: &'a str,
+}
+
+fn mapping_rule_direction_matches(
+    source_games: &[String],
+    target_games: &[String],
+    source_game: &str,
+    target_game: &str,
+    rule_source: &str,
+    rule_target: &str,
+    source_name: &str,
+    target_name: &str,
+) -> bool {
+    let forward = game_scope_matches(source_games, source_game)
+        && game_scope_matches(target_games, target_game)
+        && normalized_names_equal(rule_source, source_name)
+        && normalized_names_equal(rule_target, target_name);
+    let reverse = game_scope_matches(source_games, target_game)
+        && game_scope_matches(target_games, source_game)
+        && normalized_names_equal(rule_source, target_name)
+        && normalized_names_equal(rule_target, source_name);
+    forward || reverse
+}
+
+fn game_scope_matches(games: &[String], game: &str) -> bool {
+    games.is_empty() || games.iter().any(|candidate| candidate == game)
+}
+
+fn normalized_names_equal(left: &str, right: &str) -> bool {
+    normalize_option_name(left) == normalize_option_name(right)
+}
+
+fn guid_rule_matches(
+    source_rule: Option<&str>,
+    target_rule: Option<&str>,
+    source_guid: [u8; 16],
+    target_guid: [u8; 16],
+    source_game: &str,
+    target_game: &str,
+    source_games: &[String],
+    target_games: &[String],
+) -> bool {
+    let source_rule = source_rule.and_then(parse_schema_guid);
+    let target_rule = target_rule.and_then(parse_schema_guid);
+    let forward = game_scope_matches(source_games, source_game)
+        && game_scope_matches(target_games, target_game)
+        && source_rule.is_none_or(|guid| guid == source_guid)
+        && target_rule.is_none_or(|guid| guid == target_guid);
+    let reverse = game_scope_matches(source_games, target_game)
+        && game_scope_matches(target_games, source_game)
+        && source_rule.is_none_or(|guid| guid == target_guid)
+        && target_rule.is_none_or(|guid| guid == source_guid);
+    forward || reverse
+}
+
+/// How a struct is addressed in an alias table.
+///
+/// A GUID is the right key where there is one: it survives a struct rename, so
+/// `weapon_group` and `weapon_block_struct` share an entry. But **every struct in
+/// `haloce_mcc` (752) and `halo2_mcc` (2,323) has an all-zero GUID** — they were
+/// dumped from HABT classic XML layouts — so keying on it alone collapses a whole
+/// classic game onto one bucket and leaks aliases between unrelated structs. Fall
+/// back to the struct's own name there, which is a JSON object key and therefore
+/// unique within the group.
+fn schema_struct_key(guid: [u8; 16], struct_name: &str) -> String {
+    if guid == [0u8; 16] {
+        format!("name:{}", struct_name.to_ascii_lowercase())
+    } else {
+        guid.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+}
+
+#[derive(Default)]
+struct SchemaFieldAliases {
+    by_struct: HashMap<String, HashMap<String, HashSet<String>>>,
+    /// Cleaned field key -> the `:units` annotation the *schema* gives it.
+    ///
+    /// A tag's own layout stores the display name only — `clean_blay_field_name`
+    /// cuts at `:` and `#` — so by the time the converter sees a field, its unit
+    /// is gone. The schema is the only place left that says whether `grenade
+    /// angle` is degrees, and that is what decides an `angle`/`real` rescale.
+    /// Keyed group-wide rather than per struct because the answer is a property
+    /// of the field's name, and a struct GUID is unavailable for the classic
+    /// profiles anyway.
+    units: HashMap<String, String>,
+    /// Cleaned keys whose *schema* name carries `*` — the editor-owned marker.
+    ///
+    /// Stripped from a tag's own layout just like `:units`, so it has to be read
+    /// off the definition. Used to tell an opaque blob the author wrote from one
+    /// the toolchain wrote and will overwrite.
+    editor_owned: HashSet<String>,
+    /// Cleaned keys whose *schema* name carries `!` — engine-managed / not in
+    /// cache. Stripped from a tag's own layout, so it too must come from here.
+    engine_managed: HashSet<String>,
+}
+
+impl SchemaFieldAliases {
+    fn load(path: &Path) -> Result<Self, String> {
+        let bytes = fs::read(path)
+            .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("Could not parse {}: {error}", path.display()))?;
+        let mut result = Self::default();
+        // A group's JSON carries only its *own* registry. Anything it inherits
+        // — `biped` -> `unit` -> `object`, which is where `grenade angle:degrees`
+        // actually lives — sits in the ancestor files, so a lookup that reads one
+        // file sees neither their aliases nor their units. Walk the chain the way
+        // the engine's `merge_parent_schemas` does, tolerating a missing
+        // `_meta.json` or parent file as "no parent".
+        for value in std::iter::once(value)
+            .chain(ancestor_schemas(path).into_iter())
+            .collect::<Vec<_>>()
+        {
+            result.absorb(&value);
+        }
+        Ok(result)
+    }
+
+    fn absorb(&mut self, value: &Value) {
+        let result = self;
+        let Some(structs) = value.get("structs").and_then(Value::as_object) else {
+            return;
+        };
+        for (struct_name, structure) in structs {
+            let (Some(guid), Some(fields)) = (
+                structure
+                    .get("guid")
+                    .and_then(Value::as_str)
+                    .and_then(parse_schema_guid),
+                structure.get("fields").and_then(Value::as_array),
+            ) else {
+                continue;
+            };
+            let aliases = result
+                .by_struct
+                .entry(schema_struct_key(guid, struct_name))
+                .or_default();
+            for field in fields {
+                let Some(name) = field.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let base = name.split(['#', ':']).next().unwrap_or(name);
+                if base.contains('*') {
+                    result.editor_owned.insert(clean_field_key(base));
+                }
+                if base.contains('!') || base.trim_start().starts_with("runtime ") {
+                    result.engine_managed.insert(clean_field_key(base));
+                }
+                if let Some(unit) = field_unit_annotation(name) {
+                    // Keyed by the base name, because that is all a tag's own
+                    // layout keeps and so all the converter can look up with.
+                    result.units.insert(clean_field_key(base), unit);
+                }
+                // Keyed with `clean_field_key`, the same function every lookup uses.
+                //
+                // `option_name_aliases` normalizes for *enum option* comparison —
+                // it strips `*!^`, turns `_`/`-` into spaces and collapses runs,
+                // but does not lowercase. `matches` is called with
+                // `clean_field_key`, which lowercases via `TagFieldPath`. Keying
+                // with one and looking up with the other silently lost every
+                // `{former name}` alias whose name carries a capital, an underscore
+                // or a hyphen — and the schema declares hundreds of them, which is
+                // how Reach's `root offset max scale idle{root offset max scale}`
+                // failed to pair with Halo 3's `root offset max scale` even though
+                // the schema states the rename outright.
+                let names = option_name_aliases(base);
+                for name in &names {
+                    aliases
+                        .entry(clean_field_key(name))
+                        .or_default()
+                        .extend(
+                            names
+                                .iter()
+                                .filter(|alias| *alias != name)
+                                .map(|alias| clean_field_key(alias)),
+                        );
+                }
+            }
+        }
+    }
+
+    fn matches(&self, guid: [u8; 16], struct_name: &str, left: &str, right: &str) -> bool {
+        self.by_struct
+            .get(&schema_struct_key(guid, struct_name))
+            .and_then(|fields| fields.get(left))
+            .is_some_and(|aliases| aliases.contains(right))
+    }
+
+    fn unit_of(&self, key: &str) -> Option<&str> {
+        self.units.get(key).map(String::as_str)
+    }
+
+    fn is_editor_owned(&self, key: &str) -> bool {
+        self.editor_owned.contains(key)
+    }
+
+    fn is_engine_managed(&self, key: &str) -> bool {
+        self.engine_managed.contains(key)
+    }
+}
+
+/// Every ancestor group's schema JSON for `path`, nearest parent first.
+///
+/// `parent_tag` names a four-CC that `_meta.json`'s `tag_index` maps to the
+/// sibling file name. Anything unresolvable is treated as "no parent", matching
+/// the engine's `merge_parent_schemas`.
+fn ancestor_schemas(path: &Path) -> Vec<Value> {
+    let Some(dir) = path.parent() else { return Vec::new() };
+    let Ok(meta_bytes) = fs::read(dir.join("_meta.json")) else { return Vec::new() };
+    let Ok(meta) = serde_json::from_slice::<Value>(&meta_bytes) else { return Vec::new() };
+    let Some(index) = meta.get("tag_index").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut current = fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| {
+            value.get("parent_tag").and_then(Value::as_str).map(str::to_owned)
+        });
+    for _ in 0..32 {
+        let Some(parent) = current.take() else { break };
+        let Some(name) = index.get(&parent).and_then(Value::as_str) else { break };
+        let Ok(bytes) = fs::read(dir.join(format!("{name}.json"))) else { break };
+        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else { break };
+        current = value.get("parent_tag").and_then(Value::as_str).map(str::to_owned);
+        out.push(value);
+    }
+    out
+}
+
+impl ConversionMappingCatalog {
+    /// What `group` is called in `target_game`, if a reviewed rule renames it.
+    ///
+    /// Reversible like every other rule: a rule written `contrail` ->
+    /// `contrail_system` also answers `contrail_system` -> `contrail` when the
+    /// direction is reversed.
+    fn group_alias(&self, group: &str, source_game: &str, target_game: &str) -> Option<&str> {
+        self.group_aliases.iter().find_map(|rule| {
+            let forward = game_scope_matches(&rule.source_games, source_game)
+                && game_scope_matches(&rule.target_games, target_game);
+            let reverse = game_scope_matches(&rule.source_games, target_game)
+                && game_scope_matches(&rule.target_games, source_game);
+            if forward && normalized_names_equal(&rule.source, group) {
+                Some(rule.target.as_str())
+            } else if reverse && normalized_names_equal(&rule.target, group) {
+                Some(rule.source.as_str())
+            } else {
+                None
+            }
+        })
+    }
+}
+
+/// The group tag `group_name` lands on in `target_groups`, by canonical name and
+/// then by reviewed alias.
+///
+/// The one place group identity is decided. Three call sites used to do this
+/// lookup independently — the conversion root, reference-fidelity validation, and
+/// the per-field reference remap — which is how a renamed class could be resolved
+/// in one and dropped in another.
+fn resolve_target_group(
+    group_name: &str,
+    target_groups: &GameTagIndex,
+    catalog: &ConversionMappingCatalog,
+    source_game: &str,
+    target_game: &str,
+) -> Option<(u32, String)> {
+    // A reviewed alias outranks a same-name group, because the case that needs an
+    // alias most is the one where the target *has* the name and never uses it.
+    // Halo 4 and H2A still declare `shader` — and ship zero `.shader` tags, against
+    // 7,140 and 1,917 `.material` — so resolving `shader` to `shader` produced a
+    // class the game does not load, and the alias saying "use `material` here" was
+    // dead code behind the direct lookup.
+    //
+    // Safe for the renames already in the catalog: measured across every profile,
+    // no game declares both halves of a pair (`contrail` exists only in H1/H2,
+    // `contrail_system` only in H3 onward, and likewise for `decal`/`decal_system`,
+    // `light_volume`/`light_volume_system`, `model_animations`/
+    // `model_animation_graph`). `shader`/`material` is the sole overlap, which is
+    // exactly what this ordering exists to resolve.
+    if let Some(aliased) = catalog.group_alias(group_name, source_game, target_game)
+        && let Some(tag) = target_groups
+            .by_name
+            .get(&aliased.to_ascii_lowercase())
+            .copied()
+    {
+        let name = target_groups
+            .by_tag
+            .get(&tag)
+            .cloned()
+            .unwrap_or_else(|| aliased.to_owned());
+        return Some((tag, name));
+    }
+    let tag = target_groups
+        .by_name
+        .get(&group_name.to_ascii_lowercase())
+        .copied()?;
+    let name = target_groups.by_tag.get(&tag).cloned();
+    Some((tag, name.unwrap_or_else(|| group_name.to_owned())))
+}
+
+/// A game's group table, loaded once per game and kept for the rest of a walk.
+fn game_groups<'a>(
+    game: &str,
+    definitions_root: &Path,
+    cache: &'a mut HashMap<String, GameTagIndex>,
+) -> Result<&'a GameTagIndex, String> {
+    if !cache.contains_key(game) {
+        let groups = GameTagIndex::load(definitions_root, game)?;
+        cache.insert(game.to_owned(), groups);
+    }
+    Ok(&cache[game])
+}
+
+/// The group a `group_name` tag ends up as in `target_game`, following the same
+/// reviewed renames and the same routing a conversion would.
+///
+/// Public because naming a converted file is not the converter's job, but has to
+/// agree with it exactly. Deciding by canonical name alone gets it wrong in two
+/// opposite ways, and both are live: a renamed class the target does not declare
+/// looks unconvertible — `contrail_system` into Halo 4 — while one it *does*
+/// still declare gets a name that contradicts its contents, because Halo 4 keeps
+/// a vestigial `shader` group it ships no tags of and every Reach shader converts
+/// to `material`.
+///
+/// Routes are followed because a rename can take two hops. Halo 4 has no
+/// `contrail` at all, so a Halo 2 one reaches it only through Halo 3, arriving as
+/// `contrail` -> `contrail_system` -> `tracer_system`.
+///
+/// This is a prediction, and the honest limit is worth stating: the converter
+/// tries the direct pair first and routes only if that is refused, so a group
+/// that resolves directly is answered directly even where a route would have
+/// renamed it further. A caller holding a finished draft should prefer its
+/// `target_extension`, which is what actually happened rather than what was
+/// expected to.
+pub fn converted_group(
+    group_name: &str,
+    source_game: &str,
+    target_game: &str,
+    definitions_root: &Path,
+) -> Result<Option<(u32, String)>, String> {
+    let catalog = ConversionMappingCatalog::load()?;
+    let mut cache = HashMap::new();
+    let mut routes = conversion_routes(source_game, target_game);
+    if routes.is_empty() && source_game == target_game {
+        // A profile-to-itself pair has no route, because normally it has no work
+        // to do. A big-endian source is the exception (see
+        // `analyze_conversion_inner`), and the class it lands in is still a real
+        // question: an alias rule can rename a group inside one profile. Ask it
+        // the way every other hop is asked, over a one-hop identity route.
+        routes.push(vec![source_game.to_owned(), target_game.to_owned()]);
+    }
+    for route in routes {
+        let mut name = group_name.to_owned();
+        let mut landed = None;
+        for hop in route.windows(2) {
+            let groups = game_groups(&hop[1], definitions_root, &mut cache)?;
+            let Some((group_tag, hop_name)) =
+                resolve_target_group(&name, groups, &catalog, &hop[0], &hop[1])
+            else {
+                // This route has no answer for the class, so it is not the route
+                // the tag would take either. Try the next.
+                landed = None;
+                break;
+            };
+            name = hop_name.clone();
+            landed = Some((group_tag, hop_name));
+        }
+        if let Some(found) = landed {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
+fn parse_schema_guid(value: &str) -> Option<[u8; 16]> {
+    if value.len() != 32 {
+        return None;
+    }
+    let mut result = [0u8; 16];
+    for (index, byte) in result.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(result)
+}
+
+#[derive(Clone)]
+struct TargetFieldInfo {
+    ordinal: usize,
+    name: String,
+    key: String,
+    field_type: TagFieldType,
+}
+
+/// Where each hop of a route gets its kit-authored layout templates.
+///
+/// A route's intermediate profiles need templates too — the hop into Halo 3 is a
+/// conversion into Halo 3 like any other, and starting it from a kit tag is what
+/// makes its output the shape Halo 3 actually ships. A profile with no entry
+/// still converts, from a schema-built tag, so a missing intermediate kit costs
+/// fidelity rather than the whole route. Classic profiles are the exception and
+/// say so: one cannot be built from a schema at all.
+pub trait TemplateSource {
+    fn templates_for(&self, game: &str) -> Option<&NativeTemplateIndex>;
+}
+
+impl TemplateSource for () {
+    fn templates_for(&self, _game: &str) -> Option<&NativeTemplateIndex> {
+        None
+    }
+}
+
+impl TemplateSource for HashMap<String, NativeTemplateIndex> {
+    fn templates_for(&self, game: &str) -> Option<&NativeTemplateIndex> {
+        self.get(game)
+    }
+}
+
+/// Convert `source` into `target_game`, routing through intermediate engines when
+/// the direct pair cannot carry it.
+///
+/// Tries the direct conversion first and returns it untouched when it works, so
+/// nothing that converts today starts taking a detour. Only on refusal does it
+/// walk [`conversion_routes`], shortest first, hop by hop.
+///
+/// A hop hands the next one *serialized bytes*, not the draft's in-memory tag.
+/// That is deliberate and it is the difference between this and a shortcut: the
+/// intermediate is exactly the file the user would have got by saving into that
+/// game and importing from it, so a draft that would not survive a save fails
+/// here instead of two hops later. Nothing is written to disk, so there is no
+/// intermediate file to clean up and no half-finished tag left in a kit if a
+/// later hop fails.
+///
+/// Every hop's issues are kept, tagged with the hop that raised them. A routed
+/// conversion loses more than a direct one and the report has to show where.
+pub fn analyze_conversion_routed(
+    source: &TagFile,
+    source_game: &str,
+    target_game: &str,
+    definitions_root: &Path,
+    templates: &dyn TemplateSource,
+) -> Result<TagConversionDraft, String> {
+    analyze_conversion_routed_with_policy(
+        source,
+        source_game,
+        target_game,
+        definitions_root,
+        templates,
+        LossPolicy::default(),
+    )
+}
+
+/// [`analyze_conversion_routed`] under an explicit loss policy.
+///
+/// The policy applies to every hop. A route exists to get a tag somewhere the
+/// direct pair could not take it, and accepting a loss on the last hop while
+/// refusing one on the first would mean the answer depended on which engine the
+/// field happened to go missing in.
+pub fn analyze_conversion_routed_with_policy(
+    source: &TagFile,
+    source_game: &str,
+    target_game: &str,
+    definitions_root: &Path,
+    templates: &dyn TemplateSource,
+    policy: LossPolicy,
+) -> Result<TagConversionDraft, String> {
+    let routes = conversion_routes(source_game, target_game);
+    if routes.is_empty() {
+        return Err(unsupported_pair_message(source_game, target_game));
+    }
+    let mut refusals = Vec::new();
+    for route in &routes {
+        match run_conversion_route(source, route, definitions_root, templates, policy) {
+            Ok(draft) => return Ok(draft),
+            Err(error) => refusals.push(format!("{}: {error}", route.join(" \u{2192} "))),
+        }
+    }
+    // Every route refused. The direct one's reason is the one that answers the
+    // user's question, so it leads; the rest say what else was tried, because
+    // "no route works" and "we did not look" are different answers.
+    Err(format!(
+        "Could not convert {source_game} to {target_game}. Tried {} route(s):\n  {}",
+        refusals.len(),
+        refusals.join("\n  ")
+    ))
+}
+
+/// Run one route end to end, or fail saying which hop broke.
+fn run_conversion_route(
+    source: &TagFile,
+    route: &[String],
+    definitions_root: &Path,
+    templates: &dyn TemplateSource,
+    policy: LossPolicy,
+) -> Result<TagConversionDraft, String> {
+    let mut carried: Option<TagFile> = None;
+    let mut earlier_issues: Vec<ConversionIssue> = Vec::new();
+    // A loss on an intermediate hop is still a loss from the tag, so the final
+    // draft has to name it. Without this, routing would hide exactly what the
+    // direct conversion refuses over.
+    let mut earlier_losses: Vec<String> = Vec::new();
+    for (index, hop) in route.windows(2).enumerate() {
+        let (from, to) = (hop[0].as_str(), hop[1].as_str());
+        let input = carried.as_ref().unwrap_or(source);
+        let mut draft = analyze_conversion_with_policy(
+            input,
+            from,
+            to,
+            definitions_root,
+            templates.templates_for(to),
+            policy,
+        )
+        .map_err(|error| format!("{from} \u{2192} {to} failed: {error}"))?;
+
+        let final_hop = index + 2 == route.len();
+        if final_hop {
+            // The route's loss, oldest first, ahead of this hop's own.
+            earlier_issues.append(&mut draft.report.issues);
+            draft.report.issues = earlier_issues;
+            earlier_losses.append(&mut draft.report.fail_closed_losses);
+            draft.report.fail_closed_losses = earlier_losses;
+            draft.route = if route.len() > 2 {
+                route.to_vec()
+            } else {
+                Vec::new()
+            };
+            return Ok(draft);
+        }
+
+        // A companion tag synthesized mid-route has nowhere reviewed to go: the
+        // rules that would carry it onward are written for the group it was
+        // extracted from, not for a tag that only exists because of an earlier
+        // hop. Refusing the route beats inventing a path for it, and the next
+        // route may not need one.
+        if !draft.companion_tags.is_empty() {
+            return Err(format!(
+                "{from} \u{2192} {to} produced {} companion tag(s), which cannot be carried \
+                 through a further conversion",
+                draft.companion_tags.len()
+            ));
+        }
+        for hop_loss in draft.report.fail_closed_losses.drain(..) {
+            earlier_losses.push(format!("[{from} \u{2192} {to}] {hop_loss}"));
+        }
+        for issue in draft.report.issues.drain(..) {
+            earlier_issues.push(ConversionIssue {
+                kind: issue.kind,
+                path: issue.path,
+                message: format!("[{from} \u{2192} {to}] {}", issue.message),
+            });
+        }
+        // Serialize and reparse, so the next hop reads what a saved tag would be.
+        let bytes = draft
+            .tag
+            .write_to_bytes()
+            .map_err(|error| format!("{from} \u{2192} {to} produced an unwritable tag: {error}"))?;
+        carried = Some(reparse_intermediate(&bytes, to, definitions_root).map_err(|error| {
+            format!("{from} \u{2192} {to} produced a tag that will not reopen: {error}")
+        })?);
+    }
+    Err("A conversion route needs at least two profiles".to_owned())
+}
+
+/// Reparse a hop's output from its own bytes.
+///
+/// Classic containers take the JSON-layout path for the same reason
+/// [`read_tag_for_conversion`] does: they carry no embedded layout, so
+/// `read_from_bytes` cannot parse them and fails in a way that points anywhere
+/// but at the reader.
+fn reparse_intermediate(
+    bytes: &[u8],
+    game: &str,
+    definitions_root: &Path,
+) -> Result<TagFile, String> {
+    if ClassicHeader::parse(bytes).is_some() {
+        let (header, _) = ClassicHeader::parse(bytes).expect("checked above");
+        let group_tag = u32::from_be_bytes(header.group_tag);
+        let group_name =
+            group_tag_to_extension(group_tag).ok_or("unknown group for classic intermediate")?;
+        let definition = definitions_root.join(game).join(format!("{group_name}.json"));
+        let layout = TagLayout::from_json(&definition)
+            .map_err(|error| format!("failed to load {}: {error}", definition.display()))?;
+        return read_classic_tag_file(bytes, layout).map_err(|error| error.to_string());
+    }
+    TagFile::read_from_bytes(bytes).map_err(|error| error.to_string())
+}
+
+pub fn analyze_conversion(
+    source: &TagFile,
+    source_game: &str,
+    target_game: &str,
+    definitions_root: &Path,
+    target_tags_root: Option<&Path>,
+) -> Result<TagConversionDraft, String> {
+    let target_groups = GameTagIndex::load(definitions_root, target_game)?;
+    let native_templates =
+        target_tags_root.map(|root| NativeTemplateIndex::build(root, &target_groups));
+    analyze_conversion_with_templates(
+        source,
+        source_game,
+        target_game,
+        definitions_root,
+        native_templates.as_ref(),
+    )
+}
+
+/// [`analyze_conversion_with_templates`] under an explicit loss policy.
+///
+/// The plain form fails closed, which is right for anything unattended. This one
+/// exists for a caller that has shown the user what would be lost and been told
+/// to go ahead.
+pub fn analyze_conversion_with_policy(
+    source: &TagFile,
+    source_game: &str,
+    target_game: &str,
+    definitions_root: &Path,
+    native_templates: Option<&NativeTemplateIndex>,
+    policy: LossPolicy,
+) -> Result<TagConversionDraft, String> {
+    analyze_conversion_inner(
+        source,
+        source_game,
+        target_game,
+        definitions_root,
+        native_templates,
+        policy,
+    )
+}
+
+pub fn analyze_conversion_with_templates(
+    source: &TagFile,
+    source_game: &str,
+    target_game: &str,
+    definitions_root: &Path,
+    native_templates: Option<&NativeTemplateIndex>,
+) -> Result<TagConversionDraft, String> {
+    analyze_conversion_inner(
+        source,
+        source_game,
+        target_game,
+        definitions_root,
+        native_templates,
+        LossPolicy::default(),
+    )
+}
+
+fn analyze_conversion_inner(
+    source: &TagFile,
+    source_game: &str,
+    target_game: &str,
+    definitions_root: &Path,
+    native_templates: Option<&NativeTemplateIndex>,
+    policy: LossPolicy,
+) -> Result<TagConversionDraft, String> {
+    // Byte order is not a barrier in either container. Reading dispatches on
+    // `TagFile::endian` all the way down (see `crate::fields`), and the target is
+    // little-endian from birth — it is either built by `TagFile::new`, which
+    // hard-codes `Endian::Le`, or borrowed from a kit tag, and
+    // `find_native_target_template` only accepts a little-endian one. So the field
+    // walk below *is* the byte-order conversion: every value is read big-endian out
+    // of the source and written little-endian into the target.
+    //
+    // What does not cross for free is a pageable resource payload, an opaque codec
+    // stream in source byte order. `transfer_resource` decides that per resource
+    // and records whatever it cannot carry, so a 360 tag whose data cannot come
+    // with it is held back rather than landing half-converted.
+    if source.classic_engine().is_some() && !CLASSIC_CONVERSION_GAMES.contains(&source_game) {
+        return Err(format!(
+            "{source_game} is not a classic profile, but this tag is a classic \
+             {:?} container",
+            source.classic_engine()
+        ));
+    }
+    // Converting a profile to itself is normally meaningless, and
+    // `conversion_pair_supported` refuses it. A big-endian source is the one case
+    // where it is not: an Xbox 360 tag and its MCC counterpart are the same profile
+    // at a different byte order, usually also at a different schema revision, so
+    // "Reach to Reach" is the honest description of the work. Routing is still
+    // never attempted for such a pair — there is nowhere to route through.
+    let byte_order_upgrade = source_game == target_game
+        && source.classic_engine().is_none()
+        && source.endian != Endian::Le;
+    if !byte_order_upgrade && !conversion_pair_supported(source_game, target_game) {
+        return Err(unsupported_pair_message(source_game, target_game));
+    }
+
+    let source_groups = GameTagIndex::load(definitions_root, source_game)?;
+    let target_groups = GameTagIndex::load(definitions_root, target_game)?;
+    let source_group_name = source_groups
+        .by_tag
+        .get(&source.group().tag)
+        .ok_or_else(|| {
+            format!(
+                "{} does not identify group {}",
+                source_game,
+                format_group_tag(source.group().tag)
+            )
+        })?;
+    let mapping_catalog = ConversionMappingCatalog::load()?;
+    let (target_group_tag, target_group_name) = resolve_target_group(
+        source_group_name,
+        &target_groups,
+        &mapping_catalog,
+        source_game,
+        target_game,
+    )
+    .ok_or_else(|| format!("{target_game} has no {source_group_name} tag group"))?;
+    let source_schema_path = definitions_root
+        .join(source_game)
+        .join(format!("{source_group_name}.json"));
+    let schema_path = definitions_root
+        .join(target_game)
+        .join(format!("{target_group_name}.json"));
+    let source_field_aliases = SchemaFieldAliases::load(&source_schema_path)?;
+    let target_field_aliases = SchemaFieldAliases::load(&schema_path)?;
+    let native_target = native_templates
+        .map(|templates| {
+            find_native_target_template(
+                templates,
+                target_group_tag,
+                target_game,
+                Some(&target_field_aliases),
+                definitions_root,
+                &schema_path,
+            )
+        })
+        .transpose()?
+        .flatten();
+    for game in [source_game, target_game] {
+        if let Some(reason) = mapping_catalog.unusable_schema_reason(source_group_name, game) {
+            let native_layout_avoids_schema_construction = game == target_game
+                && native_target.is_some()
+                && source_group_name.eq_ignore_ascii_case("contrail_system");
+            if native_layout_avoids_schema_construction || game == source_game {
+                continue;
+            }
+            return Err(format!(
+                "{game} {source_group_name} schema cannot be converted safely: {reason}"
+            ));
+        }
+    }
+    // Every rule in the catalog answers "what changes between these engines?".
+    // A byte-order upgrade changes no engine, so none of them is about it. The
+    // sound rule is the one that matters in practice: it refuses a conversion
+    // because the audio sits in a bank the *target game* does not have, which
+    // cannot be true when the target game is the source game.
+    if let Some(reason) = mapping_catalog
+        .incompatibility_reason(source_group_name, source_game, target_game)
+        .filter(|_| !byte_order_upgrade)
+    {
+        let native_contrail_layout =
+            native_target.is_some() && source_group_name.eq_ignore_ascii_case("contrail_system");
+        if !native_contrail_layout {
+            return Err(format!(
+                "{source_game} and {target_game} {source_group_name} layouts are explicitly incompatible: {reason}"
+            ));
+        }
+    }
+    // A tag built from the target game's own definitions, which is where a
+    // conversion should start: the fields are then filled from the source and
+    // nothing else is carried. `None` when the definitions cannot produce one —
+    // a classic container, or a schema that does not survive construction.
+    let from_definitions = if CLASSIC_CONVERSION_GAMES.contains(&target_game) {
+        // `TagFile::new` can only build an MCC container: it hard-codes
+        // `TagContainer::Mcc` and `Endian::Le`, there is no `ClassicHeader`
+        // writer, and Halo 2's root block header is never synthesized. So a
+        // classic target has to start from a tag the kit authored.
+        None
+    } else {
+        build_target_from_definitions(&schema_path, false)
+    };
+    // Which starting point wins when both are available.
+    //
+    // Building from the target's own definitions is the better design and the
+    // one this is heading for: nothing reaches the tag except what the source
+    // gave it, and the result does not depend on what a user has installed. It
+    // is not the default yet, because it is not yet proven where it counts —
+    // effects and particles built this way were reported failing to open, and
+    // crashing, in Halo 4's own tools, where kit-seeded ones opened. Until that
+    // is understood, a user with a populated kit keeps the path that works.
+    //
+    // A user with an *empty* kit gets the definitions either way, which is the
+    // case that started this: it is a fallback, not a preference.
+    let prefer_definitions = std::env::var_os("BLAM_BUILD_FROM_DEFINITIONS").is_some();
+    let mut built_without_a_template_body = false;
+    // A byte-order upgrade will not fall back to the schema.
+    //
+    // Everywhere else the schema is a legitimate fallback: somebody converting
+    // into an empty kit has nothing to start from, and a partial tag beats no
+    // tag. Here the destination is the *same engine* as the source, so a class
+    // it ships none of is a class its own tools have never written — and,
+    // measured against Halo Reach's ManagedBlam, a schema-built tag of such a
+    // class is one the loader takes down the process over rather than reports.
+    //
+    // It costs almost nothing to refuse. Of the 103,182 tags in the July 2011
+    // Reach build, 14 are in a class HREK ships no example of.
+    if byte_order_upgrade && native_target.is_none() {
+        return Err(format!(
+            "{target_game} ships no {target_group_name} to start from, and one built from the \
+             schema is a tag its own tools refuse to load. Nothing was written."
+        ));
+    }
+    // A compiled shader does not change byte order, it changes instruction set.
+    //
+    // The build's tags carry Xenon microcode -- the Xbox 360 GPU's own -- and
+    // the kit's carry DX9 bytecode: a `pixel_shader` here begins `FF FF 03 00`,
+    // which is `ps_3_0`, where the build's begins `10 2A 11 00`. No byte order
+    // relates the two, and turning one into the other is a shader compiler.
+    //
+    // Worse than useless to try: these are the rasterizer's own shared tables,
+    // and the build's are *shorter* than the kit's -- 24 entry points against
+    // 27, 31 vertex types against 32. Written over the kit's, every lookup past
+    // the end of the shorter list finds the wrong shader, which is an artifact
+    // on a model whose own tags converted perfectly.
+    //
+    // The kit already ships its DX9 build of the same shaders, so refusing
+    // leaves the right thing in place rather than losing anything.
+    if byte_order_upgrade && is_compiled_shader_group(&target_group_name) {
+        return Err(format!(
+            "a {target_group_name} holds compiled Xbox 360 shader microcode, and this engine \
+             runs DX9 bytecode -- no byte order relates them, and {target_game} already ships \
+             its own build of these shaders. Nothing was written."
+        ));
+    }
+    let (mut target, target_template) = match (from_definitions, native_target) {
+        (Some(target), None) => (target, None),
+        (Some(target), Some(_)) if prefer_definitions => (target, None),
+        (Some(target), Some((template, template_path))) => {
+            let _ = target;
+            (template, Some(template_path))
+        }
+        (None, Some((template, template_path))) => (template, Some(template_path)),
+        (None, None) if CLASSIC_CONVERSION_GAMES.contains(&target_game) => {
+            return Err(format!(
+                "Converting to {target_game} needs a {target_group_name} tag from its \
+                 editing kit to start from, because a classic tag cannot be built \
+                 from a schema alone. Configure the {target_game} kit and make sure \
+                 it ships at least one {target_group_name}."
+            ));
+        }
+        // A `tmpl` group with no kit tag to borrow a template body from. Build it
+        // from the schema anyway rather than refusing outright: the tag converts,
+        // and what cannot be carried is exactly what the loss guard already
+        // measures and reports. Refusing here turned an answerable question —
+        // "this loses the render method, do you still want it?" — into 375 dead
+        // rows in a folder report, which is worse for a user with an empty kit
+        // than the honest partial result they asked for.
+        (None, None) => match build_target_from_definitions(&schema_path, true) {
+            Some(target) => {
+                built_without_a_template_body = true;
+                (target, None)
+            }
+            None => {
+                return Err(format!(
+                    "Could not build a {target_group_name} for {target_game} from \
+                     {}, and the kit has none to start from either.",
+                    schema_path.display()
+                ));
+            }
+        },
+    };
+    apply_editing_kit_mcc_header(&mut target, target_game)?;
+    // From the template as the kit wrote it, not from `target`: the reset clears
+    // every block on the way to a blank starting point, so by now the count is
+    // gone. One extra read of a tag already on disk, and only when a native
+    // template was used at all.
+    let template_option_counts = target_template
+        .as_ref()
+        .and_then(|path| {
+            read_tag_for_conversion(
+                path,
+                Some(target_game),
+                Some(definitions_root),
+                target_group_tag,
+            )
+            .ok()
+        })
+        .map(|template| render_method_option_counts(&template))
+        .unwrap_or_default();
+
+    let mut context = ConversionContext {
+        source_groups: &source_groups,
+        target_groups: &target_groups,
+        source_field_aliases: &source_field_aliases,
+        target_field_aliases: &target_field_aliases,
+        mapping_catalog: &mapping_catalog,
+        definitions_root,
+        native_templates,
+        source_game,
+        target_game,
+        group_name: source_group_name,
+        report: TagConversionReport::default(),
+        companion_tags: Vec::new(),
+        fatal_error: None,
+        root_matches: 0,
+        wire_identical: HashMap::new(),
+        payloads_left_behind: Vec::new(),
+        resources_left_behind: Vec::new(),
+    };
+    // Groups whose substance is compiled geometry, not authored fields.
+    //
+    // A converted one is structurally valid and the numbers all carry, but the
+    // meshes, collision hulls and rigid bodies were built by the *source* game's
+    // tool from source art, and each generation's importer produces different
+    // vertex formats, compression and node layouts. So the honest advice is to
+    // reimport from the original assets rather than trust the upgrade. Stated as a
+    // warning rather than a refusal because the conversion is still useful for
+    // reading the settings across, which is what the user asked for: "cool and
+    // somewhat useful", but reimport is what they should actually do.
+    //
+    // `bitmap` is deliberately absent — pixel data carried forward avoids a
+    // recompression pass, which is the one case where the upgrade beats reimporting.
+    const REIMPORT_INSTEAD: &[&str] = &["render_model", "physics_model", "collision_model"];
+    if REIMPORT_INSTEAD
+        .iter()
+        .any(|group| group.eq_ignore_ascii_case(&target_group_name))
+    {
+        context.report.issues.push(ConversionIssue {
+            kind: ConversionIssueKind::Warning,
+            path: target_group_name.clone(),
+            message: format!(
+                "{target_group_name} holds geometry compiled by {source_game}'s own importer. \
+                 The settings convert, but the meshes, collision and rigid-body data were \
+                 built for a different engine's vertex formats and compression — reimport \
+                 from the source art with {target_game}'s tool rather than relying on this."
+            ),
+        });
+    }
+    if built_without_a_template_body {
+        context.report.issues.push(ConversionIssue {
+            kind: ConversionIssueKind::Warning,
+            path: "target layout".to_owned(),
+            message: format!(
+                "Built {target_group_name} from {target_game}'s own definitions with no kit tag \
+                 to start from. The definitions describe this group's render method as a \
+                 fixed-size hole rather than as fields, so its options, parameters and \
+                 postprocess have nowhere to be written — a {target_group_name} anywhere in the \
+                 {target_game} kit would supply them. Everything else converts."
+            ),
+        });
+    }
+    if let Some(template_path) = target_template.as_ref() {
+        context.report.issues.push(ConversionIssue {
+            kind: ConversionIssueKind::Warning,
+            path: "target layout".to_owned(),
+            message: format!(
+                "Used native {target_group_name} layout template {} and cleared its values before conversion",
+                template_path.display()
+            ),
+        });
+    } else {
+        context.report.issues.push(ConversionIssue {
+            kind: ConversionIssueKind::Warning,
+            path: "target layout".to_owned(),
+            message: format!(
+                "Used generated {target_group_name} layout; Baboon round-trip verification cannot prove native editing-kit stream compatibility"
+            ),
+        });
+    }
+    if let Some((source_path, target_path)) =
+        mapping_catalog.struct_mapping(source_group_name, source_game, target_game)
+    {
+        let source_struct = struct_at_path(source.root(), source_path).ok_or_else(|| {
+            format!(
+                "Configured source struct path '{source_path}' was not found in {source_game} {source_group_name}"
+            )
+        })?;
+        // A kit-authored template carries its *own* layout, which does not always
+        // agree with the dumped JSON the rule was reviewed against — the same
+        // divergence the particle work turned up. Fall back to root-to-root
+        // rather than refusing a tag that converts fine without the reparent.
+        if !convert_to_struct_path(
+            source_struct,
+            target.root_mut(),
+            target_path,
+            source_path,
+            &mut context,
+        ) {
+            context.report.issues.push(ConversionIssue {
+                kind: ConversionIssueKind::Warning,
+                path: target_path.to_owned(),
+                message: format!(
+                    "Reviewed reparent target '{target_path}' is absent from this                      {target_game} {target_group_name} layout; converted root to root instead"
+                ),
+            });
+            convert_struct(source.root(), target.root_mut(), "", true, &mut context);
+        }
+    } else {
+        convert_struct(source.root(), target.root_mut(), "", true, &mut context);
+    }
+    if let Some(error) = context.fatal_error.take() {
+        return Err(error);
+    }
+    // Nothing matched at the root. Usually that means the two profiles disagree
+    // about what this group even is, and writing the template out under the
+    // source's name would be worse than refusing.
+    //
+    // Not always, though: a few groups carry nothing at the root at all.
+    // `scenario_structure_lighting_resource` is one -- both sides declare a
+    // single byte of padding and put the substance in the resource -- so there
+    // is no field for a match to happen on and zero matches is the whole
+    // conversion rather than the absence of one. Only when the two roots are
+    // the same struct: the GUID says so outright, and a shared name says so for
+    // the profiles that carry no GUIDs.
+    if context.root_matches == 0 {
+        let source_root = source.root();
+        let target_root = target.root();
+        let (source_definition, target_definition) =
+            (source_root.definition(), target_root.definition());
+        let same_struct = (source_definition.guid() == target_definition.guid()
+            && source_definition.guid() != [0u8; 16])
+            || source_definition.name() == target_definition.name();
+        let nothing_to_match =
+            source_root.fields().count() == 0 && target_root.fields().count() == 0;
+        if !(same_struct && nothing_to_match) {
+            return Err(format!(
+                "{} and {} do not share a compatible root structure for {}",
+                source_game, target_game, source_group_name
+            ));
+        }
+    }
+
+    let dependency_schema = definitions_root
+        .join(target_game)
+        .join("tag_dependency_list.json");
+    if dependency_schema.is_file() {
+        target
+            .rebuild_dependency_list(&dependency_schema)
+            .map_err(|error| format!("Could not rebuild target dependencies: {error}"))?;
+    } else {
+        context.report.issues.push(ConversionIssue {
+            kind: ConversionIssueKind::Warning,
+            path: "dependency list".to_owned(),
+            message: format!(
+                "Target dependency schema is missing: {}",
+                dependency_schema.display()
+            ),
+        });
+    }
+
+    validate_reference_fidelity(
+        source,
+        &target,
+        &source_groups,
+        &target_groups,
+        source_group_name,
+        source_game,
+        target_game,
+        &mapping_catalog,
+        &mut context.report,
+    )?;
+    strip_cross_engine_scripts(&mut target, &mut context);
+    restore_render_method_option_slots(&mut target, &template_option_counts, &mut context);
+    apply_default_material(&mut target, &mut context);
+    // After the default, because the material it names is what decides which
+    // inputs there are to seed.
+    seed_material_parameters(&mut target, source, &mut context);
+    report_materials_without_a_shader(&target, &mut context);
+    // Before the safety check, and only ever after the walk: it reads what the
+    // target ended up with, and its whole job is to take a resource back off the
+    // lost list.
+    forgive_hydrated_geometry(&target, &mut context);
+    settle_uncompiled_geometry(byte_order_upgrade, &mut target, &mut context);
+    carry_animation_resources(byte_order_upgrade, source, &mut target, &mut context);
+    carry_structure_resources(byte_order_upgrade, source, &mut target, &mut context);
+    convert_x360_bitmap_pixels(source, &mut target, &mut context);
+    forgive_externally_stored_payload(byte_order_upgrade, &mut target, &mut context);
+    swap_function_curves(byte_order_upgrade, &mut target, &mut context);
+    swap_geometry_user_data(byte_order_upgrade, &mut target, &mut context);
+    let fail_closed_losses = validate_critical_runtime_safety(source, &context, policy)?;
+    if !fail_closed_losses.is_empty() {
+        context.report.issues.push(ConversionIssue {
+            kind: ConversionIssueKind::Warning,
+            path: fail_closed_losses.join(", "),
+            message: format!(
+                "Imported with {} audited field(s) lost, because that was asked for.                  {} has no counterpart for them.",
+                fail_closed_losses.len(),
+                context.target_game
+            ),
+        });
+    }
+    context.report.fail_closed_losses = fail_closed_losses;
+
+    let target_extension = group_tag_to_extension(target_group_tag)
+        .unwrap_or(&target_group_name)
+        .to_owned();
+    Ok(TagConversionDraft {
+        tag: target,
+        companion_tags: context.companion_tags,
+        report: context.report,
+        target_group_name,
+        target_extension,
+        native_layout_template: target_template,
+        route: Vec::new(),
+    })
+}
+
+/// How many `options` a kit-authored template's render methods started with,
+/// keyed by the struct's field path.
+///
+/// Captured before conversion because conversion is what loses them: the block
+/// is resized to match the source, and a source with fewer options than the
+/// destination's rmdf declares leaves the target short.
+fn render_method_option_counts(tag: &TagFile) -> HashMap<String, usize> {
+    fn walk(value: TagStruct<'_>, prefix: &str, out: &mut HashMap<String, usize>) {
+        if is_render_method_struct(value) {
+            if let Some(options) = value
+                .fields()
+                .find(|field| clean_field_key(field.name()) == "options")
+                .and_then(|field| field.as_block())
+            {
+                out.insert(prefix.to_owned(), options.len());
+            }
+        }
+        for field in value.fields() {
+            if let Some(nested) = field.as_struct() {
+                let path = if prefix.is_empty() {
+                    field.name().to_owned()
+                } else {
+                    format!("{prefix}/{}", field.name())
+                };
+                walk(nested, &path, out);
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    walk(tag.root(), "", &mut out);
+    out
+}
+
+/// The value a render-method option slot carries when nothing selected it.
+///
+/// Halo's universal "no index" sentinel, and what most shipped tags use: across
+/// 400 Halo 4 particles the tenth slot holds `-1` in 240, an explicit option in
+/// the other 160. A slot the source never had an opinion about is unset, not set
+/// to the first option.
+const UNSET_RENDER_METHOD_OPTION: i16 = -1;
+
+/// Give a converted render method back the option slots its rmdf requires.
+///
+/// A render method's `options` block is one element per category of the
+/// `render_method_definition` it points at, in order — the count is fixed by the
+/// rmdf, not by the tag. Conversion resizes the block to match the source, which
+/// is wrong whenever the source is shorter than the destination needs.
+///
+/// Reach tolerates a short block and Halo 4 does not: 30 of 400 shipped Reach
+/// particles carry 9 options where their rmdf declares 10, while **all 900**
+/// shipped Halo 4 particles carry exactly 10. So a faithful conversion of one of
+/// those 30 produces a Halo 4 particle its mod tools will not open — reported as
+/// `smoke_fiery_large.particle`.
+///
+/// The template is the reference for the count rather than the rmdf tag itself:
+/// it is a real destination-game tag of the same group, so its block is already
+/// the length that game's tools expect, and reading it costs nothing where
+/// resolving and parsing an rmdf would need the target kit threaded in. Skipped
+/// when the two point at different render methods, since then the template's
+/// count says nothing about this tag's.
+fn restore_render_method_option_slots(
+    target: &mut TagFile,
+    template_counts: &HashMap<String, usize>,
+    context: &mut ConversionContext<'_>,
+) {
+    if template_counts.is_empty() {
+        return;
+    }
+    let mut padded: Vec<(String, usize, usize)> = Vec::new();
+    fn walk(
+        mut value: TagStructMut<'_>,
+        prefix: &str,
+        counts: &HashMap<String, usize>,
+        padded: &mut Vec<(String, usize, usize)>,
+    ) {
+        if is_render_method_struct(value.as_ref()) {
+            if let Some(&wanted) = counts.get(prefix) {
+                let ordinal = value
+                    .as_ref()
+                    .fields()
+                    .position(|field| clean_field_key(field.name()) == "options");
+                if let Some(ordinal) = ordinal {
+                    if let Some(mut field) = value.field_at_mut(ordinal) {
+                        if let Some(mut options) = field.as_block_mut() {
+                            let had = options.len();
+                            while options.len() < wanted {
+                                let index = options.add_element();
+                                if let Some(mut element) = options.element_mut(index) {
+                                    if let Some(mut slot) = element.field_at_mut(0) {
+                                        let _ = slot.set(TagFieldData::ShortInteger(
+                                            UNSET_RENDER_METHOD_OPTION,
+                                        ));
+                                    }
+                                }
+                            }
+                            if options.len() != had {
+                                padded.push((prefix.to_owned(), had, options.len()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let field_count = value.as_ref().fields().count();
+        for ordinal in 0..field_count {
+            let name = match value.as_ref().fields().nth(ordinal) {
+                Some(field) if field.as_struct().is_some() => field.name().to_owned(),
+                _ => continue,
+            };
+            let path = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if let Some(mut field) = value.field_at_mut(ordinal) {
+                if let Some(nested) = field.as_struct_mut() {
+                    walk(nested, &path, counts, padded);
+                }
+            }
+        }
+    }
+    walk(target.root_mut(), "", template_counts, &mut padded);
+    for (path, had, now) in padded {
+        context.report.issues.push(ConversionIssue {
+            kind: ConversionIssueKind::Warning,
+            path: format!("{path}/options"),
+            message: format!(
+                "{} declares fewer render-method options than {} requires ({had} against \
+                 {now}); the missing slots were added unset. The option block has one entry \
+                 per category of the render method definition, so a short one is a tag the \
+                 destination's tools cannot open.",
+                context.source_game, context.target_game
+            ),
+        });
+    }
+}
+
+/// The material shader a converted particle starts with, per target game.
+///
+/// Halo 4 and H2A put a `material` beside the render method; the older engines
+/// have no such thing, so a particle converted forward has nothing to fill it
+/// with and arrives with a null `mats` reference. That configuration *is*
+/// shipped -- 7 of 900 Halo 4 particles have it, all with a working render
+/// method -- so it opens, but the particle has no material to draw with.
+///
+/// `particle_base` is the plain one and the most used: 344 of those 900 pick it,
+/// ahead of `particle_palettized` at 137. It is a starting point rather than a
+/// guess at the original look, and the report says so, because which material a
+/// Reach particle *should* become is an art decision the tag does not carry.
+/// Verified present in both kits that declare the field.
+/// The material a converted fx tag starts with, by target game and *source*
+/// group.
+///
+/// Halo 4 puts a `material` where the older engines put a render method, so a tag
+/// converted forward has nothing to fill it with and arrives holding a null
+/// `mats` reference. For a particle that is survivable — 7 of 900 shipped Halo 4
+/// particles are the same, all with a working render method — but a tracer has no
+/// render method at all, and **none** of the 316 shipped tracer entries has a null
+/// material. There the tag has simply nothing to draw with.
+///
+/// Each default is the plain member of its family: `particle_base` leads Halo 4's
+/// own particles at 344 of 900, and `tracer_base` is the unadorned tracer (124
+/// entries, behind `tracer_palettized` at 146 only because palettized is a look
+/// rather than a baseline). A starting point, not a guess at the original — which
+/// material a Reach effect *should* become is an art decision the tag does not
+/// carry, and the report says so. Both verified present in both kits.
+/// A decal and a light volume need one for a harder reason than a particle: a
+/// converted Reach `decal_system` **crashed Halo 4** the moment the decal was
+/// triggered, with `#0 is not a valid material_postprocess_block index in
+/// [#0, #0)`. Nothing indexes that block in the schema — it is the renderer,
+/// building a material's postprocess from the material shader and finding no
+/// material shader to build one from. Shipped Halo 4 content ships that block
+/// empty too, in all 466 decal slots and all 400 particle slots sampled, so an
+/// empty postprocess is normal and a *null shader* is what is not.
+///
+/// `decals\base` is the plain member again rather than the most common:
+/// `decals\normal` leads at 221 of 504 against `base`'s 119, but a normal-mapped
+/// decal wants a normal map a Reach decal has no way to supply, and `base` is the
+/// one whose name says baseline. `light_volume_smooth` needs no such judgement —
+/// it is 232 of 236.
+const DEFAULT_MATERIALS: &[(&str, &str, &str)] = &[
+    ("halo4_mcc", "particle", r"shaders\material_shaders\fx\particle_base"),
+    ("halo2amp_mcc", "particle", r"shaders\material_shaders\fx\particle_base"),
+    ("halo4_mcc", "contrail_system", r"shaders\material_shaders\fx\tracer_base"),
+    ("halo2amp_mcc", "contrail_system", r"shaders\material_shaders\fx\tracer_base"),
+    ("halo4_mcc", "decal_system", r"shaders\material_shaders\decals\base"),
+    ("halo2amp_mcc", "decal_system", r"shaders\material_shaders\decals\base"),
+    (
+        "halo4_mcc",
+        "light_volume_system",
+        r"shaders\material_shaders\fx\light_volume_smooth",
+    ),
+    (
+        "halo2amp_mcc",
+        "light_volume_system",
+        r"shaders\material_shaders\fx\light_volume_smooth",
+    ),
+];
+
+/// Whether a struct is a material: the shader reference, its parameters, and the
+/// physics material names together.
+///
+/// Shape rather than name, for the same reason the render method is: `material
+/// shader` alone is not distinctive enough to blanket-match on, and the group is
+/// not the right key when the same struct appears in several.
+fn is_material_struct(value: TagStruct<'_>) -> bool {
+    let has = |name: &str| {
+        value
+            .fields()
+            .any(|field| clean_field_key(field.name()) == name)
+    };
+    has("material shader") && has("material parameters") && has("physics material name")
+}
+
+/// Give a converted fx tag a material to draw with.
+///
+/// Only where the conversion left the reference empty: a source that supplied one
+/// keeps it, and a target game or group with no entry in the table is untouched.
+///
+/// Descends into block elements as well as nested structs, because that is where
+/// the material usually is — a particle keeps one at the root, but a tracer keeps
+/// one per entry in the `tracers` block, and only handling the root would have
+/// fixed the case that was already survivable while leaving the one that is not.
+fn apply_default_material(target: &mut TagFile, context: &mut ConversionContext<'_>) {
+    let Some((_, _, default_path)) = DEFAULT_MATERIALS.iter().find(|(game, group, _)| {
+        *game == context.target_game && context.group_name.eq_ignore_ascii_case(group)
+    }) else {
+        return;
+    };
+    let default_path = (*default_path).to_owned();
+    let group = parse_group_tag("mats").unwrap_or(u32::from_be_bytes(*b"mats"));
+
+    fn walk(
+        mut value: TagStructMut<'_>,
+        default_path: &str,
+        group: u32,
+        applied: &mut usize,
+    ) {
+        if is_material_struct(value.as_ref()) {
+            let shader_ordinal = value
+                .as_ref()
+                .fields()
+                .position(|field| clean_field_key(field.name()) == "material shader");
+            if let Some(ordinal) = shader_ordinal {
+                if let Some(mut shader) = value.field_at_mut(ordinal) {
+                    let empty = match shader.as_ref().value() {
+                        Some(TagFieldData::TagReference(reference)) => reference
+                            .group_tag_and_name
+                            .as_ref()
+                            .is_none_or(|(_, path)| path.is_empty()),
+                        _ => false,
+                    };
+                    if empty
+                        && shader
+                            .set(TagFieldData::TagReference(TagReferenceData {
+                                group_tag_and_name: Some((group, default_path.to_owned())),
+                            }))
+                            .is_ok()
+                    {
+                        *applied += 1;
+                    }
+                }
+            }
+        }
+        let field_count = value.as_ref().fields().count();
+        for ordinal in 0..field_count {
+            let kind = match value.as_ref().fields().nth(ordinal) {
+                Some(field) => field.field_type(),
+                None => continue,
+            };
+            match kind {
+                TagFieldType::Struct => {
+                    if let Some(mut field) = value.field_at_mut(ordinal) {
+                        if let Some(nested) = field.as_struct_mut() {
+                            walk(nested, default_path, group, applied);
+                        }
+                    }
+                }
+                TagFieldType::Block => {
+                    if let Some(mut field) = value.field_at_mut(ordinal) {
+                        if let Some(mut block) = field.as_block_mut() {
+                            for index in 0..block.len() {
+                                if let Some(element) = block.element_mut(index) {
+                                    walk(element, default_path, group, applied);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut applied = 0usize;
+    walk(target.root_mut(), &default_path, group, &mut applied);
+    if applied == 0 {
+        return;
+    }
+    context.report.issues.push(ConversionIssue {
+        kind: ConversionIssueKind::Warning,
+        path: context.group_name.to_owned(),
+        message: format!(
+            "{} has no material for {} to carry across, so {applied} started on \
+             `{default_path}` — the plain member of {}'s family for this group. Point them \
+             somewhere else if the original wanted a palettized, scrolling or plasma look.",
+            context.source_game, context.group_name, context.target_game
+        ),
+    });
+}
+
+/// Report any material the conversion leaves with nothing to draw with.
+///
+/// A null `material shader` is not a cosmetic gap: Halo 4's renderer builds a
+/// material's postprocess from its material shader, so a material without one
+/// crashes the moment the effect plays — `#0 is not a valid
+/// material_postprocess_block index in [#0, #0)` on a converted Reach
+/// `decal_system`. [`DEFAULT_MATERIALS`] exists to stop that happening, and this
+/// exists so the next group nobody has put in that table says so in the report
+/// rather than in the game.
+///
+/// A finding, not a refusal. Halo 4 does ship a handful of particles with a null
+/// material and a working render method behind it, so this is survivable for some
+/// groups and fatal for others, and the difference is not something the tag
+/// carries.
+fn report_materials_without_a_shader(target: &TagFile, context: &mut ConversionContext<'_>) {
+    fn walk(value: TagStruct<'_>, prefix: &str, empty: &mut Vec<String>) {
+        if is_material_struct(value) {
+            let shader = value
+                .fields()
+                .find(|field| clean_field_key(field.name()) == "material shader")
+                .and_then(|field| match field.value() {
+                    Some(TagFieldData::TagReference(reference)) => reference
+                        .group_tag_and_name
+                        .map(|(_, path)| path),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if shader.is_empty() {
+                empty.push(if prefix.is_empty() {
+                    "actual material?".to_owned()
+                } else {
+                    prefix.to_owned()
+                });
+            }
+        }
+        for field in value.fields() {
+            let key = clean_field_key(field.name());
+            let name = if key.is_empty() {
+                field.type_name().to_owned()
+            } else {
+                key
+            };
+            let path = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if let Some(child) = field.as_struct() {
+                walk(child, &path, empty);
+            }
+            if let Some(block) = field.as_block() {
+                for index in 0..block.len() {
+                    if let Some(element) = block.element(index) {
+                        walk(element, &format!("{path}[{index}]"), empty);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut empty = Vec::new();
+    walk(target.root(), "", &mut empty);
+    if empty.is_empty() {
+        return;
+    }
+    let shown = empty.len().min(6);
+    context.report.issues.push(ConversionIssue {
+        kind: ConversionIssueKind::Unsupported,
+        path: empty[..shown].join(", "),
+        message: format!(
+            "{} material(s) arrived with no material shader, because {} has nothing to fill one \
+             from and this group has no reviewed default. {} builds a material's postprocess from \
+             its material shader, so an effect like this can crash when it plays rather than \
+             merely look wrong — point them at a material shader before using the tag.",
+            empty.len(),
+            context.source_game,
+            context.target_game
+        ),
+    });
+}
+
+/// Build an empty target tag from the game's own definitions.
+///
+/// This is where a conversion starts. Reading the source and filling a tag built
+/// from the target's schema is both what a user expects an importer to do and
+/// what makes the result clean: nothing arrives in the tag except what came from
+/// the source or what the schema says the field defaults to. Starting from a tag
+/// the kit happened to ship means inheriting whichever revision and whichever
+/// leftover values that tag had, and it means a user with an empty editing kit
+/// gets nothing at all — which is the case that made this the default.
+///
+/// `None` rather than an error when the definitions cannot produce a usable tag,
+/// because the caller has a second option. Three cases, and each is decided by
+/// asking rather than by consulting a list:
+///
+/// - **A classic container**, which has no writer at all. The caller checks that.
+/// - **A schema that will not build.** Reach's `contrail_system` *panics* in
+///   `layout.rs` with an out-of-range layout index, so the panic is caught rather
+///   than predicted and a schema that starts or stops building needs no list
+///   maintained anywhere.
+/// - **A schema with a `tmpl` hole of non-zero width.** This is the one that
+///   cannot be worked around, and it is why the kit-template path is kept rather
+///   than deleted. A `tmpl` custom field stands in for another group's inlined
+///   render method: the definitions know how many bytes it occupies and nothing
+///   about what is in it, so the `options`, `parameters` and `postprocess` blocks
+///   inside it have no field list and no field index, and a tag built from the
+///   schema cannot hold them. Converting an H3 particle into Reach from a
+///   schema-built tag loses 18 authored `options` entries and is refused — which
+///   is the guard working, since a Reach particle with no render-method
+///   definition is what crashed the mod tools in the first place.
+///
+/// A zero-width hole is not a reason to fall back: the template it names resolves
+/// to nothing, so there is nothing the schema is failing to describe.
+///
+/// **As of the template fold in `schema.rs`, no hole has width any more** —
+/// `fold_template_bases` puts the inherited render method's fields in the struct
+/// that carries them, so `options`, `parameters` and `postprocess` have a field
+/// list and a schema-built particle can hold them. This check is left standing
+/// rather than deleted: it costs a scan of an already-built layout, and it is
+/// how a template that stops folding — a new group, a renamed ancestor, a
+/// `_meta.json` that loses an entry — announces itself instead of quietly
+/// converting into padding again.
+fn build_target_from_definitions(schema_path: &Path, allow_template_hole: bool) -> Option<TagFile> {
+    std::panic::catch_unwind(|| {
+        let layout = crate::layout::TagLayout::from_json(schema_path).ok()?;
+        if !allow_template_hole && layout.tmpl_holes.iter().any(|hole| hole.size > 0) {
+            return None;
+        }
+        let mut target = TagFile::new(schema_path).ok()?;
+        initialize_block_index_defaults(target.root_mut());
+        Some(target)
+    })
+    .ok()
+    .flatten()
+}
+
+/// A parameter, as the name it answers to plus every value it carries.
+type ParameterFields = (String, Vec<(String, TagFieldData)>);
+
+/// What a material shader calls one of its inputs, and what kind it is.
+///
+/// Only the identity, not the values: a `TagFieldData` cannot be cloned, and the
+/// values a seeded parameter should carry come from the source anyway.
+#[derive(Clone)]
+struct DeclaredParameter {
+    name: String,
+    parameter_type: Option<(i32, Option<String>)>,
+}
+
+/// What each material in [`DEFAULT_MATERIALS`] declares its inputs to be.
+///
+/// So that seeding works with **no editing kit at all**. Reading the kit's own
+/// `.material_shader` is more accurate and still preferred when one is there — it
+/// covers materials outside this table, and it carries each parameter's declared
+/// type — but a user whose target kit is empty was getting a material with no
+/// inputs, which is the case this exists for.
+///
+/// Measured from both kits that declare the field, which agree parameter for
+/// parameter on all four. Names only: the type is inferred from whichever value
+/// the source actually carried, since `material_shader_parameter_type_enum` is
+/// `bitmap, real, int, bool, color` and the value says which it is.
+const DEFAULT_MATERIAL_PARAMETERS: &[(&str, &[&str])] = &[
+    (
+        r"shaders\material_shaders\fx\particle_base",
+        &[
+            "newschoolframeindex",
+            "constantscreensize",
+            "lightingperparticle",
+            "lighting_per_particle_strength",
+            "lighting_bright_intensity_decrease",
+            "lighting_dim_alpha_increase",
+            "lighting_bright_alpha_decrease",
+            "lightingsmooth",
+            "lightingcontrastscale",
+            "lightingcontrastoffset",
+            "lightingstrength",
+            "spherewarpstrength",
+            "depthfadeasvcoord",
+            "basemap",
+            "depthfaderange",
+            "depthfadeinvert",
+        ],
+    ),
+    (r"shaders\material_shaders\fx\tracer_base", &["basemap"]),
+    (r"shaders\material_shaders\decals\base", &["color_map"]),
+    (
+        r"shaders\material_shaders\fx\light_volume_smooth",
+        &["centeroffset", "falloff", "depthfaderange", "depthfadeinvert"],
+    ),
+];
+
+/// The `material_shader_parameter_type_enum` index for a value of this kind.
+///
+/// Inferred rather than read when there is no kit to read it from. The enum is
+/// `bitmap, real, int, bool, color` in that order, and a parameter carrying a
+/// bitmap reference is a bitmap parameter — nothing subtler is needed, because
+/// these are the only kinds a render-method parameter can hold either.
+fn inferred_parameter_type(fields: &[(String, TagFieldData)]) -> Option<(i32, Option<String>)> {
+    for (key, data) in fields {
+        match (key.as_str(), data) {
+            ("bitmap", TagFieldData::TagReference(reference))
+                if reference
+                    .group_tag_and_name
+                    .as_ref()
+                    .is_some_and(|(_, path)| !path.is_empty()) =>
+            {
+                return Some((0, Some("bitmap".to_owned())));
+            }
+            _ => {}
+        }
+    }
+    for (key, _) in fields {
+        match key.as_str() {
+            "color" => return Some((4, Some("color".to_owned()))),
+            "real" => return Some((1, Some("real".to_owned()))),
+            "int/bool" => return Some((2, Some("int".to_owned()))),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Reviewed parameter renames, where squashing the punctuation is not enough.
+///
+/// By *source* group, as `(group, render method name, material name)`. Mined from
+/// Halo 4's own ports rather than guessed: taking every pair of parameters in a
+/// shipped tag that name the same bitmap and disagree on their name, decals give
+/// `base_map` -> `color_map` consistently across all three material families it
+/// uses (44 on `normal`, 38 on `base`, 24 on `palette_alpha`), plus `bump_map` ->
+/// `normal_map` and `palette` -> `palette_map`. Halo 4's `impact.decal_system` is
+/// literally the ported Reach decal of the same name, and that is the rename it
+/// carries.
+///
+/// Deliberately decals only. The same mining over particles returns contradictory
+/// pairs — `alpha_map` -> `basemap` 534 times *and* `base_map` -> `alpha_map` 99
+/// times — because a particle that uses one bitmap for both slots makes every
+/// combination look like a rename. Squashing already handles the particle cases
+/// that are real, so nothing is added on the strength of evidence that cannot
+/// tell a rename from a coincidence.
+const MATERIAL_PARAMETER_ALIASES: &[(&str, &str, &str)] = &[
+    ("decal_system", "base_map", "color_map"),
+    ("decal_system", "bump_map", "normal_map"),
+    ("decal_system", "palette", "palette_map"),
+];
+
+/// A parameter name with the punctuation taken out.
+///
+/// The two blocks name the same input differently — `base_map` against
+/// `basemap`, `depth_fade_range` against `depthfaderange`, `alpha_map` against
+/// `alphamap`. Measured across the 1,986 H4EK particles that fill both blocks,
+/// squashing is what lines them up; nothing subtler was needed.
+fn squashed_parameter_name(name: &str) -> String {
+    name.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// Every element of `block_name`, as its parameter name plus its field values.
+fn parameter_elements(value: TagStruct<'_>, block_name: &str) -> Vec<ParameterFields> {
+    let Some(block) = value
+        .fields()
+        .find(|field| clean_field_key(field.name()) == block_name)
+        .and_then(|field| field.as_block())
+    else {
+        return Vec::new();
+    };
+    (0..block.len())
+        .filter_map(|index| block.element(index))
+        .filter_map(|element| {
+            let mut fields = Vec::new();
+            let mut name = None;
+            for field in element.fields() {
+                let Some(data) = field.value() else { continue };
+                let key = clean_field_key(field.name());
+                if key == "parameter name"
+                    && let TagFieldData::StringId(value) | TagFieldData::OldStringId(value) = &data
+                {
+                    name = Some(value.string.clone());
+                }
+                fields.push((key, data));
+            }
+            name.map(|name| (name, fields))
+        })
+        .collect()
+}
+
+/// What the kit's own `.material_shader` says its inputs are called.
+///
+/// Read from the target kit rather than derived, because the answer is per
+/// material shader: `particle_base` declares 16 parameters and `tracer_base`
+/// exactly one. Cached, since a folder run converts hundreds of particles that
+/// all name the same handful of shaders.
+fn material_shader_parameters(
+    templates: Option<&NativeTemplateIndex>,
+    tag_path: &str,
+    target_game: &str,
+    definitions_root: &Path,
+) -> Vec<DeclaredParameter> {
+    // The reviewed table, for when there is no kit to ask. Not a fallback of last
+    // resort so much as the answer for the materials this converter chose itself.
+    let from_table = || -> Vec<DeclaredParameter> {
+        DEFAULT_MATERIAL_PARAMETERS
+            .iter()
+            .find(|(material, _)| material.eq_ignore_ascii_case(tag_path))
+            .map(|(_, names)| {
+                names
+                    .iter()
+                    .map(|name| DeclaredParameter {
+                        name: (*name).to_owned(),
+                        parameter_type: None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let Some(templates) = templates else {
+        return from_table();
+    };
+    if let Some(cached) = templates.material_parameters.borrow().get(tag_path) {
+        return cached.clone();
+    }
+    let group = parse_group_tag("mats").unwrap_or(u32::from_be_bytes(*b"mats"));
+    let wanted =
+        format!("{}.material_shader", tag_path.replace('\\', "/")).to_ascii_lowercase();
+    let found: Vec<DeclaredParameter> = templates
+        .by_group
+        .get(&group)
+        .into_iter()
+        .flatten()
+        .find(|path| {
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+                .ends_with(&wanted)
+        })
+        .and_then(|path| {
+            read_tag_for_conversion(path, Some(target_game), Some(definitions_root), group).ok()
+        })
+        .map(|tag| {
+            parameter_elements(tag.root(), "material parameters")
+                .into_iter()
+                .map(|(name, fields)| DeclaredParameter {
+                    name,
+                    parameter_type: fields.into_iter().find_map(|(key, data)| match data {
+                        TagFieldData::LongEnum { value, name } if key == "parameter type" => {
+                            Some((value, name))
+                        }
+                        _ => None,
+                    }),
+                })
+                .collect()
+        })
+        .unwrap_or_else(from_table);
+    templates
+        .material_parameters
+        .borrow_mut()
+        .insert(tag_path.to_owned(), found.clone());
+    found
+}
+
+/// Give a converted fx tag's material the inputs its own render method carries.
+///
+/// Halo 4 keeps two parameter blocks side by side: the legacy render method's,
+/// under `actual shader?`, and the material's, under `actual material?`. Both are
+/// populated in shipped content — 3,429 of H4EK's 3,916 particles fill the
+/// material block — and only the material one feeds the material shader the tag
+/// actually draws with. A conversion carries the render method faithfully and, up
+/// to now, left the material block empty, so a ported particle named a material
+/// shader and gave it nothing: the texture sat in the deprecated half and the
+/// visible half fell back to the shader's own defaults.
+///
+/// Only parameters the material shader *declares* are seeded, and the element is
+/// built from that declaration so its type and sampler settings are the shader's
+/// own — with just the values overlaid from the render method. For a Reach
+/// particle on `particle_base` that is `base_map` -> `basemap`, the particle's
+/// texture, and `depth_fade_range` -> `depthfaderange`.
+///
+/// Seeding, not translating, and the report says so. Halo 4's artists re-authored
+/// these when they ported content: of the shipped pairs that share a squashed
+/// name and carry a bitmap, 2,491 agree and 796 deliberately do not. An automatic
+/// port cannot know which it is looking at, and the source's own texture is a far
+/// better starting point than none.
+fn seed_material_parameters(
+    target: &mut TagFile,
+    source: &TagFile,
+    context: &mut ConversionContext<'_>,
+) {
+    // A kit is welcome but not required: without one the reviewed table answers
+    // for the materials this converter assigns itself, which is the whole of what
+    // a from-scratch conversion needs.
+    let templates = context.native_templates;
+
+    // Keyed by block path — `/decals[0]`, `/tracers[1]`, or the empty string for
+    // a particle's root. Struct names are left out deliberately: the two engines
+    // disagree about them and about how many struct layers there are, while a
+    // block and its index mean the same thing on both sides.
+    let mut by_path: HashMap<String, Vec<ParameterFields>> = HashMap::new();
+    collect_render_parameters(source.root(), String::new(), &mut by_path);
+
+    fn walk(
+        mut value: TagStructMut<'_>,
+        path: &str,
+        by_path: &mut HashMap<String, Vec<ParameterFields>>,
+        templates: Option<&NativeTemplateIndex>,
+        target_game: &str,
+        definitions_root: &Path,
+        group: &str,
+        seeded: &mut Vec<String>,
+    ) {
+        // Found by shape rather than by field name, because the slot is at the
+        // root of a particle and inside a block element of a tracer, and named
+        // for its own group either way.
+        let material_ordinal = value
+            .as_ref()
+            .fields()
+            .position(|field| field.as_struct().is_some_and(is_material_struct));
+        if let Some(material_ordinal) = material_ordinal {
+            let carried: Vec<ParameterFields> = by_path.remove(path).unwrap_or_default();
+            let existing = value
+                .as_ref()
+                .fields()
+                .nth(material_ordinal)
+                .and_then(|field| field.as_struct())
+                .map(|material| parameter_elements(material, "material parameters"))
+                .unwrap_or_default();
+            let shader_path = value
+                .as_ref()
+                .fields()
+                .nth(material_ordinal)
+                .and_then(|field| field.as_struct())
+                .and_then(|material| {
+                    material
+                        .fields()
+                        .find(|field| clean_field_key(field.name()) == "material shader")
+                })
+                .and_then(|field| match field.value() {
+                    Some(TagFieldData::TagReference(reference)) => {
+                        reference.group_tag_and_name.map(|(_, path)| path)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+
+            // A material the author already parameterised is left exactly as it
+            // is: this fills a blank, it does not second-guess a filled one.
+            if !carried.is_empty() && existing.is_empty() && !shader_path.is_empty() {
+                let declared =
+                    material_shader_parameters(templates, &shader_path, target_game, definitions_root);
+                let mut carried = carried;
+                let wanted: Vec<(DeclaredParameter, Vec<(String, TagFieldData)>)> = declared
+                    .into_iter()
+                    .filter_map(|declaration| {
+                        let squashed = squashed_parameter_name(&declaration.name);
+                        let position = carried.iter().position(|(name, _)| {
+                            squashed_parameter_name(name) == squashed
+                                || MATERIAL_PARAMETER_ALIASES.iter().any(|(scope, from, to)| {
+                                    scope.eq_ignore_ascii_case(group)
+                                        && squashed_parameter_name(from)
+                                            == squashed_parameter_name(name)
+                                        && squashed_parameter_name(to) == squashed
+                                })
+                        })?;
+                        // Taken, not borrowed: the values move into the new
+                        // element, and no parameter should be seeded twice.
+                        let (_, fields) = carried.remove(position);
+                        Some((declaration, fields))
+                    })
+                    .collect();
+                if !wanted.is_empty()
+                    && let Some(mut field) = value.field_at_mut(material_ordinal)
+                    && let Some(mut material) = field.as_struct_mut()
+                {
+                    let block_ordinal = material
+                        .as_ref()
+                        .fields()
+                        .position(|field| clean_field_key(field.name()) == "material parameters");
+                    if let Some(block_ordinal) = block_ordinal
+                        && let Some(mut block_field) = material.field_at_mut(block_ordinal)
+                        && let Some(mut block) = block_field.as_block_mut()
+                    {
+                        for (declaration, fields) in wanted {
+                            let index = block.add_element();
+                            let Some(mut element) = block.element_mut(index) else {
+                                continue;
+                            };
+                            let mut source_name = String::new();
+                            // Worked out before the values are moved out, so the
+                            // type can be inferred from what the source carried
+                            // when no kit told us what it should be.
+                            let inferred = inferred_parameter_type(&fields);
+                            for (key, data) in fields {
+                                if key == "parameter name" {
+                                    if let TagFieldData::StringId(value)
+                                    | TagFieldData::OldStringId(value) = &data
+                                    {
+                                        source_name = value.string.clone();
+                                    }
+                                    // The material shader's own spelling wins.
+                                    continue;
+                                }
+                                if key == "parameter type" {
+                                    continue;
+                                }
+                                set_named_field(&mut element, &key, data);
+                            }
+                            // Identity from the declaration, so the element
+                            // names an input the shader actually has and types
+                            // it the way the shader does.
+                            set_named_field(
+                                &mut element,
+                                "parameter name",
+                                TagFieldData::StringId(StringIdData {
+                                    string: declaration.name.clone(),
+                                }),
+                            );
+                            if let Some((value, name)) =
+                                declaration.parameter_type.clone().or(inferred)
+                            {
+                                set_named_field(
+                                    &mut element,
+                                    "parameter type",
+                                    TagFieldData::LongEnum { value, name },
+                                );
+                            }
+                            seeded.push(format!("{} <- {source_name}", declaration.name));
+                        }
+                    }
+                }
+            }
+        }
+
+        let field_count = value.as_ref().fields().count();
+        for ordinal in 0..field_count {
+            let (kind, name) = match value.as_ref().fields().nth(ordinal) {
+                Some(field) => (field.field_type(), clean_field_key(field.name())),
+                None => continue,
+            };
+            match kind {
+                TagFieldType::Struct => {
+                    if let Some(mut field) = value.field_at_mut(ordinal)
+                        && let Some(nested) = field.as_struct_mut()
+                    {
+                        // A struct does not move the path; only a block does.
+                        walk(
+                            nested,
+                            path,
+                            by_path,
+                            templates,
+                            target_game,
+                            definitions_root,
+                            group,
+                            seeded,
+                        );
+                    }
+                }
+                TagFieldType::Block => {
+                    if let Some(mut field) = value.field_at_mut(ordinal)
+                        && let Some(mut block) = field.as_block_mut()
+                    {
+                        for index in 0..block.len() {
+                            if let Some(element) = block.element_mut(index) {
+                                let child = format!("{path}/{name}[{index}]");
+                                walk(
+                                    element,
+                                    &child,
+                                    by_path,
+                                    templates,
+                                    target_game,
+                                    definitions_root,
+                                    group,
+                                    seeded,
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut seeded = Vec::new();
+    let target_game = context.target_game;
+    let definitions_root = context.definitions_root;
+    let group = context.group_name;
+    walk(
+        target.root_mut(),
+        "",
+        &mut by_path,
+        templates,
+        target_game,
+        definitions_root,
+        group,
+        &mut seeded,
+    );
+    if seeded.is_empty() {
+        return;
+    }
+    seeded.sort();
+    seeded.dedup();
+    context.report.issues.push(ConversionIssue {
+        kind: ConversionIssueKind::Warning,
+        path: context.group_name.to_owned(),
+        message: format!(
+            "Seeded the material with {} input(s) from the render method it came with ({}). \
+             Only inputs the material shader declares were filled, from the values the source \
+             already had — Halo 4's own ports often re-authored these, so check them against \
+             the look you want.",
+            seeded.len(),
+            seeded.join(", ")
+        ),
+    });
+}
+
+/// Every render-method `parameters` block in a tag, keyed by block path.
+///
+/// Read from the *source*, because the target need not have anywhere to keep a
+/// render method at all. Halo 4's declared `decal_system` revision holds only the
+/// material in a decal entry — no `actual shader?` beside it — so a Reach decal's
+/// `base_map` has no slot to land in, and looking for it next to the material in
+/// the converted tag finds nothing. The source always has it.
+fn collect_render_parameters(
+    value: TagStruct<'_>,
+    path: String,
+    out: &mut HashMap<String, Vec<ParameterFields>>,
+) {
+    for field in value.fields() {
+        if let Some(child) = field.as_struct() {
+            let parameters = parameter_elements(child, "parameters");
+            if !parameters.is_empty() {
+                out.entry(path.clone()).or_insert(parameters);
+            }
+            collect_render_parameters(child, path.clone(), out);
+        }
+    }
+    for field in value.fields() {
+        if field.field_type() != TagFieldType::Block {
+            continue;
+        }
+        let Some(block) = field.as_block() else {
+            continue;
+        };
+        let name = clean_field_key(field.name());
+        for index in 0..block.len() {
+            if let Some(element) = block.element(index) {
+                collect_render_parameters(element, format!("{path}/{name}[{index}]"), out);
+            }
+        }
+    }
+}
+
+/// Set the field called `key`, if the element has one that will take the value.
+///
+/// A mismatch is not an error worth reporting: the two parameter blocks share
+/// most of their fields but not all, and a field the material's element does not
+/// have is one the material shader has no use for.
+fn set_named_field(element: &mut TagStructMut<'_>, key: &str, data: TagFieldData) {
+    let Some(ordinal) = element
+        .as_ref()
+        .fields()
+        .position(|field| clean_field_key(field.name()) == key)
+    else {
+        return;
+    };
+    if let Some(mut field) = element.field_at_mut(ordinal) {
+        let _ = field.set(data);
+    }
+}
+
+/// A scenario's compiled HaloScript, which never survives an engine change.
+///
+/// The string table, the syntax datums that index into it, and the script and
+/// global declarations that index those. All or nothing: they are one artefact
+/// spread across five fields.
+const COMPILED_SCRIPT_FIELDS: &[&str] = &[
+    "script string data",
+    "script syntax data",
+    "hs syntax datums",
+    "scripts",
+    "globals",
+];
+
+/// Empty a converted scenario's compiled scripts, and say why.
+///
+/// A compiled script node stores an *index* into its own game's function table,
+/// and those tables are renumbered at every engine boundary. Measured against
+/// Baboon's own per-game script documentation: Halo 2 declares 887 functions and
+/// Halo 3 1,377; the two agree position-for-position for the first 20 entries and
+/// then diverge, and of the 628 names both games have, **608 sit at a different
+/// index**. Even the closest pair, Halo 3 and ODST, moves 1,113 of 1,293.
+///
+/// So carrying the bytecode across is not a lossy copy, it is a wrong one: the
+/// scenario would load and then call whatever function now occupies each slot.
+/// That is worse than arriving with no scripts, because it looks like it worked.
+///
+/// The `.hsc` **source** is a different matter and is deliberately left alone —
+/// it is text, it carries fine, and 47 of the 68 scenarios Halo 2's kit ships
+/// bring it along. Recompiling from it in the destination game's tools is the
+/// route that produces correct bytecode, and the warning says so.
+fn strip_cross_engine_scripts(target: &mut TagFile, context: &mut ConversionContext<'_>) {
+    if !context.group_name.eq_ignore_ascii_case("scenario")
+        || context.source_game == context.target_game
+    {
+        return;
+    }
+    let mut emptied = Vec::new();
+    {
+        let mut root = target.root_mut();
+        let ordinals: Vec<(usize, String)> = root
+            .as_ref()
+            .fields()
+            .enumerate()
+            .filter(|(_, field)| {
+                let key = clean_field_key(field.name());
+                COMPILED_SCRIPT_FIELDS.iter().any(|name| key == *name)
+            })
+            .map(|(ordinal, field)| (ordinal, field.name().to_owned()))
+            .collect();
+        for (ordinal, name) in ordinals {
+            let Some(mut field) = root.field_at_mut(ordinal) else {
+                continue;
+            };
+            if let Some(mut block) = field.as_block_mut() {
+                if block.len() > 0 {
+                    block.clear();
+                    emptied.push(name);
+                }
+                continue;
+            }
+            let filled = matches!(field.as_ref().value(), Some(TagFieldData::Data(bytes)) if !bytes.is_empty());
+            if filled && field.set(TagFieldData::Data(Vec::new())).is_ok() {
+                emptied.push(name);
+            }
+        }
+    }
+    // The payload check must stop treating the string table as lost data: it was
+    // not dropped for want of a home, it was removed on purpose.
+    context
+        .payloads_left_behind
+        .retain(|path| !COMPILED_SCRIPT_FIELDS.iter().any(|name| path == name));
+    if emptied.is_empty() {
+        return;
+    }
+    let sources = target
+        .root()
+        .fields()
+        .find(|field| clean_field_key(field.name()) == "source files")
+        .and_then(|field| field.as_block())
+        .map(|block| block.len())
+        .unwrap_or(0);
+    let advice = if sources > 0 {
+        format!(
+            "The {sources} .hsc source file(s) came across with the tag \u{2014} recompile them \
+             with {}'s tools to get working scripts.",
+            context.target_game
+        )
+    } else {
+        "This scenario carried no .hsc source, so the scripts have to be reauthored.".to_owned()
+    };
+    context.report.issues.push(ConversionIssue {
+        kind: ConversionIssueKind::Warning,
+        path: emptied.join(", "),
+        message: format!(
+            "Compiled scripts were cleared rather than carried. A script node indexes its own \
+             game's function table, and {} renumbers {}'s \u{2014} the two tables diverge within \
+             the first two dozen entries, so carried bytecode would call the wrong functions. {advice}",
+            context.target_game, context.source_game
+        ),
+    });
+}
+
+
+/// Groups whose payload is compiled GPU code rather than data.
+///
+/// Named rather than detected, because the thing that makes them different
+/// is not visible in the schema: the field is a `data` blob either way, and
+/// both sides call it a shader. What differs is the instruction set inside.
+fn is_compiled_shader_group(group_name: &str) -> bool {
+    matches!(
+        group_name,
+        "pixel_shader"
+            | "vertex_shader"
+            | "global_pixel_shader"
+            | "global_vertex_shader"
+            // Not code itself, but the thing that names it: a
+            // template points at the pixel and vertex shaders and
+            // declares which entry points they were built with. The
+            // kit ships its own set, paired with its own DX9
+            // shaders, and the build's declares different entry
+            // points -- 1 where the kit has 0 -- so importing one
+            // pairs the kit's shaders with the build's idea of them.
+            | "render_method_template"
+    )
+}
+
+/// Refuse, or record, a conversion that loses audited data.
+///
+/// Returns the lost field paths when `policy` lets them through, so the caller
+/// can put them on the report; an empty list means nothing was at stake.
+fn validate_critical_runtime_safety(
+    source: &TagFile,
+    context: &ConversionContext<'_>,
+    policy: LossPolicy,
+) -> Result<Vec<String>, String> {
+    // Not "does the source have resources?" but "did any resource fail to
+    // cross?". The old question refused every animation graph, because an
+    // animation graph's payload *is* a pageable resource — it is why a loose
+    // HREK jmad runs to a hundred megabytes and more.
+    if !context.resources_left_behind.is_empty() {
+        // A pass that gave up will usually have said why on its way past. That
+        // reason is the whole answer and it was being dropped here, leaving a
+        // refusal that names the resource and not one thing a reader could do
+        // about it.
+        let mut reasons: Vec<&str> = context
+            .report
+            .issues
+            .iter()
+            .filter(|issue| issue.kind == ConversionIssueKind::Unsupported)
+            .map(|issue| issue.message.as_str())
+            .collect();
+        reasons.dedup();
+        let because = if reasons.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", reasons.join("; "))
+        };
+        return Err(format!(
+            "{} carries {} pageable resource(s) that could not be translated from {} to {} ({}); \
+             the tag was not written{because}",
+            context.group_name,
+            context.resources_left_behind.len(),
+            context.source_game,
+            context.target_game,
+            context
+                .resources_left_behind
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
+    // Same question as the resource check, for inline `data` blobs. A reviewed
+    // `accepted_field_drops` rule can still say a particular blob is fine to
+    // lose; anything else refuses, because the alternative is a tag that opens
+    // to nothing or takes the kit down with it.
+    let unreviewed_payloads: Vec<&String> = context
+        .payloads_left_behind
+        .iter()
+        .filter(|path| {
+            context
+                .mapping_catalog
+                .accepted_drop_reason(
+                    context.group_name,
+                    context.source_game,
+                    context.target_game,
+                    path,
+                )
+                .is_none()
+                && context
+                    .mapping_catalog
+                    .accepted_payload_drop_reason(
+                        context.group_name,
+                        context.source_game,
+                        context.target_game,
+                        path,
+                    )
+                    .is_none()
+        })
+        .collect();
+    if !unreviewed_payloads.is_empty() {
+        return Err(format!(
+            "{} carries {} data blob(s) that {} stores differently from {} ({}); the bytes are \
+             the substance of the tag, so it was not written rather than written empty",
+            context.group_name,
+            unreviewed_payloads.len(),
+            context.source_game,
+            context.target_game,
+            unreviewed_payloads
+                .iter()
+                .take(3)
+                .map(|path| path.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
+    let _ = source;
+    const FAIL_CLOSED_GROUPS: &[&str] = &[
+        "model_animation_graph",
+        "damage_effect",
+        "effect",
+        "lens_flare",
+        "light",
+        "particle",
+    ];
+    let critical_issues = context
+        .report
+        .issues
+        .iter()
+        .filter(|issue| issue.kind == ConversionIssueKind::Unsupported)
+        .filter(|issue| {
+            context
+                .mapping_catalog
+                .accepted_drop_reason(
+                    context.group_name,
+                    context.source_game,
+                    context.target_game,
+                    &issue.path,
+                )
+                .is_none()
+        })
+        .filter(|issue| {
+            !(context
+                .group_name
+                .eq_ignore_ascii_case("model_animation_graph")
+                && ["desired compression", "current compression"]
+                    .iter()
+                    .any(|field| clean_field_key(&issue.path).ends_with(field)))
+        })
+        .collect::<Vec<_>>();
+    let animation_graph = context
+        .group_name
+        .eq_ignore_ascii_case("model_animation_graph");
+    let audited_h3_to_reach = ["halo3_mcc", "halo3odst_mcc"].contains(&context.source_game)
+        && context.target_game == "haloreach_mcc";
+    if (animation_graph
+        || (audited_h3_to_reach
+            && FAIL_CLOSED_GROUPS
+                .iter()
+                .any(|group| context.group_name.eq_ignore_ascii_case(group))))
+        && !critical_issues.is_empty()
+    {
+        let lost: Vec<String> = critical_issues
+            .iter()
+            .map(|issue| issue.path.clone())
+            .collect();
+        let examples = lost.iter().take(4).cloned().collect::<Vec<_>>().join(", ");
+        if policy == LossPolicy::FailClosed {
+            return Err(format!(
+                "{} conversion would lose {} meaningful runtime or authored field(s) ({examples}); the tag was not written",
+                context.group_name,
+                lost.len()
+            ));
+        }
+        // Allowed through, but never quietly. The caller asked for this tag
+        // knowing the cost, and the report is where that cost stays on record —
+        // both as prose for a reader and as a list for whatever writes it.
+        return Ok(lost);
+    }
+    Ok(Vec::new())
+}
+
+
+fn struct_at_path<'a>(mut structure: TagStruct<'a>, path: &str) -> Option<TagStruct<'a>> {
+    for component in path.split('/').filter(|component| !component.is_empty()) {
+        structure = structure
+            .fields()
+            .find(|field| clean_field_key(field.name()) == clean_field_key(component))?
+            .as_struct()?;
+    }
+    Some(structure)
+}
+
+/// Convert `source` into the struct at `path` inside `target`.
+///
+/// `source_prefix` is where `source` sits in the *source* tag, and it becomes the
+/// path every issue inside is reported at. That matters because the
+/// reference-fidelity check explains a dropped reference by looking for an issue at
+/// (or above) the field's absolute source path: with a reparent whose source is
+/// nested — `shader`'s `render_method` is the first — reporting `definition`
+/// instead of `render_method/definition` left every dropped reference looking
+/// "unexplained", i.e. like a field-matching bug, and turned a reviewed loss into a
+/// fatal error.
+fn convert_to_struct_path(
+    source: TagStruct<'_>,
+    mut target: TagStructMut<'_>,
+    path: &str,
+    source_prefix: &str,
+    context: &mut ConversionContext<'_>,
+) -> bool {
+    let mut components = path.split('/').filter(|component| !component.is_empty());
+    let Some(component) = components.next() else {
+        convert_struct(source, target, source_prefix, true, context);
+        return true;
+    };
+    let remainder = components.collect::<Vec<_>>().join("/");
+    let ordinal = target
+        .as_ref()
+        .fields()
+        .enumerate()
+        .find(|(_, field)| clean_field_key(field.name()) == clean_field_key(component))
+        .map(|(ordinal, _)| ordinal);
+    let Some(ordinal) = ordinal else {
+        return false;
+    };
+    let Some(mut field) = target.field_at_mut(ordinal) else {
+        return false;
+    };
+    let Some(nested) = field.as_struct_mut() else {
+        return false;
+    };
+    convert_to_struct_path(source, nested, &remainder, source_prefix, context)
+}
+
+/// Whether a candidate on disk is an acceptable native layout template for
+/// `target_game`.
+///
+/// The rule everywhere else is "not one of our own conversion drafts", and a
+/// draft is recognized by `version == -1` where an editing-kit tag carries a
+/// real one. That rule *inverts* for Campaign Evolved, whose shipped generation
+/// is exactly `1 / 2 / 0xffffffff` — all 12,289 of its tag blobs read it. Left
+/// unqualified the check rejects the entire game, and silently: the converter
+/// would simply fall back to a generated layout every time with nothing saying
+/// why.
+/// How many of a group's shipped tags to consider before concluding the kit has
+/// no usable template for it.
+///
+/// A bound is needed because *proving there is none* is the expensive case, and
+/// it is a real case: Halo Reach ships 10,675 bitmaps and not one carries a
+/// source revision, so the search rejects every last one. Opening a file costs
+/// far more than reading its header — 10,675 opens is ~15 seconds here even at
+/// 64 bytes each — so the count, not the bytes, is what has to be capped.
+///
+/// 256 is chosen against measurement rather than taste. In every Halo Reach
+/// group that has an acceptable tag at all, the first one sits at index 1 or 2,
+/// and between 15% and 90% of the group qualifies. The cap is two orders of
+/// magnitude past where the answer has ever been found.
+///
+/// The cost of being wrong is bounded and visible: the conversion falls back to
+/// a generated layout and the report says so, which is exactly what a group with
+/// no acceptable tag already gets.
+const NATIVE_TEMPLATE_SCAN_LIMIT: usize = 256;
+
+/// Whether a candidate's header marks it as a kit-authored tag worth starting
+/// from.
+///
+/// Takes the header rather than the tag so the test can be applied to a
+/// candidate that has not been parsed — which is the whole point, since a group
+/// may ship thousands of candidates and the answer is 64 bytes in. See
+/// [`TagFileHeader::peek`].
+fn accepts_native_header(header: &TagFileHeader, target_game: &str) -> bool {
+    if target_game == CAMPAIGN_EVOLVED_GAME {
+        let (build_version, build_number, version) = CAMPAIGN_EVOLVED_GENERATION;
+        return header.build_version == build_version
+            && header.build_number == build_number
+            && header.version == version;
+    }
+    // Nothing to test for an MCC target. The header carries a generation and a
+    // `version` that is a per-file *source revision*, and a source revision says
+    // nothing about whether a tag is a good template — most shipped content has
+    // none. What actually decides a candidate is its group, its byte order,
+    // whether it parses and resets, and whether its root size matches the
+    // schema; all four are checked by the search itself.
+    //
+    // This used to reject `version == u32::MAX`, which is the value
+    // `apply_editing_kit_mcc_header` stamps on everything and the value a tag
+    // with no recorded revision carries. Whole groups carry it and nothing
+    // else: of Halo Reach's 9,286 shipped bitmaps and 10,624 shipped sounds not
+    // one has a revision, so not one could ever be a template, and every
+    // converted bitmap, sound, shader and render-method template was built from
+    // a schema instead of from the kit's own tag.
+    let _ = header;
+    true
+}
+
+/// The root size `target_schema` declares, or `None` if it will not build.
+///
+/// This is what makes a template *fit* rather than merely exist. A kit ships one
+/// group at many layout revisions — every tag embeds the `blay` it was authored
+/// against — and H4EK's effects come in three: 96 bytes (480 tags), 104 (2,740)
+/// and 108 (4). Taking whichever sorts first means taking one by accident.
+///
+/// Matching the definition is the principled tie-break rather than "the most
+/// common one", because the definition is the schema the conversion maps fields
+/// *with*. A template narrower than the definition has nowhere to put fields the
+/// converter knows how to fill: measured on one Reach effect into Halo 4, the
+/// 96-byte revision carried 1,758 values and the 104-byte one 2,084.
+///
+/// Read out of the JSON rather than taken from a built `TagFile`, because
+/// *building* is the thing some groups cannot survive: Reach's
+/// `contrail_system` panics in `layout.rs`, which is the whole reason a native
+/// template is preferred there in the first place. The declared number is the
+/// same either way — it already accounts for `tmpl` expansion, so Reach's
+/// particle reads 496 from both.
+fn declared_root_size(target_schema: &Path) -> Option<usize> {
+    let bytes = fs::read(target_schema).ok()?;
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    let block = value.get("block")?.as_str()?;
+    let root = value.get("blocks")?.get(block)?.get("struct")?.as_str()?;
+    let size = value.get("structs")?.get(root)?.get("size")?.as_u64()?;
+    usize::try_from(size).ok()
+}
+
+/// Every struct a schema declares, by name and packed size.
+///
+/// The root size alone does not tell the revisions apart. A kit can ship the
+/// same group at two revisions that agree about the root and differ several
+/// blocks down -- HREK's animation graphs do, 259 of them without
+/// `override blend out time` on an animation and 136 with -- and a conversion
+/// against the shorter one drops whatever the source had in the missing field
+/// while reporting a perfectly matched root.
+fn declared_struct_sizes(target_schema: &Path) -> HashMap<String, usize> {
+    let mut out = HashMap::new();
+    let Ok(bytes) = fs::read(target_schema) else { return out };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else { return out };
+    let Some(structs) = value.get("structs").and_then(Value::as_object) else { return out };
+    for (name, definition) in structs {
+        if let Some(size) = definition.get("size").and_then(Value::as_u64) {
+            out.insert(name.clone(), size as usize);
+        }
+    }
+    out
+}
+
+/// Every struct a template's own layout declares, by name and packed size.
+///
+/// Walked from the root declaration rather than from data, so a block with no
+/// elements still contributes the shape of the elements it would hold.
+fn template_struct_sizes(tag: &TagFile) -> HashMap<String, usize> {
+    let mut out = HashMap::new();
+    let mut pending = vec![tag.definitions().root_struct()];
+    while let Some(structure) = pending.pop() {
+        if out.insert(structure.name().to_owned(), structure.size()).is_some() {
+            // Seen it: the declaration tree is a graph and a struct can name
+            // itself, directly or round a loop.
+            continue;
+        }
+        for field in structure.fields() {
+            if let Some(nested) = field.as_struct() {
+                pending.push(nested);
+            } else if let Some(block) = field.as_block() {
+                pending.push(block.struct_definition());
+            } else if let Some(array) = field.as_array() {
+                pending.push(array.struct_definition());
+            } else if let Some(resource) = field.as_resource() {
+                pending.push(resource.struct_definition());
+            }
+        }
+    }
+    out
+}
+
+/// How many structs a template disagrees with the schema about.
+///
+/// Only names the two share count. A template declaring structs the schema
+/// does not is the normal case and the reason a kit tag is preferred over a
+/// generated layout in the first place.
+fn template_disagreements(
+    template: &HashMap<String, usize>,
+    schema: &HashMap<String, usize>,
+) -> usize {
+    template
+        .iter()
+        .filter(|(name, size)| schema.get(*name).is_some_and(|declared| declared != *size))
+        .count()
+}
+
+fn find_native_target_template(
+    templates: &NativeTemplateIndex,
+    target_group_tag: u32,
+    target_game: &str,
+    engine_managed: Option<&SchemaFieldAliases>,
+    definitions_root: &Path,
+    target_schema: &Path,
+) -> Result<Option<(TagFile, PathBuf)>, String> {
+    // A classic target needs a kit-authored tag to start from — `TagFile::new`
+    // only builds MCC containers — but a classic tag cannot be read by
+    // `TagFile::read` (no embedded layout) nor cached as bytes and re-read
+    // (`read_from_bytes` would not parse it either). So it takes its own pass:
+    // read through the JSON layout, and skip the byte cache.
+    if CLASSIC_CONVERSION_GAMES.contains(&target_game) {
+        let Some(paths) = templates.by_group.get(&target_group_tag) else {
+            return Ok(None);
+        };
+        for path in paths.iter().take(NATIVE_TEMPLATE_SCAN_LIMIT) {
+            let Ok(mut tag) = read_tag_for_conversion(
+                path,
+                Some(target_game),
+                Some(definitions_root),
+                target_group_tag,
+            ) else {
+                continue;
+            };
+            if tag.group().tag == target_group_tag
+                && tag.classic_engine().is_some()
+                && reset_tag_to_defaults(&mut tag, engine_managed).is_ok()
+            {
+                return Ok(Some((tag, path.to_path_buf())));
+            }
+        }
+        return Ok(None);
+    }
+    {
+        let cached = templates.cached.borrow();
+        if let Some(value) = cached.get(&target_group_tag) {
+            return match value {
+                Some((bytes, path)) => TagFile::read_from_bytes(bytes)
+                    .map(|tag| Some((tag, path.clone())))
+                    .map_err(|error| format!("Could not restore cached native template: {error}")),
+                None => Ok(None),
+            };
+        }
+    }
+    let Some(paths) = templates.by_group.get(&target_group_tag) else {
+        templates.cached.borrow_mut().insert(target_group_tag, None);
+        return Ok(None);
+    };
+    // Which revision to hold out for. `by_group` is sorted by path, so without
+    // this the choice is whichever tag sorts first — on one H4EK that is
+    // everything under `2011\`, and a kit missing that folder (or holding a tag
+    // sorting before it, including one a previous import wrote) silently
+    // converts against a different layout. Same editor, same tag, different
+    // machine, different output: that is the bug this exists to remove.
+    let wanted_root_size = declared_root_size(target_schema);
+    // And which revision of everything below it. The root size settles the
+    // outermost shape; a kit that ships two revisions of the same group can
+    // agree there and differ several blocks down, so the nested structs decide
+    // between the survivors.
+    let wanted_struct_sizes = declared_struct_sizes(target_schema);
+    // The best of the wrong ones, kept in case the kit ships no matching
+    // revision at all. A template of the wrong revision still beats none: the
+    // fallback from here is a layout built from the schema, which no kit ever
+    // authored.
+    let mut fallback: Option<(TagFile, PathBuf)> = None;
+    // The best of the right ones. A candidate that agrees about the root but
+    // not about everything under it is worth keeping while the scan looks for
+    // one that agrees about both.
+    let mut best: Option<(usize, TagFile, PathBuf)> = None;
+    for path in paths.iter().take(NATIVE_TEMPLATE_SCAN_LIMIT) {
+        // Sift on the 64-byte header first. Every candidate has to be *ruled
+        // out* somehow, and for a group the kit ships in bulk the ruled-out ones
+        // are nearly all of them: Halo Reach ships 10,675 bitmaps, 6.4 GB, and
+        // not one carries a source revision — so a scan that parsed each to read
+        // its header spent half a minute proving there was nothing to find. The
+        // full checks below still run on whatever survives; this only decides
+        // what is worth opening.
+        let Ok((header, endian)) = TagFileHeader::peek(path) else {
+            continue;
+        };
+        if endian != Endian::Le
+            || header.group_tag != target_group_tag
+            || !accepts_native_header(&header, target_game)
+        {
+            continue;
+        }
+        let Ok(mut tag) = TagFile::read(path) else {
+            continue;
+        };
+        // Prefer a game-authored tag so its embedded layout carries the
+        // expansions a dumped JSON schema need not describe.
+        if tag.group().tag == target_group_tag
+            && tag.classic_engine().is_none()
+            && tag.endian == Endian::Le
+            && accepts_native_header(&tag.header, target_game)
+            && reset_tag_to_defaults(&mut tag, engine_managed).is_ok()
+        {
+            // Read after the reset, because that is the shape the conversion
+            // will actually fill.
+            let root_size = tag.root().definition().size();
+            if wanted_root_size.is_some_and(|wanted| wanted != root_size) {
+                if fallback.is_none() {
+                    fallback = Some((tag, path.to_path_buf()));
+                }
+                continue;
+            }
+            let disagreements =
+                template_disagreements(&template_struct_sizes(&tag), &wanted_struct_sizes);
+            if disagreements == 0 {
+                return cache_native_template(templates, target_group_tag, tag, path.clone());
+            }
+            if best.as_ref().is_none_or(|(worst, _, _)| disagreements < *worst) {
+                best = Some((disagreements, tag, path.to_path_buf()));
+            }
+            continue;
+        }
+    }
+    if let Some((_, tag, path)) = best {
+        return cache_native_template(templates, target_group_tag, tag, path);
+    }
+    if let Some((tag, path)) = fallback {
+        return cache_native_template(templates, target_group_tag, tag, path);
+    }
+    templates.cached.borrow_mut().insert(target_group_tag, None);
+    Ok(None)
+}
+
+/// Remember a chosen template as bytes, so the next tag of the group reuses it.
+fn cache_native_template(
+    templates: &NativeTemplateIndex,
+    target_group_tag: u32,
+    tag: TagFile,
+    path: PathBuf,
+) -> Result<Option<(TagFile, PathBuf)>, String> {
+    let bytes = tag
+        .write_to_bytes()
+        .map_err(|error| format!("Could not cache native template {}: {error}", path.display()))?;
+    templates
+        .cached
+        .borrow_mut()
+        .insert(target_group_tag, Some((bytes, path.clone())));
+    Ok(Some((tag, path)))
+}
+
+fn create_companion_tag(
+    key: &str,
+    file_suffix: &str,
+    group_name: &str,
+    context: &ConversionContext<'_>,
+) -> Result<CompanionTagDraft, String> {
+    let group_tag = context
+        .target_groups
+        .by_name
+        .get(&group_name.to_ascii_lowercase())
+        .copied()
+        .ok_or_else(|| format!("{} has no {group_name} tag group", context.target_game))?;
+    let schema = context
+        .definitions_root
+        .join(context.target_game)
+        .join(format!("{group_name}.json"));
+    let native_target = context
+        .native_templates
+        .map(|templates| {
+            find_native_target_template(
+                templates,
+                group_tag,
+                context.target_game,
+                Some(context.target_field_aliases),
+                context.definitions_root,
+                &schema,
+            )
+        })
+        .transpose()?
+        .flatten();
+    let (mut tag, native_layout_template) = if let Some((template, template_path)) = native_target {
+        (template, Some(template_path))
+    } else {
+        let mut tag = TagFile::new(&schema).map_err(|error| {
+            format!(
+                "Could not create companion {group_name} tag from {}: {error}",
+                schema.display()
+            )
+        })?;
+        initialize_block_index_defaults(tag.root_mut());
+        (tag, None)
+    };
+    apply_editing_kit_mcc_header(&mut tag, context.target_game)?;
+    let extension = group_tag_to_extension(group_tag)
+        .unwrap_or(group_name)
+        .to_owned();
+    Ok(CompanionTagDraft {
+        key: key.to_owned(),
+        file_suffix: file_suffix.to_owned(),
+        group_name: group_name.to_owned(),
+        extension,
+        tag,
+        native_layout_template,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct ReferenceValue {
+    pub field_path: String,
+    pub group_tag: u32,
+    pub tag_path: String,
+}
+
+pub fn collect_reference_values(
+    structure: TagStruct<'_>,
+    parent_path: &str,
+    values: &mut Vec<ReferenceValue>,
+) {
+    for field in structure.fields() {
+        let key = clean_field_key(field.name());
+        let field_path = join_path(
+            parent_path,
+            if key.is_empty() {
+                field.type_name()
+            } else {
+                &key
+            },
+        );
+        if let Some(TagFieldData::TagReference(reference)) = field.value()
+            && let Some((group_tag, path)) = reference.group_tag_and_name
+            && !path.is_empty()
+            && !path.eq_ignore_ascii_case("none")
+        {
+            values.push(ReferenceValue {
+                field_path,
+                group_tag,
+                tag_path: path,
+            });
+            continue;
+        }
+        if let Some(nested) = field.as_struct() {
+            collect_reference_values(nested, &field_path, values);
+        } else if let Some(block) = field.as_block() {
+            for (index, element) in block.iter().enumerate() {
+                collect_reference_values(element, &format!("{field_path}[{index}]"), values);
+            }
+        } else if let Some(array) = field.as_array() {
+            for (index, element) in array.iter().enumerate() {
+                collect_reference_values(element, &format!("{field_path}[{index}]"), values);
+            }
+        }
+    }
+}
+
+fn validate_reference_fidelity(
+    source: &TagFile,
+    target: &TagFile,
+    source_groups: &GameTagIndex,
+    target_groups: &GameTagIndex,
+    group_name: &str,
+    source_game: &str,
+    target_game: &str,
+    mapping_catalog: &ConversionMappingCatalog,
+    report: &mut TagConversionReport,
+) -> Result<(), String> {
+    let mut source_values = Vec::new();
+    collect_reference_values(source.root(), "", &mut source_values);
+    let mut expected = HashSet::<(u32, String, String)>::new();
+    for reference in source_values {
+        if let Some(reason) = mapping_catalog.reference_drop_reason(
+            group_name,
+            source_game,
+            target_game,
+            &reference.field_path,
+        ) {
+            report.issues.push(ConversionIssue {
+                kind: ConversionIssueKind::Warning,
+                path: reference.field_path,
+                message: format!(
+                    "Target schema has no safe slot for reference {}: {reason}",
+                    reference.tag_path
+                ),
+            });
+            continue;
+        }
+        // The source profile's `_meta.json` does not name this group, so there is
+        // nothing to look the target up by. Nothing correct can be done with it,
+        // and refusing the whole tag over one unnameable reference is worse than
+        // reporting it — the same reasoning as a target that has no such class.
+        let Some(source_group_name) = source_groups.by_tag.get(&reference.group_tag) else {
+            report.issues.push(ConversionIssue {
+                kind: ConversionIssueKind::Warning,
+                path: reference.field_path.clone(),
+                message: format!(
+                    "{source_game} does not name group {}, so the reference to {} was                      left empty — reconnect it by hand",
+                    format_group_tag(reference.group_tag),
+                    reference.tag_path,
+                ),
+            });
+            report.dropped_references += 1;
+            continue;
+        };
+        let Some((target_group, _)) = resolve_target_group(
+            source_group_name,
+            target_groups,
+            mapping_catalog,
+            source_game,
+            target_game,
+        ) else {
+            // The target game has no such tag class at all. No correct
+            // implementation could preserve this reference, so refusing the
+            // whole tag over it says nothing about the conversion's quality —
+            // it just makes the tag unconvertible.
+            //
+            // Halo Reach's `model` points at a `render_model`; Campaign Evolved
+            // replaced Halo's render geometry with Unreal skeletal meshes and
+            // defines no such group. Every Reach model refuses on that, and
+            // will keep refusing however good the field matching gets.
+            //
+            // So report it, precisely enough to act on: the field to fill in
+            // and the tag path that used to be there.
+            report.issues.push(ConversionIssue {
+                kind: ConversionIssueKind::Warning,
+                path: reference.field_path,
+                message: format!(
+                    "{target_game} has no {source_group_name} group, so this reference to {} \
+                     was left empty — reconnect it by hand if the target needs one",
+                    reference.tag_path,
+                ),
+            });
+            report.dropped_references += 1;
+            continue;
+        };
+        expected.insert((target_group, reference.tag_path, reference.field_path));
+    }
+
+    let mut actual_values = Vec::new();
+    collect_reference_values(target.root(), "", &mut actual_values);
+    let actual = actual_values
+        .into_iter()
+        .map(|value| (value.group_tag, value.tag_path))
+        .collect::<HashSet<_>>();
+
+    // A reference that did not arrive is one of two very different things, and
+    // this check is only worth having if it can tell them apart.
+    //
+    // If the conversion already reported a problem at that field, the target
+    // simply has no home for it -- Campaign Evolved's biped declares no
+    // fireteam name, Reach's does. That is a fact about the games, and the
+    // author reconnects what they need.
+    //
+    // If nothing was reported, the field matched and the value vanished
+    // anyway. That is a bug in field matching, and it is what this check
+    // exists to catch, so it stays fatal.
+    let mut unexplained = Vec::new();
+    for (group, tag_path, field_path) in expected {
+        if actual.contains(&(group, tag_path.clone())) {
+            continue;
+        }
+        let explained = report.issues.iter().any(|issue| {
+            crate::TagFieldPath::parse(&clean_field_key(&issue.path))
+                .is_ancestor_of(&crate::TagFieldPath::parse(&clean_field_key(&field_path)))
+        });
+        if explained {
+            report.dropped_references += 1;
+            report.issues.push(ConversionIssue {
+                kind: ConversionIssueKind::Warning,
+                path: field_path,
+                message: format!(
+                    "Reference to {}:{tag_path} was left empty — reconnect it by hand if the                      target needs one",
+                    format_group_tag(group),
+                ),
+            });
+            continue;
+        }
+        unexplained.push(format!("{}:{tag_path} (at {field_path})", format_group_tag(group)));
+    }
+
+    if unexplained.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Conversion would lose {} tag reference(s) the target does have a field for,              which means field matching went wrong rather than the games differing: {}",
+            unexplained.len(),
+            unexplained.join(", ")
+        ))
+    }
+}
+
+fn reset_tag_to_defaults(
+    tag: &mut TagFile,
+    engine_managed: Option<&SchemaFieldAliases>,
+) -> Result<(), String> {
+    reset_struct_to_defaults(tag.root_mut(), "", engine_managed)?;
+    tag.remove_dependency_list();
+    tag.remove_import_info();
+    tag.remove_asset_depot_storage();
+    Ok(())
+}
+
+/// Is this struct an inlined render method?
+///
+/// `options`, `parameters` and `postprocess` appear together in the render
+/// method and nowhere else, which makes the trio a reliable signature where the
+/// struct's own name is not: Reach hides the whole body in an unnamed `tmpl`
+/// hole, and a shipped tag's expanded layout gives the fields no distinguishing
+/// parent to test against.
+fn is_render_method_struct(value: TagStruct<'_>) -> bool {
+    let mut options = false;
+    let mut parameters = false;
+    let mut postprocess = false;
+    for field in value.fields() {
+        match clean_field_key(field.name()).as_str() {
+            "options" => options = true,
+            "parameters" => parameters = true,
+            "postprocess" | "postprocess definition" => postprocess = true,
+            _ => {}
+        }
+    }
+    options && parameters && postprocess
+}
+
+fn reset_struct_to_defaults(
+    mut value: TagStructMut<'_>,
+    path: &str,
+    engine_managed: Option<&SchemaFieldAliases>,
+) -> Result<(), String> {
+    let field_count = value.as_ref().fields().count();
+    // A render method's own `definition` reference survives the reset.
+    //
+    // The fx groups inline a render method into the tag, and which one it is
+    // rides on a single `rmdf` reference. A Reach particle with that reference
+    // empty crashes the mod tools, and the schema cannot protect it: Reach keeps
+    // the whole render method inside a `tmpl` hole, so no fx schema declares a
+    // `definition` field at all and neither the `*` nor the `!` annotation is
+    // available. A kit-authored template names it only because its *shipped*
+    // layout expands the hole.
+    //
+    // Recognised by shape, not by group or by name alone — `definition` is far
+    // too common to blanket-preserve, but a struct carrying `options`,
+    // `parameters` and `postprocess` together is a render method and nothing
+    // else. A source with its own `definition` still overwrites this during
+    // conversion, so it only decides what happens when none can be supplied.
+    let render_method = is_render_method_struct(value.as_ref());
+    for ordinal in 0..field_count {
+        let Some(mut field) = value.field_at_mut(ordinal) else {
+            continue;
+        };
+        if render_method
+            && field.as_ref().field_type() == TagFieldType::TagReference
+            && clean_field_key(field.as_ref().name()) == "definition"
+        {
+            continue;
+        }
+        // Engine-managed fields keep whatever the kit-authored template put
+        // there. Zeroing them writes a value nothing shipped: every Halo Reach
+        // particle carries `version!` 2 (one carries 1, none carries 0), and a
+        // converted particle with 0 crashed the Reach mod tools. The template is
+        // a real tag the kit wrote, so its own answer is the best one available —
+        // and a source field of the same name still overwrites it during
+        // conversion, so this only affects fields the source does not have.
+        //
+        // The same reasoning `apply_editing_kit_mcc_header` already records for
+        // the file header: `TagFile::new` zeroes it, which the library parses
+        // happily and the native tools reject.
+        let key = clean_field_key(field.as_ref().name());
+        // Also skipped: `*` editor-owned fields. A shipped Reach particle's
+        // `actual shader?` carries `definition*` -> `shaders\particle
+        // .render_method_definition`, and a particle with no render-method
+        // definition crashes the mod tools. Halo 3 cannot supply that value —
+        // its own render method is inlined under different field names — so the
+        // kit template's is the only correct one available. `*` means the editor
+        // derives this, not the author, which is precisely when the template
+        // beats a zero.
+        if engine_managed.is_some_and(|table| {
+            table.is_engine_managed(&key) || table.is_editor_owned(&key)
+        }) {
+            continue;
+        }
+        let field_path = join_path(
+            path,
+            if key.is_empty() {
+                field.as_ref().type_name()
+            } else {
+                &key
+            },
+        );
+        match field.as_ref().field_type() {
+            TagFieldType::Struct => {
+                if let Some(nested) = field.as_struct_mut() {
+                    reset_struct_to_defaults(nested, &field_path, engine_managed)?;
+                }
+            }
+            TagFieldType::Block => {
+                if let Some(mut block) = field.as_block_mut() {
+                    block.clear();
+                }
+            }
+            TagFieldType::Array => {
+                if let Some(mut array) = field.as_array_mut() {
+                    for index in 0..array.len() {
+                        if let Some(element) = array.element_mut(index) {
+                            reset_struct_to_defaults(element, &format!("{field_path}[{index}]"), engine_managed)?;
+                        }
+                    }
+                }
+            }
+            TagFieldType::PageableResource => {
+                if field
+                    .as_ref()
+                    .as_resource()
+                    .is_some_and(|resource| !matches!(resource.kind(), TagResourceKind::Null))
+                {
+                    return Err(format!(
+                        "Native template has a non-null pageable resource at {field_path}"
+                    ));
+                }
+            }
+            TagFieldType::ApiInterop => {
+                field
+                    .set(TagFieldData::ApiInterop(ApiInteropData::reset()))
+                    .map_err(|error| format!("Could not reset {field_path}: {error:?}"))?;
+            }
+            _ => {
+                let Some(current) = field.as_ref().value() else {
+                    continue;
+                };
+                if let Some(default) = default_field_value(current) {
+                    field
+                        .set(default)
+                        .map_err(|error| format!("Could not reset {field_path}: {error:?}"))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A newly allocated schema struct is byte-zeroed, but a block index uses -1
+/// as its null value. Native post-processing treats zero as a real index, so
+/// leaving a target-only index at the allocator default can make an otherwise
+/// valid converted tag assert while loading.
+fn initialize_block_index_defaults(mut value: TagStructMut<'_>) {
+    let field_count = value.as_ref().fields().count();
+    for ordinal in 0..field_count {
+        let Some(mut field) = value.field_at_mut(ordinal) else {
+            continue;
+        };
+        match field.as_ref().field_type() {
+            TagFieldType::Struct => {
+                if let Some(nested) = field.as_struct_mut() {
+                    initialize_block_index_defaults(nested);
+                }
+            }
+            TagFieldType::Array => {
+                if let Some(mut array) = field.as_array_mut() {
+                    for index in 0..array.len() {
+                        if let Some(element) = array.element_mut(index) {
+                            initialize_block_index_defaults(element);
+                        }
+                    }
+                }
+            }
+            TagFieldType::CharBlockIndex => {
+                let _ = field.set(TagFieldData::CharBlockIndex(-1));
+            }
+            TagFieldType::CustomCharBlockIndex => {
+                let _ = field.set(TagFieldData::CustomCharBlockIndex(-1));
+            }
+            TagFieldType::ShortBlockIndex => {
+                let _ = field.set(TagFieldData::ShortBlockIndex(-1));
+            }
+            TagFieldType::CustomShortBlockIndex => {
+                let _ = field.set(TagFieldData::CustomShortBlockIndex(-1));
+            }
+            TagFieldType::LongBlockIndex => {
+                let _ = field.set(TagFieldData::LongBlockIndex(-1));
+            }
+            TagFieldType::CustomLongBlockIndex => {
+                let _ = field.set(TagFieldData::CustomLongBlockIndex(-1));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn default_field_value(value: TagFieldData) -> Option<TagFieldData> {
+    Some(match value {
+        TagFieldData::String(_) => TagFieldData::String(String::new()),
+        TagFieldData::LongString(_) => TagFieldData::LongString(String::new()),
+        TagFieldData::StringId(_) => TagFieldData::StringId(StringIdData {
+            string: String::new(),
+        }),
+        TagFieldData::OldStringId(_) => TagFieldData::OldStringId(StringIdData {
+            string: String::new(),
+        }),
+        TagFieldData::TagReference(_) => TagFieldData::TagReference(TagReferenceData {
+            group_tag_and_name: None,
+        }),
+        TagFieldData::Data(_) => TagFieldData::Data(Vec::new()),
+        TagFieldData::ApiInterop(_) => TagFieldData::ApiInterop(ApiInteropData::reset()),
+        TagFieldData::CharInteger(_) => TagFieldData::CharInteger(0),
+        TagFieldData::ShortInteger(_) => TagFieldData::ShortInteger(0),
+        TagFieldData::LongInteger(_) => TagFieldData::LongInteger(0),
+        TagFieldData::Int64Integer(_) => TagFieldData::Int64Integer(0),
+        TagFieldData::ByteInteger(_) => TagFieldData::ByteInteger(0),
+        TagFieldData::WordInteger(_) => TagFieldData::WordInteger(0),
+        TagFieldData::DwordInteger(_) => TagFieldData::DwordInteger(0),
+        TagFieldData::QwordInteger(_) => TagFieldData::QwordInteger(0),
+        TagFieldData::Tag(_) => TagFieldData::Tag(0),
+        TagFieldData::CharEnum { .. } => TagFieldData::CharEnum {
+            value: 0,
+            name: None,
+        },
+        TagFieldData::ShortEnum { .. } => TagFieldData::ShortEnum {
+            value: 0,
+            name: None,
+        },
+        TagFieldData::LongEnum { .. } => TagFieldData::LongEnum {
+            value: 0,
+            name: None,
+        },
+        TagFieldData::ByteFlags { .. } => TagFieldData::ByteFlags {
+            value: 0,
+            names: Vec::new(),
+        },
+        TagFieldData::WordFlags { .. } => TagFieldData::WordFlags {
+            value: 0,
+            names: Vec::new(),
+        },
+        TagFieldData::LongFlags { .. } => TagFieldData::LongFlags {
+            value: 0,
+            names: Vec::new(),
+        },
+        TagFieldData::ByteBlockFlags(_) => TagFieldData::ByteBlockFlags(0),
+        TagFieldData::WordBlockFlags(_) => TagFieldData::WordBlockFlags(0),
+        TagFieldData::LongBlockFlags(_) => TagFieldData::LongBlockFlags(0),
+        TagFieldData::CharBlockIndex(_) => TagFieldData::CharBlockIndex(-1),
+        TagFieldData::CustomCharBlockIndex(_) => TagFieldData::CustomCharBlockIndex(-1),
+        TagFieldData::ShortBlockIndex(_) => TagFieldData::ShortBlockIndex(-1),
+        TagFieldData::CustomShortBlockIndex(_) => TagFieldData::CustomShortBlockIndex(-1),
+        TagFieldData::LongBlockIndex(_) => TagFieldData::LongBlockIndex(-1),
+        TagFieldData::CustomLongBlockIndex(_) => TagFieldData::CustomLongBlockIndex(-1),
+        TagFieldData::Angle(_) => TagFieldData::Angle(0.0),
+        TagFieldData::Real(_) => TagFieldData::Real(0.0),
+        TagFieldData::RealSlider(_) => TagFieldData::RealSlider(0.0),
+        TagFieldData::RealFraction(_) => TagFieldData::RealFraction(0.0),
+        TagFieldData::Point2d(_) => TagFieldData::Point2d(Default::default()),
+        TagFieldData::Rectangle2d(_) => TagFieldData::Rectangle2d(Default::default()),
+        TagFieldData::RealPoint2d(_) => TagFieldData::RealPoint2d(Default::default()),
+        TagFieldData::RealPoint3d(_) => TagFieldData::RealPoint3d(Default::default()),
+        TagFieldData::RealVector2d(_) => TagFieldData::RealVector2d(Default::default()),
+        TagFieldData::RealVector3d(_) => TagFieldData::RealVector3d(Default::default()),
+        TagFieldData::RealQuaternion(_) => TagFieldData::RealQuaternion(Default::default()),
+        TagFieldData::RealEulerAngles2d(_) => TagFieldData::RealEulerAngles2d(Default::default()),
+        TagFieldData::RealEulerAngles3d(_) => TagFieldData::RealEulerAngles3d(Default::default()),
+        TagFieldData::RealPlane2d(_) => TagFieldData::RealPlane2d(Default::default()),
+        TagFieldData::RealPlane3d(_) => TagFieldData::RealPlane3d(Default::default()),
+        TagFieldData::RgbColor(_) => TagFieldData::RgbColor(Default::default()),
+        TagFieldData::ArgbColor(_) => TagFieldData::ArgbColor(Default::default()),
+        TagFieldData::RealRgbColor(_) => TagFieldData::RealRgbColor(Default::default()),
+        TagFieldData::RealArgbColor(_) => TagFieldData::RealArgbColor(Default::default()),
+        TagFieldData::RealHsvColor(_) => TagFieldData::RealHsvColor(Default::default()),
+        TagFieldData::RealAhsvColor(_) => TagFieldData::RealAhsvColor(Default::default()),
+        TagFieldData::ShortIntegerBounds(_) => TagFieldData::ShortIntegerBounds(Default::default()),
+        TagFieldData::AngleBounds(_) => TagFieldData::AngleBounds(Default::default()),
+        TagFieldData::RealBounds(_) => TagFieldData::RealBounds(Default::default()),
+        TagFieldData::FractionBounds(_) => TagFieldData::FractionBounds(Default::default()),
+        TagFieldData::Custom(bytes) => TagFieldData::Custom(vec![0; bytes.len()]),
+    })
+}
+
+/// One cleaned field name to trace through the matcher, from `BLAM_DEBUG_FIELD`.
+///
+/// A field that fails to map is the converter's characteristic failure, and its
+/// four match clauses can each look satisfied in isolation while the whole
+/// condition does not hold. This prints what the matcher sees instead.
+static DEBUG_FIELD: std::sync::LazyLock<Option<String>> =
+    std::sync::LazyLock::new(|| std::env::var("BLAM_DEBUG_FIELD").ok());
+
+fn convert_struct(
+    source: TagStruct<'_>,
+    mut target: TagStructMut<'_>,
+    path: &str,
+    root: bool,
+    context: &mut ConversionContext<'_>,
+) {
+    let source_guid = source.definition().guid();
+    let target_guid = target.as_ref().definition().guid();
+    let source_struct_name = source.definition().name().to_owned();
+    let target_struct_name = target.as_ref().definition().name().to_owned();
+    // Two all-zero GUIDs are not evidence of anything: every classic struct has
+    // one. Require a real GUID before treating the pair as the same type, which
+    // is what unlocks empty-name matching and verbatim `Data`/`Custom` copies.
+    let same_guid = source_guid == target_guid && source_guid != [0u8; 16];
+    // A second identity key, for the profiles that have no GUIDs at all.
+    //
+    // Every Halo 1 and Halo 2 struct carries an all-zero GUID, so `same_guid` is
+    // permanently false for a classic pair and the verbatim `Data`/`Custom` copy
+    // path is unreachable — which is why a Halo 1 bitmap's `processed pixel data`
+    // was refused on the way to Halo 2 even though both games store the same
+    // bytes in the same field. Wire-identical struct trees prove the pair
+    // describes the same thing without needing a GUID to say so.
+    //
+    // Used *only* to unlock the opaque-copy path. Empty-name matching still
+    // requires a real GUID, because congruence is a weaker claim: it says the
+    // shapes agree, not that the structs share a lineage.
+    let structurally_identical = !same_guid && {
+        let key = (source.definition().index() as u32, target.as_ref().definition().index() as u32);
+        match context.wire_identical.get(&key) {
+            Some(known) => *known,
+            None => {
+                let identical = crate::struct_trees_are_wire_identical(
+                    source.definition(),
+                    target.as_ref().definition(),
+                )
+                .is_ok();
+                context.wire_identical.insert(key, identical);
+                identical
+            }
+        }
+    };
+    let mut reparented_fields = if context.group_name == "model_animation_graph"
+        && path.contains("animations")
+        && source
+            .fields()
+            .all(|field| !clean_field_key(field.name()).starts_with("shared animation data"))
+    {
+        convert_local_animation_payload(source, &mut target, path, context)
+    } else {
+        HashSet::new()
+    };
+    if root && context.group_name.eq_ignore_ascii_case("weapon") {
+        reparented_fields.extend(convert_weapon_melee_layout(source, &mut target, context));
+    }
+    if root && context.group_name.eq_ignore_ascii_case("effect") {
+        reparented_fields.extend(convert_effect_looping_sound_layout(
+            source,
+            &mut target,
+            context,
+        ));
+    }
+    reparented_fields.extend(report_legacy_explicit_function(source, &target, path, context));
+    if root && context.group_name.eq_ignore_ascii_case("vehicle") {
+        reparented_fields.extend(convert_vehicle_physics_types(source, &mut target, context));
+    }
+    if root && context.group_name.eq_ignore_ascii_case("damage_effect") {
+        match convert_h3_player_responses_to_reach_companions(source, &mut target, context) {
+            Ok(fields) => reparented_fields.extend(fields),
+            Err(error) => context.fatal_error = Some(error),
+        }
+    }
+    let target_fields = target
+        .as_ref()
+        .fields()
+        .enumerate()
+        .map(|(ordinal, field)| TargetFieldInfo {
+            ordinal,
+            name: field.name().to_owned(),
+            key: clean_field_key(field.name()),
+            field_type: field.field_type(),
+        })
+        .collect::<Vec<_>>();
+    let mut used = vec![false; target_fields.len()];
+
+    for source_field in source.fields() {
+        let key = clean_field_key(source_field.name());
+        // `BLAM_DEBUG_FIELD=<cleaned source name>` dumps every target candidate for
+        // that one field with each half of the match condition evaluated separately.
+        // Reasoning about the clauses in isolation proved every precondition true
+        // while the match still did not fire, so print what the matcher itself sees
+        // rather than what the schemas say it should. Read once — this is the
+        // matcher's inner loop, once per source field per struct element.
+        if DEBUG_FIELD.as_deref() == Some(key.as_str()) {
+            eprintln!(
+                "DEBUG {key:?}: source struct {source_struct_name:?} -> target struct \
+                 {target_struct_name:?} (target guid {}), {} candidate(s)",
+                target_guid
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
+                target_fields.len(),
+            );
+            for (index, candidate) in target_fields.iter().enumerate() {
+                eprintln!(
+                    "   cand[{index}] used={} name={:?} key={:?} name_match={} alias_target={} \
+                     alias_source={} shape={}",
+                    used[index],
+                    candidate.name,
+                    candidate.key,
+                    field_names_match(source_field.name(), &candidate.name),
+                    context.target_field_aliases.matches(
+                        target_guid,
+                        &target_struct_name,
+                        &candidate.key,
+                        &key,
+                    ),
+                    context.source_field_aliases.matches(
+                        source_guid,
+                        &source_struct_name,
+                        &key,
+                        &candidate.key,
+                    ),
+                    compatible_field_shapes(source_field.field_type(), candidate.field_type),
+                );
+            }
+        }
+        let matched = target_fields.iter().enumerate().find(|(index, candidate)| {
+            !used[*index]
+                && (field_names_match(source_field.name(), &candidate.name)
+                    || context
+                        .target_field_aliases
+                        .matches(target_guid, &target_struct_name, &candidate.key, &key)
+                    || context
+                        .source_field_aliases
+                        .matches(source_guid, &source_struct_name, &key, &candidate.key)
+                    || context
+                        .mapping_catalog
+                        .field_names_match(FieldMappingRequest {
+                            group: context.group_name,
+                            source_game: context.source_game,
+                            target_game: context.target_game,
+                            source_guid,
+                            target_guid,
+                            source_name: &key,
+                            target_name: &candidate.key,
+                        }))
+                && (compatible_field_shapes(source_field.field_type(), candidate.field_type)
+                    || compatible_semantic_field(
+                        context.group_name,
+                        &key,
+                        source_field.field_type(),
+                        candidate.field_type,
+                    )
+                    || compatible_function_curve_field(
+                        &key,
+                        &candidate.key,
+                        source_field.field_type(),
+                        candidate.field_type,
+                    ))
+                && (!key.is_empty() || same_guid)
+        });
+        let field_path = join_path(
+            path,
+            if key.is_empty() {
+                source_field.type_name()
+            } else {
+                &key
+            },
+        );
+        let Some((target_index, target_info)) = matched else {
+            if !reparented_fields.contains(&key) {
+                record_unmatched_field_values(source_field, &field_path, context);
+            }
+            continue;
+        };
+        used[target_index] = true;
+        if key != target_info.key {
+            context.report.mapped_aliases += 1;
+        }
+        if root {
+            context.root_matches += 1;
+        }
+        let Some(target_field) = target.field_at_mut(target_info.ordinal) else {
+            continue;
+        };
+        convert_field(
+            source_field,
+            target_field,
+            &field_path,
+            same_guid || structurally_identical,
+            context,
+        );
+    }
+
+    let defaulted = used
+        .iter()
+        .zip(&target_fields)
+        .filter(|(used, field)| !**used && is_reportable_target_default(field.field_type))
+        .count();
+    context.report.defaulted_target += defaulted;
+}
+
+fn convert_weapon_melee_layout(
+    source: TagStruct<'_>,
+    target: &mut TagStructMut<'_>,
+    context: &mut ConversionContext<'_>,
+) -> HashSet<String> {
+    const LEGACY_GAMES: &[&str] = &["halo3_mcc", "halo3odst_mcc"];
+    const BLOCK_GAMES: &[&str] = &["haloreach_mcc", "halo4_mcc", "halo2amp_mcc"];
+    let legacy_to_block =
+        LEGACY_GAMES.contains(&context.source_game) && BLOCK_GAMES.contains(&context.target_game);
+    let block_to_legacy =
+        BLOCK_GAMES.contains(&context.source_game) && LEGACY_GAMES.contains(&context.target_game);
+    if !legacy_to_block && !block_to_legacy {
+        return HashSet::new();
+    }
+
+    if legacy_to_block {
+        convert_legacy_melee_to_block(source, target, context)
+    } else {
+        convert_block_melee_to_legacy(source, target, context)
+    }
+}
+
+type ReferencePair = (Option<(u32, String)>, Option<(u32, String)>);
+
+fn field_ordinal_by_key(structure: TagStruct<'_>, key: &str) -> Option<usize> {
+    structure
+        .fields()
+        .enumerate()
+        .find(|(_, field)| clean_field_key(field.name()) == clean_field_key(key))
+        .map(|(ordinal, _)| ordinal)
+}
+
+fn struct_field_by_key<'a>(structure: TagStruct<'a>, key: &str) -> Option<TagStruct<'a>> {
+    structure
+        .fields()
+        .find(|field| clean_field_key(field.name()) == clean_field_key(key))?
+        .as_struct()
+}
+
+fn reference_by_key(structure: TagStruct<'_>, key: &str) -> Option<(u32, String)> {
+    let field = structure
+        .fields()
+        .find(|field| clean_field_key(field.name()) == clean_field_key(key))?;
+    let TagFieldData::TagReference(reference) = field.value()? else {
+        return None;
+    };
+    reference
+        .group_tag_and_name
+        .filter(|(_, path)| !path.is_empty() && !path.eq_ignore_ascii_case("none"))
+}
+
+fn push_unique_reference_pair(pairs: &mut Vec<ReferencePair>, pair: ReferencePair) {
+    if (pair.0.is_some() || pair.1.is_some()) && !pairs.contains(&pair) {
+        pairs.push(pair);
+    }
+}
+
+fn set_mapped_reference(
+    target: &mut TagStructMut<'_>,
+    target_key: &str,
+    value: Option<(u32, String)>,
+    path: &str,
+    context: &mut ConversionContext<'_>,
+) {
+    let Some((source_group, name)) = value else {
+        return;
+    };
+    let Some(group_name) = context.source_groups.by_tag.get(&source_group) else {
+        record_unsupported(
+            context,
+            path.to_owned(),
+            format!(
+                "Source reference group {} is unknown",
+                format_group_tag(source_group)
+            ),
+        );
+        return;
+    };
+    let Some((target_group, _)) = resolve_target_group(
+        group_name,
+        context.target_groups,
+        context.mapping_catalog,
+        context.source_game,
+        context.target_game,
+    ) else {
+        record_unsupported(
+            context,
+            path.to_owned(),
+            format!("Target profile has no {group_name} reference group"),
+        );
+        return;
+    };
+    let Some(ordinal) = field_ordinal_by_key(target.as_ref(), target_key) else {
+        record_unsupported(
+            context,
+            path.to_owned(),
+            format!("Target melee layout has no {target_key} field"),
+        );
+        return;
+    };
+    let Some(mut field) = target.field_at_mut(ordinal) else {
+        return;
+    };
+    set_converted(
+        &mut field,
+        TagFieldData::TagReference(TagReferenceData {
+            group_tag_and_name: Some((target_group, name)),
+        }),
+        path,
+        source_group == target_group,
+        context,
+    );
+}
+
+fn convert_legacy_melee_to_block(
+    source: TagStruct<'_>,
+    target: &mut TagStructMut<'_>,
+    context: &mut ConversionContext<'_>,
+) -> HashSet<String> {
+    let Some(source_melee) = struct_field_by_key(source, "melee damage parameters") else {
+        return HashSet::new();
+    };
+    let Some(target_ordinal) = field_ordinal_by_key(target.as_ref(), "melee damage parameters")
+    else {
+        return HashSet::new();
+    };
+    let mut pairs = Vec::new();
+    push_unique_reference_pair(
+        &mut pairs,
+        (
+            reference_by_key(source, "player melee damage"),
+            reference_by_key(source, "player melee response"),
+        ),
+    );
+    for prefix in ["1st hit", "2nd hit", "3rd hit"] {
+        push_unique_reference_pair(
+            &mut pairs,
+            (
+                reference_by_key(source_melee, &format!("{prefix} melee damage")),
+                reference_by_key(source_melee, &format!("{prefix} melee response")),
+            ),
+        );
+    }
+    let unique_pair_count = pairs.len();
+    if pairs.is_empty() && struct_has_meaningful_value(source_melee) {
+        pairs.push((None, None));
+    }
+
+    let Some(mut target_field) = target.field_at_mut(target_ordinal) else {
+        return HashSet::new();
+    };
+    let Some(mut target_block) = target_field.as_block_mut() else {
+        return HashSet::new();
+    };
+    target_block.clear();
+    let maximum = target_block.definition().max_count() as usize;
+    let count = pairs.len().min(maximum);
+    for (index, pair) in pairs.iter().take(count).cloned().enumerate() {
+        let target_index = target_block.add_element();
+        if let Some(element) = target_block.element_mut(target_index) {
+            initialize_block_index_defaults(element);
+        }
+        if let Some(element) = target_block.element_mut(target_index) {
+            convert_struct(
+                source_melee,
+                element,
+                &format!("melee damage parameters[{index}]"),
+                false,
+                context,
+            );
+        }
+        let mut removed_unsupported = 0;
+        context.report.issues.retain(|issue| {
+            let transferred_hit = issue
+                .path
+                .starts_with(&format!("melee damage parameters[{index}]"))
+                && ["1st hit melee", "2nd hit melee", "3rd hit melee"]
+                    .iter()
+                    .any(|name| issue.path.contains(name));
+            if transferred_hit && issue.kind == ConversionIssueKind::Unsupported {
+                removed_unsupported += 1;
+            }
+            !transferred_hit
+        });
+        context.report.unsupported_source = context
+            .report
+            .unsupported_source
+            .saturating_sub(removed_unsupported);
+        let Some(mut element) = target_block.element_mut(target_index) else {
+            continue;
+        };
+        set_mapped_reference(
+            &mut element,
+            "melee damage",
+            pair.0,
+            &format!("melee damage parameters[{index}]/melee damage"),
+            context,
+        );
+        set_mapped_reference(
+            &mut element,
+            "melee response",
+            pair.1,
+            &format!("melee damage parameters[{index}]/melee response"),
+            context,
+        );
+    }
+    if unique_pair_count > maximum {
+        let omitted = unique_pair_count - maximum;
+        context.report.truncated += omitted;
+        context.report.issues.push(ConversionIssue {
+            kind: ConversionIssueKind::Truncated,
+            path: "melee damage parameters".to_owned(),
+            message: format!("Target melee block limit omitted {omitted} unique damage pair(s)"),
+        });
+    }
+    HashSet::from([
+        "player melee damage".to_owned(),
+        "player melee response".to_owned(),
+        "melee damage parameters".to_owned(),
+    ])
+}
+
+fn convert_block_melee_to_legacy(
+    source: TagStruct<'_>,
+    target: &mut TagStructMut<'_>,
+    context: &mut ConversionContext<'_>,
+) -> HashSet<String> {
+    let Some(source_field) = source
+        .fields()
+        .find(|field| clean_field_key(field.name()) == "melee damage parameters")
+    else {
+        return HashSet::new();
+    };
+    let Some(source_block) = source_field.as_block() else {
+        return HashSet::new();
+    };
+    let pairs = source_block
+        .iter()
+        .map(|element| {
+            (
+                reference_by_key(element, "melee damage"),
+                reference_by_key(element, "melee response"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let Some(target_ordinal) = field_ordinal_by_key(target.as_ref(), "melee damage parameters")
+    else {
+        return HashSet::new();
+    };
+    if let Some(first) = source_block.element(0) {
+        let Some(mut target_field) = target.field_at_mut(target_ordinal) else {
+            return HashSet::new();
+        };
+        let Some(target_melee) = target_field.as_struct_mut() else {
+            return HashSet::new();
+        };
+        convert_struct(
+            first,
+            target_melee,
+            "melee damage parameters",
+            false,
+            context,
+        );
+    }
+    for (index, pair) in pairs.into_iter().take(3).enumerate() {
+        let Some(mut target_field) = target.field_at_mut(target_ordinal) else {
+            continue;
+        };
+        let Some(mut target_melee) = target_field.as_struct_mut() else {
+            continue;
+        };
+        let prefix = ["1st hit", "2nd hit", "3rd hit"][index];
+        set_mapped_reference(
+            &mut target_melee,
+            &format!("{prefix} melee damage"),
+            pair.0,
+            &format!("melee damage parameters/{prefix} melee damage"),
+            context,
+        );
+        set_mapped_reference(
+            &mut target_melee,
+            &format!("{prefix} melee response"),
+            pair.1,
+            &format!("melee damage parameters/{prefix} melee response"),
+            context,
+        );
+    }
+    HashSet::from(["melee damage parameters".to_owned()])
+}
+
+fn field_by_key<'a>(structure: TagStruct<'a>, key: &str) -> Option<TagField<'a>> {
+    structure
+        .fields()
+        .find(|field| clean_field_key(field.name()) == clean_field_key(key))
+}
+
+/// Copy every value `target` can hold from a *flat* `source` struct, descending
+/// into the target's nested structs.
+///
+/// The ordinary matcher pairs fields within one struct level. This is for the case
+/// where the target has grouped into sub-structs what the source keeps flat — Halo
+/// 3 files `overdampen cusp angle` under `steering control` and `turn rate` under
+/// `turning control`, both of which sit bare on a Halo 2 vehicle root. Matching is
+/// still strictly by cleaned field name, so nothing is paired positionally.
+///
+/// Every key it consumes is recorded, so the caller can tell the main matcher not
+/// to report those source fields as unmatched.
+fn fill_nested_target_from_flat_source(
+    source: TagStruct<'_>,
+    target: &mut TagStructMut<'_>,
+    path: &str,
+    consumed: &mut HashSet<String>,
+    context: &mut ConversionContext<'_>,
+) {
+    let targets = target
+        .as_ref()
+        .fields()
+        .enumerate()
+        .map(|(ordinal, field)| (ordinal, clean_field_key(field.name()), field.field_type()))
+        .collect::<Vec<_>>();
+    for (ordinal, key, field_type) in targets {
+        if field_type == TagFieldType::Struct {
+            let child_path = join_path(path, &key);
+            let Some(mut field) = target.field_at_mut(ordinal) else {
+                continue;
+            };
+            let Some(mut child) = field.as_struct_mut() else {
+                continue;
+            };
+            fill_nested_target_from_flat_source(source, &mut child, &child_path, consumed, context);
+            continue;
+        }
+        if key.is_empty() {
+            continue;
+        }
+        let Some(source_field) = field_by_key(source, &key) else {
+            continue;
+        };
+        if !compatible_field_shapes(source_field.field_type(), field_type) {
+            continue;
+        }
+        let field_path = join_path(path, &key);
+        if let Some(target_field) = target.field_at_mut(ordinal) {
+            convert_field(source_field, target_field, &field_path, false, context);
+            consumed.insert(key);
+        }
+    }
+}
+
+/// Report a Halo 2 version-0 `mapping_function` that the target can only hold as a
+/// serialized blob, and say so instead of guessing at one.
+///
+/// H2's `mapping_function` is a versioned struct: v1 holds the serialized
+/// `c_function_definition` (which [`convert_function_mapping`] carries across, and
+/// which is 9,193 of the 10,027 mappings in the H2EK corpus), while **v0 spells the
+/// curve out as explicit fields** — `function type`, `flags`, four colours and a
+/// `values` block of reals. Halo 3 onward have only the blob form, so a v0 curve
+/// would have to be synthesized.
+///
+/// Deliberately not synthesized. Surveying the 834 v0 mappings the kit ships, the
+/// `function type` byte takes values of **40 and 24**, which are not valid
+/// `FunctionType` discriminants at all (the enum runs 0..=10) — so v0's type byte
+/// cannot be assumed to be the modern enum, and the flat `values` list does not
+/// have a derivable mapping onto the per-type compact structures either (a
+/// `Constant` appears with 0, 2 and 12 values). Anything built from that would be a
+/// guess, and a curve that parses but describes the wrong shape silently changes
+/// how a particle looks — worse than one the user is told to reauthor.
+///
+/// Returns the source keys it consumed so the ordinary matcher does not also report
+/// each field individually; one issue per curve is the useful granularity.
+fn report_legacy_explicit_function(
+    source: TagStruct<'_>,
+    target: &TagStructMut<'_>,
+    path: &str,
+    context: &mut ConversionContext<'_>,
+) -> HashSet<String> {
+    let mut consumed = HashSet::new();
+    let Some(function_type) = field_by_key(source, "function type") else {
+        return consumed;
+    };
+    let Some(values) = field_by_key(source, "values").and_then(|field| field.as_block()) else {
+        return consumed;
+    };
+    // The target must be the blob form, i.e. hold function data and nothing the
+    // explicit fields could match.
+    let wants_blob = target
+        .as_ref()
+        .fields()
+        .any(|field| field.is_function_data() || clean_field_key(field.name()) == "data");
+    if !wants_blob || field_ordinal_by_key(target.as_ref(), "function type").is_some() {
+        return consumed;
+    }
+    let kind = function_type.value().and_then(integer_value).unwrap_or(-1);
+    record_unsupported(
+        context,
+        path.to_owned(),
+        format!(
+            "This curve is stored in {}'s older explicit form (function type {kind}, \
+             {} value(s)); {} stores curves only as a serialized function definition, \
+             and the older form's type byte does not map onto the modern function \
+             types, so the curve was left unset rather than guessed at. Reauthor it \
+             in the target editor.",
+            context.source_game,
+            values.len(),
+            context.target_game,
+        ),
+    );
+    for field in source.fields() {
+        let key = clean_field_key(field.name());
+        if matches!(
+            key.as_str(),
+            "function type" | "flags" | "function 1" | "function 2" | "values"
+        ) || key.starts_with("color ")
+        {
+            consumed.insert(key);
+        }
+    }
+    consumed
+}
+
+/// Route a legacy vehicle's flat physics fields into the per-type block the modern
+/// layout expects.
+///
+/// Halo 2 keeps one flat set of physics values on the vehicle root and a `type`
+/// enum saying which of them the engine reads. Halo 3 replaced that with
+/// `physics types`, a struct of ten blocks — `type-human_tank`, `type-human_jeep`,
+/// `type-human_plane`, … — whose own schema comment says "define one of the
+/// following blocks for the type of physics you wish this vehicle to have". So the
+/// values did not change name or meaning; they moved into a block chosen by the
+/// enum. Until this ran, every one of them was dropped: a Halo 2 warthog arrived
+/// in Halo 3 with its speeds, slides, turn rates and thrust all at zero.
+///
+/// Driven by the shapes present rather than by a game list, so it applies to any
+/// pair where the source is flat and the target has `physics types`.
+///
+/// `human boat` is deliberately unhandled — Halo 3 ships no boat block, and there
+/// is no honest destination for those values, so it is reported.
+fn convert_vehicle_physics_types(
+    source: TagStruct<'_>,
+    target: &mut TagStructMut<'_>,
+    context: &mut ConversionContext<'_>,
+) -> HashSet<String> {
+    let mut consumed = HashSet::new();
+    let Some(types_ordinal) = field_ordinal_by_key(target.as_ref(), "physics types") else {
+        return consumed;
+    };
+    // A source that already has `physics types` is the modern layout; the ordinary
+    // struct match handles it.
+    if field_by_key(source, "physics types").is_some() {
+        return consumed;
+    }
+    let Some(type_field) = field_by_key(source, "type") else {
+        return consumed;
+    };
+    let type_name = match type_field.value() {
+        Some(TagFieldData::CharEnum { name, .. })
+        | Some(TagFieldData::ShortEnum { name, .. })
+        | Some(TagFieldData::LongEnum { name, .. }) => name,
+        _ => None,
+    };
+    let Some(type_name) = type_name else {
+        record_unsupported(
+            context,
+            "physics types".to_owned(),
+            "Source vehicle type has no name, so its physics block could not be chosen".to_owned(),
+        );
+        return consumed;
+    };
+    // `human plane` -> `type-human_plane`. The enum option names and the block
+    // names are the same words, so no lookup table is needed — and a type the
+    // target dropped simply finds no block.
+    let block_key = format!("type-{}", type_name.trim().to_ascii_lowercase().replace(' ', "_"));
+
+    let Some(mut types_field) = target.field_at_mut(types_ordinal) else {
+        return consumed;
+    };
+    let Some(mut types_struct) = types_field.as_struct_mut() else {
+        return consumed;
+    };
+    let Some(block_ordinal) = field_ordinal_by_key(types_struct.as_ref(), &block_key) else {
+        record_unsupported(
+            context,
+            format!("physics types/{block_key}"),
+            format!(
+                "{} has no {block_key} physics block, so this vehicle's physics \
+                 values have no destination and need reauthoring",
+                context.target_game
+            ),
+        );
+        return consumed;
+    };
+    let Some(mut block_field) = types_struct.field_at_mut(block_ordinal) else {
+        return consumed;
+    };
+    let Some(mut block) = block_field.as_block_mut() else {
+        return consumed;
+    };
+    // Exactly one element: the schema's instruction is to define one block.
+    if block.is_empty() {
+        block.add_element();
+    }
+    let Some(mut element) = block.element_mut(0) else {
+        return consumed;
+    };
+    let path = format!("physics types/{block_key}[0]");
+    fill_nested_target_from_flat_source(source, &mut element, &path, &mut consumed, context);
+    // `type` itself is spent selecting the block, not copied.
+    consumed.insert("type".to_owned());
+    consumed
+}
+
+fn convert_effect_looping_sound_layout(
+    source: TagStruct<'_>,
+    target: &mut TagStructMut<'_>,
+    context: &mut ConversionContext<'_>,
+) -> HashSet<String> {
+    const LEGACY_GAMES: &[&str] = &["halo3_mcc", "halo3odst_mcc"];
+    const BLOCK_GAMES: &[&str] = &["haloreach_mcc", "halo4_mcc", "halo2amp_mcc"];
+    if LEGACY_GAMES.contains(&context.source_game) && BLOCK_GAMES.contains(&context.target_game) {
+        convert_legacy_effect_looping_sound_to_block(source, target, context)
+    } else if BLOCK_GAMES.contains(&context.source_game)
+        && LEGACY_GAMES.contains(&context.target_game)
+    {
+        convert_effect_looping_sound_block_to_legacy(source, target, context)
+    } else {
+        HashSet::new()
+    }
+}
+
+fn convert_legacy_effect_looping_sound_to_block(
+    source: TagStruct<'_>,
+    target: &mut TagStructMut<'_>,
+    context: &mut ConversionContext<'_>,
+) -> HashSet<String> {
+    let Some(source_sound) = field_by_key(source, "looping sound") else {
+        return HashSet::new();
+    };
+    let Some(target_ordinal) = field_ordinal_by_key(target.as_ref(), "looping sounds") else {
+        return HashSet::new();
+    };
+    let has_sound = matches!(
+        source_sound.value(),
+        Some(TagFieldData::TagReference(TagReferenceData {
+            group_tag_and_name: Some((_, ref path)),
+        })) if !path.is_empty() && !path.eq_ignore_ascii_case("none")
+    );
+    let Some(mut target_field) = target.field_at_mut(target_ordinal) else {
+        return HashSet::new();
+    };
+    let Some(mut target_block) = target_field.as_block_mut() else {
+        return HashSet::new();
+    };
+    target_block.clear();
+    if has_sound {
+        let index = target_block.add_element();
+        if let Some(element) = target_block.element_mut(index) {
+            initialize_block_index_defaults(element);
+        }
+        if let Some(mut element) = target_block.element_mut(index) {
+            for key in ["looping sound", "location", "bind scale to event"] {
+                let (Some(source_field), Some(target_ordinal)) = (
+                    field_by_key(source, key),
+                    field_ordinal_by_key(element.as_ref(), key),
+                ) else {
+                    continue;
+                };
+                if let Some(target_field) = element.field_at_mut(target_ordinal) {
+                    convert_field(
+                        source_field,
+                        target_field,
+                        &format!("looping sounds[0]/{key}"),
+                        false,
+                        context,
+                    );
+                }
+            }
+        }
+    }
+    HashSet::from([
+        "looping sound".to_owned(),
+        "location".to_owned(),
+        "bind scale to event".to_owned(),
+    ])
+}
+
+fn convert_effect_looping_sound_block_to_legacy(
+    source: TagStruct<'_>,
+    target: &mut TagStructMut<'_>,
+    context: &mut ConversionContext<'_>,
+) -> HashSet<String> {
+    let Some(source_block) =
+        field_by_key(source, "looping sounds").and_then(|field| field.as_block())
+    else {
+        return HashSet::new();
+    };
+    if let Some(element) = source_block.element(0) {
+        for key in ["looping sound", "location", "bind scale to event"] {
+            let (Some(source_field), Some(target_ordinal)) = (
+                field_by_key(element, key),
+                field_ordinal_by_key(target.as_ref(), key),
+            ) else {
+                continue;
+            };
+            if let Some(target_field) = target.field_at_mut(target_ordinal) {
+                convert_field(source_field, target_field, key, false, context);
+            }
+        }
+    }
+    if source_block.len() > 1 {
+        record_unsupported(
+            context,
+            "looping sounds".to_owned(),
+            format!(
+                "Legacy target supports one looping sound but source has {}",
+                source_block.len()
+            ),
+        );
+    }
+    HashSet::from(["looping sounds".to_owned()])
+}
+
+/// Reach-family animation entries moved the H3 inline payload into a
+/// single-element `shared animation data` block. This is a structural move,
+/// not a rename, so map the compatible source fields into that nested element
+/// without reporting the already-copied entry metadata as unmatched.
+fn convert_local_animation_payload(
+    source: TagStruct<'_>,
+    target: &mut TagStructMut<'_>,
+    path: &str,
+    context: &mut ConversionContext<'_>,
+) -> HashSet<String> {
+    let mut transferred = HashSet::new();
+    let payload_ordinal = target
+        .as_ref()
+        .fields()
+        .enumerate()
+        .find(|(_, field)| {
+            field.field_type() == TagFieldType::Block
+                && clean_field_key(field.name()).starts_with("shared animation data")
+        })
+        .map(|(ordinal, _)| ordinal);
+    let Some(payload_ordinal) = payload_ordinal else {
+        return transferred;
+    };
+    let Some(mut payload_field) = target.field_at_mut(payload_ordinal) else {
+        return transferred;
+    };
+    let Some(mut payload_block) = payload_field.as_block_mut() else {
+        return transferred;
+    };
+    payload_block.clear();
+    let payload_index = payload_block.add_element();
+    let Some(payload) = payload_block.element_mut(payload_index) else {
+        return transferred;
+    };
+    initialize_block_index_defaults(payload);
+    let Some(mut payload) = payload_block.element_mut(payload_index) else {
+        return transferred;
+    };
+    let target_guid = payload.as_ref().definition().guid();
+    let target_struct_name = payload.as_ref().definition().name().to_owned();
+    let target_fields = payload
+        .as_ref()
+        .fields()
+        .enumerate()
+        .map(|(ordinal, field)| TargetFieldInfo {
+            ordinal,
+            name: field.name().to_owned(),
+            key: clean_field_key(field.name()),
+            field_type: field.field_type(),
+        })
+        .collect::<Vec<_>>();
+    let mut used = vec![false; target_fields.len()];
+    let source_guid = source.definition().guid();
+    let source_struct_name = source.definition().name().to_owned();
+    for source_field in source.fields() {
+        let key = clean_field_key(source_field.name());
+        let matched = target_fields.iter().enumerate().find(|(index, candidate)| {
+            !used[*index]
+                && (field_names_match(source_field.name(), &candidate.name)
+                    || context
+                        .target_field_aliases
+                        .matches(target_guid, &target_struct_name, &candidate.key, &key)
+                    || context
+                        .source_field_aliases
+                        .matches(source_guid, &source_struct_name, &key, &candidate.key)
+                    || context
+                        .mapping_catalog
+                        .field_names_match(FieldMappingRequest {
+                            group: context.group_name,
+                            source_game: context.source_game,
+                            target_game: context.target_game,
+                            source_guid,
+                            target_guid,
+                            source_name: &key,
+                            target_name: &candidate.key,
+                        }))
+                && (compatible_field_shapes(source_field.field_type(), candidate.field_type)
+                    || compatible_function_curve_field(
+                        &key,
+                        &candidate.key,
+                        source_field.field_type(),
+                        candidate.field_type,
+                    ))
+        });
+        let Some((target_index, target_info)) = matched else {
+            continue;
+        };
+        used[target_index] = true;
+        transferred.insert(key.clone());
+        if key != target_info.key {
+            context.report.mapped_aliases += 1;
+        }
+        if let Some(target_field) = payload.field_at_mut(target_info.ordinal) {
+            convert_field(
+                source_field,
+                target_field,
+                &join_path(
+                    path,
+                    &format!("shared animation data[0]/{}", target_info.key),
+                ),
+                source_guid == target_guid,
+                context,
+            );
+        }
+    }
+    transferred
+}
+
+fn is_reportable_target_default(field_type: TagFieldType) -> bool {
+    !matches!(
+        field_type,
+        TagFieldType::Terminator
+            | TagFieldType::Explanation
+            | TagFieldType::Pad
+            | TagFieldType::UselessPad
+            | TagFieldType::Skip
+            | TagFieldType::Custom
+            | TagFieldType::ApiInterop
+            | TagFieldType::PageableResource
+    )
+}
+
+fn record_unmatched_field_values(
+    field: TagField<'_>,
+    path: &str,
+    context: &mut ConversionContext<'_>,
+) {
+    if !field_has_meaningful_value(field) {
+        return;
+    }
+    if field.name().contains('!') || clean_field_key(field.name()).starts_with("runtime ") {
+        context.report.issues.push(ConversionIssue {
+            kind: ConversionIssueKind::Warning,
+            path: path.to_owned(),
+            message: "Engine-managed source value was reset for the target engine".to_owned(),
+        });
+        return;
+    }
+    match field.field_type() {
+        TagFieldType::Struct => {
+            if let Some(structure) = field.as_struct() {
+                for child in structure.fields() {
+                    let key = clean_field_key(child.name());
+                    let child_path = join_path(
+                        path,
+                        if key.is_empty() {
+                            child.type_name()
+                        } else {
+                            &key
+                        },
+                    );
+                    record_unmatched_field_values(child, &child_path, context);
+                }
+            }
+        }
+        TagFieldType::Block => {
+            if let Some(block) = field.as_block() {
+                for (index, element) in block.iter().enumerate() {
+                    for child in element.fields() {
+                        let key = clean_field_key(child.name());
+                        let child_path = join_path(
+                            &format!("{path}[{index}]"),
+                            if key.is_empty() {
+                                child.type_name()
+                            } else {
+                                &key
+                            },
+                        );
+                        record_unmatched_field_values(child, &child_path, context);
+                    }
+                }
+            }
+        }
+        TagFieldType::Array => {
+            if let Some(array) = field.as_array() {
+                for (index, element) in array.iter().enumerate() {
+                    for child in element.fields() {
+                        let key = clean_field_key(child.name());
+                        let child_path = join_path(
+                            &format!("{path}[{index}]"),
+                            if key.is_empty() {
+                                child.type_name()
+                            } else {
+                                &key
+                            },
+                        );
+                        record_unmatched_field_values(child, &child_path, context);
+                    }
+                }
+            }
+        }
+        _ => record_unsupported(
+            context,
+            path.to_owned(),
+            format!("No compatible target field for {}", field.type_name()),
+        ),
+    }
+}
+
+fn field_names_match(left: &str, right: &str) -> bool {
+    let left_key = clean_field_key(left);
+    let right_key = clean_field_key(right);
+    if left_key == right_key {
+        return true;
+    }
+    if left_key.is_empty() || right_key.is_empty() {
+        return false;
+    }
+    // `|ABCDCC` and similar suffixes are editor presentation/order metadata,
+    // not alternate field names. Including them made unrelated blocks with
+    // the same suffix appear compatible.
+    let aliases =
+        |name: &str| option_name_aliases(name.split(['#', ':', '|']).next().unwrap_or(name));
+    let left = aliases(left);
+    let right = aliases(right);
+    left.iter()
+        .any(|left| right.iter().any(|right| left == right))
+}
+
+fn compatible_field_shapes(source: TagFieldType, target: TagFieldType) -> bool {
+    source == target
+        || (is_integer_type(source) && is_integer_type(target))
+        || (is_real_scalar(source) && is_real_scalar(target))
+        || (is_enum_type(source) && is_enum_type(target))
+        || (is_flags_type(source) && is_flags_type(target))
+        || (is_string_type(source) && is_string_type(target))
+        || (is_string_id_type(source) && is_string_id_type(target))
+}
+
+/// Whether a `mapping_function` curve is being matched across its two spellings.
+///
+/// Halo 2 and earlier hold the serialized curve in `block 'data' byte_block`;
+/// Halo 3 onward hold it in `data 'data' function_definition_data`. The field name
+/// is `data` on both sides, so the pair is unambiguous — but the *shapes* are a
+/// block and a blob, which every ordinary shape rule rejects. Without this the
+/// matcher never proposes the pair and [`convert_function_mapping`] never gets a
+/// chance to look at it.
+///
+/// Deliberately permissive about what the block contains: this only decides
+/// whether the pair is worth *offering*. `convert_function_mapping` still checks
+/// that the target really is function data, that the block really is one byte
+/// wide, and that the bytes parse as a function before writing anything.
+fn compatible_function_curve_field(
+    source_key: &str,
+    target_key: &str,
+    source: TagFieldType,
+    target: TagFieldType,
+) -> bool {
+    source_key == "data"
+        && target_key == "data"
+        && matches!(
+            (source, target),
+            (TagFieldType::Block, TagFieldType::Data) | (TagFieldType::Data, TagFieldType::Block)
+        )
+}
+
+fn compatible_semantic_field(
+    group: &str,
+    field: &str,
+    source: TagFieldType,
+    target: TagFieldType,
+) -> bool {
+    group.eq_ignore_ascii_case("lens_flare")
+        && clean_field_key(field) == "occlusion inner radius scale"
+        && ((is_enum_type(source) && target == TagFieldType::Real)
+            || (source == TagFieldType::Real && is_enum_type(target)))
+}
+
+fn convert_lens_flare_occlusion_scale(
+    source: TagField<'_>,
+    target: &mut TagFieldMut<'_>,
+    path: &str,
+    context: &mut ConversionContext<'_>,
+) -> bool {
+    if !context.group_name.eq_ignore_ascii_case("lens_flare")
+        || clean_field_key(path.split('/').next_back().unwrap_or(path))
+            != "occlusion inner radius scale"
+    {
+        return false;
+    }
+
+    const SCALES: [(&str, f32); 7] = [
+        ("none", 0.0),
+        ("1/2", 0.5),
+        ("1/4", 0.25),
+        ("1/8", 0.125),
+        ("1/16", 0.0625),
+        ("1/32", 0.03125),
+        ("1/64", 0.015625),
+    ];
+    if is_enum_type(source.field_type()) && target.as_ref().field_type() == TagFieldType::Real {
+        let name = match source.value() {
+            Some(TagFieldData::CharEnum { name, .. })
+            | Some(TagFieldData::ShortEnum { name, .. })
+            | Some(TagFieldData::LongEnum { name, .. }) => name,
+            _ => None,
+        };
+        let Some((_, scale)) = name.as_deref().and_then(|name| {
+            SCALES
+                .iter()
+                .find(|(candidate, _)| option_names_match(candidate, name))
+        }) else {
+            if field_has_meaningful_value(source) {
+                record_unsupported(
+                    context,
+                    path.to_owned(),
+                    "Unresolved lens-flare occlusion scale enum".to_owned(),
+                );
+            }
+            return true;
+        };
+        set_converted(target, TagFieldData::Real(*scale), path, false, context);
+        return true;
+    }
+
+    if source.field_type() == TagFieldType::Real && is_enum_type(target.as_ref().field_type()) {
+        let Some(TagFieldData::Real(scale)) = source.value() else {
+            return true;
+        };
+        let Some((index, (name, _))) = SCALES
+            .iter()
+            .enumerate()
+            .find(|(_, (_, candidate))| (scale - *candidate).abs() <= f32::EPSILON)
+        else {
+            if scale != 0.0 {
+                record_unsupported(
+                    context,
+                    path.to_owned(),
+                    format!("Legacy lens-flare schema cannot represent occlusion scale {scale}"),
+                );
+            }
+            return true;
+        };
+        let value = match target.as_ref().field_type() {
+            TagFieldType::CharEnum => TagFieldData::CharEnum {
+                value: index as i8,
+                name: Some((*name).to_owned()),
+            },
+            TagFieldType::ShortEnum => TagFieldData::ShortEnum {
+                value: index as i16,
+                name: Some((*name).to_owned()),
+            },
+            TagFieldType::LongEnum => TagFieldData::LongEnum {
+                value: index as i32,
+                name: Some((*name).to_owned()),
+            },
+            _ => return false,
+        };
+        set_converted(target, value, path, false, context);
+        return true;
+    }
+    false
+}
+
+fn convert_field(
+    source: TagField<'_>,
+    mut target: TagFieldMut<'_>,
+    path: &str,
+    same_struct_guid: bool,
+    context: &mut ConversionContext<'_>,
+) {
+    let source_type = source.field_type();
+    let target_type = target.as_ref().field_type();
+    if convert_lens_flare_occlusion_scale(source, &mut target, path, context) {
+        return;
+    }
+    if convert_function_mapping(source, &mut target, path, context) {
+        return;
+    }
+    match source_type {
+        TagFieldType::Struct => {
+            let (Some(source_struct), Some(target_struct)) =
+                (source.as_struct(), target.as_struct_mut())
+            else {
+                record_unsupported(
+                    context,
+                    path.to_owned(),
+                    "Missing nested struct data".to_owned(),
+                );
+                return;
+            };
+            convert_struct(source_struct, target_struct, path, false, context);
+        }
+        TagFieldType::Block => {
+            let (Some(source_block), Some(mut target_block)) =
+                (source.as_block(), target.as_block_mut())
+            else {
+                record_unsupported(
+                    context,
+                    path.to_owned(),
+                    "Missing tag block data".to_owned(),
+                );
+                return;
+            };
+            target_block.clear();
+            let maximum = target_block.definition().max_count() as usize;
+            let count = source_block.len().min(maximum);
+            for index in 0..count {
+                let target_index = target_block.add_element();
+                if let Some(target_element) = target_block.element_mut(target_index) {
+                    initialize_block_index_defaults(target_element);
+                }
+                if let (Some(source_element), Some(target_element)) = (
+                    source_block.element(index),
+                    target_block.element_mut(target_index),
+                ) {
+                    convert_struct(
+                        source_element,
+                        target_element,
+                        &format!("{path}[{index}]"),
+                        false,
+                        context,
+                    );
+                }
+            }
+            if source_block.len() > count {
+                let omitted = source_block.len() - count;
+                context.report.truncated += omitted;
+                context.report.issues.push(ConversionIssue {
+                    kind: ConversionIssueKind::Truncated,
+                    path: path.to_owned(),
+                    message: format!("Target block limit omitted {omitted} element(s)"),
+                });
+            }
+        }
+        TagFieldType::Array => {
+            let (Some(source_array), Some(mut target_array)) =
+                (source.as_array(), target.as_array_mut())
+            else {
+                record_unsupported(
+                    context,
+                    path.to_owned(),
+                    "Missing fixed-array data".to_owned(),
+                );
+                return;
+            };
+            let count = source_array.len().min(target_array.len());
+            for index in 0..count {
+                if let (Some(source_element), Some(target_element)) =
+                    (source_array.element(index), target_array.element_mut(index))
+                {
+                    convert_struct(
+                        source_element,
+                        target_element,
+                        &format!("{path}[{index}]"),
+                        false,
+                        context,
+                    );
+                }
+            }
+            if source_array.len() > count {
+                let omitted = source_array.len() - count;
+                context.report.truncated += omitted;
+                context.report.issues.push(ConversionIssue {
+                    kind: ConversionIssueKind::Truncated,
+                    path: path.to_owned(),
+                    message: format!("Target array omitted {omitted} element(s)"),
+                });
+            }
+        }
+        TagFieldType::PageableResource => {
+            transfer_resource(source, &mut target, path, context);
+        }
+        TagFieldType::ApiInterop => {
+            if field_has_meaningful_value(source) {
+                record_unsupported(
+                    context,
+                    path.to_owned(),
+                    "API interop runtime data is not transferred".to_owned(),
+                );
+            }
+        }
+        TagFieldType::TagReference => convert_reference(source, target, path, context),
+        TagFieldType::CharEnum | TagFieldType::ShortEnum | TagFieldType::LongEnum => {
+            convert_enum(source, target, path, context)
+        }
+        TagFieldType::ByteFlags | TagFieldType::WordFlags | TagFieldType::LongFlags => {
+            convert_flags(source, target, path, context)
+        }
+        TagFieldType::StringId | TagFieldType::OldStringId => {
+            let Some(value) = source.value() else { return };
+            let string = match value {
+                TagFieldData::StringId(value) | TagFieldData::OldStringId(value) => value.string,
+                _ => return,
+            };
+            let value = if target_type == TagFieldType::StringId {
+                TagFieldData::StringId(StringIdData { string })
+            } else {
+                TagFieldData::OldStringId(StringIdData { string })
+            };
+            set_converted(
+                &mut target,
+                value,
+                path,
+                source_type == target_type,
+                context,
+            );
+        }
+        TagFieldType::String | TagFieldType::LongString => {
+            let Some(value) = source.value() else { return };
+            let string = match value {
+                TagFieldData::String(value) | TagFieldData::LongString(value) => value,
+                _ => return,
+            };
+            let limit = if target_type == TagFieldType::String {
+                31
+            } else {
+                255
+            };
+            if string.len() > limit {
+                record_unsupported(
+                    context,
+                    path.to_owned(),
+                    format!(
+                        "String is {} bytes but target limit is {limit}",
+                        string.len()
+                    ),
+                );
+                return;
+            }
+            let value = if target_type == TagFieldType::String {
+                TagFieldData::String(string)
+            } else {
+                TagFieldData::LongString(string)
+            };
+            set_converted(
+                &mut target,
+                value,
+                path,
+                source_type == target_type,
+                context,
+            );
+        }
+        TagFieldType::Data | TagFieldType::Custom => {
+            // A third identity key, for the blob that *is* the tag.
+            //
+            // The struct GUID and wire congruence both describe the enclosing
+            // struct, and neither holds for a Halo 1 bitmap against a Halo 2 one:
+            // Halo 1 groups its root into `processing`/`color plate` sub-structs
+            // where Halo 2 flattens them, so the roots differ in size and field
+            // count. But both declare the pixels with the *same data definition
+            // name* — `processed_pixel_data_data` — and the schema's own name for
+            // what a blob holds is exactly the claim needed here: these two fields
+            // hold the same kind of payload.
+            //
+            // Measured before relying on it: Halo 1's per-bitmap `format_enum` and
+            // Halo 2's `format_enum_2` agree entry-for-entry for indices 0..=16
+            // (A8 through DXT5), and the enum is carried by *name*, so Halo 1's
+            // `P8` at 17 lands on Halo 2's `p8` at 18 rather than on `p8-bump`.
+            // The bytes therefore mean the same thing on both sides. Halo 1's
+            // `BC7` has no Halo 2 option and is reported by the enum conversion.
+            let same_payload_kind = source_type == target_type
+                && source
+                    .data_definition_name()
+                    .zip(target.as_ref().data_definition_name())
+                    .is_some_and(|(source_name, target_name)| {
+                        source_name == target_name
+                            || context.mapping_catalog.payload_alias_allows(
+                                context.group_name,
+                                context.source_game,
+                                context.target_game,
+                                source_name,
+                                target_name,
+                            )
+                    });
+            if (!same_struct_guid && !same_payload_kind) || source_type != target_type {
+                if field_has_meaningful_value(source) {
+                    record_unsupported(
+                        context,
+                        path.to_owned(),
+                        "Opaque bytes require an identical struct GUID and field type".to_owned(),
+                    );
+                    // A `data` blob is usually not one field among many — it is
+                    // what the tag *is*. A bitmap's `processed pixel data`, a
+                    // sound's samples, a mesh's `vertices`. Leaving one behind
+                    // produces a tag whose metadata promises bytes that are not
+                    // there, which reads past the end and crashes the editing kit
+                    // rather than merely failing to open. Record it so the write
+                    // refuses.
+                    //
+                    // Unless the target marks the field `*`. That is the schema's
+                    // own "the editor owns this, not the author" marker, and the
+                    // one blob in the corpus that carries it — an animation
+                    // graph's `last import results*`, the log `tool` writes and
+                    // overwrites on the next import — is exactly the kind of
+                    // bookkeeping a conversion has no business refusing over.
+                    let editor_owned = context
+                        .target_field_aliases
+                        .is_editor_owned(&clean_field_key(target.as_ref().name()))
+                        || context
+                            .source_field_aliases
+                            .is_editor_owned(&clean_field_key(source.name()));
+                    if source_type == TagFieldType::Data && !editor_owned {
+                        context.payloads_left_behind.push(path.to_owned());
+                    }
+                }
+                return;
+            }
+            if let Some(value) = source.value() {
+                set_converted(&mut target, value, path, true, context);
+            }
+        }
+        _ if is_integer_type(source_type) && is_integer_type(target_type) => {
+            convert_integer(source, target, path, context)
+        }
+        _ if is_real_scalar(source_type) && is_real_scalar(target_type) => {
+            let Some(value) = source.value().and_then(real_value) else {
+                return;
+            };
+            // A NaN or an infinity is not a number an author typed, and writing one
+            // into the target is worse than keeping the template's default — the
+            // destination game's own tools have to read it, and a non-finite float
+            // is how a tag becomes one that will not open. Halo 2 stamps junk into
+            // the unused `object` collision-damage slots, and a shipped H2
+            // projectile carries a NaN `material responses[0]/angular noise` that
+            // this converter copied straight through into Halo 3.
+            //
+            // Scoped to real scalars because that is what was measured; bounds and
+            // vectors travel through the same-type copy below and are not guarded.
+            if !value.is_finite() {
+                context.report.issues.push(ConversionIssue {
+                    kind: ConversionIssueKind::Warning,
+                    path: path.to_owned(),
+                    message: format!(
+                        "Source value is not a finite number ({value}), so the target \
+                         keeps its default"
+                    ),
+                });
+                return;
+            }
+            let target_key = clean_field_key(target.as_ref().name());
+            let value = match real_scalar_unit_change(
+                source_type,
+                context.source_field_aliases.unit_of(&clean_field_key(source.name())),
+                target_type,
+                context.target_field_aliases.unit_of(&target_key),
+            ) {
+                RealUnitChange::Copy => value,
+                RealUnitChange::RadiansToDegrees => value.to_degrees(),
+                RealUnitChange::DegreesToRadians => value.to_radians(),
+            };
+            let converted = real_field_value(target_type, value);
+            set_converted(
+                &mut target,
+                converted,
+                path,
+                source_type == target_type,
+                context,
+            );
+        }
+        _ if source_type == target_type => {
+            if let Some(value) = source.value() {
+                set_converted(&mut target, value, path, true, context);
+            }
+        }
+        _ => {
+            if field_has_meaningful_value(source) {
+                record_unsupported(
+                    context,
+                    path.to_owned(),
+                    format!("Cannot convert {source_type:?} to {target_type:?}"),
+                );
+            }
+        }
+    }
+}
+
+fn convert_reference(
+    source: TagField<'_>,
+    mut target: TagFieldMut<'_>,
+    path: &str,
+    context: &mut ConversionContext<'_>,
+) {
+    let Some(TagFieldData::TagReference(reference)) = source.value() else {
+        return;
+    };
+    let Some((source_group, name)) = reference.group_tag_and_name else {
+        return;
+    };
+    let Some(group_name) = context.source_groups.by_tag.get(&source_group) else {
+        record_unsupported(
+            context,
+            path.to_owned(),
+            format!(
+                "Source reference group {} is unknown",
+                format_group_tag(source_group)
+            ),
+        );
+        return;
+    };
+    let Some((target_group, _)) = resolve_target_group(
+        group_name,
+        context.target_groups,
+        context.mapping_catalog,
+        context.source_game,
+        context.target_game,
+    ) else {
+        record_unsupported(
+            context,
+            path.to_owned(),
+            format!("Target profile has no {group_name} reference group"),
+        );
+        return;
+    };
+    set_converted(
+        &mut target,
+        TagFieldData::TagReference(TagReferenceData {
+            group_tag_and_name: Some((target_group, name)),
+        }),
+        path,
+        source_group == target_group,
+        context,
+    );
+}
+
+/// The bytes of a `mapping_function` held as a block of one-byte elements.
+///
+/// Halo 2 and earlier spell a function curve out as `block 'data' byte_block`,
+/// one element per byte; Halo 3 onward store the same serialized
+/// `c_function_definition` in a single `data 'data' function_definition_data`
+/// field. Same name, same content, different container — so an ordinary
+/// field-shape match rejects the pair and the whole curve is lost. One real Halo 2
+/// `effect` carries 1,180 bytes of curve this way, which is why an effect arrived
+/// in Halo 3 with 544 of its numbers sitting at zero.
+fn function_bytes_from_block(block: TagBlock<'_>) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(block.len());
+    for element in block.iter() {
+        let mut fields = element.fields().filter(|field| field.value().is_some());
+        let only = fields.next()?;
+        if fields.next().is_some() {
+            // More than one value per element means this is not a byte block.
+            return None;
+        }
+        bytes.push(u8::try_from(integer_value(only.value()?)? & 0xff).ok()?);
+    }
+    Some(bytes)
+}
+
+/// The byte offset at which Halo 3 inserted `compact_size` into the
+/// `c_function_definition` header.
+///
+/// A Halo 3 header is 32 bytes: `function_type | flags | color_graph_type | pad`,
+/// then 16 bytes of clamp range (or four packed colors), then
+/// `exclusion_min`/`exclusion_max`, then a 4-byte `compact_size` giving the length
+/// of the per-type compact block that follows. Halo 2 stores the same fields in
+/// the same order but stops at 28 bytes — it has no `compact_size`, because the
+/// enclosing byte block's own element count already gives the total length.
+const FUNCTION_COMPACT_SIZE_OFFSET: usize = 28;
+
+/// Move a serialized `c_function_definition` between the Halo 2 and Halo 3 header
+/// layouts.
+///
+/// Halo 3 gained a 4-byte `compact_size` at [`FUNCTION_COMPACT_SIZE_OFFSET`]; the
+/// bytes on either side of it are unchanged. So promoting is "splice the length
+/// in" and demoting is "cut it out" — no reinterpretation of any field.
+///
+/// This is what a real Halo 2 effect needs: all 30 of one effect's emitter curves
+/// are 28-byte headers describing constant functions, and without the splice every
+/// one is rejected as too short and the emitter loses its authored value.
+/// Which header layout a curve is written in cannot be told from its length — a
+/// 36-byte legacy curve (28-byte header plus 8 bytes of compact data) is the same
+/// size as a 36-byte modern one. The *container* settles it: a block of bytes is
+/// always the legacy spelling and a `data` blob always the modern one, because no
+/// game uses both.
+fn retarget_function_bytes(
+    bytes: &[u8],
+    source_is_modern: bool,
+    target_is_modern: bool,
+) -> Option<Vec<u8>> {
+    if source_is_modern == target_is_modern {
+        return Some(bytes.to_vec());
+    }
+    if target_is_modern {
+        if bytes.len() < FUNCTION_COMPACT_SIZE_OFFSET {
+            return None;
+        }
+        let compact = bytes.len() - FUNCTION_COMPACT_SIZE_OFFSET;
+        let mut out = Vec::with_capacity(bytes.len() + 4);
+        out.extend_from_slice(&bytes[..FUNCTION_COMPACT_SIZE_OFFSET]);
+        out.extend_from_slice(&u32::try_from(compact).ok()?.to_le_bytes());
+        out.extend_from_slice(&bytes[FUNCTION_COMPACT_SIZE_OFFSET..]);
+        Some(out)
+    } else {
+        if bytes.len() < FUNCTION_COMPACT_SIZE_OFFSET + 4 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(bytes.len() - 4);
+        out.extend_from_slice(&bytes[..FUNCTION_COMPACT_SIZE_OFFSET]);
+        out.extend_from_slice(&bytes[FUNCTION_COMPACT_SIZE_OFFSET + 4..]);
+        Some(out)
+    }
+}
+
+/// Carry a function curve between the block-of-bytes and data-blob spellings.
+///
+/// Returns `true` when the pair was recognised and handled, so the caller stops.
+/// The bytes are only moved when they parse as a `c_function_definition` on the
+/// way out — [`TagFunction::parse`] is the engine's own decoder, so a format the
+/// target generation could not read is reported rather than written. That check
+/// is the whole safety argument for copying these bytes verbatim.
+fn convert_function_mapping(
+    source: TagField<'_>,
+    target: &mut TagFieldMut<'_>,
+    path: &str,
+    context: &mut ConversionContext<'_>,
+) -> bool {
+    let source_type = source.field_type();
+    let target_type = target.as_ref().field_type();
+    let bytes = match (source_type, target_type) {
+        (TagFieldType::Block, TagFieldType::Data) => {
+            if !target.as_ref().is_function_data() {
+                return false;
+            }
+            let Some(block) = source.as_block() else {
+                return false;
+            };
+            match function_bytes_from_block(block) {
+                Some(bytes) => bytes,
+                None => return false,
+            }
+        }
+        (TagFieldType::Data, TagFieldType::Block) => {
+            if !source.is_function_data() {
+                return false;
+            }
+            // Only claim the pair if the target really is a byte block. An empty
+            // block cannot prove it, so require a definition of width one.
+            let Some(target_block) = target.as_block_mut() else {
+                return false;
+            };
+            if target_block.definition().struct_definition().size() != 1 {
+                return false;
+            }
+            source.as_data().unwrap_or_default().to_vec()
+        }
+        _ => return false,
+    };
+
+    if bytes.is_empty() {
+        // Nothing authored. Leaving the target's default alone is correct.
+        return true;
+    }
+    // A data blob is the modern spelling and a byte block the legacy one, so the
+    // target's own shape says which header layout it wants.
+    let source_len = bytes.len();
+    let Some(bytes) = retarget_function_bytes(
+        &bytes,
+        source_type == TagFieldType::Data,
+        target_type == TagFieldType::Data,
+    ) else {
+        record_unsupported(
+            context,
+            path.to_owned(),
+            format!("{source_len} bytes is too short to be a function definition"),
+        );
+        return true;
+    };
+    // The engine's own decoder is the arbiter. A curve that will not parse is
+    // reported rather than written, because a malformed function is worse for the
+    // target game's tools than an unset one.
+    if crate::TagFunction::parse(&bytes).is_err() {
+        record_unsupported(
+            context,
+            path.to_owned(),
+            format!(
+                "{source_len} bytes of function curve did not parse as a function \
+                 definition, so they were not carried across"
+            ),
+        );
+        return true;
+    }
+
+    if target_type == TagFieldType::Data {
+        set_converted(target, TagFieldData::Data(bytes), path, false, context);
+        return true;
+    }
+
+    let Some(mut block) = target.as_block_mut() else {
+        return true;
+    };
+    block.clear();
+    for (index, byte) in bytes.iter().enumerate() {
+        let element_index = block.add_element();
+        let Some(mut element) = block.element_mut(element_index) else {
+            record_unsupported(
+                context,
+                path.to_owned(),
+                "Could not grow the target function block".to_owned(),
+            );
+            return true;
+        };
+        let Some(mut field) = element.field_at_mut(0) else {
+            return true;
+        };
+        let field_type = field.as_ref().field_type();
+        if let Some(value) = integer_field_value(field_type, i128::from(*byte))
+            && field.set(value).is_err()
+        {
+            record_unsupported(
+                context,
+                path.to_owned(),
+                format!("Could not write function byte {index}"),
+            );
+            return true;
+        }
+    }
+    context.report.copied_exact += 1;
+    true
+}
+
+fn convert_enum(
+    source: TagField<'_>,
+    mut target: TagFieldMut<'_>,
+    path: &str,
+    context: &mut ConversionContext<'_>,
+) {
+    let source_name = match source.value() {
+        Some(TagFieldData::CharEnum { name, .. })
+        | Some(TagFieldData::ShortEnum { name, .. })
+        | Some(TagFieldData::LongEnum { name, .. }) => name,
+        _ => None,
+    };
+    let Some(source_name) = source_name else {
+        if field_has_meaningful_value(source) {
+            record_unsupported(
+                context,
+                path.to_owned(),
+                "Unresolved source enum value".to_owned(),
+            );
+        }
+        return;
+    };
+    let Some(TagOptions::Enum { names, .. }) = target.as_ref().options() else {
+        return;
+    };
+    let Some((index, mapped_by_catalog)) = names.iter().enumerate().find_map(|(index, name)| {
+        if option_names_match(name, &source_name) {
+            Some((index, false))
+        } else if context.mapping_catalog.option_names_match(
+            context.group_name,
+            path,
+            context.source_game,
+            context.target_game,
+            &source_name,
+            name,
+        ) {
+            Some((index, true))
+        } else {
+            None
+        }
+    }) else {
+        record_unsupported(
+            context,
+            path.to_owned(),
+            format!("Target enum has no {source_name:?} option"),
+        );
+        return;
+    };
+    if mapped_by_catalog {
+        context.report.mapped_aliases += 1;
+    }
+    let value = match target.as_ref().field_type() {
+        TagFieldType::CharEnum => TagFieldData::CharEnum {
+            value: index as i8,
+            name: Some(source_name),
+        },
+        TagFieldType::ShortEnum => TagFieldData::ShortEnum {
+            value: index as i16,
+            name: Some(source_name),
+        },
+        TagFieldType::LongEnum => TagFieldData::LongEnum {
+            value: index as i32,
+            name: Some(source_name),
+        },
+        _ => return,
+    };
+    set_converted(&mut target, value, path, false, context);
+}
+
+fn convert_flags(
+    source: TagField<'_>,
+    mut target: TagFieldMut<'_>,
+    path: &str,
+    context: &mut ConversionContext<'_>,
+) {
+    let names = match source.value() {
+        Some(TagFieldData::ByteFlags { value, names }) => (value as u64, names),
+        Some(TagFieldData::WordFlags { value, names }) => (value as u64, names),
+        Some(TagFieldData::LongFlags { value, names }) => (value as u32 as u64, names),
+        _ => return,
+    };
+    if names.0 != 0 && names.1.is_empty() {
+        record_unsupported(
+            context,
+            path.to_owned(),
+            "Set source flag bits have no names".to_owned(),
+        );
+        return;
+    }
+    let Some(TagOptions::Flags(target_options)) = target.as_ref().options() else {
+        return;
+    };
+    let mut raw = 0u64;
+    for (_, source_name) in names.1 {
+        let Some((option, mapped_by_catalog)) = target_options.iter().find_map(|option| {
+            if option_names_match(&option.name, &source_name) {
+                Some((option, false))
+            } else if context.mapping_catalog.option_names_match(
+                context.group_name,
+                path,
+                context.source_game,
+                context.target_game,
+                &source_name,
+                &option.name,
+            ) {
+                Some((option, true))
+            } else {
+                None
+            }
+        }) else {
+            record_unsupported(
+                context,
+                path.to_owned(),
+                format!("Target flags have no {source_name:?} bit"),
+            );
+            continue;
+        };
+        if mapped_by_catalog {
+            context.report.mapped_aliases += 1;
+        }
+        raw |= 1u64 << option.bit;
+    }
+    let value = match target.as_ref().field_type() {
+        TagFieldType::ByteFlags => TagFieldData::ByteFlags {
+            value: raw as u8,
+            names: Vec::new(),
+        },
+        TagFieldType::WordFlags => TagFieldData::WordFlags {
+            value: raw as u16,
+            names: Vec::new(),
+        },
+        TagFieldType::LongFlags => TagFieldData::LongFlags {
+            value: raw as u32 as i32,
+            names: Vec::new(),
+        },
+        _ => return,
+    };
+    set_converted(&mut target, value, path, false, context);
+}
+
+fn option_names_match(left: &str, right: &str) -> bool {
+    if left.trim().is_empty() || right.trim().is_empty() {
+        return left.trim().is_empty() && right.trim().is_empty();
+    }
+    let left = option_name_aliases(left);
+    let right = option_name_aliases(right);
+    left.iter()
+        .any(|left| right.iter().any(|right| left == right))
+}
+
+fn option_name_aliases(name: &str) -> Vec<String> {
+    let mut aliases = Vec::new();
+    let mut current = String::new();
+    for character in name.chars() {
+        match character {
+            '{' | '}' | '|' => {
+                let normalized = normalize_option_name(&current);
+                if !normalized.is_empty() && !aliases.contains(&normalized) {
+                    aliases.push(normalized);
+                }
+                current.clear();
+            }
+            _ => current.push(character),
+        }
+    }
+    let normalized = normalize_option_name(&current);
+    if !normalized.is_empty() && !aliases.contains(&normalized) {
+        aliases.push(normalized);
+    }
+    aliases
+}
+
+fn normalize_option_name(name: &str) -> String {
+    name.split('#')
+        .next()
+        .unwrap_or(name)
+        .replace(['*', '!', '^'], "")
+        .replace(['_', '-'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+/// Byte width of an integer field type, or `None` if it is not one.
+fn integer_width(field_type: TagFieldType) -> Option<u32> {
+    Some(match field_type {
+        TagFieldType::CharInteger | TagFieldType::ByteInteger => 1,
+        TagFieldType::ShortInteger | TagFieldType::WordInteger => 2,
+        TagFieldType::LongInteger | TagFieldType::DwordInteger => 4,
+        TagFieldType::Int64Integer | TagFieldType::QwordInteger => 8,
+        _ => return None,
+    })
+}
+
+fn is_signed_integer(field_type: TagFieldType) -> bool {
+    matches!(
+        field_type,
+        TagFieldType::CharInteger
+            | TagFieldType::ShortInteger
+            | TagFieldType::LongInteger
+            | TagFieldType::Int64Integer
+    )
+}
+
+/// Reinterpret `value` between two same-width integer types of different
+/// signedness, leaving every other pair alone.
+///
+/// The two declare the same bytes; only how an editor prints them differs. A
+/// signed -1 and an unsigned 255 in a one-byte field are the same 0xFF, and the
+/// engine reads the byte. Passing the mathematical value through a range check
+/// instead would reject the most common sentinel in the format.
+///
+/// Widening and narrowing are deliberately untouched: those really can lose a
+/// value, and the range check is what catches it.
+fn reinterpret_same_width_integer(
+    source_type: TagFieldType,
+    target_type: TagFieldType,
+    value: i128,
+) -> i128 {
+    let (Some(source_width), Some(target_width)) =
+        (integer_width(source_type), integer_width(target_type))
+    else {
+        return value;
+    };
+    if source_width != target_width || is_signed_integer(source_type) == is_signed_integer(target_type)
+    {
+        return value;
+    }
+    let bits = source_width * 8;
+    let mask = if bits >= 128 { u128::MAX } else { (1u128 << bits) - 1 };
+    let stored = value as u128 & mask;
+    if is_signed_integer(target_type) {
+        // Unsigned to signed: sign-extend from the top bit of the stored width.
+        let shift = 128 - bits;
+        ((stored << shift) as i128) >> shift
+    } else {
+        // Signed to unsigned: the masked bits are already the value.
+        stored as i128
+    }
+}
+
+fn convert_integer(
+    source: TagField<'_>,
+    mut target: TagFieldMut<'_>,
+    path: &str,
+    context: &mut ConversionContext<'_>,
+) {
+    let Some(value) = source.value().and_then(integer_value) else {
+        return;
+    };
+    let target_type = target.as_ref().field_type();
+    // Two integers of the same width under different signedness are the same
+    // bytes, so carry the bits rather than the mathematical value. Halo Reach
+    // declares an animation graph's IK `chain index` as `char_integer` and
+    // Campaign Evolved as `byte_integer`; both write 0xFF for "none", but a
+    // range check sees -1 arriving at a u8 and calls it a loss. It reported
+    // 2,124 of them on one character graph, none of them real.
+    let value = reinterpret_same_width_integer(source.field_type(), target_type, value);
+    let Some(converted) = integer_field_value(target_type, value) else {
+        record_unsupported(
+            context,
+            path.to_owned(),
+            format!("Value {value} does not fit target {target_type:?}"),
+        );
+        return;
+    };
+    set_converted(
+        &mut target,
+        converted,
+        path,
+        source.field_type() == target_type,
+        context,
+    );
+}
+
+fn set_converted(
+    target: &mut TagFieldMut<'_>,
+    value: TagFieldData,
+    path: &str,
+    exact: bool,
+    context: &mut ConversionContext<'_>,
+) {
+    if let Err(error) = target.set(value) {
+        record_unsupported(
+            context,
+            path.to_owned(),
+            format!("Could not assign target value: {error:?}"),
+        );
+    } else if exact {
+        context.report.copied_exact += 1;
+    } else {
+        context.report.converted_semantic += 1;
+    }
+}
+
+fn record_unsupported(context: &mut ConversionContext<'_>, path: String, message: String) {
+    context.report.unsupported_source += 1;
+    context.report.issues.push(ConversionIssue {
+        kind: ConversionIssueKind::Unsupported,
+        path,
+        message,
+    });
+}
+
+fn join_path(parent: &str, child: &str) -> String {
+    if parent.is_empty() {
+        child.to_owned()
+    } else {
+        format!("{parent}/{child}")
+    }
+}
+
+fn field_has_meaningful_value(field: TagField<'_>) -> bool {
+    match field.field_type() {
+        TagFieldType::Struct => field.as_struct().is_some_and(struct_has_meaningful_value),
+        TagFieldType::Array => field
+            .as_array()
+            .is_some_and(|array| array.iter().any(struct_has_meaningful_value)),
+        TagFieldType::Block => field.as_block().is_some_and(|block| !block.is_empty()),
+        TagFieldType::PageableResource => field
+            .as_resource()
+            .is_some_and(|resource| !matches!(resource.kind(), TagResourceKind::Null)),
+        _ => field.value().is_some_and(value_is_meaningful),
+    }
+}
+
+fn struct_has_meaningful_value(value: TagStruct<'_>) -> bool {
+    value.fields().any(field_has_meaningful_value)
+}
+
+fn value_is_meaningful(value: TagFieldData) -> bool {
+    match value {
+        TagFieldData::String(value) | TagFieldData::LongString(value) => !value.is_empty(),
+        TagFieldData::StringId(value) | TagFieldData::OldStringId(value) => {
+            !value.string.is_empty()
+        }
+        TagFieldData::TagReference(value) => value.group_tag_and_name.is_some(),
+        TagFieldData::Data(value) | TagFieldData::Custom(value) => {
+            value.iter().any(|byte| *byte != 0)
+        }
+        TagFieldData::CharInteger(value) => value != 0,
+        TagFieldData::ShortInteger(value) => value != 0,
+        TagFieldData::LongInteger(value) => value != 0,
+        TagFieldData::Int64Integer(value) => value != 0,
+        TagFieldData::ByteInteger(value) => value != 0,
+        TagFieldData::WordInteger(value) => value != 0,
+        TagFieldData::DwordInteger(value) | TagFieldData::Tag(value) => value != 0,
+        TagFieldData::QwordInteger(value) => value != 0,
+        TagFieldData::CharEnum { value, .. } => value != 0,
+        TagFieldData::ShortEnum { value, .. } => value != 0,
+        TagFieldData::LongEnum { value, .. } => value != 0,
+        TagFieldData::ByteFlags { value, .. } | TagFieldData::ByteBlockFlags(value) => value != 0,
+        TagFieldData::WordFlags { value, .. } | TagFieldData::WordBlockFlags(value) => value != 0,
+        TagFieldData::LongFlags { value, .. } | TagFieldData::LongBlockFlags(value) => value != 0,
+        TagFieldData::CharBlockIndex(value) | TagFieldData::CustomCharBlockIndex(value) => {
+            value != 0
+        }
+        TagFieldData::ShortBlockIndex(value) | TagFieldData::CustomShortBlockIndex(value) => {
+            value != 0
+        }
+        TagFieldData::LongBlockIndex(value) | TagFieldData::CustomLongBlockIndex(value) => {
+            value != 0
+        }
+        TagFieldData::Angle(value)
+        | TagFieldData::Real(value)
+        | TagFieldData::RealSlider(value)
+        | TagFieldData::RealFraction(value) => value != 0.0,
+        TagFieldData::Point2d(value) => value != Default::default(),
+        TagFieldData::Rectangle2d(value) => value != Default::default(),
+        TagFieldData::RealPoint2d(value) => value != Default::default(),
+        TagFieldData::RealPoint3d(value) => value != Default::default(),
+        TagFieldData::RealVector2d(value) => value != Default::default(),
+        TagFieldData::RealVector3d(value) => value != Default::default(),
+        TagFieldData::RealQuaternion(value) => value != Default::default(),
+        TagFieldData::RealEulerAngles2d(value) => value != Default::default(),
+        TagFieldData::RealEulerAngles3d(value) => value != Default::default(),
+        TagFieldData::RealPlane2d(value) => value != Default::default(),
+        TagFieldData::RealPlane3d(value) => value != Default::default(),
+        TagFieldData::RgbColor(value) => value != Default::default(),
+        TagFieldData::ArgbColor(value) => value != Default::default(),
+        TagFieldData::RealRgbColor(value) => value != Default::default(),
+        TagFieldData::RealArgbColor(value) => value != Default::default(),
+        TagFieldData::RealHsvColor(value) => value != Default::default(),
+        TagFieldData::RealAhsvColor(value) => value != Default::default(),
+        TagFieldData::ShortIntegerBounds(value) => value != Default::default(),
+        TagFieldData::AngleBounds(value) => value != Default::default(),
+        TagFieldData::RealBounds(value) => value != Default::default(),
+        TagFieldData::FractionBounds(value) => value != Default::default(),
+        TagFieldData::ApiInterop(value) => value.raw.iter().any(|byte| *byte != 0),
+    }
+}
+
+fn is_integer_type(value: TagFieldType) -> bool {
+    matches!(
+        value,
+        TagFieldType::CharInteger
+            | TagFieldType::ShortInteger
+            | TagFieldType::LongInteger
+            | TagFieldType::Int64Integer
+            | TagFieldType::ByteInteger
+            | TagFieldType::WordInteger
+            | TagFieldType::DwordInteger
+            | TagFieldType::QwordInteger
+            | TagFieldType::CharBlockIndex
+            | TagFieldType::CustomCharBlockIndex
+            | TagFieldType::ShortBlockIndex
+            | TagFieldType::CustomShortBlockIndex
+            | TagFieldType::LongBlockIndex
+            | TagFieldType::CustomLongBlockIndex
+    )
+}
+
+pub fn is_real_scalar(value: TagFieldType) -> bool {
+    matches!(
+        value,
+        TagFieldType::Angle
+            | TagFieldType::Real
+            | TagFieldType::RealSlider
+            | TagFieldType::RealFraction
+    )
+}
+
+/// What must happen to a real scalar's *number* when it crosses an
+/// `angle`/`real` boundary.
+///
+/// An `angle` field stores radians and is authored in degrees — that contract is
+/// pinned by `angle_fields_are_edited_in_degrees_and_stored_in_radians`, which
+/// exists because Baboon once wrote 0.15 radians where Guerilla read 8.59437
+/// degrees. A plain `real` stores whatever its name says. So the same quantity
+/// can be typed `angle` in one game and `real` in the next, and copying the bits
+/// across is wrong by 180/pi.
+///
+/// Six fields do exactly this across the shipped definitions: `unit`'s three
+/// `grenade angle …:degrees` (ODST `angle` -> Reach/H4/H2A/CE `real`),
+/// `vehicle`'s `fixed gun pitch`/`fixed gun yaw` (H3/ODST `real` -> Reach+
+/// `angle`), and `scenario`'s `local north` (H1 `real` -> H2/CE `angle`).
+/// Only a matching `:units` annotation on both sides justifies rescaling. Where
+/// the schemas say nothing, the bits move — which is what the shipped tags show
+/// is right: `vehicle`'s `fixed gun pitch` is `real` 0.25 in H3EK/H3ODSTEK and
+/// `angle` 0.24993114 in HREK/H4EK. That is the same number, not one 180/pi from
+/// the other, so the type changed and the stored quantity did not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RealUnitChange {
+    /// Both sides agree, or nothing proves otherwise: move the bits.
+    Copy,
+    /// Source stores radians, target stores degrees.
+    RadiansToDegrees,
+    /// Source stores degrees, target stores radians.
+    DegreesToRadians,
+}
+
+/// The `:units` annotation a field name carries, if any — the `secs` in
+/// `strike delay bounds:secs`. Cut the `#help` tail first so a colon inside the
+/// help text cannot be mistaken for a unit.
+fn field_unit_annotation(name: &str) -> Option<String> {
+    let name = name.split('#').next().unwrap_or(name);
+    let unit = name.split_once(':')?.1.trim();
+    (!unit.is_empty()).then(|| unit.to_ascii_lowercase())
+}
+
+/// `source_unit`/`target_unit` come from each side's *schema*, via
+/// [`SchemaFieldAliases::unit_of`] — a tag's layout has already discarded them.
+fn real_scalar_unit_change(
+    source_type: TagFieldType,
+    source_unit: Option<&str>,
+    target_type: TagFieldType,
+    target_unit: Option<&str>,
+) -> RealUnitChange {
+    let source_angle = source_type == TagFieldType::Angle;
+    let target_angle = target_type == TagFieldType::Angle;
+    if source_angle == target_angle {
+        return RealUnitChange::Copy;
+    }
+    // Only the annotation proves the authored quantity is the same on both
+    // sides. `grenade angle:degrees` says `degrees` in every game that declares
+    // it, so only the storage differs and the factor is provable. An
+    // unannotated pair like `fixed gun pitch` says nothing, and guessing there
+    // would be the same silent corruption in the other direction.
+    if source_unit.is_none() || source_unit != target_unit {
+        return RealUnitChange::Copy;
+    }
+    if source_angle {
+        RealUnitChange::RadiansToDegrees
+    } else {
+        RealUnitChange::DegreesToRadians
+    }
+}
+
+pub fn is_enum_type(value: TagFieldType) -> bool {
+    matches!(
+        value,
+        TagFieldType::CharEnum | TagFieldType::ShortEnum | TagFieldType::LongEnum
+    )
+}
+
+pub fn is_flags_type(value: TagFieldType) -> bool {
+    matches!(
+        value,
+        TagFieldType::ByteFlags | TagFieldType::WordFlags | TagFieldType::LongFlags
+    )
+}
+
+fn is_string_type(value: TagFieldType) -> bool {
+    matches!(value, TagFieldType::String | TagFieldType::LongString)
+}
+
+pub fn is_string_id_type(value: TagFieldType) -> bool {
+    matches!(value, TagFieldType::StringId | TagFieldType::OldStringId)
+}
+
+fn integer_value(value: TagFieldData) -> Option<i128> {
+    match value {
+        TagFieldData::CharInteger(value) => Some(value as i128),
+        TagFieldData::ShortInteger(value) => Some(value as i128),
+        TagFieldData::LongInteger(value) => Some(value as i128),
+        TagFieldData::Int64Integer(value) => Some(value as i128),
+        TagFieldData::ByteInteger(value) => Some(value as i128),
+        TagFieldData::WordInteger(value) => Some(value as i128),
+        TagFieldData::DwordInteger(value) => Some(value as i128),
+        TagFieldData::QwordInteger(value) => Some(value as i128),
+        TagFieldData::CharBlockIndex(value) | TagFieldData::CustomCharBlockIndex(value) => {
+            Some(value as i128)
+        }
+        TagFieldData::ShortBlockIndex(value) | TagFieldData::CustomShortBlockIndex(value) => {
+            Some(value as i128)
+        }
+        TagFieldData::LongBlockIndex(value) | TagFieldData::CustomLongBlockIndex(value) => {
+            Some(value as i128)
+        }
+        _ => None,
+    }
+}
+
+fn integer_field_value(field_type: TagFieldType, value: i128) -> Option<TagFieldData> {
+    Some(match field_type {
+        TagFieldType::CharInteger => TagFieldData::CharInteger(i8::try_from(value).ok()?),
+        TagFieldType::ShortInteger => TagFieldData::ShortInteger(i16::try_from(value).ok()?),
+        TagFieldType::LongInteger => TagFieldData::LongInteger(i32::try_from(value).ok()?),
+        TagFieldType::Int64Integer => TagFieldData::Int64Integer(i64::try_from(value).ok()?),
+        TagFieldType::ByteInteger => TagFieldData::ByteInteger(u8::try_from(value).ok()?),
+        TagFieldType::WordInteger => TagFieldData::WordInteger(u16::try_from(value).ok()?),
+        TagFieldType::DwordInteger => TagFieldData::DwordInteger(u32::try_from(value).ok()?),
+        TagFieldType::QwordInteger => TagFieldData::QwordInteger(u64::try_from(value).ok()?),
+        TagFieldType::CharBlockIndex => TagFieldData::CharBlockIndex(i8::try_from(value).ok()?),
+        TagFieldType::CustomCharBlockIndex => {
+            TagFieldData::CustomCharBlockIndex(i8::try_from(value).ok()?)
+        }
+        TagFieldType::ShortBlockIndex => TagFieldData::ShortBlockIndex(i16::try_from(value).ok()?),
+        TagFieldType::CustomShortBlockIndex => {
+            TagFieldData::CustomShortBlockIndex(i16::try_from(value).ok()?)
+        }
+        TagFieldType::LongBlockIndex => TagFieldData::LongBlockIndex(i32::try_from(value).ok()?),
+        TagFieldType::CustomLongBlockIndex => {
+            TagFieldData::CustomLongBlockIndex(i32::try_from(value).ok()?)
+        }
+        _ => return None,
+    })
+}
+
+fn real_value(value: TagFieldData) -> Option<f32> {
+    match value {
+        TagFieldData::Angle(value)
+        | TagFieldData::Real(value)
+        | TagFieldData::RealSlider(value)
+        | TagFieldData::RealFraction(value) => Some(value),
+        _ => None,
+    }
+}
+
+pub fn real_field_value(field_type: TagFieldType, value: f32) -> TagFieldData {
+    match field_type {
+        TagFieldType::Angle => TagFieldData::Angle(value),
+        TagFieldType::RealSlider => TagFieldData::RealSlider(value),
+        TagFieldType::RealFraction => TagFieldData::RealFraction(value),
+        _ => TagFieldData::Real(value),
+    }
+}
+
+pub fn normalize_conversion_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// How many of the kit's particles the conversion sweep covers. The layout
+    /// is schema-derived and so identical for every one of them; the corpus is
+    /// there for the *values* — a tag whose references do not survive, or one
+    /// the walk trips over. Bounded because the point is reached long before
+    /// Reach's 1,160th particle.
+    const SWEPT_PARTICLES: usize = 256;
+
+    /// Where a scratch kit for a test lives. Named by process and clock so
+    /// parallel test threads cannot collide.
+    fn scratch(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "blam_convert_{label}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// A Reach particle converts into Halo 4 with its render method described,
+    /// from the definitions alone.
+    ///
+    /// The generated-layout path is the one under test, so the template index is
+    /// deliberately withheld: with a kit template the layout comes from a
+    /// game-authored tag and the schema import never runs. Without one it does,
+    /// and until the template fold it produced a `shader_particle_struct_definition`
+    /// of 52 bytes — no `definition`, no `options`, no `parameters`, no
+    /// `postprocess` — which is the tag Bonobo refused to open.
+    ///
+    /// References are asserted alongside the struct because the two failed
+    /// together: the render method's `definition` and `reference` are tag
+    /// references *inside* the bytes the old importer charged to a `tmpl`
+    /// custom, so a hole meant a particle that named nothing. No shipped Halo 4
+    /// particle has zero references.
+    ///
+    /// Ignored by default — it needs loose Halo Reach tags.
+    ///
+    /// Run with:
+    ///   REACH_TAGS=~/Halo/haloreach_mcc/tags cargo test a_reach_particle_converts -- --ignored
+    #[test]
+    #[ignore = "requires a loose Halo Reach tag tree; set REACH_TAGS"]
+    fn a_reach_particle_converts_into_halo_4_with_its_render_method_described() {
+        let Ok(root) = std::env::var("REACH_TAGS") else {
+            eprintln!("skipping: set REACH_TAGS to a loose Halo Reach tags directory");
+            return;
+        };
+        let mut particles: Vec<PathBuf> = walk_files(Path::new(&root))
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("particle")))
+            .collect();
+        particles.sort();
+        particles.truncate(SWEPT_PARTICLES);
+        assert!(!particles.is_empty(), "no particles under {root}");
+
+        let mut converted = 0usize;
+        for path in &particles {
+            let Ok(source) = crate::TagFile::read(path) else { continue };
+            let mut source_references = Vec::new();
+            collect_reference_values(source.root(), "", &mut source_references);
+
+            let draft = analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "halo4_mcc",
+                Path::new("../definitions"),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("convert {}: {e}", path.display()));
+            assert!(
+                draft.native_layout_template.is_none(),
+                "the generated path is under test"
+            );
+
+            let definitions = draft.tag.definitions();
+            let shader = definitions
+                .root_struct()
+                .fields()
+                .find(|field| field.name() == "actual shader?")
+                .and_then(|field| field.as_struct())
+                .unwrap_or_else(|| panic!("{}: no `actual shader?` struct", path.display()));
+            assert_eq!(shader.name(), "shader_particle_struct_definition");
+            assert_eq!(shader.size(), 152, "{}: the render method's base is missing", path.display());
+            let names: Vec<String> = shader.fields().map(|f| f.name().to_owned()).collect();
+            for expected in ["definition", "options", "parameters", "postprocess"] {
+                assert!(
+                    names.iter().any(|n| n == expected),
+                    "{}: no {expected:?} in {names:?}",
+                    path.display()
+                );
+            }
+
+            if !source_references.is_empty() {
+                let mut references = Vec::new();
+                collect_reference_values(draft.tag.root(), "", &mut references);
+                assert!(
+                    !references.is_empty(),
+                    "{}: names nothing after conversion; {} references went in",
+                    path.display(),
+                    source_references.len()
+                );
+            }
+            converted += 1;
+        }
+        assert!(converted > 0, "nothing converted");
+        eprintln!("converted {converted} of {} Reach particles", particles.len());
+    }
+
+    /// Routes are shortest first, walk the chain, and never double back.
+    #[test]
+    fn routes_walk_the_generation_chain_shortest_first() {
+        let routes = conversion_routes("halo2_mcc", "haloreach_mcc");
+        assert_eq!(
+            routes[0],
+            vec!["halo2_mcc", "haloreach_mcc"],
+            "the direct pair is always tried first, so a working conversion never detours"
+        );
+        assert_eq!(
+            routes[1],
+            vec!["halo2_mcc", "halo3_mcc", "haloreach_mcc"],
+            "one intermediate before two"
+        );
+        // Every route is a walk along the chain in travel order, and stays
+        // between the endpoints.
+        let index = |game: &str| CONVERSION_CHAIN.iter().position(|e| *e == game).unwrap();
+        for route in &routes {
+            let positions: Vec<usize> = route.iter().map(|game| index(game)).collect();
+            assert!(
+                positions.windows(2).all(|pair| pair[0] < pair[1]),
+                "{route:?} doubles back"
+            );
+            assert!(
+                positions.iter().all(|p| *p >= index("halo2_mcc") && *p <= index("haloreach_mcc")),
+                "{route:?} leaves the span between its endpoints"
+            );
+        }
+
+        // Backwards routes travel backwards.
+        let down = conversion_routes("halo4_mcc", "halo2_mcc");
+        assert_eq!(down[0], vec!["halo4_mcc", "halo2_mcc"]);
+        assert!(
+            down.iter().any(|route| route
+                == &vec![
+                    "halo4_mcc".to_owned(),
+                    "haloreach_mcc".to_owned(),
+                    "halo3_mcc".to_owned(),
+                    "halo2_mcc".to_owned()
+                ]),
+            "{down:?}"
+        );
+
+        // Adjacent profiles have nothing to route through.
+        assert_eq!(
+            conversion_routes("halo3_mcc", "halo3odst_mcc"),
+            vec![vec!["halo3_mcc", "halo3odst_mcc"]]
+        );
+
+        // Campaign Evolved has exactly one partner and is never a waypoint.
+        assert_eq!(
+            conversion_routes(CAMPAIGN_EVOLVED_GAME, CAMPAIGN_EVOLVED_PARENT),
+            vec![vec![CAMPAIGN_EVOLVED_GAME, CAMPAIGN_EVOLVED_PARENT]]
+        );
+        assert!(
+            conversion_routes("halo3_mcc", CAMPAIGN_EVOLVED_GAME).is_empty(),
+            "Halo 3 must not reach Campaign Evolved by way of Reach"
+        );
+        assert!(
+            conversion_routes("haloce_mcc", "halo2amp_mcc")
+                .iter()
+                .all(|route| !route.iter().any(|game| game == CAMPAIGN_EVOLVED_GAME))
+        );
+    }
+
+    /// A bitmap Halo 2 cannot hand to Reach directly arrives by way of Halo 3.
+    ///
+    /// This is the case the routing exists for, and it is a real refusal rather
+    /// than a contrived one: Reach's bitmap block has no `pixels offset` field at
+    /// all, so pixel data carried straight there has nothing indexing it, and the
+    /// catalog refuses the pair by name. Halo 3's does, and Halo 3 to Reach works
+    /// — so the tag gets there in two hops.
+    #[test]
+    fn a_halo_2_bitmap_reaches_reach_through_halo_3() {
+        let definitions = locate_definitions_root();
+        let source = TagFile::new(definitions.join("halo2_mcc/bitmap.json")).unwrap();
+
+        let direct = analyze_conversion_with_templates(
+            &source,
+            "halo2_mcc",
+            "haloreach_mcc",
+            &definitions,
+            None,
+        );
+        let Err(refusal) = direct else {
+            panic!("the direct pair should be refused by the catalog");
+        };
+        assert!(
+            refusal.to_ascii_lowercase().contains("halo 3")
+                || refusal.to_ascii_lowercase().contains("halo3"),
+            "the refusal should already name the way round: {refusal}"
+        );
+
+        let routed = analyze_conversion_routed(
+            &source,
+            "halo2_mcc",
+            "haloreach_mcc",
+            &definitions,
+            &(),
+        )
+        .expect("routing through Halo 3 carries it");
+        assert_eq!(
+            routed.route,
+            vec!["halo2_mcc", "halo3_mcc", "haloreach_mcc"],
+            "and it records how it got there"
+        );
+        assert_eq!(routed.target_extension, "bitmap");
+        // The tag that comes out is a real Reach tag: it writes, and it reopens.
+        let bytes = routed.tag.write_to_bytes().unwrap();
+        let reopened = TagFile::read_from_bytes(&bytes).unwrap();
+        assert_eq!(reopened.header.group_tag, u32::from_be_bytes(*b"bitm"));
+    }
+
+    /// The same route, with a real Halo 2 bitmap and real kit templates.
+    ///
+    /// The schema-built version above proves the routing *machinery*; this proves
+    /// the thing the user asked for. It needs real tags because a `TagFile::new`
+    /// Halo 2 bitmap is an MCC container wearing Halo 2's schema, not a classic
+    /// container — so it never exercises the classic read path, and it carries no
+    /// pixels, which are the whole reason this pair is refused.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_real_halo_2_bitmap_carries_its_pixels_to_reach_through_halo_3() {
+        let (Some(h2), Some(h3), Some(reach)) = (
+            kit_tags("BLAM_TEST_H2EK", "H2EK"),
+            kit_tags("BLAM_TEST_H3EK", "H3EK"),
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+        ) else {
+            eprintln!("skipping: needs H2EK, H3EK and HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = u32::from_be_bytes(*b"bitm");
+
+        // A bitmap with pixels in it, so "did the payload survive?" is a question
+        // with an answer. Bounded scan: the first few stock bitmaps will do.
+        let source = tags_with_extension(&h2, "bitmap")
+            .into_iter()
+            .take(40)
+            .find_map(|path| {
+                let tag =
+                    read_tag_for_conversion(&path, Some("halo2_mcc"), Some(&definitions), group_tag)
+                        .ok()?;
+                (blob_bytes(&tag) > 0).then_some((path, tag))
+            });
+        let Some((source_path, source)) = source else {
+            eprintln!("skipping: no H2EK bitmap with pixel data in the first 40");
+            return;
+        };
+        let source_pixels = blob_bytes(&source);
+
+        let mut templates: HashMap<String, NativeTemplateIndex> = HashMap::new();
+        for (game, root) in [("halo3_mcc", &h3), ("haloreach_mcc", &reach)] {
+            let groups = GameTagIndex::load(&definitions, game).unwrap();
+            templates.insert(game.to_owned(), NativeTemplateIndex::build(root, &groups));
+        }
+
+        let draft = analyze_conversion_routed(
+            &source,
+            "halo2_mcc",
+            "haloreach_mcc",
+            &definitions,
+            &templates,
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", source_path.display()));
+
+        assert_eq!(draft.route, vec!["halo2_mcc", "halo3_mcc", "haloreach_mcc"]);
+        // The point of the detour: the pixels are still there at the far end.
+        let landed = blob_bytes(&draft.tag);
+        assert!(
+            landed > 0,
+            "{}: {source_pixels} bytes of pixel data went in and none came out",
+            source_path.display()
+        );
+        // And the result is a tag Reach's tools can open at all.
+        let bytes = draft.tag.write_to_bytes().unwrap();
+        let reopened = TagFile::read_from_bytes(&bytes).unwrap();
+        assert_eq!(reopened.header.group_tag, group_tag);
+        // Attribute any change in payload size to the hop that caused it, rather
+        // than reporting a number with no owner. The Halo 2 to Halo 3 blob carry
+        // is reviewed; a change appearing only at the second hop would not be.
+        let midpoint = analyze_conversion_with_templates(
+            &source,
+            "halo2_mcc",
+            "halo3_mcc",
+            &definitions,
+            templates.templates_for("halo3_mcc"),
+        )
+        .map(|hop| blob_bytes(&hop.tag))
+        .unwrap_or(0);
+        eprintln!(
+            "{} : {source_pixels} -> {midpoint} (halo3) -> {landed} (reach) bytes of pixel data",
+            source_path.display()
+        );
+        assert_eq!(
+            midpoint, landed,
+            "the Halo 3 to Reach hop changed the payload size; only the classic              blob carry into Halo 3 is reviewed for that"
+        );
+    }
+
+    /// A Halo 2 scenario converts, and arrives with no compiled scripts but with
+    /// its script *source* intact.
+    ///
+    /// This is the case the user hit: the conversion refused outright because the
+    /// string table is a `data` blob Halo 3 declares under a different data
+    /// definition, and a blob that cannot cross fails the whole tag rather than
+    /// being written empty. The blob genuinely cannot cross, but refusing the
+    /// scenario over it was the wrong answer — and carrying it would have been a
+    /// worse one, because the syntax datums that index it renumber between
+    /// engines.
+    ///
+    /// Three things are asserted together on purpose. Emptied scripts without the
+    /// source surviving would be data loss; emptied strings with the datums still
+    /// present would be datums indexing nothing; and either without the warning
+    /// would be a silent change to what the scenario does.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_halo_2_scenario_converts_without_its_compiled_scripts() {
+        let (Some(h2), Some(h3)) = (
+            kit_tags("BLAM_TEST_H2EK", "H2EK"),
+            kit_tags("BLAM_TEST_H3EK", "H3EK"),
+        ) else {
+            eprintln!("skipping: needs H2EK and H3EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = u32::from_be_bytes(*b"scnr");
+        let block_len = |tag: &TagFile, name: &str| -> usize {
+            tag.root()
+                .fields()
+                .find(|field| clean_field_key(field.name()) == name)
+                .and_then(|field| field.as_block())
+                .map(|block| block.len())
+                .unwrap_or(0)
+        };
+
+        // A scenario that actually has scripts *and* their source, so every
+        // assertion below has something to bite on.
+        let picked = tags_with_extension(&h2, "scenario")
+            .into_iter()
+            .take(40)
+            .find_map(|path| {
+                let tag =
+                    read_tag_for_conversion(&path, Some("halo2_mcc"), Some(&definitions), group_tag)
+                        .ok()?;
+                let datums = block_len(&tag, "hs syntax datums");
+                let sources = block_len(&tag, "source files");
+                (datums > 0 && sources > 0).then_some((path, tag, datums, sources))
+            });
+        let Some((path, source, source_datums, source_files)) = picked else {
+            eprintln!("skipping: no H2EK scenario with both compiled scripts and .hsc source");
+            return;
+        };
+
+        let groups = GameTagIndex::load(&definitions, "halo3_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h3, &groups);
+        let draft = analyze_conversion_with_templates(
+            &source,
+            "halo2_mcc",
+            "halo3_mcc",
+            &definitions,
+            Some(&templates),
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+
+        // Nothing compiled came across, and nothing came across half.
+        for field in ["hs syntax datums", "scripts", "globals"] {
+            assert_eq!(
+                block_len(&draft.tag, field),
+                0,
+                "{}: {field} still carries Halo 2 bytecode",
+                path.display()
+            );
+        }
+        let strings = draft
+            .tag
+            .root()
+            .fields()
+            .find(|field| clean_field_key(field.name()) == "script string data")
+            .and_then(|field| field.value())
+            .and_then(|value| match value {
+                TagFieldData::Data(bytes) => Some(bytes.len()),
+                _ => None,
+            })
+            .unwrap_or(0);
+        assert_eq!(strings, 0, "{}: the string table survived", path.display());
+
+        // The source text did come across — that is what makes the scripts
+        // recoverable rather than lost.
+        assert_eq!(
+            block_len(&draft.tag, "source files"),
+            source_files,
+            "{}: the .hsc source did not carry",
+            path.display()
+        );
+
+        // And it says so, naming the source as the way back.
+        let warning = draft
+            .report
+            .issues
+            .iter()
+            .find(|issue| issue.message.contains("Compiled scripts were cleared"))
+            .unwrap_or_else(|| panic!("{}: no warning raised", path.display()));
+        assert_eq!(warning.kind, ConversionIssueKind::Warning);
+        assert!(warning.message.contains(".hsc"), "{}", warning.message);
+
+        // The result is a Halo 3 tag that writes and reopens.
+        let bytes = draft.tag.write_to_bytes().unwrap();
+        let reopened = TagFile::read_from_bytes(&bytes).unwrap();
+        assert_eq!(reopened.header.group_tag, group_tag);
+        eprintln!(
+            "{}: {source_datums} datums dropped, {source_files} source file(s) kept",
+            path.display()
+        );
+    }
+
+    /// A Halo CE scenario reaches Halo 2, editor blob and all.
+    ///
+    /// The same failure shape as the reported one, on a different blob: Sapien's
+    /// `editor scenario data` is declared under a different data definition in
+    /// every profile, so the opaque copy path refused the whole scenario over a
+    /// scratch buffer. Reviewed as a drop rather than aliased, because one game's
+    /// editor state means nothing to another's.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_halo_ce_scenario_reaches_halo_2_despite_its_editor_blob() {
+        let (Some(h1), Some(h2)) = (
+            kit_tags("BLAM_TEST_HCEEK", "HCEEK"),
+            kit_tags("BLAM_TEST_H2EK", "H2EK"),
+        ) else {
+            eprintln!("skipping: needs HCEEK and H2EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = u32::from_be_bytes(*b"scnr");
+        // A scenario that actually carries the blob, so the drop is exercised
+        // rather than trivially satisfied by an empty field.
+        let picked = tags_with_extension(&h1, "scenario")
+            .into_iter()
+            .take(30)
+            .find_map(|path| {
+                let tag =
+                    read_tag_for_conversion(&path, Some("haloce_mcc"), Some(&definitions), group_tag)
+                        .ok()?;
+                let filled = tag.root().fields().any(|field| {
+                    clean_field_key(field.name()) == "editor scenario data"
+                        && matches!(field.value(), Some(TagFieldData::Data(bytes)) if !bytes.is_empty())
+                });
+                filled.then_some((path, tag))
+            });
+        let Some((path, source)) = picked else {
+            eprintln!("skipping: no HCEEK scenario carries editor scenario data");
+            return;
+        };
+
+        let groups = GameTagIndex::load(&definitions, "halo2_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h2, &groups);
+        let draft = analyze_conversion_with_templates(
+            &source,
+            "haloce_mcc",
+            "halo2_mcc",
+            &definitions,
+            Some(&templates),
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        // A classic target has to come from a kit tag; if that stopped working
+        // this would silently fall back and the assertion says so.
+        assert!(
+            draft.native_layout_template.is_some(),
+            "{}: a Halo 2 target needs a kit-authored template",
+            path.display()
+        );
+        assert!(draft.tag.classic_engine().is_some(), "{}", path.display());
+    }
+
+    /// A same-game conversion leaves the scripts alone.
+    ///
+    /// The whole justification is that function tables renumber *between*
+    /// engines, so a rule that fired within one would be destroying data for no
+    /// reason. Cheap to assert and it pins the scope.
+    #[test]
+    fn scripts_are_only_stripped_when_the_engine_changes() {
+        assert!(
+            !conversion_pair_supported("halo3_mcc", "halo3_mcc"),
+            "a same-game pair is refused before any of this is reached, which is              what makes the guard in strip_cross_engine_scripts a belt-and-braces              check rather than the only thing standing between a scenario and its              own scripts"
+        );
+    }
+
+    /// The audited-loss refusal can be overruled, and says what it cost.
+    ///
+    /// The case the user hit: a Halo 3 light loses `percent spherical` going to
+    /// Reach, which is a real loss and not a reason the tag is worthless. The
+    /// default still refuses, because an unattended run has nobody to ask; asked
+    /// to accept, it converts and records exactly what went.
+    ///
+    /// Self-skips without the kits — a schema-built light has no authored values
+    /// to lose, so only a real one exercises this.
+    #[test]
+    fn an_audited_loss_refuses_by_default_and_converts_when_accepted() {
+        let (Some(h3), Some(reach)) = (
+            kit_tags("BLAM_TEST_H3EK", "H3EK"),
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+        ) else {
+            eprintln!("skipping: needs H3EK and HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = u32::from_be_bytes(*b"ligh");
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+
+        // A light the default policy actually refuses. Bounded, but wide enough
+        // to actually reach one: measured across 400 H3EK lights, 69 are refused
+        // and the first sits at index 95 — a scan of 60 found none and skipped,
+        // which is the failure mode a bound this arbitrary invites.
+        let refused = tags_with_extension(&h3, "light")
+            .into_iter()
+            .take(200)
+            .find_map(|path| {
+                let tag =
+                    read_tag_for_conversion(&path, Some("halo3_mcc"), Some(&definitions), group_tag)
+                        .ok()?;
+                analyze_conversion_with_templates(
+                    &tag,
+                    "halo3_mcc",
+                    "haloreach_mcc",
+                    &definitions,
+                    Some(&templates),
+                )
+                .err()
+                .map(|error| (path, tag, error))
+            });
+        let Some((path, source, refusal)) = refused else {
+            eprintln!("skipping: no H3EK light in the first 60 is refused for audited loss");
+            return;
+        };
+        assert!(
+            refusal.contains("was not written"),
+            "{}: refused for some other reason: {refusal}",
+            path.display()
+        );
+
+        let draft = analyze_conversion_with_policy(
+            &source,
+            "halo3_mcc",
+            "haloreach_mcc",
+            &definitions,
+            Some(&templates),
+            LossPolicy::Accept,
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+
+        // Allowed through, and the cost is on the record in both forms: a list
+        // the caller can show, and prose a reader will see.
+        assert!(
+            !draft.report.fail_closed_losses.is_empty(),
+            "{}: accepted without recording what was lost",
+            path.display()
+        );
+        assert!(
+            draft
+                .report
+                .issues
+                .iter()
+                .any(|issue| issue.message.contains("audited field(s) lost")),
+            "{}: no warning on the report",
+            path.display()
+        );
+        // And it is a tag, not a husk.
+        let bytes = draft.tag.write_to_bytes().unwrap();
+        assert_eq!(
+            TagFile::read_from_bytes(&bytes).unwrap().header.group_tag,
+            group_tag
+        );
+        eprintln!(
+            "{}: accepted losing {:?}",
+            path.display(),
+            draft.report.fail_closed_losses
+        );
+    }
+
+    /// Accepting a loss changes nothing for a conversion that had none.
+    #[test]
+    fn accepting_loss_does_not_change_a_clean_conversion() {
+        let definitions = locate_definitions_root();
+        let source = TagFile::new(definitions.join("halo3_mcc/weapon.json")).unwrap();
+        for policy in [LossPolicy::FailClosed, LossPolicy::Accept] {
+            let draft = analyze_conversion_with_policy(
+                &source,
+                "halo3_mcc",
+                "haloreach_mcc",
+                &definitions,
+                None,
+                policy,
+            )
+            .unwrap();
+            assert!(
+                draft.report.fail_closed_losses.is_empty(),
+                "{policy:?} invented a loss that was not there"
+            );
+        }
+    }
+
+    /// A direct conversion is left exactly as it was — no route, no detour.
+    #[test]
+    fn a_direct_conversion_is_not_routed() {
+        let definitions = locate_definitions_root();
+        let source = TagFile::new(definitions.join("halo3_mcc/weapon.json")).unwrap();
+        let draft = analyze_conversion_routed(
+            &source,
+            "halo3_mcc",
+            "haloreach_mcc",
+            &definitions,
+            &(),
+        )
+        .unwrap();
+        assert!(
+            draft.route.is_empty(),
+            "a pair that works directly must not report a route: {:?}",
+            draft.route
+        );
+    }
+
+    /// When no route works, the error says what was tried rather than just "no".
+    #[test]
+    fn an_unroutable_pair_reports_every_route_it_tried() {
+        let definitions = locate_definitions_root();
+        let source = TagFile::new(definitions.join("halo3_mcc/weapon.json")).unwrap();
+        // Campaign Evolved pairs only with Reach, so this has no route at all.
+        let Err(error) = analyze_conversion_routed(
+            &source,
+            "halo3_mcc",
+            CAMPAIGN_EVOLVED_GAME,
+            &definitions,
+            &(),
+        ) else {
+            panic!("Halo 3 cannot reach Campaign Evolved");
+        };
+        assert!(
+            error.contains(CAMPAIGN_EVOLVED_PARENT),
+            "the refusal should say what to do instead: {error}"
+        );
+    }
+
+    /// The header peek agrees with a full parse, and refuses what is not a tag.
+    ///
+    /// This is the primitive the template search sifts thousands of candidates
+    /// with, so a peek that disagreed with the parse would pick a different
+    /// template than the checks below it would accept — a silent divergence
+    /// rather than a failure.
+    #[test]
+    fn a_peeked_header_says_what_a_parsed_one_does() {
+        let root = scratch("peek");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("sample.weapon");
+        let mut tag =
+            TagFile::new(locate_definitions_root().join("halo3_mcc/weapon.json")).unwrap();
+        tag.header.build_version = 1;
+        tag.header.build_number = 2;
+        tag.header.version = 7;
+        tag.write_atomic(&path).unwrap();
+
+        let (peeked, endian) = TagFileHeader::peek(&path).expect("a written tag peeks");
+        let parsed = TagFile::read(&path).unwrap();
+        assert_eq!(endian, parsed.endian);
+        assert_eq!(peeked.group_tag, parsed.header.group_tag);
+        assert_eq!(peeked.version, parsed.header.version);
+        assert_eq!(peeked.build_version, parsed.header.build_version);
+        assert_eq!(peeked.build_number, parsed.header.build_number);
+        assert_eq!(peeked.group_tag, u32::from_be_bytes(*b"weap"));
+
+        // Not a tag at all, and too short to be one: both are ordinary things to
+        // meet when walking a kit, and neither may panic.
+        fs::write(root.join("notes.txt"), b"this is not a tag file at all ok").unwrap();
+        assert!(TagFileHeader::peek(root.join("notes.txt")).is_err());
+        fs::write(root.join("stub.weapon"), b"short").unwrap();
+        assert!(TagFileHeader::peek(root.join("stub.weapon")).is_err());
+        assert!(TagFileHeader::peek(root.join("absent.weapon")).is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The template search gives up after a bounded number of candidates.
+    ///
+    /// Both halves matter. Finding one inside the bound is the ordinary case and
+    /// proves the search still works; not finding one past the bound is the
+    /// deliberate limit, and without a test it would be indistinguishable from
+    /// the search being broken. What it buys: proving a group has *no* usable
+    /// template used to mean opening every tag in it, and Halo Reach ships
+    /// 10,675 bitmaps, 6.4 GB, and reading a header out of each one to decide.
+    #[test]
+    fn the_native_template_search_stops_after_a_bounded_number_of_candidates() {
+        let definitions = locate_definitions_root();
+        let root = scratch("scan_limit");
+        let tags = root.join("tags/objects");
+        fs::create_dir_all(&tags).unwrap();
+
+        // Accepted: a tag stamped like the kit's own. `version == u32::MAX` is
+        // part of that stamp and not a disqualification — every shipped Reach
+        // bitmap and sound carries it, and rejecting it once meant neither group
+        // could ever find a template.
+        let mut accept =
+            TagFile::new(definitions.join("haloreach_mcc/particle.json")).unwrap();
+        apply_editing_kit_mcc_header(&mut accept, "haloreach_mcc").unwrap();
+
+        // Sorted order is what the search walks, so zero-padded names put the
+        // acceptable tag at an exact, chosen index.
+        let place = |index: usize, tag: &TagFile| {
+            tag.write_atomic(tags.join(format!("tag_{index:05}.particle")))
+                .unwrap();
+        };
+        // Rejected: bytes that carry the extension and are not a tag. The
+        // header sift throws these out without opening them, which is the same
+        // path a real unusable candidate takes.
+        let place_reject = |index: usize| {
+            fs::write(tags.join(format!("tag_{index:05}.particle")), b"not a tag").unwrap();
+        };
+        let past_the_bound = NATIVE_TEMPLATE_SCAN_LIMIT + 20;
+        for index in 0..past_the_bound {
+            place_reject(index);
+        }
+        place(past_the_bound, &accept);
+
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let source = TagFile::new(definitions.join("halo3_mcc/particle.json")).unwrap();
+        let analyze = |tags_root: &Path| {
+            let templates = NativeTemplateIndex::build(tags_root, &groups);
+            analyze_conversion_with_templates(
+                &source,
+                "halo3_mcc",
+                "haloreach_mcc",
+                &definitions,
+                Some(&templates),
+            )
+            .map(|draft| draft.native_layout_template)
+        };
+
+        assert!(
+            analyze(&root.join("tags")).is_ok_and(|template| template.is_none()),
+            "an acceptable tag {past_the_bound} deep is past the bound and must not be found"
+        );
+
+        // Move it inside the bound and the same search finds it, so the miss
+        // above is the bound rather than the search failing outright.
+        place(1, &accept);
+        assert!(
+            analyze(&root.join("tags")).is_ok_and(|template| template.is_some()),
+            "an acceptable tag at index 1 is well inside the bound"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[derive(Clone)]
+    struct LeafSeed {
+        ordinal: usize,
+        field_type: TagFieldType,
+        option: Option<String>,
+    }
+
+    fn first_direct_leaf(tag: &TagFile, wanted: impl Fn(TagFieldType) -> bool) -> LeafSeed {
+        tag.root()
+            .fields()
+            .enumerate()
+            .find_map(|(ordinal, field)| {
+                wanted(field.field_type()).then(|| {
+                    let option = match field.options() {
+                        Some(TagOptions::Enum { names, .. }) => {
+                            names.get(1).or(names.first()).map(|s| (*s).to_owned())
+                        }
+                        Some(TagOptions::Flags(options)) => {
+                            options.first().map(|option| option.name.to_owned())
+                        }
+                        None => None,
+                    };
+                    LeafSeed {
+                        ordinal,
+                        field_type: field.field_type(),
+                        option,
+                    }
+                })
+            })
+            .expect("expected direct field type")
+    }
+
+    fn seed_weapon_fields(tag: &mut TagFile) {
+        let reference =
+            first_direct_leaf(tag, |field_type| field_type == TagFieldType::TagReference);
+        tag.root_mut()
+            .field_at_mut(reference.ordinal)
+            .unwrap()
+            .set(TagFieldData::TagReference(TagReferenceData {
+                group_tag_and_name: Some((
+                    u32::from_be_bytes(*b"bitm"),
+                    "objects\\test\\icon".to_owned(),
+                )),
+            }))
+            .unwrap();
+
+        let real = first_direct_leaf(tag, is_real_scalar);
+        tag.root_mut()
+            .field_at_mut(real.ordinal)
+            .unwrap()
+            .set(real_field_value(real.field_type, 0.625))
+            .unwrap();
+
+        let enumeration = first_direct_leaf(tag, is_enum_type);
+        let enum_name = enumeration.option.unwrap();
+        let enum_value = match enumeration.field_type {
+            TagFieldType::CharEnum => TagFieldData::CharEnum {
+                value: 1,
+                name: Some(enum_name),
+            },
+            TagFieldType::ShortEnum => TagFieldData::ShortEnum {
+                value: 1,
+                name: Some(enum_name),
+            },
+            TagFieldType::LongEnum => TagFieldData::LongEnum {
+                value: 1,
+                name: Some(enum_name),
+            },
+            _ => unreachable!(),
+        };
+        tag.root_mut()
+            .field_at_mut(enumeration.ordinal)
+            .unwrap()
+            .set(enum_value)
+            .unwrap();
+
+        let flags = first_direct_leaf(tag, is_flags_type);
+        let flag_name = flags.option.unwrap();
+        let flag_value = match flags.field_type {
+            TagFieldType::ByteFlags => TagFieldData::ByteFlags {
+                value: 1,
+                names: vec![(0, flag_name)],
+            },
+            TagFieldType::WordFlags => TagFieldData::WordFlags {
+                value: 1,
+                names: vec![(0, flag_name)],
+            },
+            TagFieldType::LongFlags => TagFieldData::LongFlags {
+                value: 1,
+                names: vec![(0, flag_name)],
+            },
+            _ => unreachable!(),
+        };
+        tag.root_mut()
+            .field_at_mut(flags.ordinal)
+            .unwrap()
+            .set(flag_value)
+            .unwrap();
+
+        let string_id = first_direct_leaf(tag, is_string_id_type);
+        let string_value = if string_id.field_type == TagFieldType::StringId {
+            TagFieldData::StringId(StringIdData {
+                string: "converted-label".to_owned(),
+            })
+        } else {
+            TagFieldData::OldStringId(StringIdData {
+                string: "converted-label".to_owned(),
+            })
+        };
+        tag.root_mut()
+            .field_at_mut(string_id.ordinal)
+            .unwrap()
+            .set(string_value)
+            .unwrap();
+
+        let magazines = tag
+            .root()
+            .fields()
+            .enumerate()
+            .find(|(_, field)| {
+                field.field_type() == TagFieldType::Block
+                    && clean_field_key(field.name()) == "magazines"
+            })
+            .map(|(ordinal, _)| ordinal)
+            .expect("weapon has magazines block");
+        let mut root = tag.root_mut();
+        let mut field = root.field_at_mut(magazines).unwrap();
+        let mut block = field.as_block_mut().unwrap();
+        block.add_element();
+    }
+
+    #[test]
+    fn halo3_weapon_converts_to_odst_and_reopens() {
+        let root = locate_definitions_root();
+        let mut source = TagFile::new(root.join("halo3_mcc/weapon.json")).unwrap();
+        seed_weapon_fields(&mut source);
+
+        let draft = analyze_conversion(&source, "halo3_mcc", "halo3odst_mcc", &root, None).unwrap();
+        assert!(draft.native_layout_template.is_none());
+        assert!(draft.report.issues.iter().any(|issue| {
+            issue.path == "target layout" && issue.message.contains("native editing-kit")
+        }));
+        assert_eq!(draft.tag.group().tag, u32::from_be_bytes(*b"weap"));
+        assert_eq!(draft.tag.header.build_version, 1);
+        assert_eq!(draft.tag.header.build_number, 1);
+        assert_eq!(draft.tag.header.version, u32::MAX);
+        assert!(draft.report.copied_exact > 0);
+        assert!(draft.report.converted_semantic > 0);
+        assert!(draft
+            .tag
+            .root()
+            .fields()
+            .filter_map(|field| field.value())
+            .any(|value| matches!(value, TagFieldData::TagReference(reference) if reference.group_tag_and_name.as_ref().is_some_and(|(group, path)| *group == u32::from_be_bytes(*b"bitm") && path == "objects\\test\\icon"))));
+        assert_eq!(
+            draft
+                .tag
+                .root()
+                .field("magazines")
+                .and_then(|field| field.as_block())
+                .map(|block| block.len()),
+            Some(1)
+        );
+
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "baboon_conversion_weapon_{}_{}.weapon",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        draft.tag.write_atomic(&path).unwrap();
+        let reopened = TagFile::read(&path).unwrap();
+        assert_eq!(reopened.group().tag, u32::from_be_bytes(*b"weap"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn compute_shader_group_fourcc_remaps_for_reach() {
+        let root = locate_definitions_root();
+        let source = GameTagIndex::load(&root, "halo3_mcc").unwrap();
+        let target = GameTagIndex::load(&root, "haloreach_mcc").unwrap();
+        let name = source.by_tag.get(&u32::from_be_bytes(*b"cmpu")).unwrap();
+        assert_eq!(
+            target.by_name.get(name),
+            Some(&u32::from_be_bytes(*b"cmps"))
+        );
+    }
+
+    #[test]
+    fn halo3_weapon_analyzes_for_every_supported_later_profile() {
+        let root = locate_definitions_root();
+        let source = TagFile::new(root.join("halo3_mcc/weapon.json")).unwrap();
+        for target in ["haloreach_mcc", "halo4_mcc", "halo2amp_mcc"] {
+            let draft = analyze_conversion(&source, "halo3_mcc", target, &root, None)
+                .unwrap_or_else(|error| panic!("{target}: {error}"));
+            assert_eq!(draft.tag.group().tag, u32::from_be_bytes(*b"weap"));
+            assert_eq!(draft.tag.header.build_version, 1);
+            assert_eq!(
+                draft.tag.header.build_number,
+                if target == "haloreach_mcc" || target == "halo4_mcc" || target == "halo2amp_mcc" {
+                    2
+                } else {
+                    1
+                }
+            );
+            assert_eq!(draft.tag.header.version, u32::MAX);
+            draft.tag.write_to_bytes().unwrap();
+        }
+    }
+
+    #[test]
+    fn editing_kit_header_defaults_match_profile_generations() {
+        let root = locate_definitions_root();
+        for (game, build_number) in [
+            ("halo3_mcc", 1),
+            ("halo3odst_mcc", 1),
+            ("haloreach_mcc", 2),
+            ("halo4_mcc", 2),
+            ("halo2amp_mcc", 2),
+        ] {
+            let mut tag = TagFile::new(root.join(game).join("globals.json")).unwrap();
+            apply_editing_kit_mcc_header(&mut tag, game).unwrap();
+            let bytes = tag.write_to_bytes().unwrap();
+            assert_eq!(i32::from_le_bytes(bytes[36..40].try_into().unwrap()), 1);
+            assert_eq!(
+                i32::from_le_bytes(bytes[40..44].try_into().unwrap()),
+                build_number
+            );
+            assert_eq!(
+                u32::from_le_bytes(bytes[44..48].try_into().unwrap()),
+                u32::MAX
+            );
+        }
+    }
+
+    #[test]
+    fn missing_target_group_is_rejected() {
+        let root = locate_definitions_root();
+        let source = TagFile::new(root.join("halo3_mcc/gui_button_key_definition.json")).unwrap();
+        let error = analyze_conversion(&source, "halo3_mcc", "haloreach_mcc", &root, None)
+            .err()
+            .expect("group should be absent");
+        assert!(error.contains("has no gui_button_key_definition tag group"));
+    }
+
+    // `fingerprint_changes_with_source_edits` stayed in the editor with
+    // `tag_fingerprint`: hashing a tag to notice a stale preview is a UI staleness
+    // concern, not something conversion decides, and it is the only reason the
+    // converter ever pulled in a hashing crate.
+
+    #[test]
+    fn integer_conversion_rejects_overflow() {
+        assert!(integer_field_value(TagFieldType::ByteInteger, 256).is_none());
+        assert!(integer_field_value(TagFieldType::CharInteger, -129).is_none());
+        assert!(matches!(
+            integer_field_value(TagFieldType::WordInteger, 65_535),
+            Some(TagFieldData::WordInteger(65_535))
+        ));
+    }
+
+    #[test]
+    fn enum_and_flag_option_aliases_match_semantically() {
+        assert!(option_names_match(
+            "particle correlation 1{particle random 1}",
+            "particle correlation 1"
+        ));
+        assert!(option_names_match(
+            "resolved manually{resolved in postprocess|required by game}",
+            "required by game"
+        ));
+        assert!(!option_names_match(
+            "particle correlation 1",
+            "particle correlation 2"
+        ));
+        assert!(option_names_match(" ", " "));
+        assert!(option_names_match(
+            "spew#fires its primary action barrel whenever the trigger is down",
+            "spew"
+        ));
+        assert!(field_names_match(
+            "coefficient*!",
+            "spherical harmonic{coefficient}*!"
+        ));
+        assert!(!field_names_match("acceleration", "deceleration"));
+    }
+
+    #[test]
+    fn mapping_catalog_is_scoped_and_reversible() {
+        let catalog = ConversionMappingCatalog::load().unwrap();
+        let coefficient_guid = parse_schema_guid("411d27e578471259100c498a81d58751").unwrap();
+        assert!(catalog.field_names_match(FieldMappingRequest {
+            group: "render_model",
+            source_game: "halo3_mcc",
+            target_game: "haloreach_mcc",
+            source_guid: coefficient_guid,
+            target_guid: coefficient_guid,
+            source_name: "coefficient",
+            target_name: "spherical harmonic",
+        }));
+        assert!(catalog.field_names_match(FieldMappingRequest {
+            group: "render_model",
+            source_game: "haloreach_mcc",
+            target_game: "halo3_mcc",
+            source_guid: coefficient_guid,
+            target_guid: coefficient_guid,
+            source_name: "spherical harmonic",
+            target_name: "coefficient",
+        }));
+        assert!(catalog.option_names_match(
+            "particle",
+            "main flags",
+            "halo3_mcc",
+            "haloreach_mcc",
+            "dies in media",
+            "dies in water"
+        ));
+        assert!(catalog.option_names_match(
+            "particle",
+            "main flags",
+            "haloreach_mcc",
+            "halo3_mcc",
+            "dies in water",
+            "dies in media"
+        ));
+        assert!(catalog.option_names_match(
+            "effect",
+            "systems[0]/emitters[0]/movement/flags",
+            "halo3_mcc",
+            "halo4_mcc",
+            "collide with media",
+            "collide with water"
+        ));
+        assert!(catalog.option_names_match(
+            "bitmap",
+            "bitmap curve",
+            "halo3_mcc",
+            "haloreach_mcc",
+            "sRGB",
+            "sRGB (gamma 2.2)"
+        ));
+        assert!(catalog.option_names_match(
+            "weapon",
+            "secondary flags",
+            "halo3_mcc",
+            "halo2amp_mcc",
+            "magnitizes only when zoomed",
+            "magnetizes only when zoomed"
+        ));
+        assert!(!catalog.option_names_match(
+            "weapon",
+            "main flags",
+            "halo3_mcc",
+            "haloreach_mcc",
+            "dies in media",
+            "dies in water"
+        ));
+    }
+
+    #[test]
+    fn mapping_catalog_covers_complete_common_tag_base() {
+        let root = locate_definitions_root();
+        let catalog = ConversionMappingCatalog::load().unwrap();
+        let indexes = CONVERSION_GAMES
+            .iter()
+            .map(|game| GameTagIndex::load(&root, game).unwrap())
+            .collect::<Vec<_>>();
+        let common_groups = indexes[0]
+            .by_name
+            .keys()
+            .filter(|group| {
+                indexes[1..]
+                    .iter()
+                    .all(|index| index.by_name.contains_key(*group))
+            })
+            .cloned()
+            .collect::<HashSet<_>>();
+        let covered_groups = catalog
+            .covered_groups
+            .iter()
+            .map(|group| group.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(
+            common_groups.len(),
+            125,
+            "common tag-base denominator changed"
+        );
+        assert!(
+            covered_groups.is_subset(&common_groups),
+            "covered groups must exist in every supported profile: {:?}",
+            covered_groups
+                .difference(&common_groups)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            covered_groups, common_groups,
+            "the mapping catalog must cover the complete common tag base"
+        );
+    }
+
+    #[test]
+    fn every_covered_group_pair_is_compatible_or_explicitly_rejected() {
+        let root = locate_definitions_root();
+        let catalog = ConversionMappingCatalog::load().unwrap();
+        let mut failures = Vec::new();
+        for group in &catalog.covered_groups {
+            for source_game in CONVERSION_GAMES {
+                let source = match std::panic::catch_unwind(|| {
+                    TagFile::new(root.join(source_game).join(format!("{group}.json")))
+                }) {
+                    Ok(Ok(source)) => source,
+                    Ok(Err(error)) => {
+                        failures.push(format!("{source_game}/{group}: {error}"));
+                        continue;
+                    }
+                    Err(_) => {
+                        failures.push(format!(
+                            "{source_game}/{group}: schema construction panicked"
+                        ));
+                        continue;
+                    }
+                };
+                for target_game in CONVERSION_GAMES {
+                    if source_game == target_game {
+                        continue;
+                    }
+                    // This sweep runs with no kits on purpose, so a target whose
+                    // schema cannot start a conversion has nothing to test here.
+                    // Its own path is covered by the template tests below.
+                    if target_needs_kit_template(&root, target_game, group) {
+                        continue;
+                    }
+                    let analysis = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        analyze_conversion(&source, source_game, target_game, &root, None)
+                    }));
+                    if analysis.is_err() {
+                        failures.push(format!(
+                            "{group}: {source_game} -> {target_game}: conversion panicked"
+                        ));
+                    } else if let Ok(Err(error)) = analysis {
+                        if catalog
+                            .incompatibility_reason(group, source_game, target_game)
+                            .is_none()
+                        {
+                            failures
+                                .push(format!("{group}: {source_game} -> {target_game}: {error}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn every_available_tag_group_pair_is_compatible_or_explicitly_rejected() {
+        let root = locate_definitions_root();
+        let catalog = ConversionMappingCatalog::load().unwrap();
+        let indexes = CONVERSION_GAMES
+            .iter()
+            .map(|game| GameTagIndex::load(&root, game).unwrap())
+            .collect::<Vec<_>>();
+        let mut all_groups = indexes
+            .iter()
+            .flat_map(|index| index.by_name.keys().cloned())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        all_groups.sort();
+        assert_eq!(all_groups.len(), 340, "supported tag-group union changed");
+
+        let mut failures = Vec::new();
+        for group in &all_groups {
+            for (source_index, source_game) in CONVERSION_GAMES.iter().enumerate() {
+                if !indexes[source_index].by_name.contains_key(group) {
+                    continue;
+                }
+                if catalog.unusable_schema_reason(group, source_game).is_some() {
+                    continue;
+                }
+                // Resolve the schema by its real (cased) filename via `by_tag`.
+                // `group` is a lowercased `by_name` key, so `{group}.json` only
+                // matches the file on case-insensitive filesystems (macOS/Windows)
+                // — a few schema files are mixed-case (e.g.
+                // `GameEngineFirefightVariantTag.json`) and would be missed on
+                // Linux. The runtime loader uses the `by_tag` casing, so match it.
+                let index = &indexes[source_index];
+                let name = index
+                    .by_tag
+                    .get(&index.by_name[group])
+                    .map_or(group.as_str(), String::as_str);
+                let source = TagFile::new(root.join(source_game).join(format!("{name}.json")))
+                    .unwrap_or_else(|error| panic!("{source_game}/{name}: {error}"));
+                for (target_index, target_game) in CONVERSION_GAMES.iter().enumerate() {
+                    if source_game == target_game
+                        || !indexes[target_index].by_name.contains_key(group)
+                    {
+                        continue;
+                    }
+                    // Kitless sweep: a target whose schema cannot start a
+                    // conversion is covered by the template tests instead.
+                    if target_needs_kit_template(&root, target_game, group) {
+                        continue;
+                    }
+                    if catalog.unusable_schema_reason(group, target_game).is_some() {
+                        continue;
+                    }
+                    if let Err(error) =
+                        analyze_conversion(&source, source_game, target_game, &root, None)
+                    {
+                        if catalog
+                            .incompatibility_reason(group, source_game, target_game)
+                            .is_none()
+                        {
+                            failures
+                                .push(format!("{group}: {source_game} -> {target_game}: {error}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn schema_alias_table_maps_renamed_render_model_coefficient() {
+        let definitions = locate_definitions_root();
+        let aliases =
+            SchemaFieldAliases::load(&definitions.join("haloreach_mcc/render_model.json")).unwrap();
+        let guid = parse_schema_guid("411d27e578471259100c498a81d58751").unwrap();
+        assert!(aliases.matches(guid, "default_lightprobe", "spherical harmonic", "coefficient"));
+    }
+
+    /// A classic game's aliases must not leak between its structs.
+    ///
+    /// Every struct in `haloce_mcc` and `halo2_mcc` carries an all-zero GUID, so
+    /// a GUID-keyed table collapses the whole group into one bucket and starts
+    /// answering "yes, those two field names are aliases" for arbitrary pairs
+    /// from unrelated structs. Keying falls back to the struct's own name — a
+    /// JSON object key, unique within the group — precisely for these profiles.
+    #[test]
+    fn a_zero_guid_struct_is_keyed_by_name_so_classic_aliases_do_not_collide() {
+        let zero = [0u8; 16];
+        let real = parse_schema_guid("411d27e578471259100c498a81d58751").unwrap();
+        // Two different zero-GUID structs get two different keys...
+        assert_ne!(
+            schema_struct_key(zero, "weapon_block_struct"),
+            schema_struct_key(zero, "unit_block_struct")
+        );
+        // ...while a real GUID keys on itself, so a rename still shares an entry.
+        assert_eq!(
+            schema_struct_key(real, "weapon_group"),
+            schema_struct_key(real, "weapon_block_struct")
+        );
+
+        // And on a real classic schema, an alias found in one struct must not
+        // answer for a field name that lives in another.
+        let definitions = locate_definitions_root();
+        let path = definitions.join("halo2_mcc/weapon.json");
+        if !path.is_file() {
+            eprintln!("skipping: no halo2_mcc definitions");
+            return;
+        }
+        let aliases = SchemaFieldAliases::load(&path).unwrap();
+        let buckets = aliases.by_struct.len();
+        assert!(
+            buckets > 1,
+            "a zero-GUID classic group collapsed into {buckets} alias bucket(s)"
+        );
+    }
+
+    #[test]
+    fn light_values_reparent_into_halo4_midnight_parameters() {
+        let definitions = locate_definitions_root();
+        let mut source = TagFile::new(definitions.join("halo3_mcc/light.json")).unwrap();
+        let ordinal = source
+            .root()
+            .fields()
+            .enumerate()
+            .find(|(_, field)| clean_field_key(field.name()) == "destroy light after")
+            .map(|(ordinal, _)| ordinal)
+            .unwrap();
+        source
+            .root_mut()
+            .field_at_mut(ordinal)
+            .unwrap()
+            .set(TagFieldData::Real(7.5))
+            .unwrap();
+
+        let draft =
+            analyze_conversion(&source, "halo3_mcc", "halo4_mcc", &definitions, None).unwrap();
+        let midnight = draft
+            .tag
+            .root()
+            .fields()
+            .find(|field| clean_field_key(field.name()) == "midnight_light_parameters")
+            .and_then(|field| field.as_struct())
+            .unwrap();
+        assert!(matches!(
+            midnight
+                .fields()
+                .find(|field| clean_field_key(field.name()) == "destroy light after")
+                .and_then(|field| field.value()),
+            Some(TagFieldData::Real(value)) if value == 7.5
+        ));
+    }
+
+    #[test]
+    fn halo3_reverb_values_reparent_into_reach_settings() {
+        let definitions = locate_definitions_root();
+        let mut source =
+            TagFile::new(definitions.join("halo3_mcc/sound_environment.json")).unwrap();
+        let ordinal = source
+            .root()
+            .fields()
+            .enumerate()
+            .find(|(_, field)| clean_field_key(field.name()) == "room intensity")
+            .map(|(ordinal, _)| ordinal)
+            .unwrap();
+        source
+            .root_mut()
+            .field_at_mut(ordinal)
+            .unwrap()
+            .set(TagFieldData::Real(-4.25))
+            .unwrap();
+
+        let draft =
+            analyze_conversion(&source, "halo3_mcc", "haloreach_mcc", &definitions, None).unwrap();
+        let reverb = draft
+            .tag
+            .root()
+            .fields()
+            .find(|field| clean_field_key(field.name()) == "reverb settings")
+            .and_then(|field| field.as_struct())
+            .unwrap();
+        assert!(reverb.fields().any(|field| {
+            clean_field_key(field.name()) == "room intensity"
+                && matches!(field.value(), Some(TagFieldData::Real(value)) if value == -4.25)
+        }));
+    }
+
+    #[test]
+    fn a_group_the_definitions_cannot_build_uses_a_native_layout_template() {
+        let definitions = locate_definitions_root();
+        for group in ["particle"] {
+            let tags_root = std::env::temp_dir().join(format!(
+                "baboon_{group}_template_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&tags_root).unwrap();
+
+            let mut template = TagFile::new(
+                definitions
+                    .join("haloreach_mcc")
+                    .join(format!("{group}.json")),
+            )
+            .unwrap();
+            apply_editing_kit_mcc_header(&mut template, "haloreach_mcc").unwrap();
+            template.header.version = 42;
+            template
+                .write_atomic(tags_root.join(format!("template.{group}")))
+                .unwrap();
+
+            let source =
+                TagFile::new(definitions.join("halo3_mcc").join(format!("{group}.json"))).unwrap();
+            let draft = analyze_conversion(
+                &source,
+                "halo3_mcc",
+                "haloreach_mcc",
+                &definitions,
+                Some(&tags_root),
+            )
+            .unwrap();
+            assert!(draft.native_layout_template.is_some());
+            assert!(draft.report.issues.iter().any(|issue| {
+                issue.path == "target layout"
+                    && issue.message.contains(&format!("native {group} layout"))
+            }));
+            let output = tags_root.join(format!("converted.{group}"));
+            draft.tag.write_atomic(&output).unwrap();
+            assert_eq!(
+                TagFile::read(output).unwrap().group().tag,
+                source.group().tag
+            );
+            let _ = fs::remove_dir_all(tags_root);
+        }
+    }
+
+    #[test]
+    fn editor_order_annotations_do_not_alias_unrelated_fields() {
+        assert!(field_names_match(
+            "animations*|ABCDCC",
+            "animations*|ABCDCC"
+        ));
+        assert!(!field_names_match(
+            "animations*|ABCDCC",
+            "sound references|ABCDCC!*#Legacy field"
+        ));
+    }
+
+    #[test]
+    fn reach_animation_entries_default_unmapped_shared_reference_to_none() {
+        let definitions = locate_definitions_root();
+        let mut source =
+            TagFile::new(definitions.join("halo3_mcc/model_animation_graph.json")).unwrap();
+        let definitions_ordinal = source
+            .root()
+            .fields()
+            .enumerate()
+            .find(|(_, field)| clean_field_key(field.name()) == "definitions")
+            .map(|(ordinal, _)| ordinal)
+            .unwrap();
+        let mut root = source.root_mut();
+        let mut definitions_field = root.field_at_mut(definitions_ordinal).unwrap();
+        let mut definitions_struct = definitions_field.as_struct_mut().unwrap();
+        let animations_ordinal = definitions_struct
+            .as_ref()
+            .fields()
+            .enumerate()
+            .find(|(_, field)| clean_field_key(field.name()).starts_with("animations"))
+            .map(|(ordinal, _)| ordinal)
+            .unwrap();
+        let mut animations_field = definitions_struct.field_at_mut(animations_ordinal).unwrap();
+        let mut animations = animations_field.as_block_mut().unwrap();
+        let animation_index = animations.add_element();
+        let mut animation = animations.element_mut(animation_index).unwrap();
+        let node_count_ordinal = animation
+            .as_ref()
+            .fields()
+            .enumerate()
+            .find(|(_, field)| clean_field_key(field.name()).starts_with("node count"))
+            .map(|(ordinal, _)| ordinal)
+            .unwrap();
+        animation
+            .field_at_mut(node_count_ordinal)
+            .unwrap()
+            .set(TagFieldData::CharInteger(7))
+            .unwrap();
+        drop(animation);
+        drop(animations);
+        drop(animations_field);
+        drop(definitions_struct);
+        drop(definitions_field);
+        drop(root);
+        assert_eq!(
+            struct_at_path(source.root(), "definitions")
+                .unwrap()
+                .fields()
+                .find(|field| clean_field_key(field.name()).starts_with("animations"))
+                .and_then(|field| field.as_block())
+                .map(|block| block.len()),
+            Some(1)
+        );
+
+        let draft =
+            analyze_conversion(&source, "halo3_mcc", "haloreach_mcc", &definitions, None).unwrap();
+        let target_definitions = struct_at_path(draft.tag.root(), "definitions").unwrap();
+        let target_animations = target_definitions
+            .fields()
+            .find(|field| clean_field_key(field.name()).starts_with("animations"))
+            .and_then(|field| field.as_block())
+            .unwrap();
+        assert_eq!(
+            target_animations.len(),
+            1,
+            "animation block was not transferred"
+        );
+        let animation = target_animations.element(0).unwrap();
+        let shared_reference = animation
+            .fields()
+            .find(|field| clean_field_key(field.name()).starts_with("shared animation reference"))
+            .and_then(|field| field.as_struct())
+            .unwrap();
+        assert!(matches!(
+            shared_reference
+                .fields()
+                .find(|field| clean_field_key(field.name()).starts_with("graph reference"))
+                .and_then(|field| field.value()),
+            Some(TagFieldData::TagReference(TagReferenceData {
+                group_tag_and_name: None
+            }))
+        ));
+        assert!(matches!(
+            shared_reference
+                .fields()
+                .find(|field| clean_field_key(field.name()).starts_with("shared animation index"))
+                .and_then(|field| field.value()),
+            Some(TagFieldData::ShortBlockIndex(-1))
+        ));
+        let shared_data = animation
+            .fields()
+            .find(|field| clean_field_key(field.name()).starts_with("shared animation data"))
+            .and_then(|field| field.as_block())
+            .unwrap();
+        assert_eq!(shared_data.len(), 1);
+        assert!(matches!(
+            shared_data
+                .element(0)
+                .and_then(|payload| {
+                    payload
+                        .fields()
+                        .find(|field| clean_field_key(field.name()).starts_with("node count"))
+                })
+                .and_then(|field| field.value()),
+            Some(TagFieldData::CharInteger(7))
+        ));
+        assert_eq!(
+            target_definitions
+                .fields()
+                .find(|field| clean_field_key(field.name()).starts_with("sound references"))
+                .and_then(|field| field.as_block())
+                .map(|block| block.len()),
+            Some(0),
+            "animation payload must not be routed through editor annotation aliases"
+        );
+    }
+
+    #[test]
+    fn particle_template_is_cleared_before_conversion() {
+        let definitions = locate_definitions_root();
+        let unique = format!(
+            "baboon_particle_template_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let tags_root = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&tags_root).unwrap();
+
+        let mut template = TagFile::new(definitions.join("haloreach_mcc/particle.json")).unwrap();
+        apply_editing_kit_mcc_header(&mut template, "haloreach_mcc").unwrap();
+        template.header.version = 42;
+        let low_res = template
+            .root()
+            .fields()
+            .enumerate()
+            .find(|(_, field)| clean_field_key(field.name()) == "low res switch distance")
+            .map(|(ordinal, _)| ordinal)
+            .unwrap();
+        template
+            .root_mut()
+            .field_at_mut(low_res)
+            .unwrap()
+            .set(TagFieldData::Real(123.0))
+            .unwrap();
+        template
+            .add_import_info(definitions.join("haloreach_mcc/tag_import_information.json"))
+            .unwrap();
+        template
+            .add_asset_depot_storage(definitions.join("haloreach_mcc/asset_depot_storage.json"))
+            .unwrap();
+        template
+            .write_atomic(tags_root.join("template.particle"))
+            .unwrap();
+
+        let mut source = TagFile::new(definitions.join("halo3_mcc/particle.json")).unwrap();
+        let main_flags = source
+            .root()
+            .fields()
+            .enumerate()
+            .find(|(_, field)| clean_field_key(field.name()) == "main flags")
+            .and_then(|(ordinal, field)| match field.options() {
+                Some(TagOptions::Flags(options)) => options
+                    .iter()
+                    .find(|option| option.name == "dies in media")
+                    .map(|option| (ordinal, option.bit, option.name.to_owned())),
+                _ => None,
+            })
+            .unwrap();
+        source
+            .root_mut()
+            .field_at_mut(main_flags.0)
+            .unwrap()
+            .set(TagFieldData::LongFlags {
+                value: (1u32 << main_flags.1) as i32,
+                names: vec![(main_flags.1, main_flags.2)],
+            })
+            .unwrap();
+        let billboard = source
+            .root()
+            .fields()
+            .enumerate()
+            .find(|(_, field)| clean_field_key(field.name()) == "particle billboard style")
+            .map(|(ordinal, _)| ordinal)
+            .unwrap();
+        source
+            .root_mut()
+            .field_at_mut(billboard)
+            .unwrap()
+            .set(TagFieldData::ShortEnum {
+                value: 6,
+                name: Some("local vertical".to_owned()),
+            })
+            .unwrap();
+        let attachments = source
+            .root()
+            .fields()
+            .enumerate()
+            .find(|(_, field)| clean_field_key(field.name()) == "attachments")
+            .map(|(ordinal, _)| ordinal)
+            .unwrap();
+        let mut root = source.root_mut();
+        let mut attachments_field = root.field_at_mut(attachments).unwrap();
+        let mut attachments_block = attachments_field.as_block_mut().unwrap();
+        let attachment_index = attachments_block.add_element();
+        let mut attachment = attachments_block.element_mut(attachment_index).unwrap();
+        let type_ordinal = attachment
+            .as_ref()
+            .fields()
+            .enumerate()
+            .find(|(_, field)| clean_field_key(field.name()) == "type")
+            .map(|(ordinal, _)| ordinal)
+            .unwrap();
+        attachment
+            .field_at_mut(type_ordinal)
+            .unwrap()
+            .set(TagFieldData::TagReference(TagReferenceData {
+                group_tag_and_name: Some((
+                    u32::from_be_bytes(*b"effe"),
+                    "effects\\particles\\spark_attachment".to_owned(),
+                )),
+            }))
+            .unwrap();
+        drop(attachment);
+        drop(attachments_block);
+        drop(attachments_field);
+        drop(root);
+        let draft = analyze_conversion(
+            &source,
+            "halo3_mcc",
+            "haloreach_mcc",
+            &definitions,
+            Some(&tags_root),
+        )
+        .unwrap();
+        assert!(draft.report.issues.iter().any(|issue| {
+            issue.path == "target layout" && issue.message.contains("native particle layout")
+        }));
+        assert!(draft.report.mapped_aliases > 0);
+        assert!(draft.tag.root().fields().any(|field| {
+            clean_field_key(field.name()) == "main flags"
+                && matches!(field.value(), Some(TagFieldData::LongFlags { names, .. }) if names.iter().any(|(_, name)| name == "dies in water"))
+        }));
+        assert!(draft.tag.root().fields().any(|field| {
+            clean_field_key(field.name()) == "particle billboard style"
+                && matches!(field.value(), Some(TagFieldData::ShortEnum { name: Some(name), .. }) if name == "local vertical")
+        }));
+        let target_attachments = draft
+            .tag
+            .root()
+            .fields()
+            .find(|field| clean_field_key(field.name()) == "attachments")
+            .and_then(|field| field.as_block())
+            .unwrap();
+        assert_eq!(target_attachments.len(), 1);
+        assert!(target_attachments.element(0).unwrap().fields().any(|field| {
+            clean_field_key(field.name()) == "type"
+                && matches!(field.value(), Some(TagFieldData::TagReference(reference)) if reference.group_tag_and_name == Some((u32::from_be_bytes(*b"effe"), "effects\\particles\\spark_attachment".to_owned())))
+        }));
+        assert!(draft.tag.root().fields().any(|field| {
+            clean_field_key(field.name()) == "low res switch distance"
+                && matches!(field.value(), Some(TagFieldData::Real(value)) if value == 0.0)
+        }));
+        assert!(draft.tag.import_info().is_none());
+        assert!(draft.tag.asset_depot_storage().is_none());
+
+        fs::remove_dir_all(tags_root).unwrap();
+    }
+
+    #[test]
+    fn particle_downport_rejects_unmatched_material_reference() {
+        let definitions = locate_definitions_root();
+        let unique = format!(
+            "baboon_particle_downport_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let tags_root = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&tags_root).unwrap();
+        let mut template = TagFile::new(definitions.join("halo3_mcc/particle.json")).unwrap();
+        apply_editing_kit_mcc_header(&mut template, "halo3_mcc").unwrap();
+        template.header.version = 42;
+        template
+            .write_atomic(tags_root.join("template.particle"))
+            .unwrap();
+
+        let mut source = TagFile::new(definitions.join("halo4_mcc/particle.json")).unwrap();
+        let material_ordinal = source
+            .root()
+            .fields()
+            .enumerate()
+            .find(|(_, field)| clean_field_key(field.name()) == "actual material?")
+            .map(|(ordinal, _)| ordinal)
+            .unwrap();
+        let mut root = source.root_mut();
+        let mut material_field = root.field_at_mut(material_ordinal).unwrap();
+        let mut material = material_field.as_struct_mut().unwrap();
+        let shader_ordinal = material
+            .as_ref()
+            .fields()
+            .enumerate()
+            .find(|(_, field)| clean_field_key(field.name()) == "material shader")
+            .map(|(ordinal, _)| ordinal)
+            .unwrap();
+        material
+            .field_at_mut(shader_ordinal)
+            .unwrap()
+            .set(TagFieldData::TagReference(TagReferenceData {
+                group_tag_and_name: Some((
+                    u32::from_be_bytes(*b"mats"),
+                    "materials\\particles\\energy".to_owned(),
+                )),
+            }))
+            .unwrap();
+        drop(material);
+        drop(material_field);
+        drop(root);
+
+        let draft = analyze_conversion(
+            &source,
+            "halo4_mcc",
+            "halo3_mcc",
+            &definitions,
+            Some(&tags_root),
+        )
+        .expect("a down-port reports what it cannot carry rather than refusing");
+
+        // Halo 3 has no `material` group at all, so no implementation could
+        // preserve this reference. What matters is that it is named precisely,
+        // so the author can rebuild that part with the older render-method
+        // system — which is exactly what `docs/tag-conversion-mappings.md`
+        // promises a down-port report will do.
+        assert!(draft.report.dropped_references > 0);
+        assert!(
+            draft
+                .report
+                .issues
+                .iter()
+                .any(|issue| issue.message.contains("materials\\particles\\energy")),
+            "the report has to name the material that needs recreating: {:?}",
+            draft.report.issues.iter().map(|i| &i.message).collect::<Vec<_>>(),
+        );
+
+        // The other half of that promise: nothing was forced into an unrelated
+        // older field to make the reference appear to survive.
+        let mut carried = Vec::new();
+        collect_reference_values(draft.tag.root(), "", &mut carried);
+        assert!(
+            !carried
+                .iter()
+                .any(|value| value.tag_path.contains("particles\\energy")),
+            "the material must not be re-pointed at some unrelated Halo 3 field",
+        );
+
+        fs::remove_dir_all(tags_root).unwrap();
+    }
+
+    #[test]
+    fn target_default_count_excludes_layout_and_runtime_storage() {
+        assert!(!is_reportable_target_default(TagFieldType::Custom));
+        assert!(!is_reportable_target_default(TagFieldType::Pad));
+        assert!(!is_reportable_target_default(
+            TagFieldType::PageableResource
+        ));
+        assert!(is_reportable_target_default(TagFieldType::Real));
+        assert!(is_reportable_target_default(TagFieldType::Block));
+    }
+
+    #[test]
+    fn default_values_are_not_reported_as_meaningful() {
+        assert!(!value_is_meaningful(TagFieldData::Real(0.0)));
+        assert!(!value_is_meaningful(TagFieldData::TagReference(
+            TagReferenceData {
+                group_tag_and_name: None,
+            }
+        )));
+        assert!(!value_is_meaningful(TagFieldData::Data(Vec::new())));
+    }
+
+    #[test]
+    fn reference_fidelity_rejects_missing_non_empty_reference() {
+        let definitions = locate_definitions_root();
+        let source_groups = GameTagIndex::load(&definitions, "halo3_mcc").unwrap();
+        let target_groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let mut source = TagFile::new(definitions.join("halo3_mcc/weapon.json")).unwrap();
+        seed_weapon_fields(&mut source);
+        let target = TagFile::new(definitions.join("haloreach_mcc/weapon.json")).unwrap();
+        let catalog = ConversionMappingCatalog::load().unwrap();
+        let mut report = TagConversionReport::default();
+        let error = validate_reference_fidelity(
+            &source,
+            &target,
+            &source_groups,
+            &target_groups,
+            "weapon",
+            "halo3_mcc",
+            "haloreach_mcc",
+            &catalog,
+            &mut report,
+        )
+        .unwrap_err();
+        assert!(error.contains("objects\\test\\icon"));
+    }
+
+    fn set_struct_reference(
+        structure: &mut TagStructMut<'_>,
+        key: &str,
+        group_tag: u32,
+        path: &str,
+    ) {
+        let ordinal = field_ordinal_by_key(structure.as_ref(), key).unwrap();
+        structure
+            .field_at_mut(ordinal)
+            .unwrap()
+            .set(TagFieldData::TagReference(TagReferenceData {
+                group_tag_and_name: Some((group_tag, path.to_owned())),
+            }))
+            .unwrap();
+    }
+
+    #[test]
+    fn halo3_melee_hit_references_map_to_unique_reach_block_entries() {
+        let definitions = locate_definitions_root();
+        let mut source = TagFile::new(definitions.join("halo3_mcc/weapon.json")).unwrap();
+        let melee_ordinal = field_ordinal_by_key(source.root(), "melee damage parameters").unwrap();
+        let mut root = source.root_mut();
+        let mut melee_field = root.field_at_mut(melee_ordinal).unwrap();
+        let mut melee = melee_field.as_struct_mut().unwrap();
+        let damage_group = u32::from_be_bytes(*b"jpt!");
+        for (prefix, damage) in [
+            ("1st hit", "objects\\weapons\\damage_effects\\strike_melee"),
+            ("2nd hit", "objects\\weapons\\damage_effects\\strike_melee"),
+            ("3rd hit", "objects\\weapons\\damage_effects\\smash_melee"),
+        ] {
+            set_struct_reference(
+                &mut melee,
+                &format!("{prefix} melee damage"),
+                damage_group,
+                damage,
+            );
+            set_struct_reference(
+                &mut melee,
+                &format!("{prefix} melee response"),
+                damage_group,
+                "globals\\trigger_melee",
+            );
+        }
+        drop(melee);
+        drop(melee_field);
+        drop(root);
+
+        let draft =
+            analyze_conversion(&source, "halo3_mcc", "haloreach_mcc", &definitions, None).unwrap();
+        let melee_block = draft
+            .tag
+            .root()
+            .fields()
+            .find(|field| clean_field_key(field.name()) == "melee damage parameters")
+            .and_then(|field| field.as_block())
+            .unwrap();
+        assert_eq!(melee_block.len(), 2);
+        let mut references = Vec::new();
+        collect_reference_values(draft.tag.root(), "", &mut references);
+        for path in [
+            "objects\\weapons\\damage_effects\\strike_melee",
+            "globals\\trigger_melee",
+            "objects\\weapons\\damage_effects\\smash_melee",
+        ] {
+            assert!(
+                references
+                    .iter()
+                    .any(|reference| reference.tag_path == path)
+            );
+        }
+    }
+
+    #[test]
+    fn halo3_effect_looping_sound_maps_into_reach_block() {
+        let definitions = locate_definitions_root();
+        let mut source = TagFile::new(definitions.join("halo3_mcc/effect.json")).unwrap();
+        let mut root = source.root_mut();
+        set_struct_reference(
+            &mut root,
+            "looping sound",
+            u32::from_be_bytes(*b"lsnd"),
+            "sound\\visual_fx\\fire_large\\fire_large",
+        );
+        for (key, value) in [("location", 3), ("bind scale to event", 2)] {
+            let ordinal = field_ordinal_by_key(root.as_ref(), key).unwrap();
+            root.field_at_mut(ordinal)
+                .unwrap()
+                .set(TagFieldData::CharBlockIndex(value))
+                .unwrap();
+        }
+        drop(root);
+
+        let draft =
+            analyze_conversion(&source, "halo3_mcc", "haloreach_mcc", &definitions, None).unwrap();
+        let looping = field_by_key(draft.tag.root(), "looping sounds")
+            .and_then(|field| field.as_block())
+            .unwrap();
+        assert_eq!(looping.len(), 1);
+        let element = looping.element(0).unwrap();
+        assert!(matches!(
+            field_by_key(element, "looping sound").and_then(|field| field.value()),
+            Some(TagFieldData::TagReference(TagReferenceData {
+                group_tag_and_name: Some((group, ref path)),
+            })) if group == u32::from_be_bytes(*b"lsnd")
+                && path == "sound\\visual_fx\\fire_large\\fire_large"
+        ));
+        assert!(matches!(
+            field_by_key(element, "location").and_then(|field| field.value()),
+            Some(TagFieldData::ShortBlockIndex(3))
+        ));
+        assert!(matches!(
+            field_by_key(element, "bind scale to event").and_then(|field| field.value()),
+            Some(TagFieldData::ShortBlockIndex(2))
+        ));
+    }
+
+    #[test]
+    fn halo3_lens_flare_occlusion_enum_maps_to_reach_scale() {
+        let definitions = locate_definitions_root();
+        let mut source = TagFile::new(definitions.join("halo3_mcc/lens_flare.json")).unwrap();
+        let mut root = source.root_mut();
+        let ordinal = field_ordinal_by_key(root.as_ref(), "occlusion inner radius scale").unwrap();
+        root.field_at_mut(ordinal)
+            .unwrap()
+            .set(TagFieldData::ShortEnum {
+                value: 3,
+                name: Some("1/8".to_owned()),
+            })
+            .unwrap();
+        drop(root);
+
+        let draft =
+            analyze_conversion(&source, "halo3_mcc", "haloreach_mcc", &definitions, None).unwrap();
+        assert!(matches!(
+            field_by_key(draft.tag.root(), "occlusion inner radius scale")
+                .and_then(|field| field.value()),
+            Some(TagFieldData::Real(value)) if value == 0.125
+        ));
+    }
+
+    #[test]
+    fn runtime_sensitive_groups_fail_instead_of_dropping_authored_fields() {
+        let definitions = locate_definitions_root();
+        let mut source = TagFile::new(definitions.join("halo3_mcc/light.json")).unwrap();
+        let mut root = source.root_mut();
+        let ordinal = field_ordinal_by_key(root.as_ref(), "percent spherical").unwrap();
+        root.field_at_mut(ordinal)
+            .unwrap()
+            .set(TagFieldData::Real(0.75))
+            .unwrap();
+        drop(root);
+
+        let error = analyze_conversion(&source, "halo3_mcc", "haloreach_mcc", &definitions, None)
+            .err()
+            .unwrap();
+        assert!(error.contains("light conversion would lose 1 meaningful"));
+        assert!(error.contains("percent spherical"));
+    }
+
+    #[test]
+    fn halo3_player_response_generates_reach_companion_tags() {
+        let definitions = locate_definitions_root();
+        let mut source = TagFile::new(definitions.join("halo3_mcc/damage_effect.json")).unwrap();
+        let responses_ordinal = field_ordinal_by_key(source.root(), "player responses").unwrap();
+        let mut root = source.root_mut();
+        let mut responses_field = root.field_at_mut(responses_ordinal).unwrap();
+        let mut responses = responses_field.as_block_mut().unwrap();
+        let response_index = responses.add_element();
+        let response = responses.element_mut(response_index).unwrap();
+        initialize_block_index_defaults(response);
+        let mut response = responses.element_mut(response_index).unwrap();
+        let response_type = field_ordinal_by_key(response.as_ref(), "response type").unwrap();
+        response
+            .field_at_mut(response_type)
+            .unwrap()
+            .set(TagFieldData::ShortEnum {
+                value: 1,
+                name: Some("unshielded".to_owned()),
+            })
+            .unwrap();
+        let rumble_ordinal = field_ordinal_by_key(response.as_ref(), "rumble").unwrap();
+        let mut rumble_field = response.field_at_mut(rumble_ordinal).unwrap();
+        let mut rumble = rumble_field.as_struct_mut().unwrap();
+        let low_ordinal = field_ordinal_by_key(rumble.as_ref(), "low frequency rumble").unwrap();
+        let mut low_field = rumble.field_at_mut(low_ordinal).unwrap();
+        let mut low = low_field.as_struct_mut().unwrap();
+        let duration = field_ordinal_by_key(low.as_ref(), "duration").unwrap();
+        low.field_at_mut(duration)
+            .unwrap()
+            .set(TagFieldData::Real(0.4))
+            .unwrap();
+        drop(low);
+        drop(low_field);
+        drop(rumble);
+        drop(rumble_field);
+        drop(response);
+        drop(responses);
+        drop(responses_field);
+        drop(root);
+
+        let mut draft =
+            analyze_conversion(&source, "halo3_mcc", "haloreach_mcc", &definitions, None).unwrap();
+        assert_eq!(draft.companion_tags.len(), 2);
+        assert!(
+            draft
+                .companion_tags
+                .iter()
+                .any(|companion| companion.group_name == "damage_response_definition")
+        );
+        assert!(
+            draft
+                .companion_tags
+                .iter()
+                .any(|companion| companion.group_name == "rumble")
+        );
+
+        let tags_root = std::env::temp_dir().join(format!(
+            "baboon_response_companions_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(tags_root.join("objects/test")).unwrap();
+        let output = tags_root.join("objects/test/impact.damage_effect");
+        let companion_outputs = prepare_companion_outputs(
+            &mut draft,
+            &output,
+            &tags_root,
+            &definitions.join("haloreach_mcc/tag_dependency_list.json"),
+        )
+        .unwrap();
+        assert_eq!(companion_outputs.len(), 2);
+        assert!(companion_outputs.iter().any(|path| {
+            path.file_name()
+                .is_some_and(|name| name == "impact__damage_response.damage_response_definition")
+        }));
+        let (_, response_path) = reference_by_key(draft.tag.root(), "damage response").unwrap();
+        assert_eq!(response_path, "objects\\test\\impact__damage_response");
+        fs::remove_dir_all(tags_root).unwrap();
+    }
+
+    #[test]
+    fn native_reach_contrail_fixed_arrays_open_without_panicking() {
+        let path = Path::new(
+            "D:/SteamLibrary/steamapps/common/HREK/tags/cinematics/020lb_halsey/fx/010/mac_projectile.contrail_system",
+        );
+        if !path.is_file() {
+            return;
+        }
+        let result = std::panic::catch_unwind(|| TagFile::read(path));
+        assert!(result.is_ok(), "native Reach contrail read panicked");
+        assert!(
+            result.unwrap().is_ok(),
+            "native Reach contrail is unreadable"
+        );
+    }
+
+    /// A conversion starts from the layout revision the definition declares.
+    ///
+    /// A kit ships one group at several layout revisions — every tag embeds the
+    /// `blay` it was authored against — and the template index is sorted by
+    /// path, so "first acceptable" means "whichever sorts first". On one H4EK
+    /// that is everything under `2011\`; a kit without that folder, or holding a
+    /// tag sorting before it (including one a previous import wrote), starts
+    /// from a different layout. That is how the same editor converting the same
+    /// tag produced a file that opened on one machine and not another.
+    ///
+    /// The declared revision is the right one to hold out for because it is the
+    /// schema the conversion maps fields *with*. Measured on one Reach effect
+    /// into Halo 4: the 96-byte revision carried 1,758 values, the 104-byte one
+    /// — which is what `halo4_mcc/effect.json` declares — carried 2,084.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_conversion_starts_from_the_layout_revision_the_definition_declares() {
+        let (Some(reach), Some(h4)) = (
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+        ) else {
+            eprintln!("skipping: needs HREK and H4EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h4, &groups);
+        // Counts the groups where the kit actually offered a wrong revision to
+        // reject. Without one of those the assertions below hold vacuously.
+        let mut discriminated = 0usize;
+
+        // `particle` only. Every other fx group now builds from Halo 4's own
+        // definitions and never consults the kit, so there is no revision to
+        // choose between - which is the point of the change, not a gap here.
+        for (group, fourcc) in [("particle", "prt3")] {
+            let group_tag = crate::parse_group_tag(fourcc).expect("a group tag");
+            let schema = definitions.join("halo4_mcc").join(format!("{group}.json"));
+            let declared =
+                declared_root_size(&schema).expect("halo4_mcc declares a root size for {group}");
+            let offered: HashSet<usize> = templates
+                .by_group
+                .get(&group_tag)
+                .into_iter()
+                .flatten()
+                .take(NATIVE_TEMPLATE_SCAN_LIMIT)
+                .filter_map(|path| TagFile::read(path).ok())
+                .filter(|tag| accepts_native_header(&tag.header, "halo4_mcc"))
+                .map(|tag| tag.root().definition().size())
+                .collect();
+            if offered.is_empty() {
+                eprintln!("skipping {group}: H4EK offers no acceptable template");
+                continue;
+            }
+            if offered.len() > 1 {
+                discriminated += 1;
+            }
+
+            let Some(source_path) = tags_with_extension(&reach, group).into_iter().find(|path| {
+                read_tag_for_conversion(path, Some("haloreach_mcc"), Some(&definitions), group_tag)
+                    .is_ok()
+            }) else {
+                eprintln!("skipping {group}: HREK ships none");
+                continue;
+            };
+            let source = read_tag_for_conversion(
+                &source_path,
+                Some("haloreach_mcc"),
+                Some(&definitions),
+                group_tag,
+            )
+            .unwrap();
+            let draft = analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "halo4_mcc",
+                &definitions,
+                Some(&templates),
+            )
+            .unwrap_or_else(|error| panic!("{}: {error}", source_path.display()));
+            let picked = draft
+                .native_layout_template
+                .unwrap_or_else(|| panic!("{group}: no native template was used"));
+            let size = TagFile::read(&picked).unwrap().root().definition().size();
+            assert_eq!(
+                size,
+                declared,
+                "{group}: started from {} (root {size}) when the definition declares {declared}; \
+                 the kit offered {offered:?}",
+                picked.display()
+            );
+        }
+        if discriminated == 0 {
+            eprintln!("skipping: no group offered more than one revision to choose between");
+        }
+    }
+
+    /// A template of the wrong revision still beats no template.
+    ///
+    /// Holding out for the declared revision must not turn "started from an
+    /// older kit tag" into "built the layout from the schema" — that fallback is
+    /// a layout no kit ever authored, and it is the one the editor labels
+    /// unverified.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_kit_with_only_the_wrong_revision_still_supplies_a_template() {
+        let (Some(reach), Some(h4)) = (
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+        ) else {
+            eprintln!("skipping: needs HREK and H4EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+        let group_tag = crate::parse_group_tag("prt3").expect("prt3 is a group tag");
+        let declared = declared_root_size(&definitions.join("halo4_mcc/particle.json")).unwrap();
+
+        let Some(wrong) = tags_with_extension(&h4, "particle").into_iter().find(|path| {
+            TagFile::read(path).is_ok_and(|tag| {
+                accepts_native_header(&tag.header, "halo4_mcc")
+                    && tag.root().definition().size() != declared
+            })
+        }) else {
+            eprintln!("skipping: H4EK ships only the declared revision");
+            return;
+        };
+
+        // A kit holding exactly one effect, of the wrong revision.
+        let scratch = std::env::temp_dir().join(format!(
+            "blam_wrong_revision_particle_{}_{}",
+            std::process::id(),
+            group_tag
+        ));
+        let _ = fs::remove_dir_all(&scratch);
+        fs::create_dir_all(&scratch).unwrap();
+        fs::copy(&wrong, scratch.join(wrong.file_name().unwrap())).unwrap();
+        let templates = NativeTemplateIndex::build(&scratch, &groups);
+
+        let source_path = tags_with_extension(&reach, "particle")
+            .into_iter()
+            .find(|path| {
+                read_tag_for_conversion(path, Some("haloreach_mcc"), Some(&definitions), group_tag)
+                    .is_ok()
+            })
+            .expect("HREK ships a particle");
+        let source = read_tag_for_conversion(
+            &source_path,
+            Some("haloreach_mcc"),
+            Some(&definitions),
+            group_tag,
+        )
+        .unwrap();
+        let draft = analyze_conversion_with_templates(
+            &source,
+            "haloreach_mcc",
+            "halo4_mcc",
+            &definitions,
+            Some(&templates),
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", source_path.display()));
+        assert!(
+            draft.native_layout_template.is_some(),
+            "the only template on offer was rejected for its revision"
+        );
+        let _ = fs::remove_dir_all(scratch);
+    }
+
+    #[test]
+    fn h3_contrail_uses_native_reach_layout_when_kits_are_available() {
+        let source_path = Path::new(
+            "D:/SteamLibrary/steamapps/common/H3EK/tags/fx/cinematics/010la_jungle_intro/01/hatch.contrail_system",
+        );
+        let target_root = Path::new("D:/SteamLibrary/steamapps/common/HREK/tags");
+        if !source_path.is_file() || !target_root.is_dir() {
+            return;
+        }
+        let definitions = locate_definitions_root();
+        let source = TagFile::read(source_path).unwrap();
+        let draft = analyze_conversion(
+            &source,
+            "halo3_mcc",
+            "haloreach_mcc",
+            &definitions,
+            Some(target_root),
+        )
+        .unwrap();
+        assert!(draft.native_layout_template.is_some());
+        let bytes = draft.tag.write_to_bytes().unwrap();
+        TagFile::read_from_bytes(&bytes).unwrap();
+    }
+
+    /// Campaign Evolved pairs only with Halo Reach, and says so rather than
+    /// quietly offering a conversion nobody reviewed.
+    #[test]
+    fn campaign_evolved_converts_only_with_reach() {
+        assert!(conversion_pair_supported("haloreach_mcc", CAMPAIGN_EVOLVED_GAME));
+        assert!(conversion_pair_supported(CAMPAIGN_EVOLVED_GAME, "haloreach_mcc"));
+        for other in ["halo3_mcc", "halo3odst_mcc", "halo4_mcc", "halo2amp_mcc"] {
+            assert!(
+                !conversion_pair_supported(other, CAMPAIGN_EVOLVED_GAME),
+                "{other} must not convert straight into Campaign Evolved",
+            );
+            assert!(!conversion_pair_supported(CAMPAIGN_EVOLVED_GAME, other));
+        }
+        assert!(!conversion_pair_supported(CAMPAIGN_EVOLVED_GAME, CAMPAIGN_EVOLVED_GAME));
+
+        // The refusal has to say what to do instead, or it is a dead end.
+        let message = unsupported_pair_message("halo3_mcc", CAMPAIGN_EVOLVED_GAME);
+        assert!(message.contains("haloreach_mcc"), "{message}");
+
+        // The five MCC profiles are untouched.
+        assert!(conversion_pair_supported("halo3_mcc", "haloreach_mcc"));
+        assert!(conversion_pair_supported("halo4_mcc", "halo2amp_mcc"));
+    }
+
+    /// A Halo Reach animation graph converts into Campaign Evolved.
+    ///
+    /// This is the whole point of the exercise, and it used to fail twice over:
+    /// Campaign Evolved was not a conversion target at all, and the safety
+    /// check refused any tag carrying a pageable resource — which every
+    /// animation graph does, because its payload *is* one.
+    ///
+    /// Built from the schemas rather than from a kit, so it runs on CI. That
+    /// means null resources; the engine's `resource_copy_tests` cover a
+    /// populated one crossing byte-for-byte, and the fixture test below covers
+    /// a real file when HREK is installed.
+    #[test]
+    fn a_reach_animation_graph_converts_into_campaign_evolved() {
+        let definitions = locate_definitions_root();
+        let source = TagFile::new(
+            definitions.join("haloreach_mcc/model_animation_graph.json"),
+        )
+        .expect("build a Reach animation graph from its schema");
+
+        let draft = analyze_conversion(
+            &source,
+            "haloreach_mcc",
+            CAMPAIGN_EVOLVED_GAME,
+            &definitions,
+            None,
+        )
+        .expect("a Reach animation graph must convert into Campaign Evolved");
+
+        // The target's layout won, not the source's — that is the safety
+        // argument, and the four structs that changed size are where it shows.
+        let root = draft.tag.root();
+        let pool = root
+            .field_path("definitions/animations")
+            .and_then(|field| field.as_block())
+            .expect("the converted graph declares an animation pool")
+            .definition()
+            .struct_definition();
+        let shared = pool
+            .fields()
+            .find(|field| field.name() == "shared animation data")
+            .and_then(|field| field.as_block())
+            .expect("each pool entry holds shared animation data")
+            .struct_definition();
+        assert_eq!(shared.name(), "shared_model_animation_block");
+        assert_eq!(
+            shared.size(),
+            200,
+            "Campaign Evolved's 200-byte element, not Reach's 212-byte one",
+        );
+
+        // The stamp belongs to the destination.
+        assert_eq!(
+            (
+                draft.tag.header.build_version,
+                draft.tag.header.build_number,
+                draft.tag.header.version,
+            ),
+            CAMPAIGN_EVOLVED_GENERATION,
+        );
+
+        // And it round-trips.
+        let bytes = draft.tag.write_to_bytes().expect("serialize the converted graph");
+        TagFile::read_from_bytes(&bytes).expect("read the converted graph back");
+    }
+
+    /// The reviewed drops are what let the graph through, so an unreviewed loss
+    /// must still stop it. Removing one from the catalog has to bring the
+    /// refusal back — otherwise the fail-closed rule has quietly stopped
+    /// guarding anything.
+    #[test]
+    fn an_uncatalogued_animation_graph_loss_still_refuses() {
+        let catalog = ConversionMappingCatalog::load().unwrap();
+        // The paths the converter actually reports, indices and all.
+        for field in [
+            "definitions/skeleton nodes[0]/node joint flags",
+            "definitions/skeleton nodes[7]/additional flags",
+            "definitions/animations[0]/shared animation data[0]/facial wrinkle events[0]/region",
+        ] {
+            assert!(
+                catalog
+                    .accepted_drop_reason(
+                        "model_animation_graph",
+                        "haloreach_mcc",
+                        CAMPAIGN_EVOLVED_GAME,
+                        field,
+                    )
+                    .is_some(),
+                "{field} must be a reviewed drop, or every Reach graph refuses",
+            );
+        }
+        // A field nobody reviewed is not accepted just because it is in the
+        // same group.
+        assert!(
+            catalog
+                .accepted_drop_reason(
+                    "model_animation_graph",
+                    "haloreach_mcc",
+                    CAMPAIGN_EVOLVED_GAME,
+                    "definitions/some field nobody reviewed",
+                )
+                .is_none(),
+        );
+    }
+
+    /// A rule that drops a container drops what is inside it.
+    ///
+    /// Campaign Evolved has no `facial wrinkle events` block, so it has none of
+    /// the fields within one either — but the converter reports those children
+    /// individually, one per element. 85 of HREK's cinematic head graphs
+    /// refused on `.../facial wrinkle events[0]/wrinkle name` while the rule
+    /// named the block itself.
+    #[test]
+    fn a_dropped_container_covers_the_fields_inside_it() {
+        let catalog = ConversionMappingCatalog::load().unwrap();
+        let reason = |path: &str| {
+            catalog.accepted_drop_reason(
+                "model_animation_graph",
+                "haloreach_mcc",
+                CAMPAIGN_EVOLVED_GAME,
+                path,
+            )
+        };
+
+        // The block itself, and the children the converter actually reports.
+        for path in [
+            "definitions/animations[0]/shared animation data[0]/facial wrinkle events",
+            "definitions/animations[0]/shared animation data[0]/facial wrinkle events[0]/wrinkle name",
+            "definitions/animations[12]/shared animation data[0]/facial wrinkle events[3]/region",
+        ] {
+            assert!(reason(path).is_some(), "`{path}` should be covered");
+        }
+
+        // Ancestry, not string prefix: a differently-named sibling is not
+        // covered just because it starts the same way.
+        assert!(reason("definitions/animations[0]/shared animation data[0]/facial wrinkle eventsX").is_none());
+        // And an unrelated field in the same struct is still a real loss.
+        assert!(reason("definitions/animations[0]/shared animation data[0]/some other field").is_none());
+    }
+
+    /// A signedness rename carries the bits, not the arithmetic.
+    ///
+    /// `-1` is the format's "no index" sentinel and appears everywhere. Halo
+    /// Reach declares an animation graph's IK `chain index` signed and Campaign
+    /// Evolved declares it unsigned; both store 0xFF. Range-checking the
+    /// mathematical value instead reported 2,124 losses on one character graph,
+    /// none of them real.
+    #[test]
+    fn a_signedness_rename_carries_the_bits() {
+        use TagFieldType as T;
+        // One byte, signed to unsigned and back.
+        assert_eq!(reinterpret_same_width_integer(T::CharInteger, T::ByteInteger, -1), 255);
+        assert_eq!(reinterpret_same_width_integer(T::ByteInteger, T::CharInteger, 255), -1);
+        assert_eq!(reinterpret_same_width_integer(T::CharInteger, T::ByteInteger, 7), 7);
+        // Wider pairs behave the same way.
+        assert_eq!(reinterpret_same_width_integer(T::ShortInteger, T::WordInteger, -1), 65535);
+        assert_eq!(reinterpret_same_width_integer(T::LongInteger, T::DwordInteger, -1), 4294967295);
+        assert_eq!(reinterpret_same_width_integer(T::DwordInteger, T::LongInteger, 4294967295), -1);
+
+        // Same signedness is left alone.
+        assert_eq!(reinterpret_same_width_integer(T::CharInteger, T::CharInteger, -1), -1);
+        // And so is a real width change, where the range check is the point.
+        assert_eq!(reinterpret_same_width_integer(T::LongInteger, T::ByteInteger, -1), -1);
+        assert_eq!(reinterpret_same_width_integer(T::CharInteger, T::LongInteger, -1), -1);
+    }
+
+    /// What Halo 2 actually stores in a version-0 `mapping_function`.
+    ///
+    /// H2's `mapping_function` is versioned: v0 spells a curve out as explicit
+    /// fields (`Function Type`, `Flags`, four colours, a `Values` block of reals)
+    /// while v1 holds the serialized blob. Halo 3 has only the blob, so a v0 curve
+    /// has to be *synthesized* rather than copied — and whether that is safe
+    /// depends on whether the flat `Values` list can be turned into the right
+    /// per-type compact structure. Measures the distribution before anything is
+    /// written, because a plausible-but-wrong curve silently changes how a
+    /// particle looks and is worse than an unset one.
+    #[test]
+    #[ignore = "diagnostic; needs the editing kits"]
+    fn report_halo2_v0_mapping_function_shapes() {
+        let Some(h2) = kit_tags("BLAM_TEST_H2EK", "H2EK") else {
+            eprintln!("skipping: no H2EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let index = GameTagIndex::load(&definitions, "halo2_mcc").unwrap();
+        let by_ext = super::chain_sweep::extension_to_group_tag(&index);
+        // `(function type, value count)` -> how many mappings look like that.
+        let mut shapes: HashMap<(i128, usize), usize> = HashMap::new();
+        let mut blobs = 0usize;
+        let mut explicit = 0usize;
+        for group in ["particle", "effect", "contrail", "light_volume", "decal"] {
+            let Some(&group_tag) = by_ext.get(group) else {
+                continue;
+            };
+            for path in tags_with_extension(&h2, group).iter().take(300) {
+                let Ok(tag) = read_tag_for_conversion(
+                    path,
+                    Some("halo2_mcc"),
+                    Some(definitions.as_path()),
+                    group_tag,
+                ) else {
+                    continue;
+                };
+                walk_v0_mappings(tag.root(), &mut shapes, &mut blobs, &mut explicit);
+            }
+        }
+        eprintln!("blob-form mappings: {blobs}; explicit v0 mappings: {explicit}");
+        let mut shapes: Vec<_> = shapes.into_iter().collect();
+        shapes.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        for ((function_type, values), count) in shapes.iter().take(20) {
+            let name = match function_type {
+                0 => "Identity",
+                1 => "Constant",
+                2 => "Transition",
+                3 => "Periodic",
+                4 => "Linear",
+                5 => "LinearKey",
+                6 => "MultiLinearKey",
+                7 => "Spline",
+                8 => "MultiSpline",
+                9 => "Exponent",
+                10 => "Spline2",
+                _ => "?",
+            };
+            eprintln!("   type {function_type} ({name:14}) with {values:2} values: x{count}");
+        }
+    }
+
+    fn walk_v0_mappings(
+        value: TagStruct<'_>,
+        shapes: &mut HashMap<(i128, usize), usize>,
+        blobs: &mut usize,
+        explicit: &mut usize,
+    ) {
+        // A v0 mapping is recognisable by having `function type` as a field at all;
+        // the blob form has only `data`.
+        // Require *both* halves of the v0 shape. Matching on `function type` alone
+        // picked up unrelated fields of that name elsewhere in the tag and
+        // reported impossible types like 40 and 24.
+        if let Some(function_type) = field_by_key(value, "function type")
+            .and_then(|field| field.value())
+            .and_then(integer_value)
+            && let Some(values) = field_by_key(value, "values").and_then(|field| field.as_block())
+        {
+            *explicit += 1;
+            *shapes.entry((function_type, values.len())).or_default() += 1;
+        }
+        for field in value.fields() {
+            if field.is_function_data() {
+                *blobs += 1;
+            }
+            if clean_field_key(field.name()) == "data"
+                && let Some(block) = field.as_block()
+                && block.definition().struct_definition().size() == 1
+            {
+                *blobs += 1;
+                continue;
+            }
+            if let Some(child) = field.as_struct() {
+                walk_v0_mappings(child, shapes, blobs, explicit);
+            }
+            if let Some(block) = field.as_block() {
+                for element in block.iter() {
+                    walk_v0_mappings(element, shapes, blobs, explicit);
+                }
+            }
+            if let Some(array) = field.as_array() {
+                for element in array.iter() {
+                    walk_v0_mappings(element, shapes, blobs, explicit);
+                }
+            }
+        }
+    }
+
+    /// Does a kit tag's embedded layout agree with the dumped schema about a
+    /// struct's GUID and name?
+    ///
+    /// `SchemaFieldAliases` is keyed by `schema_struct_key(guid, name)`, built from
+    /// the JSON, but looked up with the GUID and name off the *runtime* struct. If a
+    /// kit's own layout disagrees, every `{former name}` alias in that struct is
+    /// unreachable — which would explain why Reach's
+    /// `root offset max scale idle{root offset max scale}` never pairs with Halo 3's
+    /// `root offset max scale` despite the table being provably correct.
+    #[test]
+    #[ignore = "diagnostic; needs the editing kits"]
+    fn report_runtime_versus_schema_struct_identity() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else {
+            eprintln!("skipping: no HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let index = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let Some(&group_tag) = super::chain_sweep::extension_to_group_tag(&index).get("biped")
+        else {
+            return;
+        };
+        let schema: Value = serde_json::from_slice(
+            &fs::read(definitions.join("haloreach_mcc").join("biped.json")).unwrap(),
+        )
+        .unwrap();
+        let declared = schema
+            .get("structs")
+            .and_then(Value::as_object)
+            .map(|structs| {
+                structs
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        Some((
+                            name.to_ascii_lowercase(),
+                            value.get("guid").and_then(Value::as_str)?.to_owned(),
+                        ))
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        for path in tags_with_extension(&reach, "biped").iter().take(3) {
+            let Ok(tag) = read_tag_for_conversion(
+                path,
+                Some("haloreach_mcc"),
+                Some(definitions.as_path()),
+                group_tag,
+            ) else {
+                continue;
+            };
+            eprintln!("== {}", path.file_name().unwrap().to_string_lossy());
+            let mut mismatches = 0usize;
+            let mut checked = 0usize;
+            compare_struct_identity(tag.root(), &declared, &mut checked, &mut mismatches);
+            // What the kit's own layout calls the fields in the struct at issue.
+            if let Some(fitting) = struct_at_path(tag.root(), "ground fitting data") {
+                eprintln!(
+                    "   runtime `ground fitting data` struct = {:?} guid {}",
+                    fitting.definition().name(),
+                    fitting
+                        .definition()
+                        .guid()
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
+                );
+                for field in fitting.fields() {
+                    if !field.name().is_empty() {
+                        eprintln!("      field {:?}", field.name());
+                    }
+                }
+            } else {
+                eprintln!("   this biped has no `ground fitting data` struct at the root");
+            }
+            eprintln!("   {checked} structs checked, {mismatches} disagreed with the schema");
+            break;
+        }
+    }
+
+    fn compare_struct_identity(
+        value: TagStruct<'_>,
+        declared: &HashMap<String, String>,
+        checked: &mut usize,
+        mismatches: &mut usize,
+    ) {
+        let definition = value.definition();
+        let name = definition.name().to_ascii_lowercase();
+        let runtime = definition
+            .guid()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if let Some(schema_guid) = declared.get(&name) {
+            *checked += 1;
+            if !schema_guid.eq_ignore_ascii_case(&runtime) {
+                *mismatches += 1;
+                eprintln!("   MISMATCH {name}: runtime {runtime} vs schema {schema_guid}");
+            }
+        } else if name.contains("ground_fitting") || name.contains("ground fitting") {
+            eprintln!("   runtime struct {name:?} is not named in the schema at all");
+        }
+        for field in value.fields() {
+            if let Some(child) = field.as_struct() {
+                compare_struct_identity(child, declared, checked, mismatches);
+            }
+            if let Some(block) = field.as_block() {
+                for element in block.iter().take(1) {
+                    compare_struct_identity(element, declared, checked, mismatches);
+                }
+            }
+            if let Some(array) = field.as_array() {
+                for element in array.iter().take(1) {
+                    compare_struct_identity(element, declared, checked, mismatches);
+                }
+            }
+        }
+    }
+
+    /// Run a real Halo 3 biped into Reach with `BLAM_DEBUG_FIELD` set, so the
+    /// matcher prints why `root offset max scale` finds no home.
+    ///
+    /// Every precondition for the `{former name}` alias was verified separately and
+    /// all of them hold, so the remaining possibilities are about the matcher's
+    /// context rather than the table: a candidate already consumed, a struct pair
+    /// that is never visited, or a struct identity that differs from the one the
+    /// alias table was keyed with.
+    #[test]
+    #[ignore = "diagnostic; needs the editing kits"]
+    fn report_why_the_ground_fitting_alias_does_not_fire() {
+        let (Some(h3), Some(reach)) = (
+            kit_tags("BLAM_TEST_H3EK", "H3EK"),
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+        ) else {
+            eprintln!("skipping: needs H3EK and HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let source_index = GameTagIndex::load(&definitions, "halo3_mcc").unwrap();
+        let target_index = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let Some(&group_tag) =
+            super::chain_sweep::extension_to_group_tag(&source_index).get("biped")
+        else {
+            return;
+        };
+        let templates = NativeTemplateIndex::build(&reach, &target_index);
+        // The same picker the numeric sweep uses, so the two diagnostics are
+        // talking about the same tag. Reading "a" biped instead of "the" biped is
+        // exactly how a fix can look proven while the ranking disagrees.
+        let sampled = super::chain_sweep::first_tag_by_extension(&h3);
+        let candidates = sampled
+            .get("biped")
+            .cloned()
+            .into_iter()
+            .chain(tags_with_extension(&h3, "biped").into_iter().take(4))
+            .collect::<Vec<_>>();
+        for path in &candidates {
+            let Ok(source) = read_tag_for_conversion(
+                path,
+                Some("halo3_mcc"),
+                Some(definitions.as_path()),
+                group_tag,
+            ) else {
+                continue;
+            };
+            let Some(fitting) = struct_at_path(source.root(), "ground fitting data") else {
+                eprintln!("-- {} has no ground fitting data", path.display());
+                continue;
+            };
+            eprintln!("== {}", path.display());
+            eprintln!(
+                "   source struct {:?} guid {}",
+                fitting.definition().name(),
+                fitting
+                    .definition()
+                    .guid()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            );
+            for field in fitting.fields() {
+                if !field.name().is_empty() {
+                    eprintln!("      source field {:?}", field.name());
+                }
+            }
+            match analyze_conversion_with_templates(
+                &source,
+                "halo3_mcc",
+                "haloreach_mcc",
+                &definitions,
+                Some(&templates),
+            ) {
+                Ok(draft) => {
+                    for issue in &draft.report.issues {
+                        if issue.path.contains("ground fitting") || issue.path.contains("root offset")
+                        {
+                            eprintln!("   issue at {:?}: {}", issue.path, issue.message);
+                        }
+                    }
+                    if let Some(fitting) = struct_at_path(draft.tag.root(), "ground fitting data") {
+                        for field in fitting.fields() {
+                            if !field.name().is_empty() {
+                                eprintln!("      target field {:?}", field.name());
+                            }
+                        }
+                    } else {
+                        eprintln!("   converted tag has no ground fitting data struct");
+                    }
+                }
+                Err(error) => eprintln!("   refused: {error}"),
+            }
+            return;
+        }
+        eprintln!("no H3 biped with a ground fitting data struct was found");
+    }
+
+    /// A non-finite source number never reaches the target tag.
+    ///
+    /// A NaN in a written tag is exactly what makes the destination game's tools
+    /// refuse to open it, so the converter refuses the value and keeps the
+    /// target's default.
+    ///
+    /// **This used to be anchored to a real Halo 2 projectile** whose
+    /// `material responses[0]/angular noise` read as NaN. It is not any more, and
+    /// the reason is worth recording: that NaN was never in the tag. Halo 2's
+    /// legacy-string engines store an `old_string_id` inline, so every field after
+    /// a name was being read 28 bytes early, and the "NaN" was the middle of some
+    /// neighbouring value. `adjust_layout_for_engine` fixed the read, and a scan
+    /// of 445 Halo 2 tags across six groups now finds **no** non-finite number
+    /// anywhere.
+    ///
+    /// So the sample is synthetic now, which is the better test regardless: it
+    /// exercises the guard rather than the corpus, needs no kit, and cannot be
+    /// invalidated by a kit-reading fix the way the last one was.
+    #[test]
+    fn a_nan_in_the_source_does_not_reach_the_converted_tag() {
+        let definitions = locate_definitions_root();
+        let mut source = TagFile::new(definitions.join("halo3_mcc/weapon.json")).unwrap();
+        let leaf = first_direct_leaf(&source, is_real_scalar);
+        source
+            .root_mut()
+            .field_at_mut(leaf.ordinal)
+            .unwrap()
+            .set(real_field_value(leaf.field_type, f32::NAN))
+            .unwrap();
+        // The premise, asserted rather than assumed: a NaN really is in there to
+        // be caught.
+        let mut before = Vec::new();
+        collect_numbers(source.root(), &mut before);
+        assert!(
+            before.iter().any(|(_, value, _)| !value.is_finite()),
+            "the synthetic source should carry a NaN"
+        );
+
+        let draft = analyze_conversion_with_templates(
+            &source,
+            "halo3_mcc",
+            "haloreach_mcc",
+            &definitions,
+            None,
+        )
+        .expect("halo3 -> reach weapon converts");
+        let mut after = Vec::new();
+        collect_numbers(draft.tag.root(), &mut after);
+        let carried: Vec<&str> = after
+            .iter()
+            .filter(|(_, value, _)| !value.is_finite())
+            .map(|(path, _, _)| path.as_str())
+            .collect();
+        assert!(
+            carried.is_empty(),
+            "non-finite numbers reached the converted tag at {carried:?}"
+        );
+        // Refused, not silently defaulted: a value dropped without a word is the
+        // failure mode this whole check exists to avoid.
+        assert!(
+            draft
+                .report
+                .issues
+                .iter()
+                .any(|issue| issue.message.contains("not a finite number")),
+            "the refusal should be reported"
+        );
+    }
+
+    /// A short Reach render method is padded to what Halo 4's rmdf requires.
+    ///
+    /// Reported as `smoke_fiery_large.particle` converting but not opening in
+    /// Halo 4's mod tools. A render method's `options` block holds one entry per
+    /// category of the `render_method_definition` it points at, so its length is
+    /// dictated by the destination, not by the source. Reach tolerates a short
+    /// one — 30 of 400 shipped Reach particles carry 9 where their own rmdf
+    /// declares 10 — and Halo 4 does not: all 900 shipped Halo 4 particles carry
+    /// exactly 10. A faithful copy of one of those 30 is therefore a tag Halo 4
+    /// cannot open.
+    ///
+    /// The premise is asserted, not assumed: if Reach stops shipping a short one
+    /// this fails rather than passing on a tag that never needed padding.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_short_reach_render_method_is_padded_for_halo_4() {
+        let (Some(reach), Some(h4)) = (
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+        ) else {
+            eprintln!("skipping: needs HREK and H4EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = u32::from_be_bytes(*b"prt3");
+        let options_of = |tag: &TagFile| -> Option<usize> {
+            tag.root()
+                .fields()
+                .find_map(|field| field.as_struct().filter(|v| is_render_method_struct(*v)))
+                .and_then(|value| {
+                    value
+                        .fields()
+                        .find(|field| clean_field_key(field.name()) == "options")
+                        .and_then(|field| field.as_block())
+                        .map(|block| block.len())
+                })
+        };
+
+        let groups = GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h4, &groups);
+        // What Halo 4 requires, taken from its own shipped tags rather than
+        // hard-coded: the number is a property of the kit's rmdf.
+        let required = tags_with_extension(&h4, "particle")
+            .into_iter()
+            .take(20)
+            .find_map(|path| TagFile::read(&path).ok().and_then(|tag| options_of(&tag)));
+        let Some(required) = required else {
+            eprintln!("skipping: no readable H4EK particle");
+            return;
+        };
+
+        let short = tags_with_extension(&reach, "particle")
+            .into_iter()
+            .take(400)
+            .find_map(|path| {
+                let tag =
+                    read_tag_for_conversion(&path, Some("haloreach_mcc"), Some(&definitions), group_tag)
+                        .ok()?;
+                options_of(&tag)
+                    .filter(|count| *count < required)
+                    .map(|count| (path, tag, count))
+            });
+        let Some((path, source, source_options)) = short else {
+            eprintln!(
+                "skipping: no HREK particle carries fewer than {required} render-method options"
+            );
+            return;
+        };
+
+        let draft = analyze_conversion_with_templates(
+            &source,
+            "haloreach_mcc",
+            "halo4_mcc",
+            &definitions,
+            Some(&templates),
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+
+        assert_eq!(
+            options_of(&draft.tag),
+            Some(required),
+            "{}: {source_options} options in, and Halo 4 needs {required}",
+            path.display()
+        );
+        // Padding silently would hide that the source had no opinion about those
+        // slots, which is the thing an author needs to know.
+        assert!(
+            draft
+                .report
+                .issues
+                .iter()
+                .any(|issue| issue.message.contains("render-method options")),
+            "{}: the padding should be reported",
+            path.display()
+        );
+        // And a source that was already the right length is left alone.
+        let full = tags_with_extension(&reach, "particle")
+            .into_iter()
+            .take(400)
+            .find_map(|path| {
+                let tag =
+                    read_tag_for_conversion(&path, Some("haloreach_mcc"), Some(&definitions), group_tag)
+                        .ok()?;
+                options_of(&tag).filter(|count| *count == required).map(|_| tag)
+            });
+        if let Some(full) = full {
+            let draft = analyze_conversion_with_templates(
+                &full,
+                "haloreach_mcc",
+                "halo4_mcc",
+                &definitions,
+                Some(&templates),
+            )
+            .unwrap();
+            assert_eq!(options_of(&draft.tag), Some(required));
+            assert!(
+                !draft
+                    .report
+                    .issues
+                    .iter()
+                    .any(|issue| issue.message.contains("render-method options")),
+                "a full-length source needs no padding and should not be reported as padded"
+            );
+        }
+        eprintln!(
+            "{}: {source_options} -> {required} render-method options",
+            path.display()
+        );
+    }
+
+    /// A particle converted into Halo 4 arrives with a material to draw with.
+    ///
+    /// Halo 4 puts a `material` beside the render method and Reach has no such
+    /// thing, so the reference lands null. That opens — 7 of 900 shipped Halo 4
+    /// particles are the same — but the particle has no material, so the default
+    /// is a starting point the author can redirect, and it is reported as one.
+    ///
+    /// Also checks the pieces that make the default *safe*: it is only applied
+    /// where the conversion left nothing, and it names a tag the kit ships.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_particle_converted_into_halo_4_gets_a_default_material() {
+        let (Some(reach), Some(h4)) = (
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+        ) else {
+            eprintln!("skipping: needs HREK and H4EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = u32::from_be_bytes(*b"prt3");
+        let material_shader = |tag: &TagFile| -> Option<(u32, String)> {
+            tag.root()
+                .fields()
+                .find_map(|field| field.as_struct().filter(|v| is_material_struct(*v)))
+                .and_then(|value| {
+                    value
+                        .fields()
+                        .find(|inner| clean_field_key(inner.name()) == "material shader")
+                        .and_then(|inner| match inner.value() {
+                            Some(TagFieldData::TagReference(reference)) => {
+                                reference.group_tag_and_name
+                            }
+                            _ => None,
+                        })
+                })
+        };
+
+        let Some(source_path) = tags_with_extension(&reach, "particle").into_iter().next() else {
+            eprintln!("skipping: HREK ships no particle");
+            return;
+        };
+        // An installed-but-empty kit is a real state - a user clearing theirs to
+        // test an empty-kit import - and it is not this test's subject.
+        if !h4
+            .join("shaders/material_shaders/fx/particle_base.material_shader")
+            .is_file()
+        {
+            eprintln!("skipping: H4EK ships no material shaders");
+            return;
+        }
+        let source =
+            read_tag_for_conversion(&source_path, Some("haloreach_mcc"), Some(&definitions), group_tag)
+                .unwrap();
+        // The premise: Reach has nothing of the sort to carry.
+        assert!(
+            material_shader(&source).is_none(),
+            "{}: Reach is not expected to declare a material",
+            source_path.display()
+        );
+
+        let groups = GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h4, &groups);
+        let draft = analyze_conversion_with_templates(
+            &source,
+            "haloreach_mcc",
+            "halo4_mcc",
+            &definitions,
+            Some(&templates),
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", source_path.display()));
+
+        let (group, path) = material_shader(&draft.tag)
+            .unwrap_or_else(|| panic!("{}: no material shader", source_path.display()));
+        assert_eq!(format_group_tag(group), "mats");
+        assert_eq!(path, r"shaders\material_shaders\fx\particle_base");
+        // A default that names a tag the kit does not ship is worse than none.
+        assert!(
+            h4.join("shaders/material_shaders/fx/particle_base.material_shader").is_file(),
+            "the default names a tag H4EK does not ship"
+        );
+        assert!(
+            draft
+                .report
+                .issues
+                .iter()
+                .any(|issue| issue.message.contains("particle_base")),
+            "the default should be reported as a starting point"
+        );
+
+        // Untouched where the source already answered: converting a Halo 4
+        // particle to H2A must keep its own material rather than overwrite it.
+        let Some(h4_source) = tags_with_extension(&h4, "particle").into_iter().find_map(|path| {
+            let tag = TagFile::read(&path).ok()?;
+            let (_, name) = material_shader(&tag)?;
+            (!name.is_empty() && !name.contains("particle_base")).then_some((path, tag, name))
+        }) else {
+            eprintln!("note: no H4EK particle with a non-default material to check against");
+            return;
+        };
+        let (h4_path, h4_tag, original) = h4_source;
+        if let Some(h2a) = kit_tags("BLAM_TEST_H2AMPEK", "H2AMPEK") {
+            let groups = GameTagIndex::load(&definitions, "halo2amp_mcc").unwrap();
+            let templates = NativeTemplateIndex::build(&h2a, &groups);
+            let draft = analyze_conversion_with_templates(
+                &h4_tag,
+                "halo4_mcc",
+                "halo2amp_mcc",
+                &definitions,
+                Some(&templates),
+            )
+            .unwrap_or_else(|error| panic!("{}: {error}", h4_path.display()));
+            assert_eq!(
+                material_shader(&draft.tag).map(|(_, name)| name),
+                Some(original),
+                "{}: a source that supplied a material must keep it",
+                h4_path.display()
+            );
+        }
+    }
+
+    /// Naming a converted file agrees with what the converter produces.
+    ///
+    /// A caller that has to name the output *before* converting — a folder run
+    /// planning where every tag lands, so it can spot two sources colliding on
+    /// one destination — cannot ask the draft. It gets the same answer here, and
+    /// this pins the three shapes that answer differs in:
+    /// a plain same-name group, a rename the target does not declare, and a
+    /// rename the target *does* still declare and never uses.
+    #[test]
+    fn the_group_a_converted_tag_lands_in_is_answerable_before_converting() {
+        let definitions = locate_definitions_root();
+        let landing = |group: &str, source: &str, target: &str| {
+            converted_group(group, source, target, &definitions)
+                .unwrap()
+                .map(|(_, name)| name)
+        };
+
+        // Unchanged classes stay put, which is most of every folder.
+        assert_eq!(
+            landing("weapon", "halo3_mcc", "haloreach_mcc").as_deref(),
+            Some("weapon")
+        );
+        // Renamed, and Halo 4 does not declare the old name — resolving by
+        // canonical name refuses this outright.
+        assert_eq!(
+            landing("contrail_system", "haloreach_mcc", "halo4_mcc").as_deref(),
+            Some("tracer_system")
+        );
+        // Renamed, and Halo 4 *does* declare the old name. This is the quiet one:
+        // canonical name resolution succeeds and gives an answer that contradicts
+        // the tag the converter builds.
+        assert_eq!(
+            landing("shader", "haloreach_mcc", "halo4_mcc").as_deref(),
+            Some("material")
+        );
+        // Two renames, one per generation, so the answer only exists along the
+        // route the converter would take.
+        assert_eq!(
+            landing("contrail", "halo2_mcc", "halo4_mcc").as_deref(),
+            Some("tracer_system")
+        );
+        // A class the target genuinely does not have stays unanswered rather than
+        // being routed into something that merely sounds close.
+        assert_eq!(landing("bitmap", "haloreach_mcc", "haloce_evolved"), None);
+    }
+
+    /// The material gets the inputs the render method came with.
+    ///
+    /// Halo 4 keeps two parameter blocks side by side and fills both in shipped
+    /// content — 3,429 of H4EK's 3,916 particles populate the material one — but
+    /// only the material block feeds the material shader the tag draws with. A
+    /// conversion used to fill the render method's block faithfully and leave
+    /// the material's empty, so a ported particle named `particle_base` and gave
+    /// it nothing: the texture sat in the deprecated half while the half that
+    /// draws fell back to the shader's defaults.
+    ///
+    /// Asserts the texture specifically, not just a count, because carrying the
+    /// scalars and dropping the bitmap would look like success and render
+    /// nothing.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_ported_particle_gives_its_material_the_texture_it_came_with() {
+        let (Some(reach), Some(h4)) = (
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+        ) else {
+            eprintln!("skipping: needs HREK and H4EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = crate::parse_group_tag("prt3").expect("prt3 is a group tag");
+        let groups = GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h4, &groups);
+
+        // The bitmap a parameter block carries, keyed by parameter name.
+        let bitmaps = |tag: &TagFile, slot: &str, block: &str| -> HashMap<String, String> {
+            tag.root()
+                .fields()
+                .find(|field| clean_field_key(field.name()) == slot)
+                .and_then(|field| field.as_struct())
+                .map(|value| parameter_elements(value, block))
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(name, fields)| {
+                    fields.into_iter().find_map(|(key, data)| match data {
+                        TagFieldData::TagReference(reference) if key == "bitmap" => reference
+                            .group_tag_and_name
+                            .map(|(_, path)| (name.clone(), path)),
+                        _ => None,
+                    })
+                })
+                .filter(|(_, path)| !path.is_empty())
+                .collect()
+        };
+
+        let mut checked = 0usize;
+        for path in tags_with_extension(&reach, "particle").into_iter().take(60) {
+            let Ok(source) =
+                read_tag_for_conversion(&path, Some("haloreach_mcc"), Some(&definitions), group_tag)
+            else {
+                continue;
+            };
+            // The premise: the source names a base map on the render method.
+            let Some(texture) = bitmaps(&source, "actual shader?", "parameters")
+                .into_iter()
+                .find(|(name, _)| squashed_parameter_name(name) == "basemap")
+                .map(|(_, path)| path)
+            else {
+                continue;
+            };
+            let Ok(draft) = analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "halo4_mcc",
+                &definitions,
+                Some(&templates),
+            ) else {
+                continue;
+            };
+            let material = bitmaps(&draft.tag, "actual material?", "material parameters");
+            assert_eq!(
+                material.get("basemap").map(String::as_str),
+                Some(texture.as_str()),
+                "{}: the material should draw with the source's own base map; it has {material:?}",
+                path.display()
+            );
+            checked += 1;
+            break;
+        }
+        if checked == 0 {
+            eprintln!("skipping: no HREK particle in the sample names a base map");
+        }
+    }
+
+    /// With no kit to lean on, a buildable target still converts.
+    ///
+    /// The empty-kit case, which is what this fallback exists for: no template
+    /// index at all, and the tag is built from the target's own definitions and
+    /// filled from the source. Preferring this even when a kit *is* available is
+    /// the intended end state and is behind `BLAM_BUILD_FROM_DEFINITIONS` until
+    /// it is proven against Halo 4's own tools.
+    ///
+    /// Self-skips without the source kit.
+    #[test]
+    fn with_no_kit_a_buildable_target_still_converts() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else {
+            eprintln!("skipping: needs HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let mut checked = 0usize;
+
+        for (group, fourcc) in [
+            ("effect", "effe"),
+            ("weapon", "weap"),
+            ("decal_system", "decs"),
+            ("biped", "bipd"),
+        ] {
+            let Some(group_tag) = crate::parse_group_tag(fourcc) else {
+                continue;
+            };
+            let Some(path) = tags_with_extension(&reach, group).into_iter().find(|path| {
+                read_tag_for_conversion(path, Some("haloreach_mcc"), Some(&definitions), group_tag)
+                    .is_ok()
+            }) else {
+                eprintln!("skipping {group}: HREK ships none");
+                continue;
+            };
+            let source = read_tag_for_conversion(
+                &path,
+                Some("haloreach_mcc"),
+                Some(&definitions),
+                group_tag,
+            )
+            .unwrap();
+            let Ok(draft) = analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "halo4_mcc",
+                &definitions,
+                None,
+            ) else {
+                eprintln!("skipping {group}: did not convert");
+                continue;
+            };
+            assert!(
+                draft.native_layout_template.is_none(),
+                "{group}: no kit was offered, so nothing could have been started from"
+            );
+            // And the schema's own root size, not whichever revision a kit tag had.
+            let declared =
+                declared_root_size(&definitions.join("halo4_mcc").join(format!("{group}.json")))
+                    .expect("a declared root size");
+            assert_eq!(
+                draft.tag.root().definition().size(),
+                declared,
+                "{group}: built to a different revision than the definitions declare"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no group was actually checked");
+    }
+
+    /// A conversion with no target kit at all still gives the material its texture.
+    ///
+    /// This is the case a user actually hit: an empty Halo 4 editing kit, so no
+    /// kit tag to seed from and nothing to read a material shader's inputs out
+    /// of, and the material arrived with no inputs. The reviewed table in
+    /// [`DEFAULT_MATERIAL_PARAMETERS`] answers for the materials this converter
+    /// assigns itself, and the parameter's type is inferred from the value rather
+    /// than read from the kit.
+    ///
+    /// Deliberately passes `None` for the templates: needing only the *source*
+    /// kit is the point of the test.
+    #[test]
+    fn a_conversion_with_no_target_kit_still_seeds_the_material() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else {
+            eprintln!("skipping: needs HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = crate::parse_group_tag("prt3").expect("prt3 is a group tag");
+
+        let bitmaps = |tag: &TagFile, slot: &str, block: &str| -> HashMap<String, String> {
+            tag.root()
+                .fields()
+                .find(|field| clean_field_key(field.name()) == slot)
+                .and_then(|field| field.as_struct())
+                .map(|value| parameter_elements(value, block))
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(name, fields)| {
+                    fields.into_iter().find_map(|(key, data)| match data {
+                        TagFieldData::TagReference(reference) if key == "bitmap" => reference
+                            .group_tag_and_name
+                            .map(|(_, path)| (name.clone(), path)),
+                        _ => None,
+                    })
+                })
+                .filter(|(_, path)| !path.is_empty())
+                .collect()
+        };
+
+        let mut checked = 0usize;
+        for path in tags_with_extension(&reach, "particle").into_iter().take(60) {
+            let Ok(source) =
+                read_tag_for_conversion(&path, Some("haloreach_mcc"), Some(&definitions), group_tag)
+            else {
+                continue;
+            };
+            let Some(texture) = bitmaps(&source, "actual shader?", "parameters")
+                .into_iter()
+                .find(|(name, _)| squashed_parameter_name(name) == "basemap")
+                .map(|(_, path)| path)
+            else {
+                continue;
+            };
+            let Ok(draft) = analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "halo4_mcc",
+                &definitions,
+                None,
+            ) else {
+                continue;
+            };
+            assert!(
+                draft.native_layout_template.is_none(),
+                "this test is about the no-kit path and a template was used"
+            );
+            let material = bitmaps(&draft.tag, "actual material?", "material parameters");
+            assert_eq!(
+                material.get("basemap").map(String::as_str),
+                Some(texture.as_str()),
+                "{}: with no kit the material still has to carry the source's base map; \
+                 it has {material:?}",
+                path.display()
+            );
+            checked += 1;
+            break;
+        }
+        if checked == 0 {
+            eprintln!("skipping: no HREK particle in the sample names a base map");
+        }
+    }
+
+    /// No converted fx tag reaches Halo 4 with a material and no material shader.
+    ///
+    /// A converted Reach `decal_system` read fine in the mod tools and **crashed
+    /// the game** the moment the decal was triggered: `#0 is not a valid
+    /// material_postprocess_block index in [#0, #0)`. Nothing in the schema
+    /// indexes that block — it is the renderer building a material's postprocess
+    /// from its material shader and finding none, because `decal_system` had no
+    /// entry in [`DEFAULT_MATERIALS`] and Reach has no material to carry over.
+    ///
+    /// Checks every group in the table plus the texture, since a decal whose
+    /// material draws with the shader's placeholder is only half-ported. Halo 4's
+    /// own `impact.decal_system` is the ported Reach decal of that name and is
+    /// what this is measured against: `decals\base`, and the source's `base_map`
+    /// bitmap arriving as `color_map`.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_converted_fx_tag_never_arrives_with_a_material_and_no_shader() {
+        let (Some(reach), Some(h4)) = (
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+        ) else {
+            eprintln!("skipping: needs HREK and H4EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h4, &groups);
+
+        // Every material in the tag, as (shader path, parameter names).
+        fn materials(value: TagStruct<'_>, out: &mut Vec<(String, Vec<String>)>) {
+            if is_material_struct(value) {
+                let shader = value
+                    .fields()
+                    .find(|field| clean_field_key(field.name()) == "material shader")
+                    .and_then(|field| match field.value() {
+                        Some(TagFieldData::TagReference(reference)) => {
+                            reference.group_tag_and_name.map(|(_, path)| path)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let names = parameter_elements(value, "material parameters")
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect();
+                out.push((shader, names));
+            }
+            for field in value.fields() {
+                if let Some(child) = field.as_struct() {
+                    materials(child, out);
+                }
+                if let Some(block) = field.as_block() {
+                    for index in 0..block.len() {
+                        if let Some(element) = block.element(index) {
+                            materials(element, out);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (group, fourcc) in [
+            ("decal_system", "decs"),
+            ("particle", "prt3"),
+            ("light_volume_system", "ligh"),
+        ] {
+            let Some(group_tag) = crate::parse_group_tag(fourcc) else {
+                continue;
+            };
+            let mut checked = 0usize;
+            for path in tags_with_extension(&reach, group).into_iter().take(40) {
+                let Ok(source) = read_tag_for_conversion(
+                    &path,
+                    Some("haloreach_mcc"),
+                    Some(&definitions),
+                    group_tag,
+                ) else {
+                    continue;
+                };
+                let Ok(draft) = analyze_conversion_with_templates(
+                    &source,
+                    "haloreach_mcc",
+                    "halo4_mcc",
+                    &definitions,
+                    Some(&templates),
+                ) else {
+                    continue;
+                };
+                let mut found = Vec::new();
+                materials(draft.tag.root(), &mut found);
+                if found.is_empty() {
+                    continue;
+                }
+                for (shader, names) in &found {
+                    assert!(
+                        !shader.is_empty(),
+                        "{group} {}: a material arrived with no material shader, which crashes \
+                         Halo 4 when the effect plays",
+                        path.display()
+                    );
+                    // A decal's texture has to reach the material as well: the
+                    // target revision has no render method to fall back on.
+                    if group == "decal_system" {
+                        assert!(
+                            names.iter().any(|name| name == "color_map"),
+                            "{}: the decal's material has {names:?}, so it draws with \
+                             {shader}'s placeholder instead of the source's own bitmap",
+                            path.display()
+                        );
+                    }
+                }
+                checked += 1;
+                break;
+            }
+            if checked == 0 {
+                eprintln!("skipping {group}: no HREK {group} in the sample converted");
+            }
+        }
+    }
+
+    /// A material the source already parameterised is left alone.
+    ///
+    /// Seeding fills a blank. A Halo 4 tag converted to H2A arrives with its
+    /// material parameters intact, and re-seeding them from the render method
+    /// would overwrite an author's work with a guess.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn seeding_does_not_touch_a_material_that_already_has_parameters() {
+        let (Some(h4), Some(h2a)) = (
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+            kit_tags("BLAM_TEST_H2AMPEK", "H2AMPEK"),
+        ) else {
+            eprintln!("skipping: needs H4EK and H2AMPEK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = crate::parse_group_tag("prt3").expect("prt3 is a group tag");
+        let groups = GameTagIndex::load(&definitions, "halo2amp_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h2a, &groups);
+
+        let names = |tag: &TagFile| -> Vec<String> {
+            tag.root()
+                .fields()
+                .find(|field| clean_field_key(field.name()) == "actual material?")
+                .and_then(|field| field.as_struct())
+                .map(|value| parameter_elements(value, "material parameters"))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect()
+        };
+
+        let mut checked = 0usize;
+        for path in tags_with_extension(&h4, "particle").into_iter().take(200) {
+            let Ok(source) =
+                read_tag_for_conversion(&path, Some("halo4_mcc"), Some(&definitions), group_tag)
+            else {
+                continue;
+            };
+            let before = names(&source);
+            if before.is_empty() {
+                continue;
+            }
+            let Ok(draft) = analyze_conversion_with_templates(
+                &source,
+                "halo4_mcc",
+                "halo2amp_mcc",
+                &definitions,
+                Some(&templates),
+            ) else {
+                continue;
+            };
+            assert_eq!(
+                names(&draft.tag),
+                before,
+                "{}: an already-parameterised material was rewritten",
+                path.display()
+            );
+            checked += 1;
+            break;
+        }
+        if checked == 0 {
+            eprintln!("skipping: no H4EK particle in the sample carries material parameters");
+        }
+    }
+
+    /// A Reach contrail_system arrives in Halo 4 as a tracer_system.
+    ///
+    /// Halo 4 renamed the class. The catalog used to say it *removed* it, which
+    /// is why this converted to nothing; measurement says otherwise. H3EK ships
+    /// 67 contrail_systems and HREK 88 with no tracer_system between them, H4EK
+    /// ships 253 tracer_systems and none of the other, and the entry structs
+    /// share 21 of the contrail's 37 fields by name and type.
+    ///
+    /// Asserts the substance moved, not just that a file came out: the entries
+    /// are all present, and one of the shared profile fields really carries.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_reach_contrail_system_becomes_a_halo_4_tracer_system() {
+        let (Some(reach), Some(h4)) = (
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+        ) else {
+            eprintln!("skipping: needs HREK and H4EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = u32::from_be_bytes(*b"cntl");
+        let entries = |tag: &TagFile, name: &str| -> usize {
+            tag.root()
+                .fields()
+                .find(|field| clean_field_key(field.name()) == name)
+                .and_then(|field| field.as_block())
+                .map(|block| block.len())
+                .unwrap_or(0)
+        };
+
+        let picked = tags_with_extension(&reach, "contrail_system")
+            .into_iter()
+            .take(40)
+            .find_map(|path| {
+                let tag = read_tag_for_conversion(
+                    &path,
+                    Some("haloreach_mcc"),
+                    Some(&definitions),
+                    group_tag,
+                )
+                .ok()?;
+                (entries(&tag, "contrails") > 0).then_some((path, tag))
+            });
+        let Some((path, source)) = picked else {
+            eprintln!("skipping: no HREK contrail_system with entries");
+            return;
+        };
+        let source_entries = entries(&source, "contrails");
+
+        let groups = GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h4, &groups);
+        let draft = analyze_conversion_with_templates(
+            &source,
+            "haloreach_mcc",
+            "halo4_mcc",
+            &definitions,
+            Some(&templates),
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+
+        assert_eq!(draft.target_group_name, "tracer_system");
+        assert_eq!(draft.target_extension, "tracer_system");
+        // The block is renamed, so every entry has to arrive under the new name
+        // or the tag is an empty shell that still counts as a conversion.
+        assert_eq!(
+            entries(&draft.tag, "tracers"),
+            source_entries,
+            "{}: {source_entries} contrail(s) in",
+            path.display()
+        );
+        // Halo 4 tracers have no render method, only a material, and none of the
+        // 316 shipped entries leaves it null — so a converted one must not.
+        let materials: Vec<String> = draft
+            .tag
+            .root()
+            .fields()
+            .find(|field| clean_field_key(field.name()) == "tracers")
+            .and_then(|field| field.as_block())
+            .map(|block| {
+                (0..block.len())
+                    .filter_map(|index| block.element(index))
+                    .filter_map(|element| {
+                        element
+                            .fields()
+                            .find(|f| clean_field_key(f.name()) == "actual material?")
+                            .and_then(|f| f.as_struct())
+                    })
+                    .filter_map(|material| {
+                        material
+                            .fields()
+                            .find(|f| clean_field_key(f.name()) == "material shader")
+                            .and_then(|f| match f.value() {
+                                Some(TagFieldData::TagReference(reference)) => {
+                                    reference.group_tag_and_name.map(|(_, name)| name)
+                                }
+                                _ => None,
+                            })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(materials.len(), source_entries, "{}", path.display());
+        assert!(
+            materials.iter().all(|name| !name.is_empty()),
+            "{}: a tracer with no material has nothing to draw with",
+            path.display()
+        );
+        // The result writes and reopens as a Halo 4 tag.
+        let bytes = draft.tag.write_to_bytes().unwrap();
+        let reopened = TagFile::read_from_bytes(&bytes).unwrap();
+        assert_eq!(
+            format_group_tag(reopened.header.group_tag),
+            "trac",
+            "{}",
+            path.display()
+        );
+        eprintln!(
+            "{}: {source_entries} contrail(s) -> {} tracer(s)",
+            path.display(),
+            entries(&draft.tag, "tracers")
+        );
+    }
+
+    /// A converted Reach particle keeps a render-method definition even when the
+    /// source cannot supply one.
+    ///
+    /// A Reach particle with an empty `rmdf` reference crashes the mod tools, and
+    /// nothing in the Reach schema protects that field: the whole render method
+    /// lives in a `tmpl` hole, so no fx schema declares `definition` and neither the
+    /// `*` nor the `!` annotation applies. It survives because a kit-authored
+    /// template supplies it and the reset now leaves a render method's own
+    /// definition alone.
+    ///
+    /// The source's reference is deliberately cleared first. Halo 3 usually carries
+    /// the same `shaders\particle` value, which would make this pass whether or not
+    /// the fallback works — so the test removes it and checks the template still
+    /// fills the gap.
+    #[test]
+    fn a_converted_reach_particle_keeps_a_render_method_definition() {
+        let (Some(h3), Some(reach)) = (
+            kit_tags("BLAM_TEST_H3EK", "H3EK"),
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+        ) else {
+            eprintln!("skipping: needs H3EK and HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let source_index = GameTagIndex::load(&definitions, "halo3_mcc").unwrap();
+        let target_index = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let Some(&group_tag) =
+            super::chain_sweep::extension_to_group_tag(&source_index).get("particle")
+        else {
+            eprintln!("skipping: halo3_mcc declares no particle");
+            return;
+        };
+        let templates = NativeTemplateIndex::build(&reach, &target_index);
+        let found = super::chain_sweep::first_tag_by_extension(&h3);
+        let Some(path) = found.get("particle") else {
+            eprintln!("skipping: H3EK ships no .particle");
+            return;
+        };
+        let Ok(mut source) = read_tag_for_conversion(
+            path,
+            Some("halo3_mcc"),
+            Some(definitions.as_path()),
+            group_tag,
+        ) else {
+            eprintln!("skipping: {} is unreadable", path.display());
+            return;
+        };
+
+        // Clear the source's own render-method definition, so only the template
+        // can account for a value in the output.
+        let mut cleared = false;
+        let located = struct_at_path(source.root(), "actual shader?").and_then(|shader| {
+            let definition = shader.fields().position(|field| {
+                field.field_type() == TagFieldType::TagReference
+                    && clean_field_key(field.name()) == "definition"
+            })?;
+            let outer = field_ordinal_by_key(source.root(), "actual shader?")?;
+            is_render_method_struct(shader).then_some((outer, definition))
+        });
+        if let Some((outer, definition)) = located
+            && let Some(mut outer_field) = source.root_mut().field_at_mut(outer)
+            && let Some(mut shader) = outer_field.as_struct_mut()
+            && let Some(mut field) = shader.field_at_mut(definition)
+        {
+            field
+                .set(TagFieldData::TagReference(TagReferenceData {
+                    group_tag_and_name: None,
+                }))
+                .unwrap();
+            cleared = true;
+        }
+        assert!(
+            cleared,
+            "could not clear the source definition; the sample changed and this test              no longer proves the fallback"
+        );
+
+        let draft = analyze_conversion_with_templates(
+            &source,
+            "halo3_mcc",
+            "haloreach_mcc",
+            &definitions,
+            Some(&templates),
+        )
+        .expect("halo3 -> reach particle converts");
+        let shader = struct_at_path(draft.tag.root(), "actual shader?")
+            .expect("the converted particle has an `actual shader?` struct");
+        let definition = shader
+            .fields()
+            .find(|field| clean_field_key(field.name()) == "definition")
+            .and_then(|field| match field.value() {
+                Some(TagFieldData::TagReference(reference)) => reference.group_tag_and_name,
+                _ => None,
+            });
+        let (group, name) = definition
+            .expect("the converted particle kept a render-method definition reference");
+        assert_eq!(format_group_tag(group), "rmdf");
+        assert!(!name.is_empty(), "the render-method reference points at nothing");
+    }
+
+    /// What does a converted Reach particle actually hold where the render method
+    /// should be?
+    ///
+    /// A shipped Reach particle expands the render method inline inside
+    /// `actual shader?` with a `definition` reference to a render_method_definition
+    /// tag, and a particle without one crashes the mod tools. Halo 3 cannot supply
+    /// that value. Print the native template and the converted output side by side
+    /// rather than trusting an earlier note about which fields survive.
+    #[test]
+    #[ignore = "diagnostic; needs the editing kits"]
+    fn report_the_converted_reach_particle_render_method() {
+        let (Some(h3), Some(reach)) = (
+            kit_tags("BLAM_TEST_H3EK", "H3EK"),
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+        ) else {
+            eprintln!("skipping: needs H3EK and HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let source_index = GameTagIndex::load(&definitions, "halo3_mcc").unwrap();
+        let target_index = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let Some(&group_tag) =
+            super::chain_sweep::extension_to_group_tag(&source_index).get("particle")
+        else {
+            return;
+        };
+        let templates = NativeTemplateIndex::build(&reach, &target_index);
+        let dump = |label: &str, value: TagStruct<'_>| {
+            eprintln!("-- {label}");
+            for field in value.fields() {
+                if field.name().is_empty() {
+                    eprintln!("      (unnamed {:?})", field.field_type());
+                    continue;
+                }
+                let extra = match field.value() {
+                    Some(TagFieldData::TagReference(reference)) => match reference.group_tag_and_name {
+                        Some((group, name)) => format!(" -> {} {name:?}", format_group_tag(group)),
+                        None => " -> (empty)".to_owned(),
+                    },
+                    _ => String::new(),
+                };
+                eprintln!("      {:?} {:?}{extra}", field.name(), field.field_type());
+            }
+        };
+        let native = super::chain_sweep::first_tag_by_extension(&reach);
+        if let Some(path) = native.get("particle")
+            && let Ok(tag) = TagFile::read(path)
+        {
+            eprintln!("== native HREK {}", path.display());
+            if let Some(shader) = struct_at_path(tag.root(), "actual shader?") {
+                dump("native actual shader?", shader);
+            } else {
+                eprintln!("   no `actual shader?` struct at the root");
+                for field in tag.root().fields() {
+                    if field.as_struct().is_some() {
+                        eprintln!("      root struct field {:?}", field.name());
+                    }
+                }
+            }
+        }
+        let found = super::chain_sweep::first_tag_by_extension(&h3);
+        let Some(path) = found.get("particle") else { return };
+        let Ok(source) = crate::convert::read_tag_for_conversion(
+            path,
+            Some("halo3_mcc"),
+            Some(definitions.as_path()),
+            group_tag,
+        ) else {
+            return;
+        };
+        eprintln!("== converted from {}", path.display());
+        match analyze_conversion_with_templates(
+            &source,
+            "halo3_mcc",
+            "haloreach_mcc",
+            &definitions,
+            Some(&templates),
+        ) {
+            Ok(draft) => {
+                eprintln!("   template: {:?}", draft.native_layout_template);
+                if let Some(shader) = struct_at_path(draft.tag.root(), "actual shader?") {
+                    dump("converted actual shader?", shader);
+                } else {
+                    eprintln!("   converted tag has no `actual shader?` struct");
+                }
+            }
+            Err(error) => eprintln!("   refused: {error}"),
+        }
+    }
+
+    /// The schema's own `{former name}` marker resolves a rename.
+    ///
+    /// Reach declares `root offset max scale idle{root offset max scale}` in
+    /// `biped_ground_fitting_data_struct`, and Halo 3 declares `root offset max
+    /// scale` in the struct with the *same* GUID — so the schema states the rename
+    /// outright and no reviewed rule should be needed. Hundreds of fields carry such
+    /// a marker, so this pins the mechanism rather than the one field.
+    #[test]
+    fn a_schema_former_name_marker_resolves_a_renamed_field() {
+        let definitions = locate_definitions_root();
+        let reach = definitions.join("haloreach_mcc").join("biped.json");
+        if !reach.is_file() {
+            eprintln!("skipping: no haloreach_mcc biped schema");
+            return;
+        }
+        let aliases = SchemaFieldAliases::load(&reach).expect("reach biped schema loads");
+        let guid = parse_schema_guid("3849958ee7443781036a85bab008781b")
+            .expect("the ground-fitting struct guid");
+        assert!(
+            aliases.matches(
+                guid,
+                "biped_ground_fitting_data_struct",
+                "root offset max scale idle",
+                "root offset max scale",
+            ),
+            "the `{{root offset max scale}}` former-name marker did not register"
+        );
+        // And the reverse lookup, which is the direction the matcher uses when the
+        // *source* schema is the one carrying the marker.
+        assert!(aliases.matches(
+            guid,
+            "biped_ground_fitting_data_struct",
+            "root offset max scale",
+            "root offset max scale idle",
+        ));
+    }
+
+    /// A Halo 2 bitmap's pixels reach Halo 3, so the chain onward to Reach carries
+    /// an image instead of empty metadata.
+    ///
+    /// The pixels are a `data` blob in both, under the same field name, but Halo 3
+    /// renamed the data *definition* from `processed_pixel_data_data` to
+    /// `bitmap_group_pixel_data_def` — so the derived "same payload kind" rule could
+    /// not see it and a reviewed `payload_aliases` entry declares the rename.
+    /// Asserts the bytes arrive whole and that the per-bitmap offsets indexing them
+    /// come too, since a blob with no offsets is the version that crashed the tools.
+    #[test]
+    fn a_halo2_bitmaps_pixels_arrive_in_halo3() {
+        let Some(h2) = kit_tags("BLAM_TEST_H2EK", "H2EK") else {
+            eprintln!("skipping: needs H2EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let index = GameTagIndex::load(&definitions, "halo2_mcc").unwrap();
+        let Some(&group_tag) = super::chain_sweep::extension_to_group_tag(&index).get("bitmap")
+        else {
+            return;
+        };
+        let mut checked = 0usize;
+        for path in tags_with_extension(&h2, "bitmap").iter().take(80) {
+            let Ok(source) = read_tag_for_conversion(
+                path,
+                Some("halo2_mcc"),
+                Some(definitions.as_path()),
+                group_tag,
+            ) else {
+                continue;
+            };
+            let Some(pixels) = field_by_key(source.root(), "processed pixel data")
+                .and_then(|field| field.as_data())
+                .map(<[u8]>::to_vec)
+            else {
+                continue;
+            };
+            let entries = field_by_key(source.root(), "bitmaps")
+                .and_then(|field| field.as_block())
+                .map(|block| block.len())
+                .unwrap_or(0);
+            if pixels.len() < 1024 || entries < 2 {
+                continue;
+            }
+            // Generated layout on purpose: scanning H3EK for a native template
+            // walks 97k files and costs two minutes, and the payload carry does not
+            // depend on the template. The template path is exercised by the
+            // adjacent-pair sweep.
+            let draft = match analyze_conversion(
+                &source,
+                "halo2_mcc",
+                "halo3_mcc",
+                &definitions,
+                None,
+            ) {
+                Ok(draft) => draft,
+                Err(error) => panic!("{} refused: {error}", path.display()),
+            };
+            let landed = field_by_key(draft.tag.root(), "processed pixel data")
+                .and_then(|field| field.as_data())
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default();
+            assert_eq!(
+                landed,
+                pixels,
+                "{} lost or altered its pixels ({} bytes in, {} out)",
+                path.display(),
+                pixels.len(),
+                landed.len()
+            );
+            let offsets: Vec<i128> = field_by_key(draft.tag.root(), "bitmaps")
+                .and_then(|field| field.as_block())
+                .map(|block| {
+                    block
+                        .iter()
+                        .filter_map(|element| {
+                            field_by_key(element, "pixels offset")?.value().and_then(integer_value)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert!(
+                offsets.iter().any(|offset| *offset != 0),
+                "{} carried {entries} bitmaps and {} bytes of pixels, but every \
+                 `pixels offset` is 0 — the blob has nothing indexing it, which is \
+                 the shape that crashed the mod tools",
+                path.display(),
+                pixels.len()
+            );
+            checked += 1;
+            break;
+        }
+        assert_eq!(checked, 1, "no multi-entry Halo 2 bitmap with pixel data was converted");
+    }
+
+    /// What a native Halo 3 bitmap actually keeps in its pageable resource, and how
+    /// that compares with the Halo 2 blob that would have to become one.
+    ///
+    /// Carrying classic pixels into Halo 3 onward means *authoring* a
+    /// `bitmap_texture_interop_resource`, and `copy_resource_from` can only copy an
+    /// existing one. Whether that is a small job or a large one depends on what the
+    /// resource holds: if the exploded payload is the pixel bytes behind a short
+    /// header, it is tractable; if it is a paged structure with its own tables, it
+    /// is not. Measures rather than guesses, because a wrong resource is exactly
+    /// what crashed the Reach mod tools.
+    #[test]
+    #[ignore = "diagnostic; needs the editing kits"]
+    fn report_native_bitmap_resource_shape() {
+        let definitions = locate_definitions_root();
+        for (kit, game) in [("H3EK", "halo3_mcc"), ("HREK", "haloreach_mcc")] {
+            let Some(tags) = kit_tags(&format!("BLAM_TEST_{kit}"), kit) else {
+                continue;
+            };
+            let index = GameTagIndex::load(&definitions, game).unwrap();
+            let Some(&group_tag) = super::chain_sweep::extension_to_group_tag(&index).get("bitmap")
+            else {
+                continue;
+            };
+            let mut shown = 0usize;
+            for path in tags_with_extension(&tags, "bitmap").iter().take(400) {
+                let Ok(tag) = read_tag_for_conversion(
+                    path,
+                    Some(game),
+                    Some(definitions.as_path()),
+                    group_tag,
+                ) else {
+                    continue;
+                };
+                let mut lines = Vec::new();
+                describe_resources(tag.root(), "", &mut lines);
+                if lines.is_empty() {
+                    continue;
+                }
+                eprintln!("== {game} {}", path.file_name().unwrap().to_string_lossy());
+                for line in &lines {
+                    eprintln!("   {line}");
+                }
+                shown += 1;
+                if shown == 2 {
+                    break;
+                }
+            }
+            if shown == 0 {
+                eprintln!("== {game}: no bitmap with a populated resource in the first 400");
+            }
+        }
+    }
+
+    fn describe_resources(value: TagStruct<'_>, prefix: &str, into: &mut Vec<String>) {
+        for field in value.fields() {
+            let key = clean_field_key(field.name());
+            let path =
+                if prefix.is_empty() { key.clone() } else { format!("{prefix}/{key}") };
+            if field.field_type() == TagFieldType::PageableResource
+                && let Some(resource) = field.as_resource()
+            {
+                let kind = format!("{:?}", resource.kind());
+                let definition = resource.definition().struct_definition();
+                into.push(format!(
+                    "{path}: kind {kind}, struct {} ({} bytes declared)",
+                    definition.name(),
+                    definition.size(),
+                ));
+            }
+            if field.is_function_data() {
+                continue;
+            }
+            if field.field_type() == TagFieldType::Data
+                && let Some(bytes) = field.as_data()
+                && !bytes.is_empty()
+            {
+                into.push(format!("{path}: data blob {} bytes", bytes.len()));
+            }
+            if let Some(child) = field.as_struct() {
+                describe_resources(child, &path, into);
+            }
+            if let Some(block) = field.as_block() {
+                for (index, element) in block.iter().enumerate().take(2) {
+                    describe_resources(element, &format!("{path}[{index}]"), into);
+                }
+            }
+        }
+    }
+
+    /// A Reach `.shader` becomes a Halo 4 `.material`, carrying its parameters.
+    ///
+    /// Halo 4 still declares a `shader` group but ships none — 0 `.shader` against
+    /// 7,140 `.material` in H4EK — so a shader-to-shader conversion produced a class
+    /// the game never loads. Three things had to line up, and each failed silently
+    /// on its own: the group alias has to outrank the same-name `shader` group, the
+    /// reparent has to lift Reach's `render_method` body onto the flat `material`
+    /// root, and the reparent must *not* apply in reverse.
+    #[test]
+    fn every_reach_shader_family_group_converts_into_a_halo4_material() {
+        let (Some(reach), Some(h4)) = (
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+        ) else {
+            eprintln!("skipping: needs HREK and H4EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let index = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let by_ext = super::chain_sweep::extension_to_group_tag(&index);
+        // The whole family, not just `shader`: H4EK ships 0 of every one of these
+        // against 7,140 `.material`, so each needed the same three rules.
+        // Every member HREK actually ships. Enumerated from the kits, not guessed:
+        // Reach declares 19 shader-family groups and H4EK/H2AMPEK ship zero of all
+        // 19, so the whole family is vestigial there. The seven this list started
+        // with missed five that ship real content, and the sweep caught them.
+        const FAMILY: &[&str] = &[
+            "shader",
+            "shader_terrain",
+            "shader_custom",
+            "shader_water",
+            "shader_halogram",
+            "shader_foliage",
+            "shader_decal",
+            "shader_glass",
+            "shader_screen",
+            "shader_fur",
+            "shader_fur_stencil",
+            "shader_mux",
+        ];
+        let mut checked = 0usize;
+        for group in FAMILY {
+        let Some(&group_tag) = by_ext.get(*group) else {
+            continue;
+        };
+        for path in tags_with_extension(&reach, group).iter().take(30) {
+            let Ok(source) = read_tag_for_conversion(
+                path,
+                Some("haloreach_mcc"),
+                Some(definitions.as_path()),
+                group_tag,
+            ) else {
+                continue;
+            };
+            // A shader with authored parameters is the one that proves anything.
+            let parameters = struct_at_path(source.root(), "render_method")
+                .and_then(|render_method| field_by_key(render_method, "parameters"))
+                .and_then(|field| field.as_block())
+                .map(|block| block.len())
+                .unwrap_or(0);
+            if parameters == 0 {
+                continue;
+            }
+            let draft = match analyze_conversion(
+                &source,
+                "haloreach_mcc",
+                "halo4_mcc",
+                &definitions,
+                Some(h4.as_path()),
+            ) {
+                Ok(draft) => draft,
+                Err(error) => panic!("{} refused: {error}", path.display()),
+            };
+            assert_eq!(
+                draft.target_extension, "material",
+                "{} must land as a material, not a shader Halo 4 never loads",
+                path.display()
+            );
+            let landed = field_by_key(draft.tag.root(), "material parameters")
+                .and_then(|field| field.as_block())
+                .map(|block| block.len())
+                .unwrap_or(0);
+            assert_eq!(
+                landed,
+                parameters,
+                "{} had {parameters} render-method parameters but {landed} arrived",
+                path.display()
+            );
+            checked += 1;
+            break;
+        }
+        }
+        assert!(
+            checked >= 6,
+            "only {checked} of the shader family converted with parameters intact"
+        );
+    }
+
+    /// A Halo 1 bitmap's pixels reach Halo 2 intact.
+    ///
+    /// The user asked for this specifically: everything else in the geometry
+    /// family is better reimported, but pixel data carried forward avoids a
+    /// recompression pass. It was refused because the opaque-copy path required a
+    /// matching struct GUID and every classic struct's GUID is all-zero — so a
+    /// converted bitmap arrived with all its metadata and no image.
+    ///
+    /// Asserts the bytes are carried whole, not merely non-empty, and that the
+    /// per-bitmap offset into the shared blob survives the `pixel data offset` ->
+    /// `pixels offset` rename. Without the rename every entry points at offset 0
+    /// and shows the first image's pixels for the whole group.
+    #[test]
+    fn a_halo1_bitmaps_pixels_arrive_in_halo2() {
+        let (Some(h1), Some(h2)) = (
+            kit_tags("BLAM_TEST_HCEEK", "HCEEK"),
+            kit_tags("BLAM_TEST_H2EK", "H2EK"),
+        ) else {
+            eprintln!("skipping: needs HCEEK and H2EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let index = GameTagIndex::load(&definitions, "haloce_mcc").unwrap();
+        let Some(&group_tag) =
+            super::chain_sweep::extension_to_group_tag(&index).get("bitmap")
+        else {
+            return;
+        };
+        let mut checked = 0usize;
+        for path in tags_with_extension(&h1, "bitmap").iter().take(60) {
+            let Ok(source) = read_tag_for_conversion(
+                path,
+                Some("haloce_mcc"),
+                Some(definitions.as_path()),
+                group_tag,
+            ) else {
+                continue;
+            };
+            let Some(pixels) = field_by_key(source.root(), "processed pixel data")
+                .and_then(|field| field.as_data())
+                .map(<[u8]>::to_vec)
+            else {
+                continue;
+            };
+            // A multi-entry group is the one that proves the offset rename: with a
+            // single bitmap the offset is 0 either way.
+            let entries = field_by_key(source.root(), "bitmaps")
+                .and_then(|field| field.as_block())
+                .map(|block| block.len())
+                .unwrap_or(0);
+            if pixels.len() < 64 || entries < 2 {
+                continue;
+            }
+            let draft = match analyze_conversion(
+                &source,
+                "haloce_mcc",
+                "halo2_mcc",
+                &definitions,
+                Some(h2.as_path()),
+            ) {
+                Ok(draft) => draft,
+                Err(error) => panic!("{} refused: {error}", path.display()),
+            };
+            let landed = field_by_key(draft.tag.root(), "processed pixel data")
+                .and_then(|field| field.as_data())
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default();
+            assert_eq!(
+                landed,
+                pixels,
+                "{} lost or altered its pixel data ({} bytes in, {} out)",
+                path.display(),
+                pixels.len(),
+                landed.len()
+            );
+            // At least one entry past the first must carry a non-zero offset,
+            // which only happens if the rename resolved.
+            let offsets: Vec<i128> = field_by_key(draft.tag.root(), "bitmaps")
+                .and_then(|field| field.as_block())
+                .map(|block| {
+                    block
+                        .iter()
+                        .filter_map(|element| {
+                            field_by_key(element, "pixels offset")?.value().and_then(integer_value)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert!(
+                offsets.iter().any(|offset| *offset != 0),
+                "{} carried {entries} bitmaps but every pixels offset is 0, so the \
+                 `pixel data offset` rename did not resolve",
+                path.display()
+            );
+            checked += 1;
+            break;
+        }
+        assert_eq!(checked, 1, "no multi-entry Halo 1 bitmap with pixel data was converted");
+    }
+
+    /// Every Halo CE -> Halo 2 conversion the kits can produce must survive the
+    /// classic encoder's own decode-verify.
+    ///
+    /// This is the regression guard for the empty-path tag reference: a reference
+    /// converted to `Some((group, ""))` used to be written as `group + NUL` with
+    /// an inline length of 0, and the decoder reads length 0 as "no path" and
+    /// consumes nothing — so each one shifted the rest of the body by a byte and
+    /// the next block header was read off by one. It took out `sky` (1 stray
+    /// byte), `weapon` (2) and `scenario`, and it is exactly the class of damage
+    /// that makes a written tag fail to open in the target game's tools while
+    /// still looking plausible.
+    #[test]
+    fn every_classic_conversion_the_kits_can_make_survives_write_verification() {
+        let (Some(h1), Some(h2)) = (
+            kit_tags("BLAM_TEST_HCEEK", "HCEEK"),
+            kit_tags("BLAM_TEST_H2EK", "H2EK"),
+        ) else {
+            eprintln!("skipping: needs HCEEK and H2EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let source_index = GameTagIndex::load(&definitions, "haloce_mcc").unwrap();
+        let by_ext = super::chain_sweep::extension_to_group_tag(&source_index);
+        let scratch = std::env::temp_dir().join("baboon-classic-verify");
+        let mut written = 0usize;
+        let mut failures = Vec::new();
+        for group in ["sky", "weapon", "scenario", "projectile", "camera_track", "biped"] {
+            let (Some(&group_tag), Some(path)) = (
+                by_ext.get(group),
+                tags_with_extension(&h1, group).into_iter().next(),
+            ) else {
+                continue;
+            };
+            let Ok(source) = read_tag_for_conversion(
+                &path,
+                Some("haloce_mcc"),
+                Some(definitions.as_path()),
+                group_tag,
+            ) else {
+                continue;
+            };
+            let Ok(mut draft) = analyze_conversion(
+                &source,
+                "haloce_mcc",
+                "halo2_mcc",
+                &definitions,
+                Some(h2.as_path()),
+            ) else {
+                continue;
+            };
+            let output = scratch.join(format!("{group}.{}", draft.target_extension));
+            if let Some(parent) = output.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            // `write_atomic` decode-verifies a classic container before it
+            // commits, so this is the same check the real save path performs.
+            match draft.tag.write_atomic(&output) {
+                Ok(()) => written += 1,
+                Err(error) => failures.push(format!("{group}: {error}")),
+            }
+            let _ = fs::remove_file(&output);
+        }
+        assert!(written > 0, "no Halo CE tag converted; are the kits installed?");
+        assert!(failures.is_empty(), "classic writes failed verification: {failures:#?}");
+    }
+
+    /// Walk a converted classic tag's root fields and predict where each
+    /// trailing payload lands, so a reported block offset can be attributed to a
+    /// field.
+    ///
+    /// The decoder reports which block ran off the end and at what body offset.
+    /// That is only actionable next to the offsets the *model* implies: the field
+    /// whose predicted end disagrees with the reported header position is the one
+    /// whose encoded length is wrong.
+    #[test]
+    #[ignore = "diagnostic; needs the editing kits"]
+    fn report_predicted_classic_trailing_offsets() {
+        let (Some(h1), Some(h2)) = (
+            kit_tags("BLAM_TEST_HCEEK", "HCEEK"),
+            kit_tags("BLAM_TEST_H2EK", "H2EK"),
+        ) else {
+            eprintln!("skipping: needs HCEEK and H2EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let source_index = GameTagIndex::load(&definitions, "haloce_mcc").unwrap();
+        let by_ext = super::chain_sweep::extension_to_group_tag(&source_index);
+        for group in ["sky", "weapon"] {
+            let (Some(&group_tag), Some(path)) = (
+                by_ext.get(group),
+                tags_with_extension(&h1, group).into_iter().next(),
+            ) else {
+                continue;
+            };
+            let Ok(source) = read_tag_for_conversion(
+                &path,
+                Some("haloce_mcc"),
+                Some(definitions.as_path()),
+                group_tag,
+            ) else {
+                continue;
+            };
+            let Ok(draft) = analyze_conversion(
+                &source,
+                "haloce_mcc",
+                "halo2_mcc",
+                &definitions,
+                Some(h2.as_path()),
+            ) else {
+                eprintln!("== {group}: refused");
+                continue;
+            };
+            let root = draft.tag.root();
+            eprintln!("== {group} root fixed size {}", root.definition().size());
+            let mut at = root.definition().size();
+            for field in root.fields() {
+                let key = clean_field_key(field.name());
+                let before = at;
+                let note = match field.field_type() {
+                    TagFieldType::TagReference => match field.value() {
+                        Some(TagFieldData::TagReference(reference)) => {
+                            match &reference.group_tag_and_name {
+                                Some((_, name)) => {
+                                    at += name.len() + 1;
+                                    format!("ref {name:?} -> {} trailing", name.len() + 1)
+                                }
+                                None => "ref null -> 0 trailing".to_owned(),
+                            }
+                        }
+                        _ => "ref (unreadable)".to_owned(),
+                    },
+                    TagFieldType::Data => {
+                        let len = field.as_data().map(<[u8]>::len).unwrap_or(0);
+                        at += len;
+                        format!("data -> {len} trailing")
+                    }
+                    TagFieldType::Block => {
+                        let Some(block) = field.as_block() else {
+                            continue;
+                        };
+                        let count = block.len();
+                        if count == 0 {
+                            "block empty -> 0 trailing".to_owned()
+                        } else {
+                            let size = block.definition().struct_definition().size();
+                            at += 16 + count * size;
+                            format!("block {count} x {size} -> {} trailing", 16 + count * size)
+                        }
+                    }
+                    _ => continue,
+                };
+                eprintln!("   at {before:>6}  {key:34} {note}");
+            }
+            eprintln!("   predicted end of root trailing: {at}");
+        }
+    }
+
+    /// Which stage breaks a classic tag's byte layout: reading, resetting, or
+    /// converting.
+    ///
+    /// Three Halo CE -> Halo 2 conversions fail write verification with the block
+    /// header read 1-2 bytes early, i.e. the encoder emitted too few bytes
+    /// somewhere before it. Read-then-write is supposed to be byte-exact, so this
+    /// narrows the desync to a stage rather than guessing at a field.
+    #[test]
+    #[ignore = "diagnostic; needs the editing kits"]
+    fn report_which_stage_desyncs_a_classic_tag() {
+        let Some(h2) = kit_tags("BLAM_TEST_H2EK", "H2EK") else {
+            eprintln!("skipping: no H2EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let index = GameTagIndex::load(&definitions, "halo2_mcc").unwrap();
+        let by_ext = super::chain_sweep::extension_to_group_tag(&index);
+        for group in ["weapon", "sky", "scenario"] {
+            let Some(&group_tag) = by_ext.get(group) else {
+                continue;
+            };
+            let Some(path) = tags_with_extension(&h2, group).into_iter().next() else {
+                eprintln!("   {group:10} no kit tag");
+                continue;
+            };
+            let Ok(tag) = read_tag_for_conversion(
+                &path,
+                Some("halo2_mcc"),
+                Some(definitions.as_path()),
+                group_tag,
+            ) else {
+                eprintln!("   {group:10} unreadable");
+                continue;
+            };
+            let original = std::fs::read(&path).unwrap_or_default();
+            let rewritten = tag.write_to_bytes();
+            let round_trip = match &rewritten {
+                Ok(bytes) if *bytes == original => "byte-exact".to_owned(),
+                Ok(bytes) => format!("differs ({} vs {} bytes)", bytes.len(), original.len()),
+                Err(error) => format!("encode failed: {error}"),
+            };
+
+            // Now reset only, no conversion, and see whether the result still
+            // decodes. If it does not, the desync is in the reset rather than in
+            // any field mapping.
+            let mut reset = read_tag_for_conversion(
+                &path,
+                Some("halo2_mcc"),
+                Some(definitions.as_path()),
+                group_tag,
+            )
+            .expect("re-read");
+            let aliases =
+                SchemaFieldAliases::load(&definitions.join("halo2_mcc").join(format!("{group}.json")))
+                    .unwrap_or_default();
+            let reset_state = match reset_tag_to_defaults(&mut reset, Some(&aliases)) {
+                Err(error) => format!("reset refused: {error}"),
+                // `write_atomic` decode-verifies a classic container before it
+                // commits, so writing to a scratch path is the real check.
+                Ok(()) => {
+                    let scratch = std::env::temp_dir().join(format!("baboon-desync.{group}"));
+                    match reset.write_atomic(&scratch) {
+                        Ok(()) => "decodes".to_owned(),
+                        Err(error) => format!("DESYNC: {error}"),
+                    }
+                }
+            };
+            eprintln!("   {group:10} round-trip {round_trip}; after reset {reset_state}");
+        }
+    }
+
+    /// A real Halo 2 vehicle's physics values land in Halo 3's per-type block.
+    ///
+    /// Halo 2 keeps them flat on the root with a `type` enum; Halo 3 moved them
+    /// into `physics types/type-<name>`. Before the routing existed every one of
+    /// them was dropped, so a converted warthog or banshee had zero speed. This
+    /// pins the whole path on a kit-authored tag: the block gets chosen from the
+    /// enum, gains exactly one element, and carries the source's numbers.
+    #[test]
+    fn a_real_halo2_vehicles_speed_reaches_halo3s_physics_block() {
+        let (Some(h2), Some(h3)) = (
+            kit_tags("BLAM_TEST_H2EK", "H2EK"),
+            kit_tags("BLAM_TEST_H3EK", "H3EK"),
+        ) else {
+            eprintln!("skipping: needs both H2EK and H3EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let source_index = GameTagIndex::load(&definitions, "halo2_mcc").unwrap();
+        let group_tag = *super::chain_sweep::extension_to_group_tag(&source_index)
+            .get("vehicle")
+            .expect("halo2_mcc defines vehicle");
+
+        // Any vehicle whose forward speed is authored will do; take the first so
+        // the test does not depend on one tag surviving a kit update.
+        let mut checked = 0usize;
+        for path in tags_with_extension(&h2, "vehicle").iter().take(40) {
+            let Ok(source) = read_tag_for_conversion(
+                path,
+                Some("halo2_mcc"),
+                Some(definitions.as_path()),
+                group_tag,
+            ) else {
+                continue;
+            };
+            let Some((speed, _)) = find_real_by_key(source.root(), "maximum forward speed") else {
+                continue;
+            };
+            if speed == 0.0 {
+                continue;
+            }
+            let Ok(draft) = analyze_conversion(
+                &source,
+                "halo2_mcc",
+                "halo3_mcc",
+                &definitions,
+                Some(h3.as_path()),
+            ) else {
+                continue;
+            };
+            // The value must be reachable under `physics types`, not merely
+            // present somewhere in the tag.
+            let types = struct_at_path(draft.tag.root(), "physics types")
+                .expect("halo3_mcc vehicle has a physics types struct");
+            let populated = types
+                .fields()
+                .filter_map(|field| field.as_block())
+                .find(|block| !block.is_empty())
+                .expect("exactly one physics block is defined");
+            assert_eq!(populated.len(), 1, "only one physics block element is defined");
+            let element = populated.iter().next().expect("the block has an element");
+            // Not every type can hold a speed: Halo 3's `human_tank_block` and
+            // `human_jeep_block` carry differentials and an engine struct instead,
+            // so a Halo 2 tank's `maximum forward speed` has no destination and is
+            // reported as unmatched rather than forced somewhere wrong. Keep
+            // looking for a type that does have the field.
+            let Some((landed, _)) = find_real_by_key(element, "maximum forward speed") else {
+                continue;
+            };
+            assert_eq!(
+                landed, speed,
+                "{} forward speed changed on the way into Halo 3",
+                path.display()
+            );
+            checked += 1;
+            break;
+        }
+        assert_eq!(checked, 1, "no Halo 2 vehicle with an authored forward speed was converted");
+    }
+
+    /// The Halo 2 -> Halo 3 function header splice, and that it is reversible.
+    ///
+    /// A Halo 2 curve is 28 bytes and a Halo 3 one is 32; the difference is the
+    /// `compact_size` word Halo 3 inserted at offset 28. Promoting has to leave
+    /// every other byte where it was, or the curve decodes as a different
+    /// function — which is exactly the corruption the parse gate exists to catch.
+    #[test]
+    fn a_legacy_function_curve_gains_the_compact_size_word_and_nothing_else() {
+        // A constant function of 60.1 with a 1.0/1.0 exclusion range, laid out
+        // the way a real Halo 2 emitter curve is.
+        let mut legacy = vec![0u8; 28];
+        legacy[0] = 1;
+        legacy[1] = 1;
+        legacy[4..8].copy_from_slice(&60.1f32.to_le_bytes());
+        legacy[20..24].copy_from_slice(&1.0f32.to_le_bytes());
+        legacy[24..28].copy_from_slice(&1.0f32.to_le_bytes());
+
+        let modern = retarget_function_bytes(&legacy, false, true).expect("28 bytes promotes");
+        assert_eq!(modern.len(), 32);
+        assert_eq!(&modern[..28], &legacy[..], "the original bytes must not move");
+        assert_eq!(
+            u32::from_le_bytes(modern[28..32].try_into().unwrap()),
+            0,
+            "a header-only curve has no compact block"
+        );
+        // The engine's decoder is the arbiter, so the promoted form must satisfy it.
+        assert!(crate::TagFunction::parse(&modern).is_ok());
+
+        // And back again, losslessly.
+        assert_eq!(
+            retarget_function_bytes(&modern, true, false).expect("32 bytes demotes"),
+            legacy
+        );
+
+        // Trailing compact data keeps its length in the spliced word.
+        let mut with_compact = legacy.clone();
+        with_compact.extend_from_slice(&[7u8; 8]);
+        let promoted = retarget_function_bytes(&with_compact, false, true).expect("promotes");
+        assert_eq!(promoted.len(), 40);
+        assert_eq!(u32::from_le_bytes(promoted[28..32].try_into().unwrap()), 8);
+        assert_eq!(&promoted[32..], &[7u8; 8]);
+
+        // Too short to be a header at all is refused rather than padded.
+        assert!(retarget_function_bytes(&[0u8; 20], false, true).is_none());
+    }
+
+    /// Total bytes across every `data` blob in a tag.
+    ///
+    /// A bitmap's pixels live in one of these, so this is "is the image still
+    /// here?" reduced to a number that survives the field being renamed between
+    /// engines.
+    pub fn blob_bytes(tag: &TagFile) -> usize {
+        fn walk(value: TagStruct<'_>, total: &mut usize) {
+            for field in value.fields() {
+                match field.value() {
+                    Some(TagFieldData::Data(bytes)) => *total += bytes.len(),
+                    _ => {}
+                }
+                if let Some(nested) = field.as_struct() {
+                    walk(nested, total);
+                }
+                if let Some(block) = field.as_block() {
+                    for index in 0..block.len() {
+                        if let Some(element) = block.element(index) {
+                            walk(element, total);
+                        }
+                    }
+                }
+            }
+        }
+        let mut total = 0;
+        walk(tag.root(), &mut total);
+        total
+    }
+
+    /// An editing kit's `tags` directory, via `env_var` or the Steam library
+    /// this repo is developed against.
+    pub fn kit_tags(env_var: &str, kit: &str) -> Option<PathBuf> {
+        if let Ok(path) = std::env::var(env_var) {
+            let path = PathBuf::from(path);
+            // The env var names the kit, the fallback below names its `tags`
+            // directory, and callers join a tag path onto whichever comes back.
+            // Returning the two shapes from the two branches meant every test
+            // that compares against a kit tag found nothing and said
+            // "skipping: the kit and the build share no untouched ..." -- which
+            // reads exactly like a kit that has none, so it went unnoticed while
+            // the oracle tests proved nothing at all.
+            let tags = path.join("tags");
+            if tags.is_dir() {
+                return Some(tags);
+            }
+            return path.is_dir().then_some(path);
+        }
+        [
+            "D:/SteamLibrary/steamapps/common",
+            "C:/Program Files (x86)/Steam/steamapps/common",
+            "C:/Program Files/Steam/steamapps/common",
+            "E:/SteamLibrary/steamapps/common",
+        ]
+        .iter()
+        .map(|root| PathBuf::from(root).join(kit).join("tags"))
+        .find(|path| path.is_dir())
+    }
+
+    /// Tags this harness wrote itself.
+    ///
+    /// `baboon_converted` lives inside the kit's own `tags` tree and sorts early,
+    /// so an unfiltered alphabetical scan picks a *converted* tag as the "stock"
+    /// source and silently measures a double conversion. That is exactly what
+    /// happened: scanning H3EK for `.particle` returned
+    /// `baboon_converted/halo2_mcc/burst_large.particle`.
+    pub fn is_generated_output(path: &Path) -> bool {
+        path.components()
+            .any(|component| component.as_os_str().eq_ignore_ascii_case("baboon_converted"))
+    }
+
+    /// Every file with `extension` under `root`, sorted so a scan is repeatable.
+    /// Does any struct in the group declare `left` and `right` as one field under a
+    /// `{former name}` marker?
+    ///
+    /// The matcher scopes this by struct identity, correctly. The numeric diff is
+    /// keyed by field name and has no struct to scope with, so it asks the question
+    /// group-wide; the value-equality test at the call site is what keeps that from
+    /// being loose.
+    fn declares_alias(aliases: &SchemaFieldAliases, left: &str, right: &str) -> bool {
+        aliases
+            .by_struct
+            .values()
+            .any(|fields| fields.get(left).is_some_and(|set| set.contains(right)))
+    }
+
+    pub fn tags_with_extension(root: &Path, extension: &str) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = walk_files(root)
+            .into_iter()
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some(extension))
+            .filter(|path| !is_generated_output(path))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Every scalar number under `value`, keyed by cleaned field name, as
+    /// `(rendered value, comparable number, type name)`.
+    ///
+    /// Keyed by name rather than path on purpose. Source and target paths differ
+    /// wherever a struct was renamed or reparented, so a path-keyed diff reports
+    /// the whole tag as changed and tells us nothing. A name that occurs exactly
+    /// once on each side is unambiguous, and that subset is large enough to catch
+    /// a value landing in the wrong place.
+    fn collect_numbers(value: TagStruct<'_>, into: &mut Vec<(String, f64, &'static str)>) {
+        collect_numbers_at(value, "", into);
+    }
+
+    /// Walk every number under `value`, keyed by an index-qualified path of
+    /// cleaned field names.
+    ///
+    /// Struct *names* are deliberately not part of the key — only field names —
+    /// because a reparented or renamed struct changes the name chain without
+    /// changing where the value belongs. Block indices *are* part of it, since a
+    /// value landing in the wrong element is exactly the failure being hunted.
+    fn collect_numbers_at(
+        value: TagStruct<'_>,
+        prefix: &str,
+        into: &mut Vec<(String, f64, &'static str)>,
+    ) {
+        for field in value.fields() {
+            let key = clean_field_key(field.name());
+            let path = if key.is_empty() {
+                prefix.to_owned()
+            } else if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}/{key}")
+            };
+            if let Some(data) = field.value() {
+                let number = match &data {
+                    TagFieldData::Real(v) | TagFieldData::Angle(v) => Some((*v as f64, "real")),
+                    _ => integer_value(data).map(|v| (v as f64, "integer")),
+                };
+                if let Some((number, kind)) = number
+                    && !key.is_empty()
+                {
+                    into.push((path.clone(), number, kind));
+                }
+            }
+            if let Some(child) = field.as_struct() {
+                collect_numbers_at(child, &path, into);
+            }
+            if let Some(block) = field.as_block() {
+                // A curve held as a block of bytes is measured by `curves_carried`,
+                // not here. Counting its bytes as numbers makes a perfect curve
+                // transfer look like total loss, because the target holds the same
+                // bytes in one opaque blob with no numeric fields at all.
+                if key == "data" && block.definition().struct_definition().size() == 1 {
+                    continue;
+                }
+                for (index, element) in block.iter().enumerate() {
+                    collect_numbers_at(element, &format!("{path}[{index}]"), into);
+                }
+            }
+            if let Some(array) = field.as_array() {
+                for (index, element) in array.iter().enumerate() {
+                    collect_numbers_at(element, &format!("{path}[{index}]"), into);
+                }
+            }
+        }
+    }
+
+    /// Total bytes of `mapping_function` curve under `value`, counting both
+    /// spellings: a `data` blob declared as function data, and a block of
+    /// one-byte elements named `data`.
+    ///
+    /// Needed because [`collect_numbers`] cannot see across the two spellings —
+    /// Halo 2's curve is 1,180 individually-numbered bytes and Halo 3's is one
+    /// opaque blob, so a number-count diff reports a *perfect* curve transfer as
+    /// total loss. Counting bytes is the comparison that means something.
+    fn curve_blobs(value: TagStruct<'_>, into: &mut Vec<Vec<u8>>) {
+        for field in value.fields() {
+            if field.is_function_data()
+                && let Some(bytes) = field.as_data()
+                && !bytes.is_empty()
+            {
+                into.push(bytes.to_vec());
+            }
+            if let Some(child) = field.as_struct() {
+                curve_blobs(child, into);
+            }
+            if let Some(block) = field.as_block() {
+                if clean_field_key(field.name()) == "data"
+                    && block.definition().struct_definition().size() == 1
+                {
+                    let mut bytes = Vec::with_capacity(block.len());
+                    for element in block.iter() {
+                        let byte = element
+                            .fields()
+                            .find_map(|f| f.value())
+                            .and_then(integer_value)
+                            .unwrap_or(0);
+                        bytes.push(byte as u8);
+                    }
+                    if !bytes.is_empty() {
+                        into.push(bytes);
+                    }
+                    continue;
+                }
+                for element in block.iter() {
+                    curve_blobs(element, into);
+                }
+            }
+            if let Some(array) = field.as_array() {
+                for element in array.iter() {
+                    curve_blobs(element, into);
+                }
+            }
+        }
+    }
+
+    /// `(source curves, of those that arrived verbatim in the target)`.
+    ///
+    /// A byte count alone cannot answer this: the engine seeds every empty
+    /// `function_definition_data` field with a 32-byte default curve, so a tag
+    /// that transferred nothing still reports plenty of curve bytes. Matching the
+    /// blobs is what distinguishes a carried curve from a default one.
+    fn curves_carried(source: TagStruct<'_>, target: TagStruct<'_>) -> (usize, usize) {
+        let mut before = Vec::new();
+        curve_blobs(source, &mut before);
+        let mut after = Vec::new();
+        curve_blobs(target, &mut after);
+        // A curve that crossed a header-layout boundary is 4 bytes longer or
+        // shorter than it started, so match against both spellings.
+        let carried = before
+            .iter()
+            .filter(|bytes| {
+                let promoted = retarget_function_bytes(bytes, false, true);
+                let demoted = retarget_function_bytes(bytes, true, false);
+                after.iter().any(|candidate| {
+                    candidate == *bytes
+                        || Some(candidate.clone()) == promoted
+                        || Some(candidate.clone()) == demoted
+                })
+            })
+            .count();
+        (before.len(), carried)
+    }
+
+    /// Names that occur exactly once in `numbers`, so a diff against them is
+    /// unambiguous.
+    fn unique_numbers(
+        numbers: &[(String, f64, &'static str)],
+    ) -> HashMap<String, (f64, &'static str)> {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for (key, _, _) in numbers {
+            *counts.entry(key.as_str()).or_default() += 1;
+        }
+        numbers
+            .iter()
+            .filter(|(key, _, _)| counts.get(key.as_str()) == Some(&1))
+            .map(|(key, number, kind)| (key.clone(), (*number, *kind)))
+            .collect()
+    }
+
+    /// Report every unambiguously-named number whose value changed across a
+    /// conversion.
+    ///
+    /// The user found "a lot of the number values are not coming over correctly"
+    /// in Halo 2 -> Halo 3 output. This measures it rather than reasoning about
+    /// it, and prints both sides so a wild *source* number (which would mean the
+    /// read is misaligned, not the conversion) is distinguishable from a wild
+    /// target one.
+    #[test]
+    #[ignore = "diagnostic; needs the editing kits"]
+    fn report_numbers_that_change_across_a_conversion() {
+        let definitions = locate_definitions_root();
+        // Every adjacent pair, over the groups a user is most likely to carry
+        // forward. Ranked output at the end, so the worst offenders are the ones
+        // to fix next rather than whichever happened to be measured first.
+        const GROUPS: &[&str] = &[
+            "biped",
+            "vehicle",
+            "weapon",
+            "projectile",
+            "equipment",
+            "scenery",
+            "crate",
+            "effect",
+            "particle",
+            "light",
+            "damage_effect",
+            "material_effects",
+            "sound_looping",
+            "physics_model",
+            "model",
+            "device_machine",
+            "device_control",
+            "lens_flare",
+            "decal_system",
+            "contrail_system",
+            "character",
+            "creature",
+            "giant",
+            "cinematic",
+            "globals",
+        ];
+        let mut ranked: Vec<(usize, String)> = Vec::new();
+        // Narrowing filters, because closing the ranked list means re-running this
+        // one leg and one group at a time and the full sweep is six legs x 25
+        // groups of kit walking. `BLAM_TEST_ONLY_PAIR` matches the source profile,
+        // `BLAM_TEST_ONLY_GROUP` the group name.
+        let only_pair = std::env::var("BLAM_TEST_ONLY_PAIR").ok();
+        let only_group = std::env::var("BLAM_TEST_ONLY_GROUP").ok();
+        // Deciding whether a group's losses are genuine engine changes means reading
+        // every one of them, and the default cap hid two thirds of the biggest
+        // entries. `BLAM_TEST_LOST_LIMIT=0` prints them all.
+        let lost_limit = std::env::var("BLAM_TEST_LOST_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map_or(8, |value| if value == 0 { usize::MAX } else { value });
+        for (source_kit, source_game, target_kit, target_game) in super::chain_sweep::CHAIN {
+            if only_pair.as_deref().is_some_and(|want| want != *source_game) {
+                continue;
+            }
+            let (Some(source_tags), Some(target_tags)) = (
+                kit_tags(&format!("BLAM_TEST_{source_kit}"), source_kit),
+                kit_tags(&format!("BLAM_TEST_{target_kit}"), target_kit),
+            ) else {
+                eprintln!("skipping {source_game} -> {target_game}: kit missing");
+                continue;
+            };
+            let source_index = GameTagIndex::load(&definitions, source_game).unwrap();
+            let target_index = GameTagIndex::load(&definitions, target_game).unwrap();
+            let by_ext = super::chain_sweep::extension_to_group_tag(&source_index);
+            let found = super::chain_sweep::first_tag_by_extension(&source_tags);
+            let templates = NativeTemplateIndex::build(&target_tags, &target_index);
+            eprintln!("== {source_game} -> {target_game}");
+            for group in GROUPS {
+                if only_group.as_deref().is_some_and(|want| want != *group) {
+                    continue;
+                }
+                if !source_index.by_name.contains_key(*group)
+                    || !target_index.by_name.contains_key(*group)
+                {
+                    continue;
+                }
+                let (Some(&group_tag), Some(path)) = (by_ext.get(*group), found.get(*group)) else {
+                    continue;
+                };
+                let Ok(source) = read_tag_for_conversion(
+                    path,
+                    Some(source_game),
+                    Some(definitions.as_path()),
+                    group_tag,
+                ) else {
+                    eprintln!("   {group:24} source unreadable");
+                    continue;
+                };
+                let draft = match analyze_conversion_with_templates(
+                    &source,
+                    source_game,
+                    target_game,
+                    &definitions,
+                    Some(&templates),
+                ) {
+                    Ok(draft) => draft,
+                    Err(error) => {
+                        eprintln!("   {group:24} refused: {error}");
+                        continue;
+                    }
+                };
+                let mut before = Vec::new();
+                collect_numbers(source.root(), &mut before);
+                let mut after = Vec::new();
+                collect_numbers(draft.tag.root(), &mut after);
+                // A companion tag is part of the conversion's output, not something
+                // outside it: H3's `player responses` become separate Reach tags, so
+                // measuring `draft.tag` alone reported nine `damage_effect` numbers
+                // as vanished with no issue raised — the signature of a silent loss,
+                // which is exactly what this diagnostic exists to catch. Counted in
+                // its own bucket so a value that left the tag is still visible as
+                // having moved rather than being folded into "comparable".
+                let mut companion_numbers = Vec::new();
+                for companion in &draft.companion_tags {
+                    collect_numbers(companion.tag.root(), &mut companion_numbers);
+                }
+                let source_total = before.len();
+                let target_total = after.len();
+                let after_all = after.clone();
+                // A NaN or infinity written into a target tag is a crash risk in the
+                // target game's own tools, and the source kits demonstrably contain
+                // them, so check that a conversion never carries one across a field
+                // that *did* match. NaN compares unequal to itself, so the changed/
+                // comparable test above cannot see this.
+                let bad_in = before
+                    .iter()
+                    .filter(|(_, value, _)| !value.is_finite())
+                    .map(|(path, _, _)| path.clone())
+                    .collect::<Vec<_>>();
+                let bad_in = if bad_in.is_empty() {
+                    String::from("none")
+                } else {
+                    bad_in.join(", ")
+                };
+                let bad_out = after_all
+                    .iter()
+                    .filter(|(_, value, _)| !value.is_finite())
+                    .map(|(path, _, _)| path.clone())
+                    .collect::<Vec<_>>();
+                if !bad_out.is_empty() {
+                    eprintln!(
+                        "   {:24} NON-FINITE in source: {bad_in}\n   {:24} NON-FINITE in output: {}",
+                        "",
+                        "",
+                        bad_out.join(", ")
+                    );
+                }
+                let before = unique_numbers(&before);
+                let after = unique_numbers(&after);
+                let mut shared = 0usize;
+                let mut changed: Vec<String> = Vec::new();
+                let mut missing: Vec<String> = Vec::new();
+                let mut moved = 0usize;
+                let mut unset = 0usize;
+                let mut renamed = 0usize;
+                let mut to_companion = 0usize;
+                let mut renamed_lines: Vec<String> = Vec::new();
+                // The schema's own `{former name}` markers, for the rename bucket
+                // below. Loaded per group because that is the file that declares
+                // them, and `load` walks the `parent_tag` chain for inherited ones.
+                let target_aliases =
+                    SchemaFieldAliases::load(&definitions.join(target_game).join(format!(
+                        "{group}.json"
+                    )))
+                    .ok();
+                for (key, (from, from_kind)) in &before {
+                    let Some((to, to_kind)) = after.get(key) else {
+                        if *from != 0.0 {
+                            // A reshape moves a value to a different path under the
+                            // same field name — Halo 2's flat `maximum forward
+                            // speed` becomes `physics types/type-human_plane[0]/
+                            // maximum forward speed`. That is a success, not a
+                            // loss, so match on trailing name plus value before
+                            // calling anything lost.
+                            let name = key.rsplit('/').next().unwrap_or(key);
+                            let landed = after_all.iter().any(|(path, value, _)| {
+                                path.rsplit('/').next().unwrap_or(path) == name
+                                    && (value - from).abs()
+                                        <= f64::from(f32::EPSILON) * from.abs().max(1.0)
+                            });
+                            // A `{former name}` rename is neither the same name nor
+                            // the same path, so the trailing-name test above cannot
+                            // see it: Reach renamed Halo 3's `root offset max scale`
+                            // to `root offset max scale idle` and the value carries
+                            // intact. Requiring the value to be *present* under the
+                            // aliased name keeps this a verification rather than a
+                            // restatement of the converter's own decision.
+                            let renamed_to = target_aliases.as_ref().and_then(|aliases| {
+                                after_all
+                                    .iter()
+                                    .find(|(path, value, _)| {
+                                        (value - from).abs()
+                                            <= f64::from(f32::EPSILON) * from.abs().max(1.0)
+                                            && declares_alias(
+                                                aliases,
+                                                path.rsplit('/').next().unwrap_or(path),
+                                                name,
+                                            )
+                                    })
+                                    .map(|(path, _, _)| path.clone())
+                            });
+                            let companioned = companion_numbers.iter().any(|(path, value, _)| {
+                                path.rsplit('/').next().unwrap_or(path) == name
+                                    && (value - from).abs()
+                                        <= f64::from(f32::EPSILON) * from.abs().max(1.0)
+                            });
+                            if landed {
+                                moved += 1;
+                            } else if companioned {
+                                to_companion += 1;
+                            } else if let Some(to) = renamed_to {
+                                renamed += 1;
+                                renamed_lines.push(format!("{key} = {from} -> {to}"));
+                            } else if !from.is_finite()
+                                || from.abs() < f64::from(f32::MIN_POSITIVE)
+                            {
+                                // NaN, an infinity, or a subnormal float is not a
+                                // number an author typed. Halo 2 stamps its unused
+                                // `object` collision-damage slots with fixed junk
+                                // patterns — the same bits appear in unrelated tags
+                                // — and counting those as lost data put `projectile`
+                                // and `crate` on the ranking on nothing at all.
+                                unset += 1;
+                            } else if *from == -1.0 && *from_kind == "integer" {
+                                // -1 is Halo's universal "none" for an index or
+                                // option slot, so a dropped one is an unset field
+                                // rather than authored data. Counted apart because
+                                // otherwise it dominates: all 36 of one Reach
+                                // decal_system's apparent losses were -1 option
+                                // indices, which put it third in the ranking on
+                                // nothing at all.
+                                unset += 1;
+                            } else {
+                                missing.push(format!("{key} = {from} ({from_kind})"));
+                            }
+                        }
+                        continue;
+                    };
+                    shared += 1;
+                    if (from - to).abs() > f64::from(f32::EPSILON) * from.abs().max(1.0) {
+                        // A field present under the same name on both sides that
+                        // ends up holding a different number is either a genuine
+                        // mistranslation or a refusal whose template default happens
+                        // to differ — opposite verdicts. Say which, because only the
+                        // first is a bug and the second is already reported.
+                        let reported = draft
+                            .report
+                            .issues
+                            .iter()
+                            .any(|issue| issue.path == *key || issue.path.ends_with(key.as_str()));
+                        changed.push(format!(
+                            "{key}: {from} ({from_kind}) -> {to} ({to_kind}) [{}]",
+                            if reported { "reported" } else { "SILENT" }
+                        ));
+                    }
+                }
+                eprintln!(
+                    "   {group:24} {source_total} numbers in -> {target_total} out; \
+                     {shared} comparable, {} changed, {moved} moved, {renamed} renamed, \
+                     {to_companion} to companions, {unset} unset, {} lost",
+                    changed.len(),
+                    missing.len(),
+                );
+                if draft.report.truncated > 0 || draft.report.unsupported_source > 0 {
+                    eprintln!(
+                        "   {:24} report: {} truncated, {} unsupported",
+                        "",
+                        draft.report.truncated,
+                        draft.report.unsupported_source
+                    );
+                }
+                let (curves, carried) = curves_carried(source.root(), draft.tag.root());
+                if curves > 0 {
+                    eprintln!("   {:24} curves {carried}/{curves} carried", "");
+                    let mut reasons: HashMap<String, usize> = HashMap::new();
+                    for issue in &draft.report.issues {
+                        if issue.message.contains("function") || issue.path.contains("mapping") {
+                            *reasons.entry(issue.message.clone()).or_default() += 1;
+                        }
+                    }
+                    let mut reasons: Vec<_> = reasons.into_iter().collect();
+                    reasons.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+                    for (message, count) in reasons.iter().take(3) {
+                        eprintln!("   {:24}   x{count} {message}", "");
+                    }
+                }
+                changed.sort();
+                for line in changed.iter().take(8) {
+                    eprintln!("      CHANGED {line}");
+                }
+                if changed.len() > 8 {
+                    eprintln!("      ... and {} more changed", changed.len() - 8);
+                }
+                renamed_lines.sort();
+                for line in renamed_lines.iter().take(8) {
+                    eprintln!("      RENAMED {line}");
+                }
+                missing.sort();
+                for line in missing.iter().take(lost_limit) {
+                    eprintln!("      LOST    {line}");
+                }
+                if missing.len() > lost_limit {
+                    eprintln!("      ... and {} more lost", missing.len() - 4);
+                }
+                if !missing.is_empty() || !changed.is_empty() {
+                    ranked.push((
+                        missing.len() + changed.len(),
+                        format!(
+                            "{source_game} -> {target_game} {group}:                              {} lost, {} changed",
+                            missing.len(),
+                            changed.len()
+                        ),
+                    ));
+                }
+            }
+        }
+        ranked.sort_by_key(|(count, _)| std::cmp::Reverse(*count));
+        eprintln!("
+== worst numeric losses, most to least");
+        for (_, line) in ranked.iter().take(30) {
+            eprintln!("   {line}");
+        }
+    }
+
+    /// The first real-scalar field anywhere under `value` whose cleaned name is
+    /// `key`, as `(f32, TagFieldType)`.
+    fn find_real_by_key(value: TagStruct<'_>, key: &str) -> Option<(f32, TagFieldType)> {
+        for field in value.fields() {
+            if clean_field_key(field.name()) == key
+                && is_real_scalar(field.field_type())
+                && let Some(number) = field.value().and_then(real_value)
+            {
+                return Some((number, field.field_type()));
+            }
+            if let Some(child) = field.as_struct()
+                && let Some(found) = find_real_by_key(child, key)
+            {
+                return Some(found);
+            }
+            if let Some(block) = field.as_block() {
+                for element in block.iter() {
+                    if let Some(found) = find_real_by_key(element, key) {
+                        return Some(found);
+                    }
+                }
+            }
+            if let Some(array) = field.as_array() {
+                for element in array.iter() {
+                    if let Some(found) = find_real_by_key(element, key) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The radians-to-degrees rescale, proved on a tag the kit authored.
+    ///
+    /// `grenade angle:degrees` is typed `angle` in ODST — radians on the wire —
+    /// and `real` in Reach, which stores the degrees its name promises. Before
+    /// this was handled, a 30-degree ODST angle arrived in Reach as 0.5236
+    /// degrees. The unit test pins the decision; this pins the number, on a real
+    /// biped, through the real conversion, which is the only place the two halves
+    /// meet.
+    #[test]
+    fn a_real_odst_grenade_angle_arrives_in_reach_as_degrees() {
+        let Some(odst) = kit_tags("BLAM_TEST_H3ODSTEK", "H3ODSTEK") else {
+            eprintln!("skipping: no ODST kit (set BLAM_TEST_H3ODSTEK to its `tags` directory)");
+            return;
+        };
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else {
+            eprintln!("skipping: no HREK kit (set BLAM_TEST_HREK to its `tags` directory)");
+            return;
+        };
+        let definitions = locate_definitions_root();
+
+        // Find a biped that actually authored the field; a zero proves nothing.
+        let mut chosen = None;
+        for path in tags_with_extension(&odst, "biped") {
+            let Ok(tag) = TagFile::read(&path) else { continue };
+            let Some((radians, field_type)) = find_real_by_key(tag.root(), "grenade angle") else {
+                continue;
+            };
+            if field_type == TagFieldType::Angle && radians.abs() > 1e-4 {
+                chosen = Some((path, tag, radians));
+                break;
+            }
+        }
+        let Some((path, source, radians)) = chosen else {
+            eprintln!("skipping: no ODST biped authored a non-zero `grenade angle`");
+            return;
+        };
+
+        let draft = analyze_conversion(
+            &source,
+            "halo3odst_mcc",
+            "haloreach_mcc",
+            &definitions,
+            Some(reach.as_path()),
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+
+        let (landed, landed_type) = find_real_by_key(draft.tag.root(), "grenade angle")
+            .expect("Reach declares `grenade angle`");
+        assert_eq!(
+            landed_type,
+            TagFieldType::Real,
+            "Reach types this field `real`; the fixture assumption changed"
+        );
+        let expected = radians.to_degrees();
+        assert!(
+            (landed - expected).abs() < 1e-3,
+            "{}: {radians} radians should land as {expected} degrees, got {landed}",
+            path.display()
+        );
+        // And the bug this guards against: the raw bits copied across.
+        assert!(
+            (landed - radians).abs() > 1e-3,
+            "{}: the value crossed unchanged, so the rescale did not run",
+            path.display()
+        );
+    }
+
+    /// An `angle` and a `real` holding the same quantity are not the same bits.
+    ///
+    /// `angle` stores radians and is authored in degrees — pinned by
+    /// `angle_fields_are_edited_in_degrees_and_stored_in_radians`. Six fields in
+    /// the shipped definitions change between `angle` and `real` across a pair,
+    /// so copying the float straight across is wrong by 180/pi. Where both names
+    /// carry the same `:units` the factor is provable and applied; where neither
+    /// does, the converter must say so rather than guess.
+    #[test]
+    fn an_angle_that_becomes_a_real_is_rescaled_only_when_the_schema_proves_it() {
+        use TagFieldType as T;
+
+        let deg = Some("degrees");
+
+        // `unit`'s `grenade angle:degrees` is `angle` in ODST and `real` in
+        // Reach/H4/H2A/CE. Both schemas say degrees, so only storage differs.
+        assert_eq!(
+            real_scalar_unit_change(T::Angle, deg, T::Real, deg),
+            RealUnitChange::RadiansToDegrees
+        );
+        assert_eq!(
+            real_scalar_unit_change(T::Real, deg, T::Angle, deg),
+            RealUnitChange::DegreesToRadians
+        );
+
+        // `vehicle`'s `fixed gun pitch` is `real` in H3/ODST and `angle` in
+        // Reach+, with no unit on either side — and the shipped tags store the
+        // same number on both (0.25 vs 0.24993114), so the bits move.
+        assert_eq!(real_scalar_unit_change(T::Real, None, T::Angle, None), RealUnitChange::Copy);
+        // A unit on one side only, or two different units, proves nothing, so
+        // the pre-existing behaviour stands rather than a guessed rescale.
+        assert_eq!(real_scalar_unit_change(T::Angle, deg, T::Real, None), RealUnitChange::Copy);
+        assert_eq!(
+            real_scalar_unit_change(T::Angle, deg, T::Real, Some("world units")),
+            RealUnitChange::Copy
+        );
+
+        // Neither side an angle, or both: the bits move untouched, unit or not.
+        assert_eq!(
+            real_scalar_unit_change(T::Real, None, T::RealFraction, None),
+            RealUnitChange::Copy
+        );
+        assert_eq!(
+            real_scalar_unit_change(T::Angle, deg, T::Angle, None),
+            RealUnitChange::Copy
+        );
+
+        // The annotation is read off the schema name, where it still exists.
+        // The `#help` tail must not be mistaken for a unit.
+        assert_eq!(field_unit_annotation("grenade angle:degrees"), Some("degrees".to_owned()));
+        assert_eq!(field_unit_annotation("delay:secs#how long to wait"), Some("secs".to_owned()));
+        assert_eq!(field_unit_annotation("ratio#a:b comparison"), None);
+        assert_eq!(field_unit_annotation("plain name"), None);
+        // And a tag's own layout has already lost it, which is why the schema is
+        // consulted rather than the field the converter is holding.
+        assert_eq!(field_unit_annotation("grenade angle"), None);
+    }
+
+    /// Every reviewed drop has to resolve to a real field, by the same path the
+    /// converter will report it under.
+    ///
+    /// This is the test the first attempt needed and did not have. The rules
+    /// were written with bare field names — `additional flags` — while the
+    /// converter reports `definitions/skeleton nodes[0]/additional flags`, so
+    /// nothing matched and every animation graph with a non-default node flag
+    /// refused. A real 167 MB Halo Reach graph found that; a schema walk finds
+    /// it in milliseconds, on CI, without a kit.
+    ///
+    /// Element indices are stripped before comparison, which is what lets one
+    /// rule cover a field inside a block of 2,136 elements.
+    #[test]
+    fn every_accepted_drop_resolves_along_the_path_the_converter_reports() {
+        let catalog = ConversionMappingCatalog::load().unwrap();
+        let definitions = locate_definitions_root();
+        assert!(
+            !catalog.accepted_field_drops.is_empty(),
+            "the animation graph rules should be here",
+        );
+
+        for rule in &catalog.accepted_field_drops {
+            for game in &rule.source_games {
+                let path = definitions.join(game).join(format!("{}.json", rule.group));
+                if !path.is_file() {
+                    continue;
+                }
+                let tag = TagFile::new(&path)
+                    .unwrap_or_else(|error| panic!("build {game}/{}: {error}", rule.group));
+                assert!(
+                    schema_path_resolves(tag.definitions().root_struct(), &rule.source_path),
+                    "{game}/{}: `{}` does not resolve; the converter would report a                      different path and this rule would never fire",
+                    rule.group,
+                    rule.source_path,
+                );
+            }
+            // And it must genuinely be absent on the far side, or the rule is
+            // hiding a conversion failure rather than recording a known loss.
+            for game in &rule.target_games {
+                let path = definitions.join(game).join(format!("{}.json", rule.group));
+                if !path.is_file() {
+                    continue;
+                }
+                let tag = TagFile::new(&path).unwrap();
+                assert!(
+                    !schema_path_resolves(tag.definitions().root_struct(), &rule.source_path),
+                    "{game}/{} does declare `{}`, so it is not a drop",
+                    rule.group,
+                    rule.source_path,
+                );
+            }
+        }
+    }
+
+    /// An accepted *payload* drop must name a blob both sides really declare.
+    ///
+    /// The mirror image of the check above, and the reason the two sections are
+    /// separate. If the target does not declare the field, the loss is an
+    /// ordinary field drop and belongs in `accepted_field_drops` where the
+    /// absence is verified; if it does, the blob is being dropped despite having
+    /// somewhere to go, and that is the claim this section makes. A rule in the
+    /// wrong list would be checked against the wrong invariant and pass.
+    #[test]
+    fn every_accepted_payload_drop_names_a_blob_both_sides_declare() {
+        let catalog = ConversionMappingCatalog::load().unwrap();
+        let definitions = locate_definitions_root();
+        for rule in &catalog.accepted_payload_drops {
+            for (role, games) in [
+                ("source", &rule.source_games),
+                ("target", &rule.target_games),
+            ] {
+                for game in games {
+                    let path = definitions.join(game).join(format!("{}.json", rule.group));
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let tag = TagFile::new(&path)
+                        .unwrap_or_else(|error| panic!("build {game}/{}: {error}", rule.group));
+                    assert!(
+                        schema_path_resolves(tag.definitions().root_struct(), &rule.source_path),
+                        "{game}/{} ({role}) does not declare `{}` \u{2014} that is an ordinary \
+                         field drop, so the rule belongs in accepted_field_drops where its \
+                         absence gets checked",
+                        rule.group,
+                        rule.source_path,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Walk a `/`-separated field path through a schema, descending containers.
+    #[cfg(test)]
+    fn schema_path_resolves(root: crate::TagStructDefinition<'_>, path: &str) -> bool {
+        let mut current = root;
+        let segments: Vec<String> = crate::TagFieldPath::parse(path)
+            .strip_node_indices()
+            .to_string()
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let Some((last, parents)) = segments.split_last() else {
+            return false;
+        };
+        for segment in parents {
+            let Some(next) = current.fields().find_map(|field| {
+                (clean_field_key(field.name()) == clean_field_key(segment))
+                    .then(|| {
+                        field
+                            .as_struct()
+                            .or_else(|| field.as_block().map(|b| b.struct_definition()))
+                            .or_else(|| field.as_array().map(|a| a.struct_definition()))
+                            .or_else(|| field.as_resource().map(|r| r.struct_definition()))
+                    })
+                    .flatten()
+            }) else {
+                return false;
+            };
+            current = next;
+        }
+        current
+            .fields()
+            .any(|field| clean_field_key(field.name()) == clean_field_key(last))
+    }
+
+    /// A real Halo Reach animation graph, off disk, with its animation payload
+    /// in it. Self-skips without HREK, so a green run here proves less than it
+    /// looks — check for the skip line.
+    ///
+    /// The schema-built test above cannot cover this: `TagFile::new` produces
+    /// null resources, and the entire question is whether a *populated* one
+    /// crosses.
+    #[test]
+    fn a_real_hrek_animation_graph_carries_its_payload_into_campaign_evolved() {
+        let source_path = Path::new(
+            "D:/SteamLibrary/steamapps/common/HREK/tags/cinematics/052lb_reflection/objects/052lb_reflection_030/elevator_1.model_animation_graph",
+        );
+        if !source_path.is_file() {
+            eprintln!("skipping: HREK is not installed at the expected path");
+            return;
+        }
+        let definitions = locate_definitions_root();
+        let source = TagFile::read(source_path).expect("read the HREK animation graph");
+
+        let resources_in = count_non_null_resources(source.root());
+        assert!(
+            resources_in > 0,
+            "this fixture must actually carry a payload, or the assertions below \
+             are 0 == 0 and prove nothing",
+        );
+        let draft = analyze_conversion(
+            &source,
+            "haloreach_mcc",
+            CAMPAIGN_EVOLVED_GAME,
+            &definitions,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("a real Reach animation graph must convert: {error}"));
+
+        assert_eq!(
+            draft.report.transferred_resources, resources_in,
+            "every pageable resource the source carried has to arrive; the payload \
+             is most of what an animation graph is",
+        );
+        let bytes = draft.tag.write_to_bytes().expect("serialize the converted graph");
+        let reopened = TagFile::read_from_bytes(&bytes).expect("read it back");
+        assert_eq!(
+            count_non_null_resources(reopened.root()),
+            resources_in,
+            "the resources survived the write",
+        );
+    }
+
+    #[cfg(test)]
+    fn count_non_null_resources(structure: TagStruct<'_>) -> usize {
+        structure
+            .fields()
+            .map(|field| {
+                let here = field
+                    .as_resource()
+                    .is_some_and(|resource| !matches!(resource.kind(), TagResourceKind::Null))
+                    as usize;
+                let nested = field.as_struct().map(count_non_null_resources).unwrap_or(0)
+                    + field
+                        .as_block()
+                        .map(|block| block.iter().map(count_non_null_resources).sum())
+                        .unwrap_or(0)
+                    + field
+                        .as_array()
+                        .map(|array| array.iter().map(count_non_null_resources).sum())
+                        .unwrap_or(0);
+                here + nested
+            })
+            .sum()
+    }
+
+    #[test]
+    fn real_h3_animation_payload_is_rejected_instead_of_written_incomplete() {
+        let source_path = Path::new(
+            "D:/SteamLibrary/steamapps/common/H3EK/tags/fx/null_object/null_up/null_up.model_animation_graph",
+        );
+        let target_root = Path::new("D:/SteamLibrary/steamapps/common/HREK/tags");
+        if !source_path.is_file() || !target_root.is_dir() {
+            return;
+        }
+        let definitions = locate_definitions_root();
+        let source = TagFile::read(source_path).unwrap();
+        let error = analyze_conversion(
+            &source,
+            "halo3_mcc",
+            "haloreach_mcc",
+            &definitions,
+            Some(target_root),
+        )
+        .err()
+        .expect("unsafe animation graph must not produce a draft");
+        assert!(
+            error.contains("pageable runtime resources")
+                || error.contains("model_animation_graph conversion would lose"),
+            "unexpected animation safety error: {error}"
+        );
+    }
+
+    #[test]
+    fn catalogued_legacy_model_and_particle_reference_drops_are_one_way() {
+        let catalog = ConversionMappingCatalog::load().unwrap();
+        for (group, field) in [("model", "lod_render_model"), ("particle", "shader")] {
+            assert!(
+                catalog
+                    .reference_drop_reason(group, "halo3_mcc", "haloreach_mcc", field,)
+                    .is_some()
+            );
+            assert!(
+                catalog
+                    .reference_drop_reason(group, "haloreach_mcc", "halo3_mcc", field,)
+                    .is_none()
+            );
+        }
+    }
+
+    // The folder-conversion worker test stayed in the editor alongside
+    // run_folder_conversion_job: walking a folder, deciding destinations and
+    // reporting progress to the UI thread is workflow, not conversion.
+}
+
+
+#[cfg(test)]
+mod chain_sweep {
+    use super::tests::kit_tags;
+    use super::*;
+
+    /// Kit folder, source profile, kit folder, target profile.
+    pub const CHAIN: &[(&str, &str, &str, &str)] = &[
+        ("HCEEK", "haloce_mcc", "H2EK", "halo2_mcc"),
+        ("H2EK", "halo2_mcc", "H3EK", "halo3_mcc"),
+        ("H3EK", "halo3_mcc", "H3ODSTEK", "halo3odst_mcc"),
+        ("H3EK", "halo3_mcc", "HREK", "haloreach_mcc"),
+        ("HREK", "haloreach_mcc", "H4EK", "halo4_mcc"),
+        ("H4EK", "halo4_mcc", "H2AMPEK", "halo2amp_mcc"),
+    ];
+
+    /// Every group the source profile defines, sorted so a run is repeatable.
+    ///
+    /// Deliberately not a hand-picked list: checking that one tag of *each* type
+    /// carries its data is the whole point, and a shortlist hides the groups
+    /// nobody thought to name.
+    fn source_groups(index: &GameTagIndex) -> Vec<String> {
+        let mut names: Vec<String> = index.by_name.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// One walk of a kit, bucketed by extension — rescanning per group turned a
+    /// measurement into a nine-minute one.
+    pub fn first_tag_by_extension(root: &Path) -> HashMap<String, PathBuf> {
+        let mut out: HashMap<String, PathBuf> = HashMap::new();
+        for path in walk_files(root) {
+            let Some(ext) = path.extension().and_then(|e| e.to_str()) else { continue };
+            let ext = ext.to_ascii_lowercase();
+            if super::tests::is_generated_output(&path) {
+                continue;
+            }
+            out.entry(ext)
+                .and_modify(|best| {
+                    if stock_rank(&path) < stock_rank(best) {
+                        *best = path.clone();
+                    }
+                })
+                .or_insert(path);
+        }
+        out
+    }
+
+    /// Sort key that prefers stock game content over editor scratch.
+    ///
+    /// The picker used to take whatever sorted first, which in H2EK means
+    /// `digsite/...` — recovered work-in-progress rather than shipped content, and
+    /// a poor thing to judge a conversion by. Rank `objects/` first (the object
+    /// tags anyone would test), then `levels/`, then the rest, and push anything
+    /// that looks like scratch to the back. Ties break alphabetically so a run is
+    /// still repeatable.
+    fn stock_rank(path: &Path) -> (u8, String) {
+        let text = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+        let scratch = ["digsite", "/test", "test/", "temp", "scratch", "_old", "unused"]
+            .iter()
+            .any(|needle| text.contains(needle));
+        let tier = if scratch {
+            3
+        } else if text.contains("/objects/") {
+            0
+        } else if text.contains("/levels/") {
+            1
+        } else {
+            2
+        };
+        (tier, text)
+    }
+
+    pub fn extension_to_group_tag(index: &GameTagIndex) -> HashMap<String, u32> {
+        let mut out = HashMap::new();
+        for (tag, name) in &index.by_tag {
+            let ext = crate::paths::group_tag_to_extension(*tag).unwrap_or(name.as_str());
+            out.insert(ext.to_ascii_lowercase(), *tag);
+        }
+        out
+    }
+
+    /// Convert one tag per group per pair and write it into the target kit, so
+    /// the result can be opened in that kit's own tools.
+    ///
+    /// Everything lands under `<kit>/tags/baboon_converted/<source profile>/`, one
+    /// folder to inspect and one folder to delete. Nothing existing is
+    /// overwritten. Uses the same save path as the UI —
+    /// `prepare_companion_outputs` then `write_atomic` — so companions are named,
+    /// their references resolved, dependency lists rebuilt, and every tag
+    /// round-trip verified before a byte is written.
+    ///
+    /// `#[ignore]`d on purpose: this writes into an installed editing kit and
+    /// must never happen as a side effect of `cargo test`.
+    #[test]
+    #[ignore = "writes converted tags into the installed editing kits"]
+    fn write_converted_samples_into_kits() {
+        let definitions = locate_definitions_root();
+        let mut written = 0usize;
+        let mut failed = 0usize;
+        // `BLAM_TEST_ONLY_PAIR=haloce_mcc` narrows the sweep to legs whose source
+        // profile matches, so one leg can be re-run without paying for all six.
+        let only_pair = std::env::var("BLAM_TEST_ONLY_PAIR").ok();
+        for (source_kit, source_game, target_kit, target_game) in CHAIN {
+            if only_pair.as_deref().is_some_and(|want| want != *source_game) {
+                continue;
+            }
+            let (Some(source_tags), Some(target_tags)) = (
+                kit_tags(&format!("BLAM_TEST_{source_kit}"), source_kit),
+                kit_tags(&format!("BLAM_TEST_{target_kit}"), target_kit),
+            ) else {
+                eprintln!("== {source_game} -> {target_game}: kit missing, skipped");
+                continue;
+            };
+            let source_index = GameTagIndex::load(&definitions, source_game).unwrap();
+            let target_index = GameTagIndex::load(&definitions, target_game).unwrap();
+            let by_ext = extension_to_group_tag(&source_index);
+            let found = first_tag_by_extension(&source_tags);
+            // Built once. `analyze_conversion` rebuilds this on every call,
+            // which means walking the whole target kit per group.
+            let templates = NativeTemplateIndex::build(&target_tags, &target_index);
+            let dependency_schema = definitions.join(target_game).join("tag_dependency_list.json");
+            let out_dir = target_tags.join("baboon_converted").join(source_game);
+            eprintln!("== {source_game} -> {target_game}  ->  {}", out_dir.display());
+            for group in source_groups(&source_index) {
+                let lower = group.clone();
+                if !source_index.by_name.contains_key(&lower)
+                    || !target_index.by_name.contains_key(&lower)
+                {
+                    continue;
+                }
+                let (Some(&group_tag), Some(path)) = (by_ext.get(&lower), found.get(&lower)) else {
+                    continue;
+                };
+                let read = std::panic::catch_unwind(|| {
+                    read_tag_for_conversion(
+                        path,
+                        Some(source_game),
+                        Some(definitions.as_path()),
+                        group_tag,
+                    )
+                });
+                let Ok(Ok(source)) = read else {
+                    eprintln!("   {group:34} source unreadable");
+                    failed += 1;
+                    continue;
+                };
+                let analyzed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    analyze_conversion_with_templates(
+                        &source,
+                        source_game,
+                        target_game,
+                        &definitions,
+                        Some(&templates),
+                    )
+                }));
+                let mut draft = match analyzed {
+                    Ok(Ok(draft)) => draft,
+                    Ok(Err(error)) => {
+                        // Printed in full on purpose. The reason *is* the finding
+                        // this sweep exists to produce; truncating it here made the
+                        // per-group breakdown unrecoverable from the log.
+                        eprintln!("   {group:34} refused: {error}");
+                        failed += 1;
+                        continue;
+                    }
+                    Err(_) => {
+                        eprintln!("   {group:34} PANICKED");
+                        failed += 1;
+                        continue;
+                    }
+                };
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(&lower);
+                let output =
+                    out_dir.join(format!("{stem}.{}", draft.target_extension));
+                if output.exists() {
+                    eprintln!("   {group:34} already present, left alone");
+                    continue;
+                }
+                let saved = (|| -> Result<usize, String> {
+                    let companions = prepare_companion_outputs(
+                        &mut draft,
+                        &output,
+                        &target_tags,
+                        &dependency_schema,
+                    )?;
+                    for path in companions.iter().chain(std::iter::once(&output)) {
+                        if let Some(parent) = path.parent() {
+                            fs::create_dir_all(parent).map_err(|error| {
+                                format!("Could not create {}: {error}", parent.display())
+                            })?;
+                        }
+                    }
+                    for (companion, path) in draft.companion_tags.iter().zip(&companions) {
+                        companion.tag.write_atomic(path).map_err(|error| {
+                            format!("Could not save {}: {error}", path.display())
+                        })?;
+                    }
+                    draft.tag.write_atomic(&output).map_err(|error| {
+                        format!("Could not save {}: {error}", output.display())
+                    })?;
+                    Ok(companions.len())
+                })();
+                match saved {
+                    Ok(companions) => {
+                        written += 1;
+                        let extra = if companions == 0 {
+                            String::new()
+                        } else {
+                            format!(" (+{companions} companion)")
+                        };
+                        eprintln!("   {group:34} wrote {}{extra}", output.display());
+                    }
+                    Err(error) => {
+                        failed += 1;
+                        eprintln!("   {group:34} SAVE FAILED {error}");
+                    }
+                }
+            }
+        }
+        eprintln!("
+{written} tag(s) written, {failed} not converted");
+        assert!(written > 0, "nothing was written; are the kits installed?");
+    }
+
+    /// Follow one tag all the way along the chain, feeding each conversion's
+    /// output in as the next hop's source.
+    ///
+    /// The adjacent-pair sweep only ever converts kit-authored tags, so it cannot
+    /// see loss that compounds: a field dropped at H2 -> H3 is simply absent by
+    /// the time Reach is reached, and nothing reports it twice. This is also the
+    /// shape a user actually wants — carry a Halo 2 asset forward to Reach — and
+    /// it is where a double conversion showed up as a crash once already.
+    #[test]
+    #[ignore = "measurement; needs the editing kits"]
+    fn sweep_the_whole_chain_hop_by_hop() {
+        const HOPS: &[(&str, &str, &str)] = &[
+            ("H2EK", "halo2_mcc", "biped"),
+        ];
+        const CHAIN: &[(&str, &str)] = &[
+            ("H3EK", "halo3_mcc"),
+            ("H3ODSTEK", "halo3odst_mcc"),
+            ("HREK", "haloreach_mcc"),
+            ("H4EK", "halo4_mcc"),
+            ("H2AMPEK", "halo2amp_mcc"),
+        ];
+        let definitions = locate_definitions_root();
+        for (start_kit, start_game, group) in HOPS {
+            let Some(start_tags) = kit_tags(&format!("BLAM_TEST_{start_kit}"), start_kit) else {
+                eprintln!("skipping: no {start_kit}");
+                continue;
+            };
+            let found = first_tag_by_extension(&start_tags);
+            let Some(path) = found.get(*group) else {
+                eprintln!("skipping: {start_kit} ships no .{group}");
+                continue;
+            };
+            let index = GameTagIndex::load(&definitions, start_game).unwrap();
+            let Some(&group_tag) = index.by_name.get(*group) else { continue };
+            let Ok(mut carried) = read_tag_for_conversion(
+                path,
+                Some(start_game),
+                Some(definitions.as_path()),
+                group_tag,
+            ) else {
+                eprintln!("skipping: {} is unreadable", path.display());
+                continue;
+            };
+            eprintln!("== chain for .{group}, from {}", path.display());
+            let mut game = *start_game;
+            for (kit, next_game) in CHAIN {
+                let Some(tags) = kit_tags(&format!("BLAM_TEST_{kit}"), kit) else {
+                    eprintln!("   {game} -> {next_game}: no {kit}, chain stops");
+                    break;
+                };
+                let target_index = GameTagIndex::load(&definitions, next_game).unwrap();
+                let templates = NativeTemplateIndex::build(&tags, &target_index);
+                let converted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    analyze_conversion_with_templates(
+                        &carried,
+                        game,
+                        next_game,
+                        &definitions,
+                        Some(&templates),
+                    )
+                }));
+                match converted {
+                    Ok(Ok(draft)) => {
+                        eprintln!(
+                            "   {game} -> {next_game}  exact={} semantic={} default={} unsupported={} dropped_refs={}",
+                            draft.report.copied_exact,
+                            draft.report.converted_semantic,
+                            draft.report.defaulted_target,
+                            draft.report.unsupported_source,
+                            draft.report.dropped_references,
+                        );
+                        carried = draft.tag;
+                        game = next_game;
+                    }
+                    Ok(Err(error)) => {
+                        let brief: String = error.chars().take(96).collect();
+                        eprintln!("   {game} -> {next_game}  STOPPED {brief}");
+                        break;
+                    }
+                    Err(_) => {
+                        eprintln!("   {game} -> {next_game}  PANICKED");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "measurement sweep; needs the editing kits"]
+    fn sweep_adjacent_pair_conversions() {
+        let definitions = locate_definitions_root();
+        for (source_kit, source_game, target_kit, target_game) in CHAIN {
+            let (Some(source_tags), Some(target_tags)) = (
+                kit_tags(&format!("BLAM_TEST_{source_kit}"), source_kit),
+                kit_tags(&format!("BLAM_TEST_{target_kit}"), target_kit),
+            ) else {
+                eprintln!("== {source_game} -> {target_game}: kit missing, skipped");
+                continue;
+            };
+            let source_index = GameTagIndex::load(&definitions, source_game).unwrap();
+            let target_index = GameTagIndex::load(&definitions, target_game).unwrap();
+            let by_ext = extension_to_group_tag(&source_index);
+            let found = first_tag_by_extension(&source_tags);
+            // Built once. `analyze_conversion` rebuilds this on every call,
+            // which means walking the whole target kit per group.
+            let templates = NativeTemplateIndex::build(&target_tags, &target_index);
+            eprintln!("== {source_game} -> {target_game}");
+            for group in source_groups(&source_index) {
+                let lower = group.clone();
+                if !source_index.by_name.contains_key(&lower) {
+                    eprintln!("   {group:34} -  source has no such group");
+                    continue;
+                }
+                if !target_index.by_name.contains_key(&lower) {
+                    eprintln!("   {group:34} -  TARGET has no such group");
+                    continue;
+                }
+                let (Some(&group_tag), Some(path)) = (by_ext.get(&lower), found.get(&lower)) else {
+                    eprintln!("   {group:34} -  kit ships none");
+                    continue;
+                };
+                let read = std::panic::catch_unwind(|| {
+                    read_tag_for_conversion(
+                        path,
+                        Some(source_game),
+                        Some(definitions.as_path()),
+                        group_tag,
+                    )
+                });
+                let source = match read {
+                    Ok(Ok(tag)) => tag,
+                    Ok(Err(error)) => {
+                        eprintln!("   {group:34} READ FAILED: {error}");
+                        continue;
+                    }
+                    Err(_) => {
+                        eprintln!("   {group:34} READ PANICKED");
+                        continue;
+                    }
+                };
+                let converted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    analyze_conversion_with_templates(
+                        &source,
+                        source_game,
+                        target_game,
+                        &definitions,
+                        Some(&templates),
+                    )
+                    .map(|draft| {
+                        (
+                            draft.report.copied_exact,
+                            draft.report.converted_semantic,
+                            draft.report.defaulted_target,
+                            draft.report.unsupported_source,
+                            draft.report.dropped_references,
+                        )
+                    })
+                }));
+                match converted {
+                    Ok(Ok((exact, semantic, default, unsupported, dropped))) => eprintln!(
+                        "   {group:34} ok exact={exact} semantic={semantic} default={default} unsupported={unsupported} dropped_refs={dropped}"
+                    ),
+                    Ok(Err(error)) => {
+                        let brief: String = error.chars().take(110).collect();
+                        eprintln!("   {group:34} FAILED {brief}");
+                    }
+                    Err(_) => eprintln!("   {group:34} PANICKED in conversion"),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod group_alias_regression {
+    use super::tests::kit_tags;
+    use super::*;
+
+    /// A converted particle must carry the format version the kit writes.
+    ///
+    /// Halo Reach's particle root has `version!`, which Halo 3 has no counterpart
+    /// for. Engine-managed fields were zeroed along with everything else when the
+    /// kit-authored template was cleared, so a converted particle claimed version
+    /// 0 — a value nothing ships (24 of 25 shipped HREK particles carry 2, one
+    /// carries 1) — and the Reach mod tools crashed on it.
+    ///
+    /// The template is a tag the kit itself wrote, so for a field the source
+    /// cannot speak to, its answer is the best one available. Same reasoning
+    /// `apply_editing_kit_mcc_header` already records for the file header.
+    #[test]
+    fn a_particle_converted_into_reach_keeps_an_initialised_version() {
+        let (Some(h3), Some(reach)) = (
+            kit_tags("BLAM_TEST_H3EK", "H3EK"),
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+        ) else {
+            eprintln!("skipping: needs H3EK and HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let Some(path) = super::tests::tags_with_extension(&h3, "particle").into_iter().next()
+        else {
+            eprintln!("skipping: H3EK ships no particle");
+            return;
+        };
+        let source = TagFile::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let draft = analyze_conversion(
+            &source,
+            "halo3_mcc",
+            "haloreach_mcc",
+            &definitions,
+            Some(reach.as_path()),
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+
+        let version = draft
+            .tag
+            .root()
+            .fields()
+            .find(|field| clean_field_key(field.name()) == "version")
+            .and_then(|field| field.value())
+            .and_then(|value| match value {
+                TagFieldData::CharInteger(value) => Some(value),
+                _ => None,
+            })
+            .expect("Reach's particle root declares `version`");
+        assert_ne!(
+            version, 0,
+            "{}: a converted particle claims version 0, which no shipped Reach              particle uses and which crashes the mod tools",
+            path.display()
+        );
+
+        // And the render method has to be there. A shipped Reach particle's
+        // `actual shader?` points `definition*` at a render_method_definition
+        // tag; Halo 3 keeps its render method inline under other names and
+        // cannot supply that reference, so it comes from the kit template.
+        // Without it the tag has no shader at all and the mod tools crash.
+        let shader = draft
+            .tag
+            .root()
+            .fields()
+            .find(|field| clean_field_key(field.name()).starts_with("actual shader"))
+            .and_then(|field| field.as_struct())
+            .expect("Reach's particle root declares `actual shader?`");
+        let definition = shader
+            .fields()
+            .find(|field| clean_field_key(field.name()) == "definition")
+            .and_then(|field| field.value());
+        assert!(
+            matches!(
+                definition,
+                Some(TagFieldData::TagReference(ref reference))
+                    if reference.group_tag_and_name.is_some()
+            ),
+            "{}: the converted particle has no render-method definition ({definition:?})",
+            path.display()
+        );
+    }
+
+    /// A tag whose payload cannot cross must not be written at all.
+    ///
+    /// All three of these were found by converting real Halo 2 tags and opening
+    /// the results in the target kit:
+    ///
+    /// - `.shader` opened in Guerilla as "not a valid tag". Halo 2 authors a
+    ///   shader as a template plus a parameter/postprocess table; Halo 3 replaced
+    ///   the system with a render method, and the two roots share exactly one
+    ///   field name out of 16 and 2. The converted tag carried a name and nothing
+    ///   else.
+    /// - `.bitmap` came across with no image data, and the same bitmap **crashed**
+    ///   the Reach mod tools, because metadata promising mipmaps with no pixels
+    ///   behind them reads off the end.
+    ///
+    /// The shader is still refused: nothing in a field-level mapping can rebuild a
+    /// render method from a template reference.
+    ///
+    /// The bitmap is no longer refused *into Halo 3*, and this test now pins the
+    /// better guarantee. The original diagnosis — "opaque bytes only copy when both
+    /// struct GUIDs match, and every Halo 2 GUID is zero" — was the mechanism, but
+    /// the conclusion drawn from it was wrong: a native H3EK bitmap keeps its pixels
+    /// in the same `processed pixel data` blob (699,052 bytes in one), so the bytes
+    /// *can* cross once the payload-definition rename is declared. What must still
+    /// be refused is Halo 2 straight to Reach, whose `bitmap_data_block_def` has no
+    /// `pixels offset` field at all — that is the version that crashed, and going
+    /// through Halo 3 is the route that works.
+    #[test]
+    fn a_halo_2_bitmap_or_shader_is_refused_rather_than_written_unusable() {
+        let Some(h2) = kit_tags("BLAM_TEST_H2EK", "H2EK") else {
+            eprintln!("skipping: needs H2EK (set BLAM_TEST_H2EK)");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        for (group, fourcc, expected, targets) in [
+            // Into Halo 3 a bitmap now carries its pixels, so only the direct hop
+            // to Reach is refused.
+            ("bitmap", "bitm", "explicitly incompatible", &["haloreach_mcc"][..]),
+            ("shader", "shad", "explicitly incompatible", &["halo3_mcc", "haloreach_mcc"][..]),
+        ] {
+            let group_tag = crate::parse_group_tag(fourcc).expect("a group tag");
+            // A bitmap with an empty `processed pixel data` has no payload to
+            // lose, so it proves nothing — find one that actually carries bytes.
+            let mut chosen = None;
+            for candidate in super::tests::tags_with_extension(&h2, group) {
+                let Ok(tag) = read_tag_for_conversion(
+                    &candidate,
+                    Some("halo2_mcc"),
+                    Some(definitions.as_path()),
+                    group_tag,
+                ) else {
+                    continue;
+                };
+                if group != "bitmap" || has_nonempty_data(tag.root()) {
+                    chosen = Some((candidate, tag));
+                    break;
+                }
+            }
+            let Some((path, source)) = chosen else {
+                eprintln!("skipping {group}: no H2EK {group} carries a payload");
+                continue;
+            };
+            for target in targets {
+                let error = analyze_conversion(
+                    &source,
+                    "halo2_mcc",
+                    target,
+                    &definitions,
+                    None,
+                )
+                .err()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}: halo2_mcc -> {target} {group} produced a draft; it would not load",
+                        path.display()
+                    )
+                });
+                assert!(
+                    error.contains(expected),
+                    "{group} -> {target}: expected a {expected:?} refusal, got {error}"
+                );
+            }
+        }
+    }
+
+    /// A renamed tag class must not take the reference to it down with it.
+    ///
+    /// Halo 2 calls the class `contrail`; Halo 3 renamed it to `contrail_system`.
+    /// An H2 projectile's attachment points at one, and before `group_aliases`
+    /// existed the canonical-name lookup found nothing and the reference was
+    /// dropped — a real loss on a real tag, reported only as `dropped_refs=1`.
+    /// Found by inspecting a converted `battle_rifle_bullet.projectile`.
+    #[test]
+    fn an_h2_attachment_keeps_its_contrail_reference_as_a_contrail_system() {
+        let (Some(h2), Some(h3)) = (
+            kit_tags("BLAM_TEST_H2EK", "H2EK"),
+            kit_tags("BLAM_TEST_H3EK", "H3EK"),
+        ) else {
+            eprintln!("skipping: needs H2EK and H3EK (set BLAM_TEST_H2EK / BLAM_TEST_H3EK)");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = crate::parse_group_tag("proj").expect("proj is a group tag");
+
+        // Any H2 projectile whose attachment names a contrail will do.
+        let mut checked = 0usize;
+        for path in super::tests::tags_with_extension(&h2, "projectile") {
+            let Ok(source) = read_tag_for_conversion(
+                &path,
+                Some("halo2_mcc"),
+                Some(definitions.as_path()),
+                group_tag,
+            ) else {
+                continue;
+            };
+            let Some(expected) = attachment_reference(source.root()) else { continue };
+            if expected.0 != crate::parse_group_tag("cont").unwrap() {
+                continue;
+            }
+            let draft = analyze_conversion(
+                &source,
+                "halo2_mcc",
+                "halo3_mcc",
+                &definitions,
+                Some(h3.as_path()),
+            )
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            let landed = attachment_reference(draft.tag.root())
+                .unwrap_or_else(|| panic!("{}: the attachment reference was dropped", path.display()));
+            assert_eq!(
+                landed.0,
+                crate::parse_group_tag("cntl").unwrap(),
+                "{}: contrail should land as contrail_system, got {}",
+                path.display(),
+                format_group_tag(landed.0)
+            );
+            assert_eq!(landed.1, expected.1, "{}: the tag path changed", path.display());
+            checked += 1;
+            break;
+        }
+        if checked == 0 {
+            eprintln!("skipping: no H2EK projectile attaches a contrail");
+        }
+    }
+
+    /// The rename carries the references to the class, not just the class.
+    ///
+    /// The companion to the Halo 2 case above, at the other rename: an HREK
+    /// effect points at a `.contrail_system`, and in Halo 4 that same tag is a
+    /// `tracer_system`. Renaming the tag and leaving every pointer to it behind
+    /// would be the worse half-measure of the two — the imported effect would
+    /// open and simply do nothing.
+    ///
+    /// The path is asserted unchanged as well, because that is what makes the
+    /// reference find the renamed tag: only the class four-cc moves.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_reach_reference_to_a_contrail_system_lands_on_halo_4s_tracer_system() {
+        let (Some(reach), Some(h4)) = (
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            kit_tags("BLAM_TEST_H4EK", "H4EK"),
+        ) else {
+            eprintln!("skipping: needs HREK and H4EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let contrail = crate::parse_group_tag("cntl").unwrap();
+        let tracer = crate::parse_group_tag("trac").unwrap();
+        let group_tag = crate::parse_group_tag("effe").unwrap();
+        let references = |tag: &TagFile| {
+            let mut found = Vec::new();
+            collect_reference_values(tag.root(), "", &mut found);
+            found
+        };
+
+        let groups = GameTagIndex::load(&definitions, "halo4_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h4, &groups);
+        let mut checked = 0usize;
+        for path in super::tests::tags_with_extension(&reach, "effect").into_iter().take(400) {
+            let Ok(source) = read_tag_for_conversion(
+                &path,
+                Some("haloreach_mcc"),
+                Some(definitions.as_path()),
+                group_tag,
+            ) else {
+                continue;
+            };
+            let wanted: Vec<String> = references(&source)
+                .into_iter()
+                .filter(|reference| reference.group_tag == contrail)
+                .map(|reference| reference.tag_path)
+                .collect();
+            if wanted.is_empty() {
+                continue;
+            }
+            let Ok(draft) = analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "halo4_mcc",
+                &definitions,
+                Some(&templates),
+            ) else {
+                continue;
+            };
+            let landed = references(&draft.tag);
+            for tag_path in &wanted {
+                assert!(
+                    landed.iter().any(|reference| {
+                        reference.group_tag == tracer && reference.tag_path == *tag_path
+                    }),
+                    "{}: {tag_path} should be referenced as a tracer_system, got {:?}",
+                    path.display(),
+                    landed
+                        .iter()
+                        .filter(|reference| reference.tag_path == *tag_path)
+                        .map(|reference| format_group_tag(reference.group_tag))
+                        .collect::<Vec<_>>()
+                );
+            }
+            checked += 1;
+            break;
+        }
+        if checked == 0 {
+            eprintln!("skipping: no HREK effect in the sample references a contrail_system");
+        }
+    }
+
+    /// Whether any `data` field anywhere in the tag holds bytes.
+    fn has_nonempty_data(value: TagStruct<'_>) -> bool {
+        for field in value.fields() {
+            if field.field_type() == TagFieldType::Data
+                && matches!(field.value(), Some(TagFieldData::Data(bytes)) if !bytes.is_empty())
+            {
+                return true;
+            }
+            if let Some(child) = field.as_struct()
+                && has_nonempty_data(child)
+            {
+                return true;
+            }
+            if let Some(block) = field.as_block()
+                && block.iter().any(has_nonempty_data)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `object/attachments[0]/type`, if it is set.
+    fn attachment_reference(root: TagStruct<'_>) -> Option<(u32, String)> {
+        let object = root
+            .fields()
+            .find(|field| clean_field_key(field.name()) == "object")
+            .and_then(|field| field.as_struct())?;
+        let block = object
+            .fields()
+            .find(|field| clean_field_key(field.name()) == "attachments")
+            .and_then(|field| field.as_block())?;
+        let element = block.iter().next()?;
+        let field = element
+            .fields()
+            .find(|field| clean_field_key(field.name()) == "type")?;
+        match field.value() {
+            Some(TagFieldData::TagReference(reference)) => reference.group_tag_and_name,
+            _ => None,
+        }
+    }
+}
+
+
+/// A tag out of an Xbox 360 monolithic build, converted into the PC kit of the
+/// same engine.
+///
+/// This is the pair `conversion_pair_supported` refuses on purpose everywhere
+/// else: a profile to itself. It is legal here only because the source is
+/// big-endian, which is the one case where "Reach to Reach" is real work. See
+/// `analyze_conversion_inner`.
+#[cfg(test)]
+mod x360_cache_conversion {
+    use super::tests::kit_tags;
+    use super::*;
+    use crate::monolithic::MonolithicCache;
+
+    /// The Halo Reach July 2011 tags build this was developed against.
+    ///
+    /// Not a fixture that can be committed — it is a 27 GB game build. Every
+    /// test here says so and returns rather than failing, which is the same
+    /// bargain the kit-backed tests make.
+    fn reach_x360_cache() -> Option<MonolithicCache> {
+        let root = std::env::var("BLAM_TEST_REACH_X360_CACHE").ok()?;
+        let root = PathBuf::from(root);
+        if !root.join("blob_index.dat").is_file() {
+            return None;
+        }
+        MonolithicCache::open(&root).ok()
+    }
+
+    fn read_cache_tag(cache: &MonolithicCache, group: &[u8; 4], name: &str) -> Option<TagFile> {
+        cache.read_tag_by_name(u32::from_be_bytes(*group), name).ok()
+    }
+
+    fn convert_into_reach(
+        source: &TagFile,
+        reach: &Path,
+        definitions: &Path,
+    ) -> Result<TagConversionDraft, String> {
+        let groups = GameTagIndex::load(definitions, "haloreach_mcc")?;
+        let templates = NativeTemplateIndex::build(reach, &groups);
+        analyze_conversion_with_templates(
+            source,
+            "haloreach_mcc",
+            "haloreach_mcc",
+            definitions,
+            Some(&templates),
+        )
+    }
+
+    /// The whole point: a big-endian source produces a little-endian tag that
+    /// survives a save and a reparse.
+    ///
+    /// Reparsing matters more than the endian flag does. A tag whose header says
+    /// little-endian over a payload still in 360 byte order would pass a flag
+    /// check and open as nonsense, so this writes the bytes a save would produce
+    /// and reads them back.
+    #[test]
+    fn a_big_endian_cache_tag_converts_to_a_little_endian_reach_tag() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let mut converted = 0;
+        let mut refusals = Vec::new();
+        for entry in cache.iter_tags().filter(|entry| {
+            entry.group_tag == u32::from_be_bytes(*b"weap") && !entry.name.is_empty()
+        }) {
+            let Some(source) = read_cache_tag(&cache, b"weap", &entry.name) else {
+                continue;
+            };
+            assert_eq!(source.endian, Endian::Be, "{} is not a 360 tag", entry.name);
+            match convert_into_reach(&source, &reach, &definitions) {
+                Ok(draft) => {
+                    assert_eq!(
+                        draft.tag.endian,
+                        Endian::Le,
+                        "{} converted but stayed big-endian",
+                        entry.name
+                    );
+                    let bytes = draft.tag.write_to_bytes().expect("serialize");
+                    let reread = TagFile::read_from_bytes(&bytes)
+                        .unwrap_or_else(|e| panic!("{} did not reparse: {e}", entry.name));
+                    assert_eq!(reread.endian, Endian::Le);
+                    assert_eq!(reread.group().tag, u32::from_be_bytes(*b"weap"));
+                    converted += 1;
+                }
+                Err(error) => refusals.push(format!("{}: {error}", entry.name)),
+            }
+            if converted >= 8 {
+                break;
+            }
+        }
+        assert!(
+            converted > 0,
+            "no weapon converted out of the 360 cache; refusals: {refusals:#?}"
+        );
+    }
+
+    /// A render model's geometry survives the move without an encoder.
+    ///
+    /// The 360 keeps its vertex and index buffers in the pageable cache and
+    /// leaves the inline author-format blocks empty; `MonolithicCache::read_tag`
+    /// hydrates them on the way out, into exactly the blocks an MCC PC tag uses.
+    /// So the field walk carries the geometry and the GPU resource is dropped —
+    /// which is only correct if the vertices really did arrive.
+    #[test]
+    fn a_360_render_model_arrives_with_its_geometry_inline() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let mut checked = 0;
+        for entry in cache.iter_tags().filter(|entry| {
+            entry.group_tag == u32::from_be_bytes(*b"mode") && !entry.name.is_empty()
+        }) {
+            let Some(source) = read_cache_tag(&cache, b"mode", &entry.name) else {
+                continue;
+            };
+            // Only a model this build actually had resident says anything about
+            // the conversion; a `tag_cache` is an LRU, not a complete archive.
+            if crate::render_geometry::author_geometry_populated(&source) != Some(true) {
+                continue;
+            }
+            let draft = convert_into_reach(&source, &reach, &definitions)
+                .unwrap_or_else(|error| panic!("{} refused: {error}", entry.name));
+            assert_eq!(
+                crate::render_geometry::author_geometry_populated(&draft.tag),
+                Some(true),
+                "{} converted with no vertices",
+                entry.name
+            );
+            assert_eq!(draft.tag.endian, Endian::Le);
+            checked += 1;
+            if checked >= 3 {
+                break;
+            }
+        }
+        assert!(checked > 0, "no resident render model in the cache to check");
+    }
+
+    /// A 360 bitmap lands with its pixels in the blob a PC tag reads from.
+    ///
+    /// The metadata crosses on its own; the pixels do not, because they sit in
+    /// a per-image texture resource in Xenos tile order. What this proves is the
+    /// re-lay-out: one `processed pixel data` blob, each image pointed at its
+    /// own slice, and a mip count that matches the single level detiled.
+    #[test]
+    fn a_360_bitmap_arrives_with_pc_shaped_pixels() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let mut checked = 0;
+        for entry in cache.iter_tags().filter(|entry| {
+            entry.group_tag == u32::from_be_bytes(*b"bitm") && !entry.name.is_empty()
+        }) {
+            let Some(source) = read_cache_tag(&cache, b"bitm", &entry.name) else {
+                continue;
+            };
+            let Ok(draft) = convert_into_reach(&source, &reach, &definitions) else {
+                continue;
+            };
+            let root = draft.tag.root();
+            let pixels = root
+                .field_path("processed pixel data")
+                .and_then(|field| field.as_data())
+                .unwrap_or_default();
+            assert!(!pixels.is_empty(), "{} converted with no pixels", entry.name);
+            let images = root
+                .field_path("bitmaps")
+                .and_then(|field| field.as_block())
+                .expect("a converted bitmap keeps its bitmaps block");
+            let mut covered = 0usize;
+            for index in 0..images.len() {
+                let image = images.element(index).unwrap();
+                let offset = image.read_int_any("pixels offset").unwrap_or(-1);
+                let size = image.read_int_any("pixels size").unwrap_or(0);
+                assert!(offset >= 0 && size > 0, "{} image {index} has no slice", entry.name);
+                assert!(
+                    (offset + size) as usize <= pixels.len(),
+                    "{} image {index} points past the blob",
+                    entry.name
+                );
+                assert_eq!(
+                    image.read_int_any("mipmap count").unwrap_or(-1),
+                    0,
+                    "{} image {index} claims mips it does not carry",
+                    entry.name
+                );
+                covered += size as usize;
+            }
+            assert_eq!(covered, pixels.len(), "{} left pixels unaccounted for", entry.name);
+            // The 360 mirrors describe storage this tag no longer has.
+            assert!(
+                root.field_path("hardware textures")
+                    .and_then(|field| field.as_block())
+                    .is_none_or(|block| block.is_empty()),
+                "{} kept its 360 texture resources",
+                entry.name
+            );
+            checked += 1;
+            if checked >= 3 {
+                break;
+            }
+        }
+        assert!(checked > 0, "no bitmap converted out of the 360 cache");
+    }
+
+    /// An animation graph's payload comes across, and the animations in it are
+    /// the ones the kit has.
+    ///
+    /// Its payload *is* a pageable resource: a codec stream in 360 byte order,
+    /// kept as a flat control-data buffer rather than the inline members a loose
+    /// tag holds. Both have to change for the tag to be worth writing, and
+    /// neither shows up in a field count -- a graph full of metadata and no
+    /// animation reads as a success and plays nothing.
+    ///
+    /// The check is the rest pose, against the kit's own copy of the same graph.
+    /// The animated tracks are not comparable: MCC re-encoded these on the way
+    /// to the PC and a July 2011 build has animations that were still being
+    /// worked on. A rest pose comes from the model and does not move, so a
+    /// difference there is this converter's.
+    #[test]
+    fn a_360_animation_graph_arrives_with_its_animations() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let Ok(groups) = GameTagIndex::load(&definitions, "haloreach_mcc") else {
+            eprintln!("skipping: no haloreach_mcc definitions");
+            return;
+        };
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let cutoff =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        // Only a kit tag the kit shipped: an imported one is this converter's
+        // own output and proves nothing.
+        let shared: Vec<_> = cache
+            .iter_tags()
+            .filter(|entry| entry.group_tag == u32::from_be_bytes(*b"jmad"))
+            .filter_map(|entry| {
+                let path =
+                    reach.join(format!("{}.model_animation_graph", entry.name.replace('\\', "/")));
+                std::fs::metadata(&path)
+                    .and_then(|meta| meta.modified())
+                    .map(|when| when < cutoff)
+                    .unwrap_or(false)
+                    .then_some((entry, path))
+            })
+            .collect();
+        if shared.is_empty() {
+            eprintln!("skipping: the kit and the build share no untouched animation graphs");
+            return;
+        }
+        let step = (shared.len() / 25).max(1);
+        let (mut converted, mut animations, mut matching) = (0usize, 0usize, 0usize);
+        for (entry, path) in shared.iter().step_by(step).take(25) {
+            let (Ok(source), Ok(kit)) = (cache.read_tag(entry), TagFile::read(path)) else {
+                continue;
+            };
+            let Ok(draft) = analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "haloreach_mcc",
+                &definitions,
+                Some(&templates),
+            ) else {
+                // A graph can still refuse for reasons of its own -- the two
+                // profiles disagree about some animation flags -- and that is a
+                // different test's business.
+                continue;
+            };
+            converted += 1;
+            let ours = inline_animation_clips(&draft.tag);
+            let theirs = inline_animation_clips(&kit);
+            assert_eq!(
+                ours.len(),
+                theirs.len(),
+                "{}: converted to {} animation(s) where the kit has {}",
+                entry.name,
+                ours.len(),
+                theirs.len(),
+            );
+            for (index, (mine, kits)) in ours.iter().zip(&theirs).enumerate() {
+                animations += 1;
+                let Some(mine) = mine.as_ref() else {
+                    // An animation the build described and kept no data for is
+                    // written empty and in place, so it has nothing to decode.
+                    // Ten of the build's 3,212 graphs have one; `ghost` is one
+                    // of them, and it used to take this test down.
+                    if empty_animation_member(&draft.tag, index) {
+                        animations -= 1;
+                        continue;
+                    }
+                    panic!("{} animation {index} would not decode after converting", entry.name);
+                };
+                let Some(kits) = kits else { continue };
+                if rest_pose_distance(mine, kits) <= 0.05 {
+                    matching += 1;
+                }
+            }
+        }
+        if converted == 0 {
+            eprintln!("skipping: no shared animation graph converted");
+            return;
+        }
+        assert!(animations > 0, "{converted} graph(s) converted but carried no animations");
+        assert_eq!(
+            matching, animations,
+            "{matching} of {animations} animation(s) rest at the pose the kit has them at",
+        );
+    }
+
+    /// Every animation in a tag that holds its resources inline, decoded.
+    fn inline_animation_clips(tag: &TagFile) -> Vec<Option<crate::animation::AnimationClip>> {
+        let mut out = Vec::new();
+        let Some(groups) = tag.root().field_path("tag resource groups").and_then(|f| f.as_block())
+        else {
+            return out;
+        };
+        for group in 0..groups.len() {
+            let Some(members) = groups
+                .element(group)
+                .and_then(|entry| entry.field("tag_resource"))
+                .and_then(|field| field.as_resource())
+                .and_then(|resource| resource.as_struct())
+                .and_then(|payload| payload.field("group_members").and_then(|f| f.as_block()))
+            else {
+                continue;
+            };
+            for index in 0..members.len() {
+                let Some(member) = members.element(index) else { continue };
+                let Some(blob) = member.field("animation_data").and_then(|f| f.as_data()) else {
+                    out.push(None);
+                    continue;
+                };
+                let mut sizes = Vec::new();
+                if let Some(declared) = member.field_path("data sizes").and_then(|f| f.as_struct()) {
+                    for name in declared.field_names() {
+                        sizes.push((name.to_owned(), declared.read_int_any(&name).unwrap_or(0) as i64));
+                    }
+                }
+                let group = crate::animation::AnimationGroup::for_blob(
+                    blob,
+                    (!sizes.is_empty()).then_some(crate::animation::PackedDataSizes { fields: sizes }),
+                    member.read_int_any("frame count").unwrap_or(1) as i16,
+                    member.read_int_any("node count").unwrap_or(0) as i8,
+                    None,
+                );
+                out.push(group.decode().ok());
+            }
+        }
+        out
+    }
+
+    /// How far apart two rest poses are: the mean of the angle between paired
+    /// rotations and the distance between paired translations.
+    fn rest_pose_distance(
+        a: &crate::animation::AnimationClip,
+        b: &crate::animation::AnimationClip,
+    ) -> f32 {
+        let (a, b) = (&a.static_tracks, &b.static_tracks);
+        let (mut total, mut count) = (0.0f32, 0usize);
+        for (left, right) in a.rotations.iter().zip(&b.rotations) {
+            for (left, right) in left.iter().zip(right) {
+                // A quaternion and its negation are the same rotation.
+                let dot =
+                    (left.i * right.i + left.j * right.j + left.k * right.k + left.w * right.w).abs();
+                total += (1.0 - dot.min(1.0)) * 2.0;
+                count += 1;
+            }
+        }
+        for (left, right) in a.translations.iter().zip(&b.translations) {
+            for (left, right) in left.iter().zip(right) {
+                total += ((left.x - right.x).powi(2)
+                    + (left.y - right.y).powi(2)
+                    + (left.z - right.z).powi(2))
+                .sqrt();
+                count += 1;
+            }
+        }
+        if count == 0 { 0.0 } else { total / count as f32 }
+    }
+
+    /// A struct's GUID reads the same whichever byte order its tag is in.
+    ///
+    /// A GUID is four 32-bit words, so a big-endian tag stores each of them the
+    /// other way round. Read as sixteen loose bytes it never equals the same
+    /// struct's GUID in a little-endian tag -- and that is the identity key the
+    /// converter uses to decide two structs are the same type, so every
+    /// big-endian struct was failing that test against its own PC counterpart
+    /// and falling back to matching on field names.
+    #[test]
+    fn a_big_endian_tag_reads_the_same_struct_guids_as_a_little_endian_one() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and HREK");
+            return;
+        };
+        let cutoff =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        let (mut compared, mut agreed) = (0usize, 0usize);
+        let mut differing: Vec<String> = Vec::new();
+        for entry in cache.iter_tags().step_by(701).take(80) {
+            let Some(extension) = crate::paths::group_tag_to_extension(entry.group_tag) else {
+                continue;
+            };
+            let path = reach.join(format!("{}.{extension}", entry.name.replace('\\', "/")));
+            // An imported tag is this converter's own output; only one the kit
+            // shipped says anything about how a GUID should read.
+            if std::fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .map(|when| when >= cutoff)
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            let (Ok(build), Ok(kit)) = (cache.read_tag(entry), TagFile::read(&path)) else {
+                continue;
+            };
+            compared += 1;
+            let (ours, theirs) = (build.root().definition().guid(), kit.root().definition().guid());
+            if ours == theirs {
+                agreed += 1;
+            } else if differing.len() < 5 {
+                let hex = |guid: [u8; 16]| {
+                    guid.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+                };
+                differing.push(format!("{extension}: {} vs {}", hex(ours), hex(theirs)));
+            }
+        }
+        if compared < 5 {
+            eprintln!("skipping: only {compared} tag(s) are in both the build and an untouched kit");
+            return;
+        }
+        assert_eq!(
+            agreed, compared,
+            "{} of {compared} root struct GUID(s) disagree between the two byte orders: {differing:?}",
+            compared - agreed,
+        );
+    }
+
+    /// A lighting resource carries nothing at its root, and converts anyway.
+    ///
+    /// `scenario_structure_lighting_resource` declares one byte of padding on
+    /// both sides and keeps its substance elsewhere, so the field walk has
+    /// nothing to match and the guard against an incompatible root fired on a
+    /// tag that had already converted completely.
+    #[test]
+    fn a_360_lighting_resource_converts_though_its_root_is_empty() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let Ok(groups) = GameTagIndex::load(&definitions, "haloreach_mcc") else {
+            eprintln!("skipping: no haloreach_mcc definitions");
+            return;
+        };
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let group = u32::from_be_bytes(*b"sslt");
+        let mut converted = 0usize;
+        for entry in cache.iter_tags().filter(|entry| entry.group_tag == group).take(8) {
+            let Ok(source) = cache.read_tag(entry) else { continue };
+            match analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "haloreach_mcc",
+                &definitions,
+                Some(&templates),
+            ) {
+                Ok(_) => converted += 1,
+                Err(why) => panic!("{} would not convert: {why}", entry.name),
+            }
+        }
+        if converted == 0 {
+            eprintln!("skipping: the build has no lighting resources");
+        }
+    }
+
+    /// A converted 360 bitmap must reproduce the kit's own pixels for the tags
+    /// the two builds share.
+    ///
+    /// The kit's 2010-dated tag for the same name is the oracle. Restricting
+    /// the comparison to images whose size, format, type and mip count all
+    /// match keeps re-authored art out of it; what is left is the pixel path,
+    /// and it either lands on the same bytes or it does not.
+    ///
+    /// The bar is deliberately not 100%: a handful of textures genuinely were
+    /// redrawn between the July 2011 build and the shipped game, and both of
+    /// the bugs this guards against -- the resource's two buffers read with
+    /// each other's sizes, and cube faces stored in Xenos rather than D3D
+    /// order -- took the rate to a fifth of this.
+    #[test]
+    fn a_360_bitmap_arrives_with_the_kits_own_pixels() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and an HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let Ok(groups) = GameTagIndex::load(&definitions, "haloreach_mcc") else {
+            eprintln!("skipping: no haloreach_mcc definitions");
+            return;
+        };
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        // Only tags the kit has not had written over by an import of its own:
+        // one of those is this converter's output, not an oracle.
+        let cutoff =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        let shared: Vec<_> = cache
+            .iter_tags()
+            .filter(|entry| entry.group_tag == u32::from_be_bytes(*b"bitm"))
+            .filter_map(|entry| {
+                let path = reach.join(format!("{}.bitmap", entry.name.replace('\\', "/")));
+                std::fs::metadata(&path)
+                    .and_then(|meta| meta.modified())
+                    .map(|when| when < cutoff)
+                    .unwrap_or(false)
+                    .then_some((entry, path))
+            })
+            .collect();
+        if shared.is_empty() {
+            eprintln!("skipping: the kit and the build share no untouched bitmaps");
+            return;
+        }
+        let describe = |tag: &TagFile| -> Vec<String> {
+            tag.root()
+                .field_path("bitmaps")
+                .and_then(|field| field.as_block())
+                .map(|block| {
+                    (0..block.len())
+                        .filter_map(|index| block.element(index))
+                        .map(|image| {
+                            format!(
+                                "{}x{}x{} {} {} mips={}",
+                                image.read_int_any("width").unwrap_or(-1),
+                                image.read_int_any("height").unwrap_or(-1),
+                                image.read_int_any("depth").unwrap_or(-1),
+                                image.read_enum_name("format").unwrap_or_default(),
+                                image.read_enum_name("type").unwrap_or_default(),
+                                image.read_int_any("mipmap count").unwrap_or(-1),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let pixels = |tag: &TagFile| {
+            tag.root()
+                .field_path("processed pixel data")
+                .and_then(|field| field.as_data())
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default()
+        };
+        let step = (shared.len() / 200).max(1);
+        let (mut comparable, mut exact) = (0usize, 0usize);
+        let mut misses: Vec<String> = Vec::new();
+        for (entry, path) in shared.iter().step_by(step).take(200) {
+            let (Ok(source), Ok(stock)) = (cache.read_tag(entry), TagFile::read(path)) else {
+                continue;
+            };
+            let Ok(draft) = analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "haloreach_mcc",
+                &definitions,
+                Some(&templates),
+            ) else {
+                continue;
+            };
+            if describe(&draft.tag) != describe(&stock) {
+                continue;
+            }
+            let (ours, theirs) = (pixels(&draft.tag), pixels(&stock));
+            if theirs.is_empty() {
+                continue;
+            }
+            comparable += 1;
+            assert_eq!(
+                ours.len(),
+                theirs.len(),
+                "{}: {} byte(s) of pixels where the kit has {}",
+                entry.name,
+                ours.len(),
+                theirs.len(),
+            );
+            if ours == theirs {
+                exact += 1;
+            } else if misses.len() < 5 {
+                misses.push(entry.name.clone());
+            }
+        }
+        if comparable < 20 {
+            eprintln!("skipping: only {comparable} bitmap(s) were comparable");
+            return;
+        }
+        // A regression floor, not a statement that the rest are right.
+        //
+        // Measured over the whole comparable set: 363 of 492 are exact, 15
+        // differ by at most 16 in a channel -- decode rounding -- and 59 differ
+        // by up to 255, which is not rounding and is not explained. Some of
+        // that is a year of art between a July 2011 build and a 2010-dated kit
+        // tag; how much is unknown, and until it is, a threshold above the
+        // measured rate is only a test nobody can run.
+        //
+        // This test also spent months passing without running at all: with
+        // `BLAM_TEST_HREK` set, `kit_tags` used to hand back the kit rather than
+        // its `tags` directory, so every path missed and it skipped.
+        assert!(
+            exact * 100 >= comparable * 70,
+            "only {exact} of {comparable} converted bitmap(s) match the kit's own pixels, \
+             which is below the rate this last measured; e.g. {misses:?}"
+        );
+    }
+
+    /// A model whose meshes are `skinned compressed` brings its geometry.
+    ///
+    /// The format is a `rigid compressed` vertex with four bone indices and
+    /// four weights appended. Nothing decoded it, so hydration failed, so the
+    /// api resource was left behind, so the whole tag was refused -- and
+    /// because the cache reader throws hydration errors away, the refusal said
+    /// only that the two tags have different byte orders. Reach's vehicles and
+    /// bipeds use the format.
+    #[test]
+    fn a_360_model_with_compressed_skinning_arrives_with_its_meshes() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and an HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let Ok(groups) = GameTagIndex::load(&definitions, "haloreach_mcc") else {
+            eprintln!("skipping: no haloreach_mcc definitions");
+            return;
+        };
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let group = u32::from_be_bytes(*b"mode");
+        let mut looked = 0usize;
+        for entry in cache.iter_tags().filter(|entry| entry.group_tag == group) {
+            if looked >= 1 {
+                break;
+            }
+            if cache.resolve_cache_block(entry).is_none() {
+                continue;
+            }
+            let Ok(source) = cache.read_tag(entry) else { continue };
+            if !uses_compressed_skinning(&source) {
+                continue;
+            }
+            looked += 1;
+            // Hydration fills these in, and it is the step that used to give up
+            // on this format.
+            assert_eq!(
+                crate::render_geometry::author_geometry_populated(&source),
+                Some(true),
+                "{} did not hydrate its geometry",
+                entry.name,
+            );
+            if let Err(why) = analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "haloreach_mcc",
+                &definitions,
+                Some(&templates),
+            ) {
+                panic!("{} would not convert: {why}", entry.name);
+            }
+        }
+        if looked == 0 {
+            eprintln!("skipping: no readable model uses compressed skinning");
+        }
+    }
+
+    /// Whether any mesh in a tag names the `skinned compressed` vertex format.
+    fn uses_compressed_skinning(tag: &TagFile) -> bool {
+        let mut pending = vec![tag.root()];
+        while let Some(value) = pending.pop() {
+            if let Some(meshes) = value.field("meshes").and_then(|f| f.as_block()) {
+                for index in 0..meshes.len() {
+                    let named = meshes
+                        .element(index)
+                        .and_then(|mesh| mesh.read_enum_name("vertex type"));
+                    if named.as_deref() == Some("skinned compressed") {
+                        return true;
+                    }
+                }
+            }
+            for name in value.field_names() {
+                if let Some(nested) = value.field(&name).and_then(|f| f.as_struct()) {
+                    pending.push(nested);
+                }
+            }
+        }
+        false
+    }
+
+    /// A graph the build kept no data for keeps every member in its place.
+    ///
+    /// The tag cache holds what was resident when the build was captured, not
+    /// an archive, so a member can arrive with its sizes filled in and nothing
+    /// where its stream should be. Ten graphs of the 3,212 in the build are
+    /// like that -- 37 members of 23,513.
+    ///
+    /// Both ways of writing one anyway are wrong, and the second was tried on a
+    /// live kit: dropping the member moves every member after it, and a member
+    /// is found by its position, so Sapien halts with `#5 is not a valid
+    /// model_animation_tag_resource_member index in [#0, #4)`. Emptying it in
+    /// place keeps the indices but invents a member with no stream, and no
+    /// member of the 1,429 in a shipped kit graph looks like that.
+    ///
+    /// So it refuses -- and the refusal has to carry the reason, or it reads as
+    /// the generic "could not be translated" that says nothing.
+    #[test]
+    fn a_360_graph_missing_its_data_keeps_every_member_in_place() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and an HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let Ok(groups) = GameTagIndex::load(&definitions, "haloreach_mcc") else {
+            eprintln!("skipping: no haloreach_mcc definitions");
+            return;
+        };
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let group = u32::from_be_bytes(*b"jmad");
+        let convert = |source: &TagFile| {
+            analyze_conversion_with_templates(
+                source,
+                "haloreach_mcc",
+                "haloreach_mcc",
+                &definitions,
+                Some(&templates),
+            )
+        };
+
+        let mut refused = 0usize;
+        let mut carried = 0usize;
+        // The affected graphs are ten of 3,212, so they are looked up rather
+        // than searched for -- scanning until one turns up is three minutes.
+        let affected = ["reach_moah", "ghost", "cargo_truck"];
+        for entry in cache.iter_tags().filter(|entry| entry.group_tag == group) {
+            if refused > 0 && carried > 0 {
+                break;
+            }
+            let named = affected
+                .iter()
+                .any(|want| entry.name.ends_with(want));
+            if !named && carried > 0 {
+                continue;
+            }
+            if cache.resolve_tag_block(entry).is_none() {
+                continue;
+            }
+            let Ok(source) = cache.read_tag(entry) else { continue };
+            let declared = source_animation_members(&source);
+            if declared == 0 {
+                continue;
+            }
+            let missing = source_members_without_data(&source);
+            match (missing > 0, convert(&source)) {
+                // Missing data: the member stays where it is, emptied, and the
+                // report says so. Every member the build described is still
+                // there -- one removed moves all the rest, and a member is
+                // found by its position.
+                (true, Ok(draft)) => {
+                    let written = count_animation_members(&draft.tag, false);
+                    assert_eq!(
+                        written, declared,
+                        "{} came across with {written} member(s) where the build has {declared}; \
+                         a member is indexed by its position, so losing one moves all the rest",
+                        entry.name,
+                    );
+                    assert!(
+                        draft
+                            .report
+                            .issues
+                            .iter()
+                            .any(|issue| issue.message.contains("present but empty")),
+                        "{} emptied {missing} animation(s) without saying so",
+                        entry.name,
+                    );
+                    refused += 1;
+                }
+                (true, Err(why)) => panic!(
+                    "{} would not convert, though only {missing} of its animation(s) are \
+                     missing data: {why}",
+                    entry.name,
+                ),
+                // Everything present: every member comes across, in its place.
+                (false, Ok(draft)) => {
+                    if carried > 0 {
+                        continue;
+                    }
+                    let written = count_animation_members(&draft.tag, false);
+                    assert_eq!(
+                        written, declared,
+                        "{} came across with {written} member(s) where the build has {declared}; \
+                         a member is indexed by its position, so losing one moves all the rest",
+                        entry.name,
+                    );
+                    carried += 1;
+                }
+                // A graph can be refused for reasons that have nothing to do
+                // with its resource -- an audited field loss, most often -- and
+                // those are somebody else's test.
+                (false, Err(why)) => assert!(
+                    !why.contains("pageable resource"),
+                    "{} has all its animation data and still lost its resource: {why}",
+                    entry.name,
+                ),
+            }
+        }
+        if refused == 0 {
+            eprintln!("note: no readable graph in the build is missing animation data");
+        }
+        assert!(carried > 0, "no graph carried its animations at all");
+    }
+
+    /// Members whose sizes promise a stream the build did not keep.
+    fn source_members_without_data(tag: &TagFile) -> usize {
+        let mut total = 0usize;
+        let Some(groups) = tag
+            .root()
+            .field_path("tag resource groups")
+            .and_then(|field| field.as_block())
+        else {
+            return 0;
+        };
+        for index in 0..groups.len() {
+            let Some(resource) = groups
+                .element(index)
+                .and_then(|group| group.field("tag_resource"))
+                .and_then(|field| field.as_resource())
+            else {
+                continue;
+            };
+            let Some(state) = resource.xsync_state() else { continue };
+            let primary = resource.exploded_payload().unwrap_or(&[]);
+            let Some(members) = crate::animation::resource::read_members(&state, primary) else {
+                continue;
+            };
+            for member in &members {
+                let declared: i64 = member.data_sizes.iter().map(|size| *size as i64).sum();
+                if member.animation_data.is_empty() && declared > 0 {
+                    total += 1;
+                }
+            }
+        }
+        total
+    }
+
+    /// How many members the build's own resource holds.
+    fn source_animation_members(tag: &TagFile) -> usize {
+        let mut total = 0usize;
+        let Some(groups) = tag
+            .root()
+            .field_path("tag resource groups")
+            .and_then(|field| field.as_block())
+        else {
+            return 0;
+        };
+        for index in 0..groups.len() {
+            let Some(resource) = groups
+                .element(index)
+                .and_then(|group| group.field("tag_resource"))
+                .and_then(|field| field.as_resource())
+            else {
+                continue;
+            };
+            let Some(state) = resource.xsync_state() else { continue };
+            let primary = resource.exploded_payload().unwrap_or(&[]);
+            if let Some(members) = crate::animation::resource::read_members(&state, primary) {
+                total += members.len();
+            }
+        }
+        total
+    }
+
+    /// Every `group_members` element a converted graph carries, or only the
+    /// ones holding nothing when `empty_only`.
+    fn count_animation_members(tag: &TagFile, empty_only: bool) -> usize {
+        let Some(groups) = tag
+            .root()
+            .field_path("tag resource groups")
+            .and_then(|field| field.as_block())
+        else {
+            return 0;
+        };
+        let mut total = 0usize;
+        for index in 0..groups.len() {
+            let Some(list) = groups
+                .element(index)
+                .and_then(|group| group.field("tag_resource"))
+                .and_then(|field| field.as_resource())
+                .and_then(|resource| resource.as_struct())
+                .and_then(|payload| {
+                    payload
+                        .field("group_members")
+                        .and_then(|field| field.as_block())
+                })
+            else {
+                continue;
+            };
+            for member in 0..list.len() {
+                let blob = list
+                    .element(member)
+                    .and_then(|element| element.field("animation_data"))
+                    .and_then(|field| field.as_data())
+                    .map(|data| data.len())
+                    .unwrap_or(0);
+                if !empty_only || blob == 0 {
+                    total += 1;
+                }
+            }
+        }
+        total
+    }
+
+    /// Turning a Curve stream round leaves no byte behind.
+    ///
+    /// Curve is swapped by walking rather than by a map: the ordinary decoder
+    /// runs over the big-endian stream and the words it read are the words to
+    /// turn round. That is only correct while the decoder reads everything the
+    /// engine reads, and it did not -- it stepped over two header words it had
+    /// no use for, in every stream in the build. They stayed big-endian, and
+    /// Sapien halted inside `curve_codec.cpp` the moment such an animation
+    /// played.
+    ///
+    /// The decode tests cannot catch that, because the decoder is correct about
+    /// everything it looks at. The only question that catches it is this one:
+    /// which bytes did the walk never touch at all.
+    ///
+    /// Runs of `0xFF` are excused -- they read the same either way, so leaving
+    /// one alone costs nothing, and the streams end with them.
+    #[test]
+    fn a_360_curve_stream_is_turned_round_whole() {
+        let Some(cache) = reach_x360_cache() else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE");
+            return;
+        };
+        let group = u32::from_be_bytes(*b"jmad");
+        let (mut streams, mut gappy) = (0usize, 0usize);
+        let mut first: Option<String> = None;
+        for entry in cache.iter_tags().filter(|entry| entry.group_tag == group) {
+            // A sample: the answer is a property of the format, not of any one
+            // graph, and reading the whole corpus is minutes.
+            if streams >= 200 {
+                break;
+            }
+            if cache.resolve_tag_block(entry).is_none() {
+                continue;
+            }
+            let Ok(tag) = cache.read_tag(entry) else { continue };
+            let Some(groups) = tag
+                .root()
+                .field_path("tag resource groups")
+                .and_then(|field| field.as_block())
+            else {
+                continue;
+            };
+            for index in 0..groups.len() {
+                let Some(resource) = groups
+                    .element(index)
+                    .and_then(|group| group.field("tag_resource"))
+                    .and_then(|field| field.as_resource())
+                else {
+                    continue;
+                };
+                let Some(state) = resource.xsync_state() else { continue };
+                let primary = resource.exploded_payload().unwrap_or(&[]);
+                let Some(members) = crate::animation::resource::read_members(&state, primary)
+                else {
+                    continue;
+                };
+                for member in &members {
+                    let mut at = 0usize;
+                    for section in 0..2usize {
+                        let size = member.data_sizes[section].max(0) as usize;
+                        let start = at;
+                        at += size;
+                        let Some(stream) = member.animation_data.get(start..start + size) else {
+                            continue;
+                        };
+                        let Some(codec) = stream
+                            .first()
+                            .and_then(|byte| crate::animation::codec::Codec::from_byte(*byte))
+                        else {
+                            continue;
+                        };
+                        let revised = codec == crate::animation::codec::Codec::RevisedCurve;
+                        if !revised && codec != crate::animation::codec::Codec::Curve {
+                            continue;
+                        }
+                        let frames = if section == 0 { 1 } else { member.frame_count.max(1) as u16 };
+                        let Some(words) = crate::animation::codec::curve_word_offsets(
+                            stream, codec, frames, revised,
+                        ) else {
+                            continue;
+                        };
+                        streams += 1;
+                        let mut painted = vec![false; size];
+                        // The codec byte and the three node counts are single
+                        // bytes and stay as they are.
+                        for byte in painted.iter_mut().take(4) {
+                            *byte = true;
+                        }
+                        for (offset, width) in &words {
+                            for byte in *offset..(*offset + *width as usize).min(size) {
+                                painted[byte] = true;
+                            }
+                        }
+                        let missed = (0..size)
+                            .filter(|byte| !painted[*byte] && stream[*byte] != 0xFF)
+                            .count();
+                        if missed > 0 {
+                            gappy += 1;
+                            first.get_or_insert_with(|| {
+                                format!("{} group {index}: {missed} byte(s)", entry.name)
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        if streams == 0 {
+            eprintln!("skipping: the build holds no readable curve streams");
+            return;
+        }
+        assert_eq!(
+            gappy,
+            0,
+            "{gappy} of {streams} curve stream(s) keep bytes the swap never turns round, \
+             first at {}",
+            first.unwrap_or_default(),
+        );
+    }
+
+    /// A turned-round animation blob is the kit's own bytes.
+    ///
+    /// The strongest check available, and the one that found four separate
+    /// faults nothing else could see. Decoding tests cannot: the decoder is
+    /// correct about everything it looks at, and every one of these was a field
+    /// it either never looked at or looked at through the wrong width.
+    ///
+    ///  * two header words the walk stepped over, so they were never swapped;
+    ///  * a keyframe's `p2`, read twice because the walk backs up to make it the
+    ///    next `p1` -- and swapped twice, which is not swapped at all;
+    ///  * the two fields a node header calls unused, which are byte pairs;
+    ///  * the tail of `uncompressed_data`, which is node indices, one byte each,
+    ///    inside a section that was being swept as words.
+    ///
+    /// HREK ships graphs the 2011 build also has. The kit tag must be dated
+    /// before 2020 or it is this converter's own output, which proves nothing --
+    /// `camera.model_animation_graph` is exactly that trap.
+    #[test]
+    fn a_360_animation_blob_matches_the_kits_own_bytes() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and an HREK");
+            return;
+        };
+        let group = u32::from_be_bytes(*b"jmad");
+        let (mut compared, mut identical) = (0usize, 0usize);
+        let mut first_bad: Option<String> = None;
+        for entry in cache.iter_tags().filter(|entry| entry.group_tag == group) {
+            if compared >= 60 {
+                break;
+            }
+            if cache.resolve_tag_block(entry).is_none() {
+                continue;
+            }
+            let twin = reach.join(format!(
+                "{}.model_animation_graph",
+                entry.name.replace(char::from(92), "/"),
+            ));
+            let Ok(meta) = std::fs::metadata(&twin) else { continue };
+            let shipped = meta
+                .modified()
+                .ok()
+                .and_then(|when| when.duration_since(std::time::UNIX_EPOCH).ok())
+                .is_some_and(|age| age.as_secs() < 1_577_836_800);
+            if !shipped {
+                continue;
+            }
+            let (Ok(source), Ok(kit)) = (cache.read_tag(entry), TagFile::read(&twin)) else {
+                continue;
+            };
+            let theirs = kit_animation_blobs(&kit);
+            if theirs.is_empty() {
+                continue;
+            }
+            for (key, (mut blob, sizes, frames)) in build_animation_blobs(&source) {
+                let Some(yours) = theirs.get(&key) else { continue };
+                if blob.len() != yours.len() {
+                    continue;
+                }
+                if crate::animation::byte_order::swap_animation_blob(&mut blob, &sizes, frames)
+                    .is_err()
+                {
+                    continue;
+                }
+                compared += 1;
+                if blob == *yours {
+                    identical += 1;
+                } else {
+                    let at = blob
+                        .iter()
+                        .zip(yours.iter())
+                        .position(|(a, b)| a != b)
+                        .unwrap_or(0);
+                    first_bad.get_or_insert_with(|| {
+                        format!("{} {key:?} differs from byte {at}", entry.name)
+                    });
+                }
+            }
+        }
+        if compared == 0 {
+            eprintln!("skipping: the kit and the build share no untouched animation blobs");
+            return;
+        }
+        assert_eq!(
+            identical,
+            compared,
+            "{} of {compared} blob(s) are not the kit's own bytes; {}",
+            compared - identical,
+            first_bad.unwrap_or_default(),
+        );
+    }
+
+    /// `(group, member)` -> the 360 blob, its section sizes and frame count.
+    fn build_animation_blobs(
+        tag: &TagFile,
+    ) -> Vec<((usize, usize), (Vec<u8>, [i32; 17], u16))> {
+        let mut out = Vec::new();
+        let Some(groups) = tag
+            .root()
+            .field_path("tag resource groups")
+            .and_then(|field| field.as_block())
+        else {
+            return out;
+        };
+        for index in 0..groups.len() {
+            let Some(resource) = groups
+                .element(index)
+                .and_then(|group| group.field("tag_resource"))
+                .and_then(|field| field.as_resource())
+            else {
+                continue;
+            };
+            let Some(state) = resource.xsync_state() else { continue };
+            let primary = resource.exploded_payload().unwrap_or(&[]);
+            let Some(members) = crate::animation::resource::read_members(&state, primary) else {
+                continue;
+            };
+            for (member, held) in members.iter().enumerate() {
+                out.push((
+                    (index, member),
+                    (
+                        held.animation_data.clone(),
+                        held.data_sizes,
+                        held.frame_count.max(1) as u16,
+                    ),
+                ));
+            }
+        }
+        out
+    }
+
+    /// `(group, member)` -> the kit's inline blob.
+    fn kit_animation_blobs(tag: &TagFile) -> std::collections::BTreeMap<(usize, usize), Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        let Some(groups) = tag
+            .root()
+            .field_path("tag resource groups")
+            .and_then(|field| field.as_block())
+        else {
+            return out;
+        };
+        for index in 0..groups.len() {
+            let Some(list) = groups
+                .element(index)
+                .and_then(|group| group.field("tag_resource"))
+                .and_then(|field| field.as_resource())
+                .and_then(|resource| resource.as_struct())
+                .and_then(|payload| {
+                    payload
+                        .field("group_members")
+                        .and_then(|field| field.as_block())
+                })
+            else {
+                continue;
+            };
+            for member in 0..list.len() {
+                let Some(blob) = list
+                    .element(member)
+                    .and_then(|element| element.field("animation_data"))
+                    .and_then(|field| field.as_data())
+                else {
+                    continue;
+                };
+                out.insert((index, member), blob.to_vec());
+            }
+        }
+        out
+    }
+
+
+    /// Whether the nth inline animation member carries no stream at all.
+    fn empty_animation_member(tag: &TagFile, wanted: usize) -> bool {
+        let Some(groups) = tag
+            .root()
+            .field_path("tag resource groups")
+            .and_then(|field| field.as_block())
+        else {
+            return false;
+        };
+        let mut at = 0usize;
+        for index in 0..groups.len() {
+            let Some(list) = groups
+                .element(index)
+                .and_then(|group| group.field("tag_resource"))
+                .and_then(|field| field.as_resource())
+                .and_then(|resource| resource.as_struct())
+                .and_then(|payload| {
+                    payload.field("group_members").and_then(|field| field.as_block())
+                })
+            else {
+                continue;
+            };
+            for member in 0..list.len() {
+                if at == wanted {
+                    return list
+                        .element(member)
+                        .and_then(|element| element.field("animation_data"))
+                        .and_then(|field| field.as_data())
+                        .is_none_or(|data| data.is_empty());
+                }
+                at += 1;
+            }
+        }
+        false
+    }
+
+    /// A converted tag names no compiled buffer it did not bring.
+    ///
+    /// Deliberately general. The first version of this test asked about one
+    /// field, `per_instance_lightmap_texcoords_vertex_buffer`, passed, and the
+    /// engine asserted on the very same index -- because a lightmap holds a
+    /// second list of buffer indices, `bsp per-vertex run-time data`, hanging
+    /// off its own block rather than off a geometry struct. Naming fields one at
+    /// a time is how that was missed twice, so this asks the question the engine
+    /// actually asks: is there any index into the compiled buffers left, when
+    /// the tag carries no compiled buffers at all.
+    ///
+    /// A shipped `scenario_lightmap_bsp_data` answers no -- 20_sword_slayer has
+    /// 4,456 mesh buffer indices, every one of them zero, and both blocks empty.
+    #[test]
+    fn a_360_tag_names_no_buffer_it_did_not_bring() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and an HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let Ok(groups) = GameTagIndex::load(&definitions, "haloreach_mcc") else {
+            eprintln!("skipping: no haloreach_mcc definitions");
+            return;
+        };
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let group = u32::from_be_bytes(*b"Lbsp");
+        // The build kept bytes for 150 of its 1,020 lightmaps; the rest cannot
+        // be read at all, let alone converted. Take the first one that actually
+        // carries dangling indices, so a pass that quietly stopped running fails
+        // here rather than looking like a success.
+        let mut checked = 0usize;
+        for entry in cache.iter_tags().filter(|entry| entry.group_tag == group) {
+            if checked >= 2 {
+                break;
+            }
+            if cache.resolve_tag_block(entry).is_none() {
+                continue;
+            }
+            let Ok(source) = cache.read_tag(entry) else { continue };
+            let (before, high) = dangling_buffer_references(&source);
+            if before == 0 {
+                continue;
+            }
+            checked += 1;
+            let draft = match analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "haloreach_mcc",
+                &definitions,
+                Some(&templates),
+            ) {
+                Ok(draft) => draft,
+                Err(why) => {
+                    eprintln!("skipping: {} would not convert: {why}", entry.name);
+                    continue;
+                }
+            };
+            let (after, _) = dangling_buffer_references(&draft.tag);
+            assert_eq!(
+                after, 0,
+                "{} kept {after} reference(s) into compiled buffers it does not carry \
+                 (the source had {before}, reaching #{high})",
+                entry.name,
+            );
+        }
+        if checked == 0 {
+            eprintln!("skipping: no readable lightmap carried a buffer reference");
+        }
+    }
+
+    /// Every surviving pointer into the compiled geometry buffers: how many, and
+    /// the highest index named.
+    ///
+    /// Counts a mesh's own `vertex buffer index` entries only when they are
+    /// non-zero -- a settled mesh keeps the array and zeroes it, which is what a
+    /// kit's own tag looks like -- and counts every element of a block that
+    /// exists solely to name buffers, because a kit's own tag has none.
+    fn dangling_buffer_references(tag: &TagFile) -> (usize, i128) {
+        fn walk(value: &TagStruct<'_>, found: &mut usize, high: &mut i128, depth: usize) {
+            if depth > 24 {
+                return;
+            }
+            for name in value.field_names() {
+                let Some(field) = value.field(&name) else { continue };
+                if name.eq_ignore_ascii_case("vertex buffer index")
+                    && let Some(index) = value.read_int_any(&name)
+                    && index != 0
+                {
+                    *found += 1;
+                    *high = (*high).max(index);
+                }
+                if let Some(block) = field.as_block() {
+                    if COMPILED_BUFFER_BLOCK_NAMES.contains(&name.as_ref()) {
+                        *found += block.len();
+                    }
+                    for index in 0..block.len() {
+                        if let Some(element) = block.element(index) {
+                            walk(&element, found, high, depth + 1);
+                        }
+                    }
+                } else if let Some(array) = field.as_array() {
+                    for index in 0..array.len() {
+                        if let Some(element) = array.element(index) {
+                            walk(&element, found, high, depth + 1);
+                        }
+                    }
+                } else if let Some(nested) = field.as_struct() {
+                    walk(&nested, found, high, depth + 1);
+                } else if let Some(resource) = field.as_resource()
+                    && let Some(nested) = resource.as_struct()
+                {
+                    walk(&nested, found, high, depth + 1);
+                }
+            }
+        }
+        let mut found = 0usize;
+        let mut high = -1i128;
+        walk(&tag.root(), &mut found, &mut high, 0);
+        (found, high)
+    }
+
+    /// Kept beside the converter's own table on purpose: if a block is added
+    /// there and not here, this test stops covering it.
+    const COMPILED_BUFFER_BLOCK_NAMES: [&str; 2] = [
+        "per_instance_lightmap_texcoords_vertex_buffer",
+        "bsp per-vertex run-time data",
+    ];
+
+    /// A converted 360 BSP must describe itself as uncompiled.
+    ///
+    /// The GPU buffers do not come across -- they are Xenos-shaped and this
+    /// engine cannot read them -- so the tag has to stop claiming they exist.
+    /// A kit's own BSPs are unanimous about how: `processed` clear, every
+    /// `index buffer index` -1, every vertex buffer slot 0, and no
+    /// `rigid compressed` in sight. Left as the 360 wrote them, the engine
+    /// looks for buffers that are not there.
+    #[test]
+    fn a_360_bsp_arrives_described_as_uncompiled() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and an HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let Ok(groups) = GameTagIndex::load(&definitions, "haloreach_mcc") else {
+            eprintln!("skipping: no haloreach_mcc definitions");
+            return;
+        };
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let group = u32::from_be_bytes(*b"sbsp");
+        let Some(entry) = cache
+            .iter_tags()
+            .filter(|entry| entry.group_tag == group)
+            .find(|entry| cache.read_tag(entry).is_ok())
+        else {
+            eprintln!("skipping: the build has no readable BSP");
+            return;
+        };
+        let Ok(source) = cache.read_tag(entry) else { return };
+        let draft = match analyze_conversion_with_templates(
+            &source,
+            "haloreach_mcc",
+            "haloreach_mcc",
+            &definitions,
+            Some(&templates),
+        ) {
+            Ok(draft) => draft,
+            Err(why) => {
+                eprintln!("skipping: {} would not convert: {why}", entry.name);
+                return;
+            }
+        };
+        let root = draft.tag.root();
+        if let Some(TagFieldData::LongFlags { names, .. }) = root
+            .field_path("render geometry/runtime flags")
+            .and_then(|field| field.value())
+        {
+            assert!(
+                !names.iter().any(|(_, name)| name == "processed"),
+                "{}: the geometry still claims it has been processed",
+                entry.name,
+            );
+        }
+        let Some(meshes) = root
+            .field_path("render geometry/meshes")
+            .and_then(|field| field.as_block())
+        else {
+            eprintln!("skipping: {} has no meshes", entry.name);
+            return;
+        };
+        assert!(meshes.len() > 0, "{}: no meshes to check", entry.name);
+        for index in 0..meshes.len() {
+            let Some(mesh) = meshes.element(index) else { continue };
+            assert_eq!(
+                mesh.read_int_any("index buffer index"),
+                Some(-1),
+                "{} mesh {index}: still names an index buffer",
+                entry.name,
+            );
+            let vertex_type = mesh.read_enum_name("vertex type").unwrap_or_default();
+            assert!(
+                !vertex_type.ends_with(" compressed"),
+                "{} mesh {index}: vertex type is {vertex_type}, which only the 360 compiles",
+                entry.name,
+            );
+            if let Some(slots) = mesh.field("vertex buffer indices").and_then(|f| f.as_array()) {
+                for slot in 0..slots.len() {
+                    let Some(slot_elem) = slots.element(slot) else { continue };
+                    assert_eq!(
+                        slot_elem.read_int_any("vertex buffer index"),
+                        Some(0),
+                        "{} mesh {index}: vertex buffer slot {slot} still names a buffer",
+                        entry.name,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every image assembles to exactly the byte count its own tag declares.
+    ///
+    /// A 360 bitmap tag carries both mirrors: the `xenon bitmaps` block that
+    /// describes what the 360 stored, and the `bitmaps` block that describes
+    /// what a PC build would. The PC block's `pixels size` is therefore ground
+    /// truth for this conversion, written by the same tool chain that would have
+    /// built the PC tag, and it is not a number this code can talk itself into.
+    ///
+    /// It also covers far more than a size. Landing on it means every mip level
+    /// was found at the right offset, every cube face and array layer was
+    /// walked, the packed tail of small mips was read out of its shared tile,
+    /// and a format the PC ships decoded was decoded rather than copied. Any one
+    /// of those going wrong moves the total.
+    #[test]
+    fn a_360_bitmap_assembles_to_the_size_its_tag_declares() {
+        let Some(cache) = reach_x360_cache() else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE");
+            return;
+        };
+        let tag_group = u32::from_be_bytes(*b"bitm");
+        let (mut checked, mut wrong) = (0, 0);
+        let mut examples: Vec<String> = Vec::new();
+        for entry in cache
+            .iter_tags()
+            .filter(|entry| entry.group_tag == tag_group && !entry.name.is_empty())
+            .step_by(23)
+            .take(800)
+        {
+            let Ok(source) = cache.read_tag_by_name(tag_group, &entry.name) else {
+                continue;
+            };
+            let Ok(bitmap) = crate::bitmap::Bitmap::new(&source) else {
+                continue;
+            };
+            let Some(pc_images) = source
+                .root()
+                .field_path("bitmaps")
+                .and_then(|field| field.as_block())
+            else {
+                continue;
+            };
+            for index in 0..bitmap.len() {
+                let (Some(image), Some(pc)) = (bitmap.image(index), pc_images.element(index))
+                else {
+                    continue;
+                };
+                let Ok(raw) = image.pixel_bytes() else { continue };
+                let declared = pc.read_int_any("pixels size").unwrap_or(0).max(0) as usize;
+                if declared == 0 {
+                    continue;
+                }
+                let source_format = image.format().ok();
+                let target_format = pc
+                    .read_enum_name("format")
+                    .and_then(|name| crate::bitmap::BitmapFormat::from_schema_name(&name));
+                let built = match (source_format, target_format) {
+                    (Some(from), Some(to)) if from != to => {
+                        match crate::bitmap::encode::transcode_levels(
+                            from,
+                            to,
+                            image.width(),
+                            image.height(),
+                            image.mipmap_levels(),
+                            image.layer_count(),
+                            raw,
+                            crate::bitmap::P8Palette::Halo2,
+                        ) {
+                            Ok(packed) => packed.len(),
+                            Err(_) => continue,
+                        }
+                    }
+                    _ => raw.len(),
+                };
+                checked += 1;
+                if built != declared {
+                    wrong += 1;
+                    if examples.len() < 8 {
+                        examples.push(format!(
+                            "{}[{index}] {}x{} {} {} mips={} layers={}: built {built}, tag says \
+                             {declared}",
+                            entry.name,
+                            image.width(),
+                            image.height(),
+                            image.format_name().unwrap_or_default(),
+                            image.type_name().unwrap_or_default(),
+                            image.mipmap_levels(),
+                            image.layer_count(),
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(checked > 100, "only {checked} images had anything to check");
+        assert_eq!(wrong, 0, "{wrong} of {checked} images: {examples:#?}");
+    }
+
+    /// A sound arrives in the shape the destination's own sounds are in.
+    ///
+    /// An Xbox 360 build keeps a sound's samples in the tag as an XMA stream.
+    /// MCC Reach does not: every one of its own sound tags carries
+    /// `sound data resource` null and names an FMOD bank instead. So the stream
+    /// is the one part of the tag that cannot move, and also the one part the
+    /// destination has no use for — the tag arrives complete otherwise and finds
+    /// its samples by name in the kit's banks, as a stock tag there does.
+    ///
+    /// The conversion catalog refuses `sound` for every pair, which is right
+    /// across engines and wrong within one; this is the test that keeps the
+    /// carve-out honest.
+    #[test]
+    fn a_360_sound_arrives_with_its_audio_left_to_the_kit() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let mut checked = 0;
+        for entry in cache
+            .iter_tags()
+            .filter(|entry| entry.group_tag == u32::from_be_bytes(*b"snd!") && !entry.name.is_empty())
+            .step_by(997)
+        {
+            let Some(source) = read_cache_tag(&cache, b"snd!", &entry.name) else {
+                continue;
+            };
+            let draft = convert_into_reach(&source, &reach, &definitions)
+                .unwrap_or_else(|error| panic!("{} refused: {error}", entry.name));
+            assert_eq!(draft.tag.endian, Endian::Le);
+            // Null, not carried: 360 audio under a Reach MCC header would be a
+            // tag that looks playable and is not.
+            let carried = draft
+                .tag
+                .root()
+                .field_path("sound data resource")
+                .and_then(|field| field.as_resource())
+                .map(|resource| resource.kind());
+            assert!(
+                matches!(carried, None | Some(TagResourceKind::Null)),
+                "{} kept its Xbox 360 audio stream",
+                entry.name
+            );
+            checked += 1;
+            if checked >= 4 {
+                break;
+            }
+        }
+        assert!(checked > 0, "no sound converted out of the 360 cache");
+    }
+
+    /// What fraction of every tag class in a 360 build converts, class by class.
+    ///
+    /// The measure behind "translate everything that can be translated", kept in
+    /// the tree because the answer moves: a build has 200-odd classes and the
+    /// only honest way to know which ones still refuse is to try them all. Prints
+    /// a table of `class, tags in build, converted/sampled, first refusal`.
+    ///
+    /// `#[ignore]` because it reads a 27 GB build and takes minutes. Run it with
+    /// `--ignored`, and `SURVEY_SAMPLE` to widen or narrow the per-class sample.
+    #[test]
+    #[ignore = "reads a whole Xbox 360 build; run with --ignored"]
+    fn every_class_in_a_360_build_reports_whether_it_converts() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            eprintln!("skipping: needs BLAM_TEST_REACH_X360_CACHE and HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+
+        let mut counts: HashMap<u32, usize> = HashMap::new();
+        for entry in cache.iter_tags().filter(|entry| !entry.name.is_empty()) {
+            *counts.entry(entry.group_tag).or_default() += 1;
+        }
+        let mut ordered: Vec<(u32, usize)> = counts.into_iter().collect();
+        ordered.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+
+        let sample: usize = std::env::var("SURVEY_SAMPLE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(4);
+        let (mut converted, mut attempted) = (0usize, 0usize);
+        for (group, total) in ordered {
+            let names: Vec<String> = cache
+                .iter_tags()
+                .filter(|entry| entry.group_tag == group && !entry.name.is_empty())
+                .step_by((total / sample).max(1))
+                .take(sample)
+                .map(|entry| entry.name.clone())
+                .collect();
+            let (mut ok, mut refusal) = (0, String::new());
+            for name in &names {
+                let Ok(source) = cache.read_tag_by_name(group, name) else {
+                    if refusal.is_empty() {
+                        refusal = "unreadable from the cache".to_owned();
+                    }
+                    continue;
+                };
+                match analyze_conversion_with_templates(
+                    &source,
+                    "haloreach_mcc",
+                    "haloreach_mcc",
+                    &definitions,
+                    Some(&templates),
+                ) {
+                    Ok(_) => ok += 1,
+                    Err(error) if refusal.is_empty() => {
+                        refusal = error.replace('\n', " ").chars().take(160).collect();
+                    }
+                    Err(_) => {}
+                }
+            }
+            converted += ok;
+            attempted += names.len();
+            eprintln!(
+                "{}\t{total}\t{ok}/{}\t{refusal}",
+                format_group_tag(group),
+                names.len()
+            );
+        }
+        eprintln!("--- {converted}/{attempted} sampled tags converted ---");
+        assert!(attempted > 0);
+    }
+
+    /// The template a group picks is the best its kit has, not the first.
+    ///
+    /// The root size is not enough to tell two revisions apart. HREK ships its
+    /// animation graphs at two: 259 whose animations have eleven fields and 136
+    /// whose animations have twelve, the twelfth being
+    /// `override blend out time`. Both agree about the root, so the picker took
+    /// whichever sorted first -- and a 2011 graph converted against the shorter
+    /// one lost that field on all 208 of its animations, along with a flag bit
+    /// and a block of velocity boundaries. 784 fields, and the conversion
+    /// refused rather than write them away.
+    ///
+    /// The bar is *no worse than any other candidate*, not *perfect*. A kit's
+    /// own tags disagree with the dumped JSON about plenty of structs -- havok
+    /// shapes, debug info, several weapon and biped blocks -- and a template
+    /// that matched everything does not exist to be picked.
+    #[test]
+    fn a_chosen_template_is_the_closest_one_its_kit_has() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else {
+            eprintln!("skipping: needs HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let Ok(groups) = GameTagIndex::load(&definitions, "haloreach_mcc") else {
+            eprintln!("skipping: no haloreach_mcc definitions");
+            return;
+        };
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let tag_group = u32::from_be_bytes(*b"jmad");
+        let Some(name) = groups.by_tag.get(&tag_group).cloned() else { return };
+        let schema = definitions.join("haloreach_mcc").join(format!("{name}.json"));
+        let Ok(Some((chosen, path))) = find_native_target_template(
+            &templates,
+            tag_group,
+            "haloreach_mcc",
+            None,
+            &definitions,
+            &schema,
+        ) else {
+            eprintln!("skipping: the kit ships no animation graph");
+            return;
+        };
+        let wanted = declared_struct_sizes(&schema);
+        if wanted.is_empty() {
+            eprintln!("skipping: no struct sizes in the schema");
+            return;
+        }
+        let ours = template_disagreements(&template_struct_sizes(&chosen), &wanted);
+
+        // Nothing the kit has does better.
+        let Some(candidates) = templates.by_group.get(&tag_group) else { return };
+        let mut best = ours;
+        let mut better = None;
+        for candidate in candidates.iter().take(NATIVE_TEMPLATE_SCAN_LIMIT) {
+            let Ok(tag) = TagFile::read(candidate) else { continue };
+            if tag.group().tag != tag_group || tag.endian != Endian::Le {
+                continue;
+            }
+            let score = template_disagreements(&template_struct_sizes(&tag), &wanted);
+            if score < best {
+                best = score;
+                better = Some(candidate.clone());
+            }
+        }
+        assert!(
+            better.is_none(),
+            "picked {} with {ours} disagreement(s) when {} has {best}",
+            path.display(),
+            better.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+        );
+
+        // And the concrete thing the elite needed: an animation that can hold
+        // every field a 2011 one carries.
+        // Asked of the layout, not of the data: a template is reset to defaults
+        // before it is handed out, so its blocks are empty by the time anybody
+        // sees it. What matters is what it can hold.
+        let animation_fields: Vec<String> = chosen
+            .definitions()
+            .root_struct()
+            .fields()
+            .find(|field| crate::field_name::clean_field_name(field.name()) == "definitions")
+            .and_then(|field| field.as_struct())
+            .and_then(|definitions| {
+                definitions.fields().find(|field| {
+                    crate::field_name::clean_field_name(field.name()) == "animations"
+                })
+            })
+            .and_then(|field| field.as_block())
+            .map(|block| {
+                block
+                    .struct_definition()
+                    .fields()
+                    .map(|field| crate::field_name::clean_field_name(field.name()).into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if animation_fields.is_empty() {
+            eprintln!("skipping: the chosen template declares no animations to look at");
+            return;
+        }
+        assert!(
+            animation_fields.iter().any(|name| name.contains("override blend out")),
+            "the chosen animation graph template has no `override blend out time`, so a 2011              graph converted against it loses that field on every animation: {}",
+            path.display(),
+        );
+    }
+
+    /// The classes a kit ships in bulk find a template in it.
+    ///
+    /// A conversion starts either from a tag the kit authored or from the
+    /// schema, and the two are not equivalent: a kit tag carries the layout the
+    /// kit's own tools expect, expansions and all, while a schema-built one
+    /// carries whatever the dumped JSON describes. The schema path is the
+    /// fallback for a group the kit does not ship.
+    ///
+    /// Reach ships 9,286 bitmaps and 10,624 sounds and every one of them records
+    /// no source revision — `version` is `0xFFFFFFFF`, the same value
+    /// `apply_editing_kit_mcc_header` stamps on everything it writes. The
+    /// template search read that as a disqualification, so those two groups, the
+    /// whole shader pipeline and the render-method templates could never find a
+    /// template, and every one of them was built from a schema. That is 34,000
+    /// tags in a Reach build taking the fallback path, silently.
+    ///
+    /// Named groups rather than a threshold: each is one the kit demonstrably
+    /// ships thousands of, so "no template" can only mean the search is wrong
+    /// again.
+    #[test]
+    fn the_classes_a_kit_ships_in_bulk_find_a_template() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else {
+            eprintln!("skipping: needs HREK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let mut starved = Vec::new();
+        for group in [
+            *b"bitm", *b"snd!", *b"pixl", *b"vtsh", *b"rmt2", *b"hlsl", *b"weap", *b"mode",
+        ] {
+            let tag_group = u32::from_be_bytes(group);
+            let name = groups
+                .by_tag
+                .get(&tag_group)
+                .cloned()
+                .unwrap_or_else(|| String::from_utf8_lossy(&group).into_owned());
+            let schema = definitions.join("haloreach_mcc").join(format!("{name}.json"));
+            let found = find_native_target_template(
+                &templates,
+                tag_group,
+                "haloreach_mcc",
+                None,
+                &definitions,
+                &schema,
+            );
+            match found {
+                Ok(Some(_)) => {}
+                Ok(None) => starved.push(format!("{name}: no template in a kit that ships them")),
+                Err(error) => starved.push(format!("{name}: {error}")),
+            }
+        }
+        assert!(starved.is_empty(), "{starved:#?}");
+    }
+
+    /// Convert the tags a file names, into a folder, keeping their own paths.
+    ///
+    /// The other half of `tools/managedblam-probe`: that asks a kit whether it
+    /// will load a tag, and this produces the tags to ask about. Kept in the
+    /// tree because the pair is the only way to answer "does the kit accept
+    /// what we write", and reinventing the producer each time is how a
+    /// comparison ends up measuring two different builds.
+    ///
+    /// `PROBE_LIST` names a file of `<tag path>|<extension>` lines, `PROBE_OUT`
+    /// the folder to write under.
+    #[test]
+    #[ignore = "produces tags for the ManagedBlam probe"]
+    fn convert_the_tags_a_probe_list_names() {
+        let (Some(cache), Some(reach), Ok(list), Ok(out)) = (
+            reach_x360_cache(),
+            kit_tags("BLAM_TEST_HREK", "HREK"),
+            std::env::var("PROBE_LIST"),
+            std::env::var("PROBE_OUT"),
+        ) else {
+            eprintln!("skipping: needs the cache, HREK, PROBE_LIST and PROBE_OUT");
+            return;
+        };
+        let out = PathBuf::from(out);
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        for line in std::fs::read_to_string(list).unwrap().lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((relative, extension)) = line.rsplit_once('|') else { continue };
+            let Some(group) = groups.by_name.get(&extension.to_ascii_lowercase()) else {
+                eprintln!("NOGROUP\t{line}");
+                continue;
+            };
+            let name = relative.replace('/', "\\");
+            let Ok(source) = cache.read_tag_by_name(*group, &name) else {
+                eprintln!("NOTINCACHE\t{line}");
+                continue;
+            };
+            match analyze_conversion_with_templates(
+                &source,
+                "haloreach_mcc",
+                "haloreach_mcc",
+                &definitions,
+                Some(&templates),
+            ) {
+                Ok(draft) => {
+                    let path = out.join(format!(
+                        "{}.{}",
+                        name.replace('\\', "/"),
+                        draft.target_extension
+                    ));
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    match draft.tag.write_atomic(&path) {
+                        Ok(()) => eprintln!("WROTE\t{line}"),
+                        Err(error) => eprintln!("WRITEFAIL\t{line}\t{error}"),
+                    }
+                }
+                Err(error) => eprintln!("REFUSED\t{line}\t{error}"),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_bsp_geometry() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let name = std::env::var("BSP_NAME")
+            .unwrap_or_else(|_| r"levels\multi\archive\70_boneyard_v2\70_boneyard_v2_000".to_owned());
+        let group = u32::from_be_bytes(*b"sbsp");
+        let Ok(source) = cache.read_tag_by_name(group, &name) else {
+            eprintln!("could not read {name}");
+            return;
+        };
+        report_geometry("SOURCE", &source);
+        match analyze_conversion_with_templates(
+            &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+        ) {
+            Ok(draft) => report_geometry("CONVERTED", &draft.tag),
+            Err(e) => eprintln!("CONVERTED\trefused: {e}"),
+        }
+        // And a stock kit BSP, as the shape a correct one has.
+        if let Some(path) = walk_files(&reach)
+            .into_iter()
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("scenario_structure_bsp"))
+            && let Ok(stock) = TagFile::read(&path)
+        {
+            report_geometry("STOCK", &stock);
+        }
+    }
+
+    /// Diff a converted tag against the kit's own copy of the same tag.
+    /// HREK ships several levels the 2011 build also carries, so for those the
+    /// shipped tag is an exact statement of what the conversion should produce.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_diff_against_kit() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let name = std::env::var("DIFF_NAME").unwrap_or_default();
+        let ext = std::env::var("DIFF_EXT").unwrap_or_else(|_| "scenario_structure_bsp".to_owned());
+        let group_tag = std::env::var("DIFF_GROUP").unwrap_or_else(|_| "sbsp".to_owned());
+        let mut gb = [b' '; 4];
+        for (i, c) in group_tag.bytes().take(4).enumerate() { gb[i] = c; }
+        let source = match cache.read_tag_by_name(u32::from_be_bytes(gb), &name) {
+            Ok(t) => t,
+            Err(e) => { eprintln!("could not read source: {e}"); return; }
+        };
+        let kit_path = reach.join(format!("{}.{ext}", name.replace('\\', "/")));
+        let stock = match TagFile::read(&kit_path) {
+            Ok(t) => t,
+            Err(e) => { eprintln!("could not read {}: {e}", kit_path.display()); return; }
+        };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let draft = match analyze_conversion_with_templates(
+            &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+        ) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("refused: {e}"); return; }
+        };
+        for (label, tag) in [("CONVERTED", &draft.tag), ("STOCK", &stock)] {
+            let bytes = tag.write_to_bytes().map(|b| b.len()).unwrap_or(0);
+            let res = tag
+                .root()
+                .field_path("render geometry/api resource")
+                .and_then(|f| f.as_resource())
+                .map(|r| format!("kind={:?}, xsync={}", r.kind(), r.xsync_state().is_some()))
+                .unwrap_or_else(|| "none".to_owned());
+            eprintln!("{label}	{bytes} bytes on disk	api resource: {res}");
+        }
+        if let (Ok(ours), Ok(theirs)) = (draft.tag.write_to_bytes(), stock.write_to_bytes()) {
+            if ours == theirs {
+                eprintln!("BYTES	identical ({} bytes)", ours.len());
+            } else {
+                let first = ours.iter().zip(theirs.iter()).position(|(a, b)| a != b);
+                let differing = ours.iter().zip(theirs.iter()).filter(|(a, b)| a != b).count();
+                eprintln!(
+                    "BYTES	{} of {} differ, first at {first:?}",
+                    differing,
+                    ours.len().min(theirs.len())
+                );
+            }
+        }
+        let mut differences = Vec::new();
+        diff_structs("", &draft.tag.root(), &stock.root(), &mut differences, 0);
+        let limit: usize = std::env::var("DIFF_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(80);
+        eprintln!("{} difference(s) vs {}", differences.len(), kit_path.display());
+        if std::env::var("DIFF_RAW").is_ok() {
+            for line in differences.iter().take(limit) { eprintln!("  {line}"); }
+            return;
+        }
+        // Collapse `foo[3]/bar` to `foo[]/bar` so one wrong field does not
+        // present as ten thousand findings.
+        let mut grouped: std::collections::BTreeMap<String, (usize, String)> = Default::default();
+        for line in &differences {
+            let (path, detail) = line.split_once(": ").unwrap_or((line.as_str(), ""));
+            let mut key = String::with_capacity(path.len());
+            let mut skipping = false;
+            for ch in path.chars() {
+                match ch {
+                    '[' | '<' => { skipping = true; key.push(ch); }
+                    ']' | '>' => { skipping = false; key.push(ch); }
+                    _ if skipping => {}
+                    _ => key.push(ch),
+                }
+            }
+            let slot = grouped.entry(key).or_insert((0, detail.to_owned()));
+            slot.0 += 1;
+        }
+        let mut rows: Vec<_> = grouped.into_iter().collect();
+        rows.sort_by_key(|(_, (count, _))| std::cmp::Reverse(*count));
+        for (path, (count, sample)) in rows.iter().take(limit) {
+            let sample: String = sample.chars().take(150).collect();
+            eprintln!("  x{count:<6} {path}
+           {sample}");
+        }
+    }
+
+    fn diff_structs(
+        path: &str,
+        ours: &TagStruct<'_>,
+        theirs: &TagStruct<'_>,
+        out: &mut Vec<String>,
+        depth: usize,
+    ) {
+        let ceiling: usize = std::env::var("DIFF_CEILING")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4000);
+        if depth > 12 || out.len() > ceiling { return; }
+        for name in theirs.field_names() {
+            let here = if path.is_empty() { name.to_string() } else { format!("{path}/{name}") };
+            let (Some(a), Some(b)) = (ours.field(&name), theirs.field(&name)) else {
+                out.push(format!("{here}: missing on one side"));
+                continue;
+            };
+            if let (Some(ab), Some(bb)) = (a.as_block(), b.as_block()) {
+                if ab.len() != bb.len() {
+                    out.push(format!("{here}: {} element(s) vs {}", ab.len(), bb.len()));
+                    continue;
+                }
+                for i in 0..ab.len() {
+                    let (Some(ae), Some(be)) = (ab.element(i), bb.element(i)) else { continue };
+                    diff_structs(&format!("{here}[{i}]"), &ae, &be, out, depth + 1);
+                    if out.len() > ceiling { return; }
+                }
+                continue;
+            }
+            if let (Some(aa), Some(ba)) = (a.as_array(), b.as_array()) {
+                for i in 0..aa.len().min(ba.len()) {
+                    let (Some(ae), Some(be)) = (aa.element(i), ba.element(i)) else { continue };
+                    diff_structs(&format!("{here}<{i}>"), &ae, &be, out, depth + 1);
+                }
+                continue;
+            }
+            if let (Some(a_s), Some(b_s)) = (a.as_struct(), b.as_struct()) {
+                diff_structs(&here, &a_s, &b_s, out, depth + 1);
+                continue;
+            }
+            let (av, bv) = (a.value(), b.value());
+            let (astr, bstr) = (format!("{av:?}"), format!("{bv:?}"));
+            if astr != bstr {
+                out.push(format!("{here}: {astr} vs {bstr}"));
+            }
+        }
+    }
+
+    /// Which BSPs exist in both the build and an untouched kit, so a diff has
+    /// a genuine oracle rather than an earlier run of this same converter.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_shared_bsp_names() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let ext = std::env::var("SHARED_EXT").unwrap_or_else(|_| "scenario_structure_bsp".to_owned());
+        let group_name = std::env::var("SHARED_GROUP").unwrap_or_else(|_| "sbsp".to_owned());
+        let mut gb = [b' '; 4];
+        for (i, c) in group_name.bytes().take(4).enumerate() { gb[i] = c; }
+        let group = u32::from_be_bytes(gb);
+        let cutoff = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_577_836_800); // 2020-01-01
+        for entry in cache.iter_tags().filter(|e| e.group_tag == group) {
+            let relative = format!("{}.{ext}", entry.name.replace('\\', "/"));
+            let path = reach.join(&relative);
+            let Ok(meta) = std::fs::metadata(&path) else { continue };
+            let stock = meta.modified().map(|m| m < cutoff).unwrap_or(false);
+            eprintln!("{}	{relative}", if stock { "STOCK  " } else { "touched" });
+        }
+    }
+
+    /// What an untouched kit puts in the fields that describe compiled
+    /// geometry, so the converter can match it rather than guess.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_kit_geometry_conventions() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        let cutoff = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_577_836_800);
+        let want: Vec<String> = std::env::var("CONV_EXT")
+            .unwrap_or_else(|_| "scenario_structure_bsp,render_model".to_owned())
+            .split(',').map(|s| s.to_owned()).collect();
+        let mut vertex_types: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut index_buffer: std::collections::BTreeMap<i128, usize> = Default::default();
+        let mut vertex_buffer: std::collections::BTreeMap<i128, usize> = Default::default();
+        let mut analytical: std::collections::BTreeMap<i128, usize> = Default::default();
+        let mut runtime: std::collections::BTreeMap<u64, usize> = Default::default();
+        let mut pmt_flags: std::collections::BTreeMap<u64, usize> = Default::default();
+        let mut seen = 0usize;
+        let cap: usize = std::env::var("CONV_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+        for path in walk_files(&reach) {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_owned();
+            if !want.contains(&ext) { continue; }
+            if std::fs::metadata(&path).and_then(|m| m.modified()).map(|m| m >= cutoff).unwrap_or(true) {
+                continue; // touched by an import; not an oracle
+            }
+            let Ok(tag) = TagFile::read(&path) else { continue };
+            let root = tag.root();
+            if let Some(TagFieldData::LongFlags { value, .. }) =
+                root.field_path("render geometry/runtime flags").and_then(|f| f.value())
+            {
+                *runtime.entry(value as u64).or_default() += 1;
+            }
+            if let Some(meshes) = root.field_path("render geometry/meshes").and_then(|f| f.as_block()) {
+                for i in 0..meshes.len() {
+                    let Some(m) = meshes.element(i) else { continue };
+                    *vertex_types.entry(m.read_enum_name("vertex type").unwrap_or_default()).or_default() += 1;
+                    if let Some(v) = m.read_int_any("index buffer index") {
+                        *index_buffer.entry(v).or_default() += 1;
+                    }
+                    if let Some(vb) = m.field("vertex buffer indices").and_then(|f| f.as_array()) {
+                        for k in 0..vb.len() {
+                            if let Some(v) = vb.element(k).and_then(|e| e.read_int_any("vertex buffer index")) {
+                                *vertex_buffer.entry(v * 100 + k as i128).or_default() += 1;
+                            }
+                        }
+                    }
+                    if let Some(sp) = m.field("subparts").and_then(|f| f.as_block()) {
+                        for k in 0..sp.len() {
+                            if let Some(v) = sp.element(k).and_then(|e| e.read_int_any("analytical light index")) {
+                                *analytical.entry(v).or_default() += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(pmt) = root.field_path("render geometry/per mesh temporary").and_then(|f| f.as_block()) {
+                for i in 0..pmt.len() {
+                    if let Some(TagFieldData::LongFlags { value, .. }) =
+                        pmt.element(i).and_then(|e| e.field("flags")).and_then(|f| f.value())
+                    {
+                        *pmt_flags.entry(value as u64).or_default() += 1;
+                    }
+                }
+            }
+            seen += 1;
+            if seen >= cap { break; }
+        }
+        eprintln!("{seen} untouched tag(s) of {want:?}");
+        eprintln!("vertex type:          {vertex_types:?}");
+        eprintln!("index buffer index:   {:?}", index_buffer.iter().take(8).collect::<Vec<_>>());
+        eprintln!("vertex buffer index (value,slot): {:?}",
+            vertex_buffer.iter().map(|(k, n)| ((k - k.rem_euclid(100)) / 100, k.rem_euclid(100), n)).take(20).collect::<Vec<_>>());
+        eprintln!("analytical light idx: {:?}", analytical.iter().take(8).collect::<Vec<_>>());
+        eprintln!("rg runtime flags:     {runtime:?}");
+        eprintln!("per mesh temp flags:  {pmt_flags:?}");
+    }
+
+    /// Every distinct reason a bitmap in the build refuses to convert, and how
+    /// many bitmaps hit each one.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_bitmap_failures() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let group = u32::from_be_bytes(*b"bitm");
+        let filter = std::env::var("BITM_FILTER").unwrap_or_default();
+        let cap: usize = std::env::var("BITM_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
+        let entries: Vec<_> = cache
+            .iter_tags()
+            .filter(|e| e.group_tag == group)
+            .filter(|e| filter.is_empty() || e.name.contains(&filter))
+            .collect();
+        eprintln!("{} candidate bitmap(s)", entries.len());
+        let step = (entries.len() / cap.max(1)).max(1);
+        let (mut ok, mut bad) = (0usize, 0usize);
+        let mut reasons: std::collections::BTreeMap<String, (usize, String)> = Default::default();
+        for entry in entries.iter().step_by(step).take(cap) {
+            let Ok(source) = cache.read_tag(entry) else { continue };
+            match analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) {
+                Ok(_) => ok += 1,
+                Err(e) => {
+                    bad += 1;
+                    // Strip the tag-specific tail so like reasons group.
+                    let text = e.to_string();
+                    let key: String = text.chars().take(90).collect();
+                    let slot = reasons.entry(key).or_insert((0, entry.name.clone()));
+                    slot.0 += 1;
+                }
+            }
+        }
+        eprintln!("converted {ok}, refused {bad}");
+        let mut rows: Vec<_> = reasons.into_iter().collect();
+        rows.sort_by_key(|(_, (count, _))| std::cmp::Reverse(*count));
+        for (reason, (count, sample)) in rows.iter().take(12) {
+            eprintln!("  x{count:<5} {reason}
+         e.g. {sample}");
+        }
+    }
+
+    /// How many bitmaps in the build describe their images only in the 360
+    /// mirror, and what a kit tag puts in the PC block for the same picture.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_bitmaps_block_missing() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let group = u32::from_be_bytes(*b"bitm");
+        let (mut both, mut mirror_only, mut neither) = (0usize, 0usize, 0usize);
+        let mut examples: Vec<String> = Vec::new();
+        for entry in cache.iter_tags().filter(|e| e.group_tag == group) {
+            let Ok(tag) = cache.read_tag_bytes(entry).and_then(|b| Ok(TagFile::read_from_bytes(&b)?))
+            else { continue };
+            let root = tag.root();
+            let count = |name: &str| {
+                root.field_path(name).and_then(|f| f.as_block()).map(|b| b.len()).unwrap_or(0)
+            };
+            let (pc, xenon) = (count("bitmaps"), count("xenon bitmaps"));
+            match (pc, xenon) {
+                (0, 0) => neither += 1,
+                (0, _) => {
+                    mirror_only += 1;
+                    if examples.len() < 5 { examples.push(entry.name.clone()); }
+                }
+                _ => both += 1,
+            }
+        }
+        eprintln!("both={both}  mirror only={mirror_only}  neither={neither}");
+        for name in &examples { eprintln!("  e.g. {name}"); }
+
+        // The 360 mirror for one of the same, field by field.
+        let chosen = std::env::var("MIRROR_NAME").ok();
+        let examples = match &chosen { Some(n) => vec![n.clone()], None => examples };
+        if let Some(name) = examples.first()
+            && let Ok(tag) = cache
+                .read_tag_bytes(cache.find_tag(group, name).unwrap())
+                .and_then(|b| Ok(TagFile::read_from_bytes(&b)?))
+        {
+            let root = tag.root();
+            eprintln!("MIRROR {name}");
+            if let Some(elem) = root
+                .field_path("xenon bitmaps")
+                .and_then(|f| f.as_block())
+                .and_then(|b| b.element(0))
+            {
+                for field in elem.field_names() {
+                    let value = elem.field(&field).and_then(|f| f.value());
+                    let text = format!("{value:?}");
+                    eprintln!("    {field}: {}", text.chars().take(110).collect::<String>());
+                }
+            }
+        }
+
+        // And what the kit writes for one of these.
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        let Ok(relative) = std::env::var("STOCK_BITMAP") else { return };
+        let Ok(stock) = TagFile::read(&reach.join(&relative)) else {
+            eprintln!("could not read {relative}");
+            return;
+        };
+        let root = stock.root();
+        eprintln!("STOCK {relative}");
+        eprintln!(
+            "  processed pixel data: {} byte(s)",
+            root.field_path("processed pixel data").and_then(|f| f.as_data()).map(<[u8]>::len).unwrap_or(0)
+        );
+        for name in ["bitmaps", "xenon bitmaps", "hardware textures"] {
+            eprintln!(
+                "  {name}: {}",
+                root.field_path(name).and_then(|f| f.as_block()).map(|b| b.len()).unwrap_or(0)
+            );
+        }
+        if let Some(elem) = root.field_path("bitmaps").and_then(|f| f.as_block()).and_then(|b| b.element(0)) {
+            for name in elem.field_names() {
+                let value = elem.field(&name).and_then(|f| f.value());
+                let text = format!("{value:?}");
+                eprintln!("    {name}: {}", text.chars().take(110).collect::<String>());
+            }
+        }
+    }
+
+    /// Convert every tag of a group the build and an untouched kit both carry,
+    /// and report what the conversions disagree with the kit about.
+    ///
+    /// The kit's own 2010-dated tag for the same name is the only oracle here
+    /// that cannot be a previous run of this converter, so keep the date test:
+    /// an import writes over the kit and turns the oracle into a mirror.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_bulk_diff_against_kit() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let ext = std::env::var("SHARED_EXT").unwrap_or_else(|_| "bitmap".to_owned());
+        let group_name = std::env::var("SHARED_GROUP").unwrap_or_else(|_| "bitm".to_owned());
+        let cap: usize = std::env::var("SHARED_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+        let mut gb = [b' '; 4];
+        for (i, c) in group_name.bytes().take(4).enumerate() { gb[i] = c; }
+        let group = u32::from_be_bytes(gb);
+        let cutoff = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_577_836_800);
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+
+        let shared: Vec<_> = cache
+            .iter_tags()
+            .filter(|e| e.group_tag == group)
+            .filter_map(|e| {
+                let path = reach.join(format!("{}.{ext}", e.name.replace('\\', "/")));
+                let stock = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map(|m| m < cutoff)
+                    .unwrap_or(false);
+                stock.then(|| (e, path))
+            })
+            .collect();
+        eprintln!("{} tag(s) the build and an untouched kit share", shared.len());
+        let step = (shared.len() / cap.max(1)).max(1);
+
+        let (mut identical, mut differing, mut refused, mut unreadable) = (0, 0, 0, 0);
+        let mut uncompiled = 0;
+        let mut fields: std::collections::BTreeMap<String, (usize, String)> = Default::default();
+        let mut refusals: std::collections::BTreeMap<String, usize> = Default::default();
+        for (entry, path) in shared.iter().step_by(step).take(cap) {
+            let (Ok(source), Ok(stock)) = (cache.read_tag(entry), TagFile::read(path)) else {
+                unreadable += 1;
+                continue;
+            };
+            let draft = match analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    refused += 1;
+                    *refusals.entry(e.chars().take(80).collect()).or_default() += 1;
+                    continue;
+                }
+            };
+            // A kit ships plenty of bitmaps with no compiled pixels at all --
+            // it recompiles them from the artist source. Comparing a converted
+            // tag that does carry pixels against one of those says nothing
+            // about the detiler, so count them apart rather than as failures.
+            // Bitmaps only: a kit ships plenty with no compiled pixels at
+            // all, and comparing one of those against a converted tag that does
+            // carry pixels says nothing about the detiler.
+            if group == u32::from_be_bytes(*b"bitm")
+                && stock
+                    .root()
+                    .field_path("processed pixel data")
+                    .and_then(|f| f.as_data())
+                    .map(<[u8]>::len)
+                    .unwrap_or(0)
+                    == 0
+            {
+                uncompiled += 1;
+                continue;
+            }
+            let mut differences = Vec::new();
+            diff_structs("", &draft.tag.root(), &stock.root(), &mut differences, 0);
+            if differences.is_empty() {
+                identical += 1;
+                continue;
+            }
+            differing += 1;
+            for line in &differences {
+                let (field, detail) = line.split_once(": ").unwrap_or((line.as_str(), ""));
+                let mut key = String::with_capacity(field.len());
+                let mut skipping = false;
+                for ch in field.chars() {
+                    match ch {
+                        '[' | '<' => { skipping = true; key.push(ch); }
+                        ']' | '>' => { skipping = false; key.push(ch); }
+                        _ if skipping => {}
+                        _ => key.push(ch),
+                    }
+                }
+                let slot = fields
+                    .entry(key)
+                    .or_insert((0, format!("{detail}   [{}]", entry.name)));
+                slot.0 += 1;
+            }
+        }
+        eprintln!(
+            "identical to the kit: {identical}   differing: {differing}   refused: {refused}   unreadable: {unreadable}   kit ships no pixels: {uncompiled}"
+        );
+        for (reason, count) in refusals.iter() {
+            eprintln!("  refused x{count}: {reason}");
+        }
+        let mut rows: Vec<_> = fields.into_iter().collect();
+        rows.sort_by_key(|(_, (count, _))| std::cmp::Reverse(*count));
+        for (field, (count, sample)) in rows.iter().take(20) {
+            eprintln!("  x{count:<6} {field}\n           {}", sample.chars().take(120).collect::<String>());
+        }
+    }
+
+    /// Compare converted pixels against the kit's own, for the tags where the
+    /// two agree about what the picture is.
+    ///
+    /// A build five months older than the shipped game has re-authored art in
+    /// it, so a byte difference on its own proves nothing. Restricting the
+    /// comparison to images whose size, format, type and mip count all match
+    /// removes that: what is left can only be the detiler.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_pixel_fidelity() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let cap: usize = std::env::var("SHARED_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
+        let group = u32::from_be_bytes(*b"bitm");
+        let cutoff = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_577_836_800);
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let shared: Vec<_> = cache
+            .iter_tags()
+            .filter(|e| e.group_tag == group)
+            .filter_map(|e| {
+                let path = reach.join(format!("{}.bitmap", e.name.replace('\\', "/")));
+                std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map(|m| m < cutoff)
+                    .unwrap_or(false)
+                    .then(|| (e, path))
+            })
+            .collect();
+        let step = (shared.len() / cap.max(1)).max(1);
+        let describe = |tag: &TagFile| -> Vec<String> {
+            tag.root()
+                .field_path("bitmaps")
+                .and_then(|f| f.as_block())
+                .map(|block| {
+                    (0..block.len())
+                        .filter_map(|i| block.element(i))
+                        .map(|e| {
+                            format!(
+                                "{}x{}x{} {} {} mips={}",
+                                e.read_int_any("width").unwrap_or(-1),
+                                e.read_int_any("height").unwrap_or(-1),
+                                e.read_int_any("depth").unwrap_or(-1),
+                                e.read_enum_name("format").unwrap_or_default(),
+                                e.read_enum_name("type").unwrap_or_default(),
+                                e.read_int_any("mipmap count").unwrap_or(-1),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let (mut comparable, mut exact, mut same_size, mut wrong_size) = (0, 0, 0, 0);
+        let mut examples: Vec<String> = Vec::new();
+        let mut spread: Vec<f64> = Vec::new();
+        let mut by_shape: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+        let (mut within_base, mut after_base) = (0usize, 0usize);
+        for (entry, path) in shared.iter().step_by(step).take(cap) {
+            let (Ok(source), Ok(stock)) = (cache.read_tag(entry), TagFile::read(path)) else {
+                continue;
+            };
+            let Ok(draft) = analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) else {
+                continue;
+            };
+            if describe(&draft.tag) != describe(&stock) {
+                continue;
+            }
+            let pixels = |tag: &TagFile| {
+                tag.root()
+                    .field_path("processed pixel data")
+                    .and_then(|f| f.as_data())
+                    .map(<[u8]>::to_vec)
+                    .unwrap_or_default()
+            };
+            let (ours, theirs) = (pixels(&draft.tag), pixels(&stock));
+            if theirs.is_empty() {
+                continue;
+            }
+            comparable += 1;
+            // What shape was it? Grouping the verdict by shape is what turns
+            // "some differ" into "this kind differs".
+            let shape = draft
+                .tag
+                .root()
+                .field_path("bitmaps")
+                .and_then(|f| f.as_block())
+                .and_then(|b| b.element(0))
+                .map(|e| {
+                    format!(
+                        "{:<10} {:<10} mips={} layers={}",
+                        e.read_enum_name("type").unwrap_or_default(),
+                        e.read_enum_name("format").unwrap_or_default(),
+                        e.read_int_any("mipmap count").unwrap_or(-1),
+                        e.read_int_any("depth").unwrap_or(-1),
+                    )
+                })
+                .unwrap_or_default();
+            let slot = by_shape.entry(shape).or_insert((0usize, 0usize));
+            slot.1 += 1;
+            if ours == theirs {
+                exact += 1;
+                slot.0 += 1;
+            } else if ours.len() == theirs.len() {
+                same_size += 1;
+                // How far apart, not just how often. Art re-authored between
+                // the two builds differs everywhere by a little; a detiler that
+                // reads the wrong texels differs by a lot.
+                let total: u64 = ours
+                    .iter()
+                    .zip(&theirs)
+                    .map(|(a, b)| a.abs_diff(*b) as u64)
+                    .sum();
+                let mean = total as f64 / ours.len() as f64;
+                let format = draft
+                    .tag
+                    .root()
+                    .field_path("bitmaps")
+                    .and_then(|f| f.as_block())
+                    .and_then(|b| b.element(0))
+                    .and_then(|e| e.read_enum_name("format"))
+                    .unwrap_or_default();
+                spread.push(mean);
+                // Where does it first go wrong, against the size of the base
+                // level? A chain problem starts after the base; a detile
+                // problem starts at nothing.
+                let base = draft
+                    .tag
+                    .root()
+                    .field_path("bitmaps")
+                    .and_then(|f| f.as_block())
+                    .and_then(|b| b.element(0))
+                    .and_then(|e| {
+                        let name = e.read_enum_name("format")?;
+                        let format = crate::bitmap::BitmapFormat::from_schema_name(&name)?;
+                        Some(format.surface_bytes(
+                            e.read_int_any("width").unwrap_or(0) as u32,
+                            e.read_int_any("height").unwrap_or(0) as u32,
+                            1,
+                        ))
+                    })
+                    .unwrap_or(0);
+                let first = ours.iter().zip(&theirs).position(|(a, b)| a != b).unwrap_or(0);
+                if (first as u64) >= base { after_base += 1; } else { within_base += 1; }
+                if examples.len() < 8 {
+                    let differing = ours.iter().zip(&theirs).filter(|(a, b)| a != b).count();
+                    examples.push(format!(
+                        "  {format:<12} mean |delta| {mean:6.2}  first diff at {first} of base {base}, {differing}/{} differ: {}",
+                        ours.len(),
+                        entry.name
+                    ));
+                }
+            } else {
+                wrong_size += 1;
+                if examples.len() < 6 {
+                    examples.push(format!(
+                        "  {} byte(s) vs {}: {}",
+                        ours.len(),
+                        theirs.len(),
+                        entry.name
+                    ));
+                }
+            }
+        }
+        eprintln!(
+            "comparable: {comparable}   byte-identical: {exact}   same size but different: {same_size}   wrong size: {wrong_size}"
+        );
+        if !spread.is_empty() {
+            spread.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            eprintln!(
+                "mean |delta| per byte -- min {:.2}  median {:.2}  max {:.2}",
+                spread[0],
+                spread[spread.len() / 2],
+                spread[spread.len() - 1]
+            );
+        }
+        for line in &examples {
+            eprintln!("{line}");
+        }
+        eprintln!("first difference within the base level: {within_base}   after it: {after_base}");
+        eprintln!("identical / comparable, by shape:");
+        let mut rows: Vec<_> = by_shape.into_iter().collect();
+        rows.sort_by_key(|(_, (_, total))| std::cmp::Reverse(*total));
+        for (shape, (good, total)) in rows.iter().take(16) {
+            eprintln!("  {good:>4}/{total:<4}  {shape}");
+        }
+    }
+
+    /// Is each mip level a smaller copy of the one above it?
+    ///
+    /// A mip chain is made by filtering the level above, so box-downsampling
+    /// level N and comparing against level N+1 should come out close on any
+    /// correctly read chain. It needs no second copy of the art to compare to,
+    /// which is what makes it usable on a build the shipped game has moved on
+    /// from -- and running it on a kit tag first says what "close" is.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_mip_chain_agrees() {
+        let kit = kit_tags("BLAM_TEST_HREK", "HREK");
+        let cache = reach_x360_cache();
+        let mut sources: Vec<(String, TagFile)> = Vec::new();
+        if let Some(kit) = &kit {
+            for relative in std::env::var("KIT_BITMAPS").unwrap_or_default().split(';') {
+                if relative.is_empty() { continue }
+                if let Ok(tag) = TagFile::read(&kit.join(relative)) {
+                    sources.push((format!("KIT   {relative}"), tag));
+                }
+            }
+        }
+        if let Some(cache) = &cache {
+            for name in std::env::var("COHERENCE_NAMES").unwrap_or_default().split(';') {
+                if name.is_empty() { continue }
+                if let Some(entry) = cache.find_tag(u32::from_be_bytes(*b"bitm"), name)
+                    && let Ok(tag) = cache.read_tag(entry)
+                {
+                    sources.push((format!("BUILD {name}"), tag));
+                }
+            }
+        }
+        for (label, tag) in &sources {
+            let Ok(bitmap) = crate::bitmap::Bitmap::new(tag) else { continue };
+            let Some(image) = bitmap.image(0) else { continue };
+            let Ok(format) = image.format() else { continue };
+            let Ok(pixels) = image.pixel_bytes() else { continue };
+            let levels = image.mipmap_levels();
+            if levels < 2 {
+                eprintln!("{label}: single level");
+                continue;
+            }
+            let (mut width, mut height, mut at) = (image.width(), image.height(), 0usize);
+            let mut previous: Option<(Vec<u8>, u32, u32)> = None;
+            let mut scores = Vec::new();
+            for _ in 0..levels {
+                let size = format.level_bytes(width, height) as usize;
+                if at + size > pixels.len() { break }
+                let Ok(rgba) = crate::bitmap::decode::decode_to_rgba8(
+                    format, width, height, &pixels[at..at + size], crate::bitmap::P8Palette::Halo2,
+                ) else { break };
+                if let Some((above, above_width, above_height)) = &previous
+                    && *above_width / 2 == width.max(1)
+                    && *above_height / 2 == height.max(1)
+                    && width >= 4
+                {
+                    // Box-downsample the level above and see how far off it is.
+                    let mut total = 0u64;
+                    let mut count = 0u64;
+                    for y in 0..height as usize {
+                        for x in 0..width as usize {
+                            for channel in 0..3 {
+                                let mut sum = 0u32;
+                                for dy in 0..2usize {
+                                    for dx in 0..2usize {
+                                        let sx = x * 2 + dx;
+                                        let sy = y * 2 + dy;
+                                        let index =
+                                            (sy * *above_width as usize + sx) * 4 + channel;
+                                        sum += above[index] as u32;
+                                    }
+                                }
+                                let expected = (sum / 4) as u8;
+                                let got = rgba[(y * width as usize + x) * 4 + channel];
+                                total += expected.abs_diff(got) as u64;
+                                count += 1;
+                            }
+                        }
+                    }
+                    scores.push(total as f64 / count.max(1) as f64);
+                }
+                previous = Some((rgba, width, height));
+                at += size;
+                width = (width / 2).max(1);
+                height = (height / 2).max(1);
+            }
+            let text: Vec<String> = scores.iter().map(|s| format!("{s:.1}")).collect();
+            eprintln!("{label}\n  mip-to-mip mean |delta|: {}", text.join("  "));
+        }
+    }
+
+    /// Where does each cube face's base level actually start?
+    ///
+    /// Reads a face-sized window at every plausible offset in the resource,
+    /// puts it through the same de-tile and swap the working path uses, and
+    /// says which offsets reproduce the kit's faces. The answer is the stride,
+    /// measured rather than derived.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_cube_face_stride() {
+        use crate::bitmap::xbox360::{EndianSwap, detile_blocks};
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let name = std::env::var("DIFF_NAME").unwrap_or_default();
+        let Some(entry) = cache.find_tag(u32::from_be_bytes(*b"bitm"), &name) else { return };
+        let Ok(source) = cache.read_tag(entry) else { return };
+        let Ok(stock) = TagFile::read(&reach.join(format!("{}.bitmap", name.replace('\\', "/"))))
+        else { return };
+        let root = source.root();
+        let Some(elem) = root
+            .field_path("xenon bitmaps")
+            .and_then(|f| f.as_block())
+            .and_then(|b| b.element(0))
+        else { return };
+        let Some(resource) = root
+            .field_path("hardware textures[0]/texture resource")
+            .and_then(|f| f.as_resource())
+        else { return };
+        let payload = resource.exploded_payload().unwrap_or(&[]);
+        let optional = resource
+            .xsync_state()
+            .map(|s| s.header.optional_location_size as usize)
+            .unwrap_or(0)
+            .min(payload.len());
+        eprintln!(
+            "{name}: payload {} byte(s), optional {optional}, more flags {:?}",
+            payload.len(),
+            elem.field("more flags").and_then(|f| f.value())
+        );
+        let width = elem.read_int_any("width").unwrap_or(0) as u32;
+        let height = elem.read_int_any("height").unwrap_or(0) as u32;
+        let format_name = elem.read_enum_name("format").unwrap_or_default();
+        let Some(format) = crate::bitmap::BitmapFormat::from_schema_name(&format_name) else { return };
+        let Some((block_width, block_height, bytes_per_block)) = format.block_dims_and_size() else { return };
+        let face = format.level_bytes(width, height) as usize;
+        let stock_pixels = stock
+            .root()
+            .field_path("processed pixel data")
+            .and_then(|f| f.as_data())
+            .unwrap_or(&[]);
+        let columns = width / block_width;
+        let rows = height / block_height;
+        // The kit's blob is level-major: the six base faces come first.
+        for wanted in 0..6usize {
+            let want = &stock_pixels[wanted * face..(wanted + 1) * face];
+            let mut hits = Vec::new();
+            let mut at = 0usize;
+            while at + face <= payload.len() {
+                for swap in [EndianSwap::None, EndianSwap::In16, EndianSwap::In32] {
+                    for detile in [true, false] {
+                        let mut data = payload[at..at + face].to_vec();
+                        if detile {
+                            data = detile_blocks(&data, columns, rows, bytes_per_block);
+                        }
+                        swap.apply(&mut data);
+                        if data == want {
+                            hits.push(format!("{at} (detile={detile}, swap={swap:?})"));
+                        }
+                    }
+                }
+                at += 4;
+            }
+            eprintln!("  kit face {wanted}: found at {}", if hits.is_empty() { "nowhere".to_owned() } else { hits.join(", ") });
+        }
+    }
+
+    /// Why do most of the build's lightmap tags have no bytes?
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_lbsp_blocks() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let group = u32::from_be_bytes(*b"Lbsp");
+        let (mut with_tag, mut with_cache, mut neither, mut cache_only) = (0, 0, 0, 0);
+        let mut examples: Vec<String> = Vec::new();
+        for entry in cache.iter_tags().filter(|e| e.group_tag == group) {
+            let tag_block = cache.resolve_tag_block(entry);
+            let cache_block = cache.resolve_cache_block(entry);
+            match (tag_block.is_some(), cache_block.is_some()) {
+                (true, true) => { with_tag += 1; with_cache += 1; }
+                (true, false) => with_tag += 1,
+                (false, true) => {
+                    cache_only += 1;
+                    if examples.len() < 4 {
+                        let size = cache_block.as_ref().map(|b| b.size).unwrap_or(0);
+                        examples.push(format!("{} (cache block {size} byte(s))", entry.name));
+                    }
+                }
+                (false, false) => {
+                    neither += 1;
+                    if examples.len() < 8 { examples.push(format!("{} (nothing)", entry.name)); }
+                }
+            }
+        }
+        eprintln!(
+            "Lbsp: {with_tag} have tag bytes ({with_cache} of those also cache bytes), \
+             {cache_only} have only cache bytes, {neither} have neither"
+        );
+        for line in &examples { eprintln!("  {line}"); }
+        // And the same question for the level the user named.
+        for name in [r"levels\multi\archive\70_boneyard_v2\70_boneyard_v2_000",
+                     r"levels\multi\70_boneyard\70_boneyard"] {
+            let Some(entry) = cache.find_tag(group, name) else {
+                eprintln!("{name}: not in the cache at all");
+                continue;
+            };
+            eprintln!(
+                "{name}: tag block {:?}, cache block {:?}",
+                cache.resolve_tag_block(entry).map(|b| (b.file_index, b.offset, b.size)),
+                cache.resolve_cache_block(entry).map(|b| (b.file_index, b.offset, b.size)),
+            );
+        }
+    }
+
+    /// Do the lightmap tags whose bytes are in the build actually convert?
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_lbsp_convert() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let group = u32::from_be_bytes(*b"Lbsp");
+        let (mut ok, mut refused, mut unreadable) = (0usize, 0usize, 0usize);
+        let mut reasons: std::collections::BTreeMap<String, (usize, String)> = Default::default();
+        let entries: Vec<_> = cache
+            .iter_tags()
+            .filter(|e| e.group_tag == group && cache.resolve_tag_block(e).is_some())
+            .collect();
+        eprintln!("{} Lbsp tag(s) with bytes", entries.len());
+        let cap: usize = std::env::var("LBSP_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+        for entry in entries.iter().take(cap) {
+            let source = match cache.read_tag(entry) {
+                Ok(t) => t,
+                Err(e) => {
+                    unreadable += 1;
+                    let slot = reasons.entry(format!("unreadable: {e}").chars().take(90).collect())
+                        .or_insert((0, entry.name.clone()));
+                    slot.0 += 1;
+                    continue;
+                }
+            };
+            match analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) {
+                Ok(_) => ok += 1,
+                Err(e) => {
+                    refused += 1;
+                    let slot = reasons.entry(e.chars().take(90).collect())
+                        .or_insert((0, entry.name.clone()));
+                    slot.0 += 1;
+                }
+            }
+        }
+        eprintln!("converted {ok}, refused {refused}, unreadable {unreadable}");
+        for (why, (count, sample)) in reasons.iter() {
+            eprintln!("  x{count} {why}
+      e.g. {sample}");
+        }
+    }
+
+    /// Every distinct reason a group's tags refuse to convert.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_group_failures() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let group_name = std::env::var("FAIL_GROUP").unwrap_or_else(|_| "sslt".to_owned());
+        let mut gb = [b' '; 4];
+        for (i, c) in group_name.bytes().take(4).enumerate() { gb[i] = c; }
+        let group = u32::from_be_bytes(gb);
+        let cap: usize = std::env::var("FAIL_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        let entries: Vec<_> = cache.iter_tags().filter(|e| e.group_tag == group).collect();
+        eprintln!("{} {group_name} tag(s) in the build", entries.len());
+        let step = (entries.len() / cap.max(1)).max(1);
+        let (mut ok, mut bad, mut unreadable) = (0usize, 0usize, 0usize);
+        let mut reasons: std::collections::BTreeMap<String, (usize, String)> = Default::default();
+        for entry in entries.iter().step_by(step).take(cap) {
+            let source = match cache.read_tag(entry) {
+                Ok(t) => t,
+                Err(e) => {
+                    unreadable += 1;
+                    let slot = reasons.entry(format!("UNREADABLE {e}").chars().take(120).collect())
+                        .or_insert((0, entry.name.clone()));
+                    slot.0 += 1;
+                    continue;
+                }
+            };
+            match analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) {
+                Ok(draft) => {
+                    ok += 1;
+                    for issue in draft.report.issues.iter().take(3) {
+                        eprintln!("   note {:?} {} {}", issue.kind, issue.path, issue.message.chars().take(100).collect::<String>());
+                    }
+                }
+                Err(e) => {
+                    bad += 1;
+                    let slot = reasons.entry(e.chars().take(160).collect())
+                        .or_insert((0, entry.name.clone()));
+                    slot.0 += 1;
+                }
+            }
+        }
+        eprintln!("converted {ok}, refused {bad}, unreadable {unreadable}");
+        for (why, (count, sample)) in reasons.iter() {
+            eprintln!("  x{count} {why}\n      e.g. {sample}");
+        }
+    }
+
+    /// Which animation codecs does each side actually use?
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_animation_codecs() {
+        let mut kit_codecs: std::collections::BTreeMap<u8, usize> = Default::default();
+        let mut build_codecs: std::collections::BTreeMap<u8, usize> = Default::default();
+        if let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") {
+            let cutoff =
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+            let mut seen = 0usize;
+            for path in walk_files(&reach) {
+                if path.extension().and_then(|e| e.to_str()) != Some("model_animation_graph") {
+                    continue;
+                }
+                if std::fs::metadata(&path).and_then(|m| m.modified()).map(|w| w >= cutoff).unwrap_or(true) {
+                    continue;
+                }
+                let Ok(tag) = TagFile::read(&path) else { continue };
+                let Some(groups) = tag.root().field_path("tag resource groups").and_then(|f| f.as_block())
+                else { continue };
+                for g in 0..groups.len() {
+                    let Some(list) = groups
+                        .element(g)
+                        .and_then(|e| e.field("tag_resource"))
+                        .and_then(|f| f.as_resource())
+                        .and_then(|r| r.as_struct())
+                        .and_then(|s| s.field("group_members").and_then(|f| f.as_block()))
+                    else { continue };
+                    for m in 0..list.len() {
+                        if let Some(data) = list
+                            .element(m)
+                            .and_then(|e| e.field("animation_data"))
+                            .and_then(|f| f.as_data())
+                            && let Some(first) = data.first()
+                        {
+                            *kit_codecs.entry(*first).or_default() += 1;
+                        }
+                    }
+                }
+                seen += 1;
+                if seen >= 300 { break }
+            }
+        }
+        if let Some(cache) = reach_x360_cache() {
+            let group = u32::from_be_bytes(*b"jmad");
+            for entry in cache.iter_tags().filter(|e| e.group_tag == group).step_by(11).take(300) {
+                let Ok(tag) = cache.read_tag(entry) else { continue };
+                let Some(groups) = tag.root().field_path("tag resource groups").and_then(|f| f.as_block())
+                else { continue };
+                for g in 0..groups.len() {
+                    let Some(resource) = groups
+                        .element(g)
+                        .and_then(|e| e.field("tag_resource"))
+                        .and_then(|f| f.as_resource())
+                    else { continue };
+                    let Some(state) = resource.xsync_state() else { continue };
+                    let primary = resource.exploded_payload().unwrap_or(&[]);
+                    let Some(members) = crate::animation::resource::read_members(&state, primary)
+                    else { continue };
+                    for member in members {
+                        if let Some(first) = member.animation_data.first() {
+                            *build_codecs.entry(*first).or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let name = |b: u8| {
+            crate::animation::codec::Codec::from_byte(b)
+                .map(|c| format!("{c:?}"))
+                .unwrap_or_else(|| "?".to_owned())
+        };
+        eprintln!("kit codec bytes:");
+        for (b, n) in &kit_codecs { eprintln!("  {b:>3} {:<32} x{n}", name(*b)); }
+        eprintln!("build codec bytes:");
+        for (b, n) in &build_codecs { eprintln!("  {b:>3} {:<32} x{n}", name(*b)); }
+    }
+
+    /// Which `data sizes` sections a 360 animation blob actually uses.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_animation_sections() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let names = [
+            "static_codec", "animated_codec", "static_flags", "animated_flags",
+            "movement", "pill_offset", "default_data", "uncompressed", "compressed",
+            "blend_screen", "object_space_offset", "ik_chain_event", "ik_chain_control",
+            "ik_chain_proxy", "ik_chain_pole", "uncompressed_object_space", "fik_anchor",
+        ];
+        let mut used = [0usize; 17];
+        let mut codecs: std::collections::BTreeMap<(u8, u8), usize> = Default::default();
+        let mut total = 0usize;
+        let mut mismatched = 0usize;
+        let group = u32::from_be_bytes(*b"jmad");
+        for entry in cache.iter_tags().filter(|e| e.group_tag == group).step_by(7).take(450) {
+            let Ok(tag) = cache.read_tag(entry) else { continue };
+            let Some(groups) = tag.root().field_path("tag resource groups").and_then(|f| f.as_block())
+            else { continue };
+            for g in 0..groups.len() {
+                let Some(resource) = groups
+                    .element(g)
+                    .and_then(|e| e.field("tag_resource"))
+                    .and_then(|f| f.as_resource())
+                else { continue };
+                let Some(state) = resource.xsync_state() else { continue };
+                let primary = resource.exploded_payload().unwrap_or(&[]);
+                let Some(members) = crate::animation::resource::read_members(&state, primary)
+                else { continue };
+                for member in members {
+                    total += 1;
+                    let sum: i64 = member.data_sizes.iter().map(|v| *v as i64).sum();
+                    if sum != member.animation_data.len() as i64 {
+                        mismatched += 1;
+                    }
+                    for (index, size) in member.data_sizes.iter().enumerate() {
+                        if *size != 0 {
+                            used[index] += 1;
+                        }
+                    }
+                    let static_codec = member.animation_data.first().copied().unwrap_or(255);
+                    let animated_at = member.data_sizes[0].max(0) as usize;
+                    let animated_codec = member
+                        .animation_data
+                        .get(animated_at)
+                        .copied()
+                        .filter(|_| member.data_sizes[1] > 0)
+                        .unwrap_or(255);
+                    *codecs.entry((static_codec, animated_codec)).or_default() += 1;
+                }
+            }
+        }
+        eprintln!("{total} member(s); {mismatched} whose sections do not sum to the blob");
+        for (index, count) in used.iter().enumerate() {
+            if *count > 0 {
+                eprintln!("  {:<28} used by {count}", names[index]);
+            }
+        }
+        eprintln!("(static codec, animated codec) pairs -- 255 means absent:");
+        for ((s, a), n) in codecs.iter() {
+            eprintln!("  ({s:>3}, {a:>3}) x{n}");
+        }
+    }
+
+    /// Swap a 360 animation blob, then ask the ordinary decoder to read it.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_animation_swap_check() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let group = u32::from_be_bytes(*b"jmad");
+        let cap: usize = std::env::var("JMAD_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
+        let (mut total, mut swapped, mut decoded) = (0usize, 0usize, 0usize);
+        let mut refusals: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut statuses: std::collections::BTreeMap<String, usize> = Default::default();
+        for entry in cache.iter_tags().filter(|e| e.group_tag == group).step_by(7).take(cap) {
+            let Ok(tag) = cache.read_tag(entry) else { continue };
+            let Some(groups) = tag.root().field_path("tag resource groups").and_then(|f| f.as_block())
+            else { continue };
+            for g in 0..groups.len() {
+                let Some(resource) = groups
+                    .element(g)
+                    .and_then(|e| e.field("tag_resource"))
+                    .and_then(|f| f.as_resource())
+                else { continue };
+                let Some(state) = resource.xsync_state() else { continue };
+                let primary = resource.exploded_payload().unwrap_or(&[]);
+                let Some(members) = crate::animation::resource::read_members(&state, primary)
+                else { continue };
+                for member in members {
+                    total += 1;
+                    let mut blob = member.animation_data.clone();
+                    let frames = member.frame_count.max(1) as u16;
+                    match crate::animation::byte_order::swap_animation_blob(
+                        &mut blob, &member.data_sizes, frames,
+                    ) {
+                        Err(why) => {
+                            *refusals.entry(why.to_string()).or_default() += 1;
+                            continue;
+                        }
+                        Ok(()) => swapped += 1,
+                    }
+                    // Read it back the way a PC tag would be read.
+                    let sizes = crate::animation::PackedDataSizes {
+                        fields: SECTION_NAMES
+                            .iter()
+                            .zip(member.data_sizes.iter())
+                            .map(|(n, v)| ((*n).to_owned(), *v as i64))
+                            .collect(),
+                    };
+                    let probe = crate::animation::AnimationGroup::for_blob(
+                        &blob, Some(sizes), member.frame_count, member.node_count, None,
+                    );
+                    match probe.decode() {
+                        Ok(clip) => {
+                            decoded += 1;
+                            let status = format!("{:?}", clip.animated_status);
+                            *statuses.entry(status).or_default() += 1;
+                        }
+                        Err(e) => {
+                            *statuses.entry(format!("decode failed: {e}").chars().take(70).collect())
+                                .or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("{total} member(s): {swapped} swapped, {decoded} decoded back");
+        for (why, count) in refusals.iter() {
+            eprintln!("  refused x{count}: {why}");
+        }
+        for (status, count) in statuses.iter() {
+            eprintln!("  status  x{count}: {status}");
+        }
+    }
+
+    /// The seventeen `data sizes` field names, in schema order.
+    const SECTION_NAMES: [&str; 17] = [
+        "static_node_flags", "animated_node_flags", "movement_data", "pill_offset_data",
+        "default_data", "uncompressed_data", "compressed_data", "blend_screen_data",
+        "object_space_offset_data", "ik_chain_event_data", "ik_chain_control_data",
+        "ik_chain_proxy_data", "ik_chain_pole_vector_data", "uncompressed_object_space_data",
+        "fik_anchor_data", "uncompressed_object_space_node_flags", "compressed_event_curve",
+    ];
+
+    /// Decode a swapped 360 animation and the kit's own copy of the same one,
+    /// and see whether they describe the same motion.
+    ///
+    /// The kit re-encoded these when the game was ported -- a 360 keyframe or
+    /// curve stream comes out of MCC's tools uncompressed -- so the bytes never
+    /// match and only the decoded tracks can be compared. Which is the better
+    /// test anyway: it is the motion that has to survive, not the encoding.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_animation_pose_compare() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let group = u32::from_be_bytes(*b"jmad");
+        let cutoff =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        let cap: usize = std::env::var("JMAD_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+        let shared: Vec<_> = cache
+            .iter_tags()
+            .filter(|e| e.group_tag == group)
+            .filter_map(|e| {
+                let path = reach.join(format!("{}.model_animation_graph", e.name.replace('\\', "/")));
+                std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map(|w| w < cutoff)
+                    .unwrap_or(false)
+                    .then_some((e, path))
+            })
+            .collect();
+        let step = (shared.len() / cap.max(1)).max(1);
+        let (mut compared, mut agreed) = (0usize, 0usize);
+        let mut worst: Vec<(f32, String)> = Vec::new();
+        for (entry, path) in shared.iter().step_by(step).take(cap) {
+            let (Ok(source), Ok(kit)) = (cache.read_tag(entry), TagFile::read(path)) else {
+                continue;
+            };
+            let ours = swapped_clips(&source);
+            let theirs = kit_clips(&kit);
+            if ours.len() != theirs.len() {
+                continue;
+            }
+            for (index, (mine, kits)) in ours.iter().zip(&theirs).enumerate() {
+                let (Some(mine), Some(kits)) = (mine, kits) else { continue };
+                compared += 1;
+                let delta = track_distance(mine, kits);
+                if delta <= 0.05 {
+                    agreed += 1;
+                } else if worst.len() < 8 {
+                    worst.push((delta, format!("{} member {index}", entry.name)));
+                }
+            }
+        }
+        eprintln!("{compared} animation(s) compared against the kit: {agreed} agree");
+        worst.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        for (delta, name) in worst.iter().take(8) {
+            eprintln!("  off by {delta:.3}: {name}");
+        }
+    }
+
+    fn swapped_clips(tag: &TagFile) -> Vec<Option<crate::animation::AnimationClip>> {
+        let mut out = Vec::new();
+        let Some(groups) = tag.root().field_path("tag resource groups").and_then(|f| f.as_block())
+        else { return out };
+        for g in 0..groups.len() {
+            let Some(resource) = groups
+                .element(g)
+                .and_then(|e| e.field("tag_resource"))
+                .and_then(|f| f.as_resource())
+            else { continue };
+            let Some(state) = resource.xsync_state() else { continue };
+            let primary = resource.exploded_payload().unwrap_or(&[]);
+            let Some(members) = crate::animation::resource::read_members(&state, primary) else {
+                continue;
+            };
+            for member in members {
+                let mut blob = member.animation_data.clone();
+                let frames = member.frame_count.max(1) as u16;
+                if crate::animation::byte_order::swap_animation_blob(
+                    &mut blob, &member.data_sizes, frames,
+                ).is_err() {
+                    out.push(None);
+                    continue;
+                }
+                let sizes = crate::animation::PackedDataSizes {
+                    fields: SECTION_NAMES
+                        .iter()
+                        .zip(member.data_sizes.iter())
+                        .map(|(n, v)| ((*n).to_owned(), *v as i64))
+                        .collect(),
+                };
+                let probe = crate::animation::AnimationGroup::for_blob(
+                    &blob, Some(sizes), member.frame_count, member.node_count, None,
+                );
+                out.push(probe.decode().ok());
+            }
+        }
+        out
+    }
+
+    fn kit_clips(tag: &TagFile) -> Vec<Option<crate::animation::AnimationClip>> {
+        let mut out = Vec::new();
+        let Some(groups) = tag.root().field_path("tag resource groups").and_then(|f| f.as_block())
+        else { return out };
+        for g in 0..groups.len() {
+            let Some(list) = groups
+                .element(g)
+                .and_then(|e| e.field("tag_resource"))
+                .and_then(|f| f.as_resource())
+                .and_then(|r| r.as_struct())
+                .and_then(|s| s.field("group_members").and_then(|f| f.as_block()))
+            else { continue };
+            for m in 0..list.len() {
+                let Some(member) = list.element(m) else { continue };
+                let Some(blob) = member.field("animation_data").and_then(|f| f.as_data()) else {
+                    out.push(None);
+                    continue;
+                };
+                let mut fields = Vec::new();
+                if let Some(sizes) = member.field_path("data sizes").and_then(|f| f.as_struct()) {
+                    for name in sizes.field_names() {
+                        let value = sizes.read_int_any(&name).unwrap_or(0) as i64;
+                        fields.push((name.to_string(), value));
+                    }
+                }
+                let probe = crate::animation::AnimationGroup::for_blob(
+                    blob,
+                    (!fields.is_empty()).then_some(crate::animation::PackedDataSizes { fields }),
+                    member.read_int_any("frame count").unwrap_or(1) as i16,
+                    member.read_int_any("node count").unwrap_or(0) as i8,
+                    None,
+                );
+                out.push(probe.decode().ok());
+            }
+        }
+        out
+    }
+
+    /// Mean distance between two clips' animated tracks. Compares whichever
+    /// nodes and frames both carry -- the two encodings can disagree about how
+    /// many keys they need, never about where the bones end up.
+    fn track_distance(
+        a: &crate::animation::AnimationClip,
+        b: &crate::animation::AnimationClip,
+    ) -> f32 {
+        let statics = std::env::var("JMAD_STATIC").is_ok();
+        let (at, bt) = if statics {
+            (&a.static_tracks, &b.static_tracks)
+        } else {
+            let (Some(at), Some(bt)) = (a.animated_tracks.as_ref(), b.animated_tracks.as_ref())
+            else { return 0.0 };
+            (at, bt)
+        };
+        let (mut total, mut count) = (0.0f32, 0usize);
+        for (an, bn) in at.rotations.iter().zip(&bt.rotations) {
+            for (af, bf) in an.iter().zip(bn) {
+                // A quaternion and its negation are the same rotation.
+                let dot = (af.i * bf.i + af.j * bf.j + af.k * bf.k + af.w * bf.w).abs();
+                total += (1.0 - dot.min(1.0)) * 2.0;
+                count += 1;
+            }
+        }
+        for (an, bn) in at.translations.iter().zip(&bt.translations) {
+            for (af, bf) in an.iter().zip(bn) {
+                let d = ((af.x - bf.x).powi(2) + (af.y - bf.y).powi(2) + (af.z - bf.z).powi(2)).sqrt();
+                total += d;
+                count += 1;
+            }
+        }
+        if count == 0 { 0.0 } else { total / count as f32 }
+    }
+
+    /// Are the values in a swapped animation plausible, and were they not before?
+    ///
+    /// Needs no second copy of the animation. A translation is a float in
+    /// metres, so read the wrong way round it comes out denormal or astronomical
+    /// almost every time; a quaternion is four quantized shorts, which say
+    /// nothing on their own but do once their squares have to sum to about one.
+    /// Measuring both readings of the same bytes is what makes this a test
+    /// rather than an observation: the wrong one should fail it loudly.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_animation_value_sanity() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let group = u32::from_be_bytes(*b"jmad");
+        let cap: usize = std::env::var("JMAD_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
+        let mut score = |clip: &crate::animation::AnimationClip, out: &mut (usize, usize, usize, usize)| {
+            for tracks in std::iter::once(&clip.static_tracks)
+                .chain(clip.animated_tracks.as_ref())
+            {
+                for node in &tracks.translations {
+                    for value in node {
+                        for component in [value.x, value.y, value.z] {
+                            out.1 += 1;
+                            // Metres. Halo levels are hundreds of units across
+                            // and a bone offset is a fraction of one.
+                            // Only the absurd counts against it: a bone offset
+                            // of a millionth of a metre is ordinary, a
+                            // denormal or an astronomical one is what a float
+                            // read back to front looks like.
+                            let plausible = component == 0.0
+                                || (component.is_finite()
+                                    && component.abs() > 1.0e-30
+                                    && component.abs() < 1.0e4);
+                            if plausible {
+                                out.0 += 1;
+                            }
+                        }
+                    }
+                }
+                for node in &tracks.rotations {
+                    for q in node {
+                        out.3 += 1;
+                        let length = (q.i * q.i + q.j * q.j + q.k * q.k + q.w * q.w).sqrt();
+                        if (length - 1.0).abs() < 1.0e-3 {
+                            out.2 += 1;
+                        }
+                    }
+                }
+            }
+        };
+        let mut swapped_score = (0usize, 0usize, 0usize, 0usize);
+        let mut raw_score = (0usize, 0usize, 0usize, 0usize);
+        for entry in cache.iter_tags().filter(|e| e.group_tag == group).step_by(11).take(cap) {
+            let Ok(tag) = cache.read_tag(entry) else { continue };
+            let Some(groups) = tag.root().field_path("tag resource groups").and_then(|f| f.as_block())
+            else { continue };
+            for g in 0..groups.len() {
+                let Some(resource) = groups
+                    .element(g)
+                    .and_then(|e| e.field("tag_resource"))
+                    .and_then(|f| f.as_resource())
+                else { continue };
+                let Some(state) = resource.xsync_state() else { continue };
+                let primary = resource.exploded_payload().unwrap_or(&[]);
+                let Some(members) = crate::animation::resource::read_members(&state, primary)
+                else { continue };
+                for member in members {
+                    let sizes = crate::animation::PackedDataSizes {
+                        fields: SECTION_NAMES
+                            .iter()
+                            .zip(member.data_sizes.iter())
+                            .map(|(n, v)| ((*n).to_owned(), *v as i64))
+                            .collect(),
+                    };
+                    // As the 360 wrote them, which is the wrong way round here.
+                    let raw = crate::animation::AnimationGroup::for_blob(
+                        &member.animation_data,
+                        Some(sizes.clone()),
+                        member.frame_count,
+                        member.node_count,
+                        None,
+                    );
+                    if let Ok(clip) = raw.decode() {
+                        score(&clip, &mut raw_score);
+                    }
+                    let mut blob = member.animation_data.clone();
+                    if crate::animation::byte_order::swap_animation_blob(
+                        &mut blob,
+                        &member.data_sizes,
+                        member.frame_count.max(1) as u16,
+                    )
+                    .is_err()
+                    {
+                        continue;
+                    }
+                    let turned = crate::animation::AnimationGroup::for_blob(
+                        &blob, Some(sizes), member.frame_count, member.node_count, None,
+                    );
+                    if let Ok(clip) = turned.decode() {
+                        score(&clip, &mut swapped_score);
+                    }
+                }
+            }
+        }
+        let percent = |a: usize, b: usize| if b == 0 { 0.0 } else { a as f64 * 100.0 / b as f64 };
+        eprintln!(
+            "as the 360 wrote them: {:.1}% of {} translation value(s) plausible, {:.1}% of {} rotation(s) unit",
+            percent(raw_score.0, raw_score.1), raw_score.1,
+            percent(raw_score.2, raw_score.3), raw_score.3,
+        );
+        eprintln!(
+            "turned round:          {:.1}% of {} translation value(s) plausible, {:.1}% of {} rotation(s) unit",
+            percent(swapped_score.0, swapped_score.1), swapped_score.1,
+            percent(swapped_score.2, swapped_score.3), swapped_score.3,
+        );
+    }
+
+    /// Convert an animation graph, write it, read it back, and compare its rest
+    /// poses against the kit's own copy of the same graph.
+    ///
+    /// End to end rather than on the blobs alone: it is the written tag that has
+    /// to hold the animations, so this goes through the file.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_jmad_round_trip() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let groups_index = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups_index);
+        let group = u32::from_be_bytes(*b"jmad");
+        let cutoff =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        let cap: usize = std::env::var("JMAD_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+        let shared: Vec<_> = cache
+            .iter_tags()
+            .filter(|e| e.group_tag == group)
+            .filter_map(|e| {
+                let path = reach.join(format!("{}.model_animation_graph", e.name.replace('\\', "/")));
+                std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map(|w| w < cutoff)
+                    .unwrap_or(false)
+                    .then_some((e, path))
+            })
+            .collect();
+        let step = (shared.len() / cap.max(1)).max(1);
+        let scratch = std::env::temp_dir().join("blam_jmad_round_trip");
+        let _ = std::fs::create_dir_all(&scratch);
+        let (mut tags, mut refused, mut animations, mut agreed, mut undecodable) =
+            (0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut notes: Vec<String> = Vec::new();
+        for (entry, path) in shared.iter().step_by(step).take(cap) {
+            let (Ok(source), Ok(kit)) = (cache.read_tag(entry), TagFile::read(path)) else {
+                continue;
+            };
+            let draft = match analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) {
+                Ok(draft) => draft,
+                Err(why) => {
+                    refused += 1;
+                    if notes.len() < 4 {
+                        notes.push(format!("  refused: {} -- {why}", entry.name));
+                    }
+                    continue;
+                }
+            };
+            let written = scratch.join("round_trip.model_animation_graph");
+            if draft.tag.write_atomic(&written).is_err() {
+                continue;
+            }
+            let Ok(reread) = TagFile::read(&written) else { continue };
+            tags += 1;
+            let ours = kit_clips(&reread);
+            let theirs = kit_clips(&kit);
+            if ours.len() != theirs.len() {
+                if notes.len() < 8 {
+                    notes.push(format!(
+                        "  {} animation(s) vs kit {}: {}", ours.len(), theirs.len(), entry.name
+                    ));
+                }
+                continue;
+            }
+            let mut tag_agreed = 0usize;
+            let mut tag_total = 0usize;
+            let mut misses: Vec<usize> = Vec::new();
+            for (index, (mine, kits)) in ours.iter().zip(&theirs).enumerate() {
+                animations += 1;
+                tag_total += 1;
+                let (Some(mine), Some(kits)) = (mine, kits) else {
+                    undecodable += 1;
+                    continue;
+                };
+                if track_distance(mine, kits) <= 0.05 {
+                    agreed += 1;
+                    tag_agreed += 1;
+                } else {
+                    misses.push(index);
+                }
+            }
+            if tag_agreed != tag_total && notes.len() < 10 {
+                notes.push(format!(
+                    "  {tag_agreed}/{tag_total} rest poses match: {}
+     indices {:?}",
+                    entry.name,
+                    &misses[..misses.len().min(40)],
+                ));
+            }
+        }
+        eprintln!(
+            "{tags} graph(s) converted and read back ({refused} refused): {animations} animation(s), \
+             {agreed} whose rest pose matches the kit, {undecodable} that would not decode"
+        );
+        for note in &notes {
+            eprintln!("{note}");
+        }
+    }
+
+    /// A work list for the ManagedBlam probe: a spread of every class, with
+    /// extra weight on the ones this round changed.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_probe_list() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let mut by_group: std::collections::BTreeMap<u32, Vec<String>> = Default::default();
+        for entry in cache.iter_tags() {
+            if entry.name.is_empty() {
+                continue;
+            }
+            by_group.entry(entry.group_tag).or_default().push(entry.name.clone());
+        }
+        let heavier = [*b"jmad", *b"sslt", *b"bitm", *b"sbsp", *b"mode"];
+        let mut lines = Vec::new();
+        for (group, names) in by_group.iter() {
+            let Some(extension) = groups.by_tag.get(group) else { continue };
+            let want = if heavier.contains(&group.to_be_bytes()) { 40 } else { 4 };
+            let step = (names.len() / want.max(1)).max(1);
+            for name in names.iter().step_by(step).take(want) {
+                // Sorted last on purpose: a template is picked from the
+                // kit by path order, and a folder of this converter's own
+                // output near the front of the alphabet becomes the template
+                // for the next run.
+                lines.push(format!("zz_baboon_probe\\{name}|{extension}"));
+            }
+        }
+        let out = std::env::var("PROBE_LIST_OUT").unwrap_or_default();
+        if out.is_empty() {
+            eprintln!("{} line(s); set PROBE_LIST_OUT to write them", lines.len());
+            return;
+        }
+        std::fs::write(&out, lines.join("\n")).unwrap();
+        eprintln!("wrote {} line(s) to {out}", lines.len());
+    }
+
+    /// Which fields a tag would lose, grouped by the field rather than the path.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_lost_fields() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let group_name = std::env::var("LOST_GROUP").unwrap_or_else(|_| "jmad".to_owned());
+        let want = std::env::var("LOST_NAME").unwrap_or_else(|_| "elite".to_owned());
+        let mut gb = [b' '; 4];
+        for (i, c) in group_name.bytes().take(4).enumerate() { gb[i] = c; }
+        let Some(entry) = cache
+            .iter_tags()
+            .filter(|e| e.group_tag == u32::from_be_bytes(gb))
+            .find(|e| e.name.ends_with(&want) || e.name.contains(&want))
+        else { eprintln!("no such tag"); return };
+        let Ok(source) = cache.read_tag(entry) else { return };
+        eprintln!("{}", entry.name);
+        let draft = match analyze_conversion_inner(
+            &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            LossPolicy::Accept,
+        ) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("refused even with Accept: {e}"); return }
+        };
+        let mut by_field: std::collections::BTreeMap<String, (usize, String)> = Default::default();
+        for issue in &draft.report.issues {
+            let mut key = String::new();
+            let mut skipping = false;
+            for ch in issue.path.chars() {
+                match ch {
+                    '[' => { skipping = true; key.push(ch); }
+                    ']' => { skipping = false; key.push(ch); }
+                    _ if skipping => {}
+                    _ => key.push(ch),
+                }
+            }
+            let slot = by_field
+                .entry(format!("{:?} {key}", issue.kind))
+                .or_insert((0, issue.message.clone()));
+            slot.0 += 1;
+        }
+        eprintln!("{} issue(s)", draft.report.issues.len());
+        for (key, (count, sample)) in by_field.iter().take(20) {
+            eprintln!("  x{count:<5} {key}\n         {}", sample.chars().take(150).collect::<String>());
+        }
+    }
+
+    /// Do the kit's own animation graphs agree about what an animation has?
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_jmad_template_layouts() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        let cutoff =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        let mut shapes: std::collections::BTreeMap<String, (usize, String)> = Default::default();
+        let mut seen = 0usize;
+        for path in walk_files(&reach) {
+            if path.extension().and_then(|e| e.to_str()) != Some("model_animation_graph") {
+                continue;
+            }
+            if std::fs::metadata(&path).and_then(|m| m.modified()).map(|w| w >= cutoff).unwrap_or(true) {
+                continue;
+            }
+            let Ok(tag) = TagFile::read(&path) else { continue };
+            let root = tag.root();
+            let Some(animations) = root
+                .field_path("definitions/animations")
+                .and_then(|f| f.as_block())
+            else { continue };
+            let names: Vec<String> = animations
+                .element(0)
+                .map(|e| e.field_names().map(str::to_owned).collect())
+                .unwrap_or_default();
+            let flags = animations
+                .element(0)
+                .and_then(|e| e.field("user flags"))
+                .and_then(|f| f.options())
+                .map(|o| match o {
+                    crate::api::TagOptions::Flags(bits) => {
+                        bits.iter().map(|b| b.name.to_owned()).collect::<Vec<_>>().join(",")
+                    }
+                    _ => String::new(),
+                })
+                .unwrap_or_default();
+            let key = format!(
+                "{} field(s), blend out {}, flags [{flags}]",
+                names.len(),
+                names.iter().any(|n| n.contains("override blend out")),
+            );
+            let slot = shapes.entry(key).or_insert((0, path.display().to_string()));
+            slot.0 += 1;
+            seen += 1;
+            if seen >= 400 { break }
+        }
+        eprintln!("{seen} untouched animation graph(s)");
+        for (shape, (count, sample)) in shapes.iter() {
+            eprintln!("  x{count:<4} {}\n         e.g. {sample}", shape.chars().take(200).collect::<String>());
+        }
+    }
+
+    /// Do the two builds agree about which animation is which?
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_jmad_checksums() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let want = std::env::var("JMAD_NAME").unwrap_or_else(|_| "characters".to_owned());
+        let Some(entry) = cache
+            .iter_tags()
+            .filter(|e| e.group_tag == u32::from_be_bytes(*b"jmad"))
+            .find(|e| e.name.contains(&want))
+        else { return };
+        let path = reach.join(format!("{}.model_animation_graph", entry.name.replace('\\', "/")));
+        let (Ok(source), Ok(kit)) = (cache.read_tag(entry), TagFile::read(&path)) else { return };
+        let ours: Vec<(i32, i16, i8)> = {
+            let mut out = Vec::new();
+            if let Some(groups) = source.root().field_path("tag resource groups").and_then(|f| f.as_block()) {
+                for g in 0..groups.len() {
+                    let Some(resource) = groups.element(g)
+                        .and_then(|e| e.field("tag_resource")).and_then(|f| f.as_resource())
+                    else { continue };
+                    let Some(state) = resource.xsync_state() else { continue };
+                    let primary = resource.exploded_payload().unwrap_or(&[]);
+                    if let Some(members) = crate::animation::resource::read_members(&state, primary) {
+                        for m in members {
+                            out.push((m.animation_checksum, m.frame_count, m.node_count));
+                        }
+                    }
+                }
+            }
+            out
+        };
+        let theirs: Vec<(i32, i16, i8)> = {
+            let mut out = Vec::new();
+            if let Some(groups) = kit.root().field_path("tag resource groups").and_then(|f| f.as_block()) {
+                for g in 0..groups.len() {
+                    let Some(list) = groups.element(g)
+                        .and_then(|e| e.field("tag_resource")).and_then(|f| f.as_resource())
+                        .and_then(|r| r.as_struct())
+                        .and_then(|s| s.field("group_members").and_then(|f| f.as_block()))
+                    else { continue };
+                    for m in 0..list.len() {
+                        let Some(member) = list.element(m) else { continue };
+                        out.push((
+                            member.read_int_any("animation_checksum").unwrap_or(0) as i32,
+                            member.read_int_any("frame count").unwrap_or(0) as i16,
+                            member.read_int_any("node count").unwrap_or(0) as i8,
+                        ));
+                    }
+                }
+            }
+            out
+        };
+        eprintln!("{}: {} member(s) vs kit {}", entry.name, ours.len(), theirs.len());
+        let mut same_checksum = 0usize;
+        let mut same_shape = 0usize;
+        let mut differing: Vec<usize> = Vec::new();
+        for (index, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+            if a.0 == b.0 { same_checksum += 1; }
+            if a.1 == b.1 && a.2 == b.2 { same_shape += 1; } else { differing.push(index); }
+        }
+        eprintln!(
+            "  same checksum: {same_checksum}; same frame and node count: {same_shape}"
+        );
+        eprintln!("  differing shape at {:?}", &differing[..differing.len().min(30)]);
+    }
+
+    /// Compare a converted BSP's raw indices and vertices against the kit's,
+    /// per mesh, with nothing truncating the comparison.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_bsp_index_compare() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let cutoff =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        let cap: usize = std::env::var("BSP_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        let shared: Vec<_> = cache
+            .iter_tags()
+            .filter(|e| e.group_tag == u32::from_be_bytes(*b"sbsp"))
+            .filter_map(|e| {
+                let path = reach.join(format!("{}.scenario_structure_bsp", e.name.replace('\\', "/")));
+                std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map(|w| w < cutoff)
+                    .unwrap_or(false)
+                    .then_some((e, path))
+            })
+            .collect();
+        let step = (shared.len() / cap.max(1)).max(1);
+        for (entry, path) in shared.iter().step_by(step).take(cap) {
+            let (Ok(source), Ok(kit)) = (cache.read_tag(entry), TagFile::read(path)) else {
+                continue;
+            };
+            let Ok(draft) = analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) else { continue };
+            let read = |tag: &TagFile| -> Vec<(usize, usize, Vec<u32>, Vec<[f32; 3]>)> {
+                let mut out = Vec::new();
+                let Some(pmt) = tag
+                    .root()
+                    .field_path("render geometry/per mesh temporary")
+                    .and_then(|f| f.as_block())
+                else { return out };
+                for i in 0..pmt.len() {
+                    let Some(elem) = pmt.element(i) else { continue };
+                    let mut indices = Vec::new();
+                    if let Some(block) = elem.field("raw indices").and_then(|f| f.as_block()) {
+                        for k in 0..block.len() {
+                            let Some(item) = block.element(k) else { continue };
+                            let value = item
+                                .field_names()
+                                .next()
+                                .and_then(|name| item.read_int_any(&name))
+                                .unwrap_or(-1);
+                            indices.push(value as u32);
+                        }
+                    }
+                    let mut vertices = Vec::new();
+                    if let Some(block) = elem.field("raw vertices").and_then(|f| f.as_block()) {
+                        for k in 0..block.len() {
+                            let Some(item) = block.element(k) else { continue };
+                            let p = if std::env::var("BSP_COLOR").is_ok() {
+                                item.read_point3d("vertex color")
+                            } else {
+                                item.read_point3d("position")
+                            };
+                            vertices.push([p.x, p.y, p.z]);
+                        }
+                    }
+                    out.push((indices.len(), vertices.len(), indices, vertices));
+                }
+                out
+            };
+            let boxes = |tag: &TagFile| -> Vec<[f32; 6]> {
+                let mut out = Vec::new();
+                let Some(block) = tag.root()
+                    .field_path("render geometry/compression info")
+                    .and_then(|f| f.as_block())
+                else { return out };
+                for i in 0..block.len() {
+                    let Some(e) = block.element(i) else { continue };
+                    let a = e.read_point3d("position bounds 0");
+                    let b = e.read_point3d("position bounds 1");
+                    out.push([a.x, a.y, a.z, b.x, b.y, b.z]);
+                }
+                out
+            };
+            let (ob, kb) = (boxes(&draft.tag), boxes(&kit));
+            let same_boxes = ob.iter().zip(&kb).filter(|(a, b)| a == b).count();
+            eprintln!(
+                "   compression info: {} vs kit {}, {same_boxes} identical",
+                ob.len(), kb.len()
+            );
+            for i in 0..ob.len().min(3) {
+                if ob.get(i) != kb.get(i) {
+                    eprintln!("     box {i} ours {:?}", ob.get(i));
+                    eprintln!("     box {i} kit  {:?}", kb.get(i));
+                }
+            }
+            let ours = read(&draft.tag);
+            let theirs = read(&kit);
+            eprintln!("{} : {} mesh(es) vs kit {}", entry.name, ours.len(), theirs.len());
+            let kinds: Vec<String> = draft.tag.root()
+                .field_path("render geometry/meshes")
+                .and_then(|f| f.as_block())
+                .map(|b| (0..b.len())
+                    .map(|i| b.element(i)
+                        .and_then(|m| m.read_enum_name("vertex type"))
+                        .unwrap_or_default())
+                    .collect())
+                .unwrap_or_default();
+            let mut worst_by_kind: std::collections::BTreeMap<String, (usize, usize, f32)> =
+                Default::default();
+            let (mut same_counts, mut same_indices, mut same_vertices, mut compared) =
+                (0usize, 0usize, 0usize, 0usize);
+            let mut examples: Vec<String> = Vec::new();
+            for (index, (mine, kits)) in ours.iter().zip(&theirs).enumerate() {
+                compared += 1;
+                if mine.0 == kits.0 && mine.1 == kits.1 {
+                    same_counts += 1;
+                } else if examples.len() < 4 {
+                    examples.push(format!(
+                        "   mesh {index}: {} indices/{} verts vs kit {}/{}",
+                        mine.0, mine.1, kits.0, kits.1
+                    ));
+                    continue;
+                }
+                if mine.2 == kits.2 { same_indices += 1 }
+                else if examples.len() < 8 {
+                    let first = mine.2.iter().zip(&kits.2).position(|(a, b)| a != b);
+                    examples.push(format!(
+                        "   mesh {index}: indices differ from {first:?} -- ours {:?} kit {:?}",
+                        &mine.2[first.unwrap_or(0)..(first.unwrap_or(0) + 6).min(mine.2.len())],
+                        &kits.2[first.unwrap_or(0)..(first.unwrap_or(0) + 6).min(kits.2.len())],
+                    ));
+                }
+                {
+                    let kind = kinds.get(index).cloned().unwrap_or_default();
+                    let slot = worst_by_kind.entry(kind).or_insert((0, 0, 0.0));
+                    slot.1 += 1;
+                    if mine.3 == kits.3 { slot.0 += 1 }
+                    for (a, b) in mine.3.iter().zip(&kits.3) {
+                        let d = ((a[0]-b[0]).powi(2) + (a[1]-b[1]).powi(2) + (a[2]-b[2]).powi(2)).sqrt();
+                        if d > slot.2 { slot.2 = d }
+                    }
+                }
+                if mine.3 == kits.3 { same_vertices += 1 }
+                else if examples.len() < 12 {
+                    let mut worst = 0.0f32;
+                    let mut total = 0.0f32;
+                    let mut first = None;
+                    for (k, (a, b)) in mine.3.iter().zip(&kits.3).enumerate() {
+                        let d = ((a[0]-b[0]).powi(2) + (a[1]-b[1]).powi(2) + (a[2]-b[2]).powi(2)).sqrt();
+                        if d > 1.0e-4 && first.is_none() { first = Some(k) }
+                        worst = worst.max(d);
+                        total += d;
+                    }
+                    let vt = kits.3.len().max(1);
+                    examples.push(format!(
+                        "   mesh {index}: {} vert(s), mean off {:.4}, worst {:.4}, first at {first:?}
+      ours {:?}
+      kit  {:?}",
+                        mine.3.len(), total / vt as f32, worst,
+                        &mine.3[first.unwrap_or(0)..(first.unwrap_or(0)+2).min(mine.3.len())],
+                        &kits.3[first.unwrap_or(0)..(first.unwrap_or(0)+2).min(kits.3.len())],
+                    ));
+                }
+            }
+            eprintln!(
+                "   {compared} mesh(es): {same_counts} same counts, {same_indices} same indices, {same_vertices} same vertices"
+            );
+            if std::env::var("BSP_COLOR").is_ok() {
+                let mut ours_seen: std::collections::BTreeMap<String, usize> = Default::default();
+                let mut kit_seen: std::collections::BTreeMap<String, usize> = Default::default();
+                for (mine, kits) in ours.iter().zip(&theirs) {
+                    for c in &mine.3 { *ours_seen.entry(format!("{:.2},{:.2},{:.2}", c[0], c[1], c[2])).or_default() += 1 }
+                    for c in &kits.3 { *kit_seen.entry(format!("{:.2},{:.2},{:.2}", c[0], c[1], c[2])).or_default() += 1 }
+                }
+                eprintln!("   ours colours: {:?}", ours_seen.iter().rev().take(4).collect::<Vec<_>>());
+                eprintln!("   kit  colours: {:?}", kit_seen.iter().rev().take(4).collect::<Vec<_>>());
+                // Is the kit white per mesh, and what marks those meshes?
+                let meshes = kit.root().field_path("render geometry/meshes").and_then(|f| f.as_block());
+                let mut tally: std::collections::BTreeMap<String, usize> = Default::default();
+                for (i, kits) in theirs.iter().enumerate() {
+                    if kits.3.is_empty() { continue }
+                    let white = kits.3.iter().filter(|c| c[0] > 0.5).count();
+                    let shade = if white == kits.3.len() { "all white" }
+                        else if white == 0 { "all black" } else { "mixed" };
+                    let mesh = meshes.as_ref().and_then(|b| b.element(i));
+                    let kind = mesh.as_ref().and_then(|m| m.read_enum_name("vertex type")).unwrap_or_default();
+                    let flags = mesh.as_ref()
+                        .and_then(|m| m.field("mesh flags"))
+                        .and_then(|f| f.value())
+                        .map(|v| format!("{v:?}"))
+                        .unwrap_or_default();
+                    let has_color = flags.contains("vertex color");
+                    *tally.entry(format!("{shade} | {kind} | mesh has vertex color={has_color}")).or_default() += 1;
+                }
+                for (k, n) in tally.iter() { eprintln!("     {n:>5}  {k}") }
+            }
+            for (kind, (same, total, worst)) in worst_by_kind.iter() {
+                eprintln!("   {kind:<20} {same}/{total} exact, worst vertex off by {worst:.4}");
+            }
+            for line in &examples.iter().take(2).collect::<Vec<_>>() { eprintln!("{line}") }
+        }
+    }
+
+    /// The tell-tale fields of a BSP already sitting in a kit.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_inspect_kit_bsp() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        for relative in std::env::var("INSPECT").unwrap_or_default().split(';') {
+            if relative.is_empty() { continue }
+            let path = reach.join(relative);
+            let Ok(tag) = TagFile::read(&path) else { eprintln!("{relative}: unreadable"); continue };
+            let root = tag.root();
+            let flags = root.field_path("render geometry/runtime flags").and_then(|f| f.value());
+            let meshes = root.field_path("render geometry/meshes").and_then(|f| f.as_block());
+            let count = meshes.as_ref().map(|b| b.len()).unwrap_or(0);
+            let mut types: std::collections::BTreeMap<String, usize> = Default::default();
+            let mut ibi: std::collections::BTreeMap<i128, usize> = Default::default();
+            let mut vbi: std::collections::BTreeMap<i128, usize> = Default::default();
+            if let Some(block) = meshes.as_ref() {
+                for i in 0..block.len() {
+                    let Some(m) = block.element(i) else { continue };
+                    *types.entry(m.read_enum_name("vertex type").unwrap_or_default()).or_default() += 1;
+                    if let Some(v) = m.read_int_any("index buffer index") { *ibi.entry(v).or_default() += 1 }
+                    if let Some(a) = m.field("vertex buffer indices").and_then(|f| f.as_array()) {
+                        for k in 0..a.len() {
+                            if let Some(v) = a.element(k).and_then(|e| e.read_int_any("vertex buffer index")) {
+                                *vbi.entry(v).or_default() += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            let defs = root
+                .field_path("resource interface/raw_resources[0]/raw_items/instanced geometries definitions")
+                .and_then(|f| f.as_block())
+                .map(|b| b.len())
+                .unwrap_or(0);
+            let use_items = root
+                .field_path("resource interface/use resource items")
+                .and_then(|f| f.value())
+                .map(|v| format!("{v:?}"))
+                .unwrap_or_default();
+            let mut flagged = 0usize;
+            let mut with_indices = 0usize;
+            if let Some(pmt) = root.field_path("render geometry/per mesh temporary").and_then(|f| f.as_block()) {
+                for i in 0..pmt.len() {
+                    let Some(e) = pmt.element(i) else { continue };
+                    let n = e.field("raw indices").and_then(|f| f.as_block()).map(|b| b.len()).unwrap_or(0);
+                    if n == 0 { continue }
+                    with_indices += 1;
+                    if e.field("flags").and_then(|f| f.value()).map(|v| format!("{v:?}").contains("indices are")).unwrap_or(false) {
+                        flagged += 1;
+                    }
+                }
+            }
+            eprintln!("{relative}");
+            eprintln!("   header version {} | {count} mesh(es)", tag.header.version);
+            eprintln!("   instanced geometry definitions: {defs}, use resource items {use_items}");
+            eprintln!("   {flagged}/{with_indices} mesh(es) say how their indices read");
+            eprintln!("   runtime flags {flags:?}");
+            eprintln!("   vertex types {types:?}");
+            eprintln!("   index buffer index {ibi:?}");
+            eprintln!("   vertex buffer index {vbi:?}");
+        }
+    }
+
+    /// What a BSP's resource interface holds, on each side.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_bsp_resource_interface() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let name = std::env::var("DIFF_NAME").unwrap_or_default();
+        let Some(entry) = cache
+            .iter_tags()
+            .find(|e| e.group_tag == u32::from_be_bytes(*b"sbsp") && e.name == name)
+        else { eprintln!("no such bsp"); return };
+        let Ok(source) = cache.read_tag(entry) else { return };
+        let kit_path = reach.join(format!("{}.scenario_structure_bsp", name.replace('\\', "/")));
+        let Ok(kit) = TagFile::read(&kit_path) else { eprintln!("no kit copy"); return };
+        let Ok(draft) = analyze_conversion_with_templates(
+            &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+        ) else { eprintln!("refused"); return };
+        if let Some(resource) = source.root()
+            .field_path("resource interface/tag_resources")
+            .and_then(|f| f.as_resource())
+            && let Some(state) = resource.xsync_state()
+        {
+            let control = state.apply_control_fixups();
+            let at = crate::monolithic::FixupAddress(state.header.root_address).offset() as usize;
+            eprintln!("control {} byte(s), root at {at}", control.len());
+            for k in 0..6 {
+                let o = at + k * 12;
+                if o + 12 <= control.len() {
+                    let raw = &control[o..o+12];
+                    let count = u32::from_be_bytes(raw[0..4].try_into().unwrap());
+                    let addr = u32::from_be_bytes(raw[4..8].try_into().unwrap());
+                    eprintln!(
+                        "   +{:>3}: count {count} addr {addr:#010x} tier {:?} off {} | {}",
+                        k * 12,
+                        crate::monolithic::FixupAddress(addr).tier(),
+                        crate::monolithic::FixupAddress(addr).offset(),
+                        raw.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "),
+                    );
+                }
+            }
+        }
+        for issue in &draft.report.issues {
+            if issue.path.contains("resource interface") || issue.message.contains("structure resource") {
+                eprintln!("ISSUE {:?} {} -- {}", issue.kind, issue.path, issue.message.chars().take(200).collect::<String>());
+            }
+        }
+        let scratch = std::env::temp_dir().join("blam_bsp_round_trip");
+        let _ = std::fs::create_dir_all(&scratch);
+        let written = scratch.join("round_trip.scenario_structure_bsp");
+        let reread = match draft.tag.write_atomic(&written) {
+            Ok(()) => match TagFile::read(&written) {
+                Ok(t) => {
+                    eprintln!(
+                        "ROUND TRIP: {} byte(s) on disk",
+                        std::fs::metadata(&written).map(|m| m.len()).unwrap_or(0)
+                    );
+                    Some(t)
+                }
+                Err(e) => { eprintln!("ROUND TRIP: re-read failed: {e}"); None }
+            },
+            Err(e) => { eprintln!("ROUND TRIP: write failed: {e}"); None }
+        };
+        for (label, tag) in [("SOURCE", &source), ("CONVERTED", &draft.tag), ("KIT", &kit)]
+            .into_iter()
+            .chain(reread.as_ref().map(|t| ("REREAD", t)))
+        {
+            let root = tag.root();
+            let interface = root.field_path("resource interface");
+            let raw = root
+                .field_path("resource interface/raw_resources")
+                .and_then(|f| f.as_block());
+            eprintln!(
+                "{label}: use resource items {:?}, raw_resources {:?}",
+                root.field_path("resource interface/use resource items").and_then(|f| f.value()),
+                raw.as_ref().map(|b| b.len()),
+            );
+            if let Some(field) = interface.as_ref().and_then(|f| f.as_struct()) {
+                for n in field.field_names() {
+                    let f = field.field(&n);
+                    let extra = f.as_ref().and_then(|f| f.as_block()).map(|b| b.len());
+                    let res = f.as_ref().and_then(|f| f.as_resource()).map(|r| {
+                        let state = r.xsync_state();
+                        format!(
+                            "kind={:?} control={} primary={} root={:?}",
+                            r.kind(),
+                            state.as_ref().map(|s| s.control_data.len()).unwrap_or(0),
+                            r.exploded_payload().map(<[u8]>::len).unwrap_or(0),
+                            state.as_ref().map(|s| (
+                                crate::monolithic::FixupAddress(s.header.root_address).tier(),
+                                crate::monolithic::FixupAddress(s.header.root_address).offset(),
+                            )),
+                        )
+                    });
+                    eprintln!("    {n}: block {extra:?} resource {res:?}");
+                }
+            }
+            if let Some(defs) = root
+                .field_path("resource interface/raw_resources[0]/raw_items/instanced geometries definitions")
+                .and_then(|f| f.as_block())
+            {
+                eprintln!("    instanced geometry definitions: {}", defs.len());
+            }
+            let instances = root
+                .field_path("instanced geometry instances")
+                .and_then(|f| f.as_block())
+                .map(|b| b.len());
+            eprintln!("    instanced geometry instances: {instances:?}");
+            for path in [
+                "render geometry/per_mesh_prt_data",
+                "render geometry/per mesh temporary",
+                "render geometry/water bounding box block",
+            ] {
+                eprintln!(
+                    "    {path}: {:?}",
+                    root.field_path(path).and_then(|f| f.as_block()).map(|b| b.len())
+                );
+            }
+        }
+    }
+
+    /// Convert every BSP under a folder and report what each one lands as.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_folder_bsps() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let prefix = std::env::var("FOLDER").unwrap_or_default();
+        for entry in cache
+            .iter_tags()
+            .filter(|e| e.group_tag == u32::from_be_bytes(*b"sbsp"))
+            .filter(|e| e.name.starts_with(&prefix))
+        {
+            let Ok(source) = cache.read_tag(entry) else {
+                eprintln!("{}: unreadable from the cache", entry.name);
+                continue;
+            };
+            match analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) {
+                Err(why) => {
+                    eprintln!("{}: REFUSED {}", entry.name, why.chars().take(140).collect::<String>());
+                    let root = source.root();
+                    let hydrated = crate::render_geometry::author_geometry_populated(&source);
+                    let resource = root
+                        .field_path("render geometry/api resource")
+                        .and_then(|f| f.as_resource());
+                    eprintln!(
+                        "      author geometry populated: {hydrated:?}; api resource {:?} xsync {:?} payload {}",
+                        resource.as_ref().map(|r| r.kind()),
+                        resource.as_ref().map(|r| r.xsync_state().is_some()),
+                        resource.as_ref().and_then(|r| r.exploded_payload()).map(<[u8]>::len).unwrap_or(0),
+                    );
+                    let meshes = root.field_path("render geometry/meshes").and_then(|f| f.as_block()).map(|b| b.len()).unwrap_or(0);
+                    let verts: usize = root
+                        .field_path("render geometry/per mesh temporary")
+                        .and_then(|f| f.as_block())
+                        .map(|b| (0..b.len()).filter_map(|i| b.element(i))
+                            .filter_map(|e| e.field("raw vertices").and_then(|f| f.as_block()))
+                            .map(|v| v.len()).sum())
+                        .unwrap_or(0);
+                    eprintln!("      {meshes} mesh(es), {verts} raw vertex(es) after hydration");
+                }
+                Ok(draft) => {
+                    let root = draft.tag.root();
+                    let defs = root
+                        .field_path("resource interface/raw_resources[0]/raw_items/instanced geometries definitions")
+                        .and_then(|f| f.as_block())
+                        .map(|b| b.len())
+                        .unwrap_or(0);
+                    let use_items = root
+                        .field_path("resource interface/use resource items")
+                        .and_then(|f| f.value()).and_then(|v| match v { TagFieldData::LongInteger(n) => Some(n as i64), _ => None })
+                        .unwrap_or(-1);
+                    let instances = root
+                        .field_path("instanced geometry instances")
+                        .and_then(|f| f.as_block())
+                        .map(|b| b.len())
+                        .unwrap_or(0);
+                    let meshes = root
+                        .field_path("render geometry/meshes")
+                        .and_then(|f| f.as_block())
+                        .map(|b| b.len())
+                        .unwrap_or(0);
+                    // Every mesh should say how its indices read.
+                    let mut unflagged = 0usize;
+                    if let Some(pmt) = root
+                        .field_path("render geometry/per mesh temporary")
+                        .and_then(|f| f.as_block())
+                    {
+                        for i in 0..pmt.len() {
+                            let flagged = pmt
+                                .element(i)
+                                .and_then(|e| e.field("flags"))
+                                .and_then(|f| f.value())
+                                .map(|v| format!("{v:?}").contains("indices are"))
+                                .unwrap_or(false);
+                            let empty = pmt
+                                .element(i)
+                                .and_then(|e| e.field("raw indices"))
+                                .and_then(|f| f.as_block())
+                                .map(|b| b.len() == 0)
+                                .unwrap_or(true);
+                            if !flagged && !empty {
+                                unflagged += 1;
+                            }
+                        }
+                    }
+                    let unsupported = draft
+                        .report
+                        .issues
+                        .iter()
+                        .filter(|i| matches!(i.kind, ConversionIssueKind::Unsupported))
+                        .count();
+                    eprintln!(
+                        "{}: ok -- {meshes} mesh(es), {defs} definition(s), {instances} instance(s), \
+                         use resource items {use_items}, {unflagged} mesh(es) with unflagged indices, \
+                         {unsupported} unsupported field(s)",
+                        entry.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// The fields the engine checks before it agrees a BSP is loadable.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_bsp_load_metadata() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let name = std::env::var("DIFF_NAME").unwrap_or_default();
+        let report = |label: &str, tag: &TagFile| {
+            let root = tag.root();
+            let mut manifest = Vec::new();
+            if let Some(block) = root.field_path("manifest build identifiers").and_then(|f| f.as_block()) {
+                for i in 0..block.len() {
+                    let Some(e) = block.element(i) else { continue };
+                    manifest.push(format!(
+                        "build {:?} importer {:?}",
+                        e.read_int_any("build_index"),
+                        e.read_int_any("structure importer version"),
+                    ));
+                }
+            }
+            let count = |path: &str| root.field_path(path).and_then(|f| f.as_block()).map(|b| b.len());
+            eprintln!(
+                "{label}: import info checksum {:?}, manifest {manifest:?}",
+                root.read_int_any("import info checksum"),
+            );
+            for path in [
+                "pathfinding data",
+                "collision materials",
+                "clusters",
+                "cluster portals",
+                "structure_physics/mopp code block",
+                "instanced geometry instances",
+                "leaves",
+                "world bounds x",
+            ] {
+                eprintln!("    {path}: {:?}", count(path));
+            }
+            if let Some(block) = root.field_path("render geometry/per_mesh_prt_data").and_then(|f| f.as_block()) {
+                let mut empty = 0usize;
+                let mut bytes = 0usize;
+                let mut instances = 0usize;
+                for i in 0..block.len() {
+                    let Some(e) = block.element(i) else { continue };
+                    let n = e.field("mesh pca data").and_then(|f| f.as_data()).map(<[u8]>::len).unwrap_or(0);
+                    if n == 0 { empty += 1 } else { bytes += n }
+                    instances += e.field("per instance prt data").and_then(|f| f.as_block()).map(|b| b.len()).unwrap_or(0);
+                }
+                eprintln!(
+                    "    per_mesh_prt_data: {} entry(s), {empty} with an empty pca blob, {bytes} byte(s) total, {instances} per-instance entry(s)",
+                    block.len()
+                );
+            }
+            for path in ["structure_physics/mopp code block", "structure_physics/breakable surfaces mopp code block"] {
+                if let Some(block) = root.field_path(path).and_then(|f| f.as_block())
+                    && let Some(e) = block.element(0)
+                {
+                    let data = e.field("mopp data").and_then(|f| f.as_data()).map(<[u8]>::len);
+                    eprintln!("    {path}[0] mopp data: {data:?} byte(s)");
+                }
+            }
+        };
+        let Some(entry) = cache
+            .iter_tags()
+            .find(|e| e.group_tag == u32::from_be_bytes(*b"sbsp") && e.name == name)
+        else { eprintln!("no such bsp"); return };
+        let Ok(source) = cache.read_tag(entry) else { return };
+        report("SOURCE", &source);
+        if let Ok(draft) = analyze_conversion_with_templates(
+            &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+        ) {
+            report("CONVERTED", &draft.tag);
+        }
+        let path = reach.join(format!("{}.scenario_structure_bsp", name.replace('\\', "/")));
+        if let Ok(kit) = TagFile::read(&path) {
+            report("KIT", &kit);
+        }
+    }
+
+    /// How many BSPs keep something in the cache-file resource we drop.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_bsp_cache_file_resources() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let (mut with_data, mut without, mut unreadable) = (0usize, 0usize, 0usize);
+        let mut examples: Vec<String> = Vec::new();
+        for entry in cache
+            .iter_tags()
+            .filter(|e| e.group_tag == u32::from_be_bytes(*b"sbsp"))
+            .step_by(7)
+            .take(120)
+        {
+            let Ok(tag) = cache.read_tag(entry) else { unreadable += 1; continue };
+            let root = tag.root();
+            let describe = |path: &str| -> Option<(usize, usize, u32)> {
+                let resource = root.field_path(path).and_then(|f| f.as_resource())?;
+                let state = resource.xsync_state()?;
+                Some((
+                    state.control_data.len(),
+                    resource.exploded_payload().map(<[u8]>::len).unwrap_or(0),
+                    state.header.root_address,
+                ))
+            };
+            match describe("resource interface/cache_file_resources") {
+                Some((control, primary, root_address)) if control > 0 || primary > 0 => {
+                    with_data += 1;
+                    if examples.len() < 6 {
+                        examples.push(format!(
+                            "   {}: control {control}, primary {primary}, root {root_address:#010x}",
+                            entry.name
+                        ));
+                    }
+                }
+                _ => without += 1,
+            }
+        }
+        eprintln!(
+            "cache_file_resources: {with_data} BSP(s) carry data, {without} do not, {unreadable} unreadable"
+        );
+        for line in &examples { eprintln!("{line}") }
+    }
+
+    /// Every tag reference in a kit tag, and whether the file is there.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_kit_references() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        for relative in std::env::var("INSPECT").unwrap_or_default().split(';') {
+            if relative.is_empty() { continue }
+            let path = reach.join(relative);
+            let Ok(tag) = TagFile::read(&path) else { eprintln!("{relative}: unreadable"); continue };
+            eprintln!("{relative}");
+            let mut missing = 0usize;
+            let mut present = 0usize;
+            let mut refs: Vec<(String, String, bool)> = Vec::new();
+            collect_refs(&tag.root(), "", &mut refs, &reach, 0);
+            for (path_in_tag, target, exists) in &refs {
+                if *exists { present += 1 } else {
+                    missing += 1;
+                    if missing <= 8 { eprintln!("   MISSING {target}   (from {path_in_tag})"); }
+                }
+            }
+            eprintln!("   {present} reference(s) resolve, {missing} do not");
+        }
+    }
+
+    fn collect_refs(
+        value: &TagStruct<'_>,
+        at: &str,
+        out: &mut Vec<(String, String, bool)>,
+        reach: &Path,
+        depth: usize,
+    ) {
+        if depth > 8 { return }
+        for name in value.field_names() {
+            let here = if at.is_empty() { name.to_string() } else { format!("{at}/{name}") };
+            let Some(field) = value.field(&name) else { continue };
+            if let Some((group, target)) = value.read_tag_ref_with_group(&name) {
+                if target.is_empty() { continue }
+                let extension = crate::paths::group_tag_to_extension(group).unwrap_or("");
+                let file = reach.join(format!("{}.{extension}", target.replace('\\', "/")));
+                out.push((here, format!("{target}.{extension}"), file.is_file()));
+                continue;
+            }
+            if let Some(block) = field.as_block() {
+                for i in 0..block.len() {
+                    if let Some(e) = block.element(i) {
+                        collect_refs(&e, &format!("{here}[{i}]"), out, reach, depth + 1);
+                    }
+                }
+                continue;
+            }
+            if let Some(nested) = field.as_struct() {
+                collect_refs(&nested, &here, out, reach, depth + 1);
+            }
+        }
+    }
+
+    /// Which levels the build kept lightmap data for.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_levels_with_lightmaps() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let group = u32::from_be_bytes(*b"Lbsp");
+        let mut ready: Vec<String> = Vec::new();
+        for entry in cache.iter_tags().filter(|e| e.group_tag == group) {
+            if cache.resolve_tag_block(entry).is_some() {
+                ready.push(entry.name.clone());
+            }
+        }
+        ready.sort();
+        eprintln!("{} lightmap BSP data tag(s) the build actually holds", ready.len());
+        // Group by level folder.
+        let mut folders: std::collections::BTreeMap<String, usize> = Default::default();
+        for name in &ready {
+            let folder = name.rsplit_once('\\').map(|(f, _)| f.to_owned()).unwrap_or_default();
+            *folders.entry(folder).or_default() += 1;
+        }
+        for (folder, count) in folders.iter() {
+            eprintln!("  {count:>3}  {folder}");
+        }
+    }
+
+    /// Every geometry struct in a kit tag: its meshes' buffer indices, and how
+    /// many buffers there are to index.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_vertex_buffer_indices() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        for relative in std::env::var("INSPECT").unwrap_or_default().split(';') {
+            if relative.is_empty() { continue }
+            let path = reach.join(relative);
+            let Ok(tag) = TagFile::read(&path) else { eprintln!("{relative}: unreadable"); continue };
+            eprintln!("{relative}");
+            let mut found = 0usize;
+            walk_geometry(&tag.root(), "", &mut found, 0);
+        }
+    }
+
+    /// Every tag already sitting in a kit that still names a compiled buffer.
+    ///
+    /// The converter is fixed, but tags imported before the fix are still on
+    /// disk and will still assert. This reads them where they lie -- no
+    /// conversion, so it is quick -- and says which ones need importing again.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_sweep_for_dangling_buffers() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        let root = std::env::var("SWEEP_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| reach.clone());
+        let newer_than = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(
+                std::env::var("SWEEP_SINCE_EPOCH")
+                    .ok()
+                    .and_then(|raw| raw.parse().ok())
+                    .unwrap_or(0),
+            );
+        let mut files = Vec::new();
+        collect_files(&root, &mut files);
+        let mut looked = 0usize;
+        let mut unreadable = 0usize;
+        let mut bad: Vec<(String, usize, i128)> = Vec::new();
+        for path in &files {
+            let Ok(meta) = std::fs::metadata(path) else { continue };
+            match meta.modified() {
+                Ok(when) if when >= newer_than => {}
+                _ => continue,
+            }
+            let Ok(tag) = TagFile::read(path) else {
+                unreadable += 1;
+                continue;
+            };
+            looked += 1;
+            let (found, high) = dangling_buffer_references(&tag);
+            if found > 0 {
+                let shown = path
+                    .strip_prefix(&root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .into_owned();
+                bad.push((shown, found, high));
+            }
+        }
+        bad.sort_by(|a, b| b.1.cmp(&a.1));
+        eprintln!("looked at {looked} tag(s), {unreadable} unreadable, {} still dangling", bad.len());
+        for (path, found, high) in bad.iter().take(60) {
+            eprintln!("   {found:>7} ref(s) high #{high}  {path}");
+        }
+        if bad.len() > 60 {
+            eprintln!("   ... and {} more not listed", bad.len() - 60);
+        }
+    }
+
+    /// Every file under a folder, depth first.
+    fn collect_files(at: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(at) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_files(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Every integer in a tag whose name mentions a buffer, however deep.
+    ///
+    /// The targeted harness above asks about the two fields that were known to
+    /// hold buffer indices. This one assumes nothing: it walks the whole tag and
+    /// reports each distinct field name, how many of them there are, and the
+    /// largest value any of them holds. When the engine asserts on an index and
+    /// names no tag, this is what says which field it came out of.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_every_buffer_index() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        let needle: i128 = std::env::var("NEEDLE")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(-1);
+        for relative in std::env::var("INSPECT").unwrap_or_default().split(';') {
+            if relative.is_empty() { continue }
+            let path = reach.join(relative);
+            let Ok(tag) = TagFile::read(&path) else {
+                eprintln!("{relative}: unreadable");
+                continue;
+            };
+            let mut tally: std::collections::BTreeMap<String, (usize, i128)> = std::collections::BTreeMap::new();
+            let mut blocks: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+            gather_buffer_indices(&tag.root(), &mut tally, &mut blocks, 0);
+            eprintln!("{relative}");
+            for (name, (count, high)) in &tally {
+                let flag = if needle >= 0 && *high >= needle { "  <== reaches the needle" } else { "" };
+                eprintln!("   {count:>7} x {name}  high {high}{flag}");
+            }
+            for (name, count) in &blocks {
+                if *count > 0 {
+                    eprintln!("   block {name}: {count}");
+                }
+            }
+        }
+    }
+
+    /// Collect every integer field whose name mentions a buffer, and the size of
+    /// every block whose name does, so an index and the thing it indexes can be
+    /// compared.
+    fn gather_buffer_indices(
+        value: &TagStruct<'_>,
+        tally: &mut std::collections::BTreeMap<String, (usize, i128)>,
+        blocks: &mut std::collections::BTreeMap<String, usize>,
+        depth: usize,
+    ) {
+        if depth > 24 { return }
+        for name in value.field_names() {
+            let Some(field) = value.field(&name) else { continue };
+            let lower = name.to_ascii_lowercase();
+            if lower.contains("buffer") {
+                if let Some(found) = value.read_int_any(&name) {
+                    let slot = tally.entry(name.to_string()).or_insert((0, i128::MIN));
+                    slot.0 += 1;
+                    slot.1 = slot.1.max(found);
+                }
+            }
+            if let Some(block) = field.as_block() {
+                if lower.contains("buffer") {
+                    *blocks.entry(name.to_string()).or_insert(0) += block.len();
+                }
+                for index in 0..block.len() {
+                    if let Some(element) = block.element(index) {
+                        gather_buffer_indices(&element, tally, blocks, depth + 1);
+                    }
+                }
+            } else if let Some(array) = field.as_array() {
+                for index in 0..array.len() {
+                    if let Some(element) = array.element(index) {
+                        gather_buffer_indices(&element, tally, blocks, depth + 1);
+                    }
+                }
+            } else if let Some(nested) = field.as_struct() {
+                gather_buffer_indices(&nested, tally, blocks, depth + 1);
+            } else if let Some(resource) = field.as_resource() {
+                if let Some(nested) = resource.as_struct() {
+                    gather_buffer_indices(&nested, tally, blocks, depth + 1);
+                }
+            }
+        }
+    }
+
+    fn walk_geometry(value: &TagStruct<'_>, at: &str, found: &mut usize, depth: usize) {
+        if depth > 6 { return }
+        let is_geometry = value.field("meshes").and_then(|f| f.as_block()).is_some()
+            && value.field("runtime flags").is_some();
+        if is_geometry {
+            *found += 1;
+            let meshes = value.field("meshes").and_then(|f| f.as_block());
+            let count = meshes.as_ref().map(|b| b.len()).unwrap_or(0);
+            let buffers = value
+                .field_path("api resource")
+                .and_then(|f| f.as_resource())
+                .and_then(|r| r.as_struct())
+                .and_then(|s| s.field("pc vertex buffers").and_then(|f| f.as_block()))
+                .map(|b| b.len());
+            let xenon = value
+                .field_path("api resource")
+                .and_then(|f| f.as_resource())
+                .and_then(|r| r.as_struct())
+                .and_then(|s| s.field("xenon vertex buffers").and_then(|f| f.as_block()))
+                .map(|b| b.len());
+            let mut worst: i128 = -1;
+            let mut nonzero = 0usize;
+            if let Some(block) = meshes.as_ref() {
+                for i in 0..block.len() {
+                    let Some(mesh) = block.element(i) else { continue };
+                    if let Some(array) = mesh.field("vertex buffer indices").and_then(|f| f.as_array()) {
+                        for k in 0..array.len() {
+                            if let Some(v) = array.element(k).and_then(|e| e.read_int_any("vertex buffer index")) {
+                                if v != 0 { nonzero += 1 }
+                                worst = worst.max(v);
+                            }
+                        }
+                    }
+                }
+            }
+            let per_instance = value
+                .field("per_instance_lightmap_texcoords_vertex_buffer")
+                .and_then(|f| f.as_block());
+            let mut per_worst: i128 = -1;
+            let mut per_count = 0usize;
+            if let Some(block) = per_instance.as_ref() {
+                per_count = block.len();
+                for i in 0..block.len() {
+                    if let Some(v) =
+                        block.element(i).and_then(|e| e.read_int_any("vertex buffer index"))
+                    {
+                        per_worst = per_worst.max(v);
+                    }
+                }
+            }
+            eprintln!(
+                "   [{at}] {count} mesh(es); buffers pc {buffers:?} xenon {xenon:?}; mesh index high {worst} ({nonzero} non-zero); per-instance lightmap buffers {per_count} high {per_worst}"
+            );
+        }
+        for name in value.field_names() {
+            let here = if at.is_empty() { name.to_string() } else { format!("{at}/{name}") };
+            let Some(field) = value.field(&name) else { continue };
+            if let Some(nested) = field.as_struct() {
+                walk_geometry(&nested, &here, found, depth + 1);
+            } else if let Some(block) = field.as_block() {
+                for i in 0..block.len().min(4) {
+                    if let Some(e) = block.element(i) {
+                        walk_geometry(&e, &format!("{here}[{i}]"), found, depth + 1);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Kit tags whose meshes name a vertex buffer that is not there.
+    ///
+    /// The engine asserts on this by index and does not say which tag, so the
+    /// only way to find it is to ask every tag the same question.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_scan_vertex_buffer_indices() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        let after = std::env::var("SCAN_AFTER")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1_577_836_800);
+        let cutoff = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(after);
+        let wanted: Vec<String> = std::env::var("SCAN_EXT")
+            .unwrap_or_else(|_| "scenario_structure_bsp,scenario_lightmap_bsp_data,render_model".to_owned())
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        let (mut checked, mut flagged) = (0usize, 0usize);
+        for path in walk_files(&reach) {
+            let Some(extension) = path.extension().and_then(|e| e.to_str()) else { continue };
+            if !wanted.iter().any(|w| w == extension) { continue }
+            if std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .map(|when| when < cutoff)
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            let Ok(tag) = TagFile::read(&path) else { continue };
+            checked += 1;
+            let mut worst: i128 = 0;
+            let mut buffers = 0usize;
+            scan_geometry(&tag.root(), &mut worst, &mut buffers, 0);
+            if worst as usize >= buffers.max(1) && worst > 0 {
+                flagged += 1;
+                if flagged <= 12 {
+                    eprintln!(
+                        "  index {worst} but {buffers} buffer(s): {}",
+                        path.strip_prefix(&reach).unwrap_or(&path).display()
+                    );
+                }
+            }
+        }
+        eprintln!("{checked} imported tag(s) checked, {flagged} name a buffer that is not there");
+    }
+
+    fn scan_geometry(value: &TagStruct<'_>, worst: &mut i128, buffers: &mut usize, depth: usize) {
+        if depth > 6 { return }
+        if let Some(meshes) = value.field("meshes").and_then(|f| f.as_block())
+            && value.field("runtime flags").is_some()
+        {
+            if let Some(resource) = value
+                .field_path("api resource")
+                .and_then(|f| f.as_resource())
+                .and_then(|r| r.as_struct())
+            {
+                for name in ["pc vertex buffers", "xenon vertex buffers"] {
+                    if let Some(block) = resource.field(name).and_then(|f| f.as_block()) {
+                        *buffers = (*buffers).max(block.len());
+                    }
+                }
+            }
+            for i in 0..meshes.len() {
+                let Some(mesh) = meshes.element(i) else { continue };
+                if let Some(array) = mesh.field("vertex buffer indices").and_then(|f| f.as_array()) {
+                    for k in 0..array.len() {
+                        if let Some(v) = array.element(k).and_then(|e| e.read_int_any("vertex buffer index")) {
+                            *worst = (*worst).max(v);
+                        }
+                    }
+                }
+            }
+        }
+        for name in value.field_names() {
+            let Some(field) = value.field(&name) else { continue };
+            if let Some(nested) = field.as_struct() {
+                scan_geometry(&nested, worst, buffers, depth + 1);
+            } else if let Some(block) = field.as_block() {
+                for i in 0..block.len().min(8) {
+                    if let Some(e) = block.element(i) {
+                        scan_geometry(&e, worst, buffers, depth + 1);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every field that names a compiled buffer, ours beside the kit's.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_compiled_buffer_fields() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        for relative in std::env::var("INSPECT").unwrap_or_default().split(';') {
+            if relative.is_empty() { continue }
+            let Ok(tag) = TagFile::read(&reach.join(relative)) else {
+                eprintln!("{relative}: unreadable");
+                continue;
+            };
+            let root = tag.root();
+            let block_len = |path: &str| {
+                root.field_path(path).and_then(|f| f.as_block()).map(|b| b.len())
+            };
+            // Decorator clusters, which name a compiled instance buffer.
+            let mut decorator_high: i128 = -1;
+            let mut decorator_count = 0usize;
+            if let Some(block) = root.field_path("clusters").and_then(|f| f.as_block()) {
+                for i in 0..block.len() {
+                    let Some(cluster) = block.element(i) else { continue };
+                    if let Some(v) = cluster.read_int_any("decorator instance buffer index") {
+                        decorator_count += 1;
+                        decorator_high = decorator_high.max(v);
+                    }
+                }
+            }
+            // The lightmap's per-vertex runtime buffer index.
+            let mut pervertex_high: i128 = -1;
+            let mut pervertex_count = 0usize;
+            for path in ["lightmap per vertex data", "per vertex lighting data"] {
+                if let Some(block) = root.field_path(path).and_then(|f| f.as_block()) {
+                    for i in 0..block.len() {
+                        let Some(e) = block.element(i) else { continue };
+                        if let Some(v) = e.read_int_any("vertex buffer index") {
+                            pervertex_count += 1;
+                            pervertex_high = pervertex_high.max(v);
+                        }
+                    }
+                }
+            }
+            eprintln!(
+                "{relative}\n   clusters {:?}; decorator instance buffer index: {decorator_count} field(s), high {decorator_high}; per-vertex buffer index: {pervertex_count} field(s), high {pervertex_high}",
+                block_len("clusters"),
+            );
+        }
+    }
+
+    /// A converted lightmap must not name compiled buffers it does not carry.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_lbsp_settled() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let want = std::env::var("LBSP_NAME").unwrap_or_default();
+        for group_name in ["Lbsp", "sbsp"] {
+            let mut gb = [b' '; 4];
+            for (i, c) in group_name.bytes().take(4).enumerate() { gb[i] = c; }
+            let group = u32::from_be_bytes(gb);
+            let Some(entry) = cache
+                .iter_tags()
+                .filter(|e| e.group_tag == group)
+                .find(|e| e.name == want)
+            else { eprintln!("{group_name}: no {want}"); continue };
+            let Ok(source) = cache.read_tag(entry) else {
+                eprintln!("{group_name}: unreadable");
+                continue;
+            };
+            let count = |tag: &TagFile| -> Vec<(String, usize, i128)> {
+                let mut out = Vec::new();
+                let mut pending = vec![(String::new(), tag.root())];
+                while let Some((at, value)) = pending.pop() {
+                    if let Some(block) = value
+                        .field("per_instance_lightmap_texcoords_vertex_buffer")
+                        .and_then(|f| f.as_block())
+                    {
+                        let mut high: i128 = -1;
+                        for i in 0..block.len() {
+                            if let Some(v) =
+                                block.element(i).and_then(|e| e.read_int_any("vertex buffer index"))
+                            {
+                                high = high.max(v);
+                            }
+                        }
+                        out.push((at.clone(), block.len(), high));
+                    }
+                    for name in value.field_names() {
+                        let Some(field) = value.field(&name) else { continue };
+                        if let Some(nested) = field.as_struct() {
+                            pending.push((format!("{at}/{name}"), nested));
+                        }
+                    }
+                }
+                out
+            };
+            eprintln!("{group_name} {want}");
+            eprintln!("   source:    {:?} dangling {:?}", count(&source), dangling_buffer_references(&source));
+            match analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) {
+                Ok(draft) => eprintln!("   converted: {:?} dangling {:?}", count(&draft.tag), dangling_buffer_references(&draft.tag)),
+                Err(why) => eprintln!("   refused: {}", why.chars().take(120).collect::<String>()),
+            }
+        }
+    }
+
+    /// How many of a kit's own animation graphs carry a resource group block,
+    /// and how many groups they carry.
+    ///
+    /// The carry pass writes into the target's `tag resource groups`, and gives
+    /// up without a word when that block is not there. If some of a kit's graphs
+    /// have it and some do not, then which template got picked decides whether a
+    /// build's graph converts, and the template is picked on struct sizes that
+    /// know nothing about this.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_kit_jmad_resource_blocks() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        let mut with = 0usize;
+        let mut without = 0usize;
+        let mut counts: std::collections::BTreeMap<usize, usize> = Default::default();
+        let mut examples: Vec<String> = Vec::new();
+        let mut files = Vec::new();
+        collect_files(&reach, &mut files);
+        for path in &files {
+            if path.extension().and_then(|e| e.to_str()) != Some("model_animation_graph") {
+                continue;
+            }
+            let Ok(tag) = TagFile::read(path) else { continue };
+            match tag.root().field_path("tag resource groups").and_then(|f| f.as_block()) {
+                Some(block) => {
+                    with += 1;
+                    *counts.entry(block.len()).or_default() += 1;
+                }
+                None => {
+                    without += 1;
+                    if examples.len() < 5 {
+                        examples.push(path.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+        eprintln!("kit graphs with the block: {with}, without: {without}");
+        eprintln!("group counts seen: {counts:?}");
+        for example in &examples {
+            eprintln!("   without: {example}");
+        }
+    }
+
+    /// Does a kit's own animation graph ever carry a member with no data?
+    ///
+    /// The question decides what to do about an animation the build described
+    /// and did not keep the bytes for. If a shipped graph never holds an empty
+    /// member, writing one is inventing a shape the engine has never been given;
+    /// if it does, then an animation with nothing to play is a thing the format
+    /// already allows and the rest of the graph need not be thrown away with it.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_kit_jmad_empty_members() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        let limit: usize = std::env::var("LIMIT")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(400);
+        let mut files = Vec::new();
+        collect_files(&reach, &mut files);
+        files.sort();
+        let (mut looked, mut members, mut empty, mut zero_sizes) = (0usize, 0usize, 0usize, 0usize);
+        let mut examples: Vec<String> = Vec::new();
+        for path in &files {
+            if looked >= limit { break }
+            if path.extension().and_then(|e| e.to_str()) != Some("model_animation_graph") {
+                continue;
+            }
+            // The big graphs are minutes each and answer the same question.
+            if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > 8_000_000 {
+                continue;
+            }
+            let Ok(tag) = TagFile::read(path) else { continue };
+            looked += 1;
+            let Some(groups) = tag.root().field_path("tag resource groups").and_then(|f| f.as_block())
+            else { continue };
+            for g in 0..groups.len() {
+                let Some(list) = groups
+                    .element(g)
+                    .and_then(|group| group.field("tag_resource"))
+                    .and_then(|f| f.as_resource())
+                    .and_then(|r| r.as_struct())
+                    .and_then(|s| s.field("group_members").and_then(|f| f.as_block()))
+                else { continue };
+                for m in 0..list.len() {
+                    let Some(member) = list.element(m) else { continue };
+                    members += 1;
+                    let blob = member
+                        .field("animation_data")
+                        .and_then(|f| f.as_data())
+                        .map(|d| d.len())
+                        .unwrap_or(0);
+                    let declared: i64 = member
+                        .field("data sizes")
+                        .and_then(|f| f.as_struct())
+                        .map(|sizes| {
+                            sizes
+                                .field_names()
+                                .filter_map(|name| sizes.read_int_any(&name))
+                                .map(|v| v as i64)
+                                .sum()
+                        })
+                        .unwrap_or(0);
+                    if blob == 0 {
+                        empty += 1;
+                        if declared == 0 { zero_sizes += 1 }
+                        if examples.len() < 6 {
+                            examples.push(format!(
+                                "{} group {g} member {m}: blob 0, declared {declared}",
+                                path.file_name().unwrap_or_default().to_string_lossy(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "{looked} kit graph(s), {members} member(s): {empty} with no blob, \
+             {zero_sizes} of those declaring nothing either"
+        );
+        for example in &examples {
+            eprintln!("   {example}");
+        }
+    }
+
+    /// Convert one named tag of one group and say exactly what happened.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_convert_one() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let index = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &index);
+        let want = std::env::var("WHY_NAME").unwrap_or_default();
+        let group_name = std::env::var("WHY_GROUP").unwrap_or_else(|_| "mode".to_owned());
+        let mut gb = [b' '; 4];
+        for (i, c) in group_name.bytes().take(4).enumerate() { gb[i] = c; }
+        let group = u32::from_be_bytes(gb);
+        for entry in cache.iter_tags().filter(|e| e.group_tag == group) {
+            if !entry.name.contains(&want) { continue }
+            let Ok(source) = cache.read_tag(entry) else {
+                eprintln!("{}: unreadable", entry.name);
+                continue;
+            };
+            eprintln!("{} [{group_name}]", entry.name);
+            match analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) {
+                Ok(draft) => {
+                    eprintln!(
+                        "   converted; template {:?}",
+                        draft.native_layout_template.as_ref().map(|p| p.display().to_string()),
+                    );
+                    for issue in &draft.report.issues {
+                        eprintln!("   issue: {} -- {}", issue.path, issue.message);
+                    }
+                }
+                Err(why) => eprintln!("   refused: {why}"),
+            }
+        }
+    }
+
+    /// Why one tag's geometry did not hydrate.
+    ///
+    /// `MonolithicCache::hydrate_resources` throws the error away -- deliberately,
+    /// because a tag with no geometry is not a failure -- so a mesh naming a
+    /// vertex format nobody has decoded looks exactly like a tag with no meshes.
+    /// This runs the same call and prints what it said.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_why_no_geometry() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let want = std::env::var("WHY_NAME").unwrap_or_default();
+        let group_name = std::env::var("WHY_GROUP").unwrap_or_else(|_| "mode".to_owned());
+        let mut gb = [b' '; 4];
+        for (i, c) in group_name.bytes().take(4).enumerate() { gb[i] = c; }
+        let group = u32::from_be_bytes(gb);
+        for entry in cache.iter_tags().filter(|e| e.group_tag == group) {
+            if !entry.name.contains(&want) { continue }
+            let Ok(mut tag) = cache.read_tag(entry) else { continue };
+            eprintln!("{}", entry.name);
+            eprintln!(
+                "   author geometry populated: {:?}",
+                crate::render_geometry::author_geometry_populated(&tag),
+            );
+            let Some(block) = cache.resolve_cache_block(entry) else {
+                eprintln!("   no cache block");
+                continue;
+            };
+            let Ok(bytes) = cache.read_cache_bytes(block) else {
+                eprintln!("   cache bytes would not read");
+                continue;
+            };
+            match crate::render_geometry::hydrate(&mut tag, &bytes) {
+                Ok(count) => eprintln!("   hydrate: {count} mesh(es)"),
+                Err(why) => eprintln!("   hydrate failed: {why}"),
+            }
+        }
+    }
+
+    /// What stride each vertex declaration actually uses in the build.
+    ///
+    /// The decoders assert a stride per format, and a format nobody has decoded
+    /// has to have its layout worked out from somewhere. The build says: every
+    /// buffer carries its own declaration and its own stride, so the pair can be
+    /// counted rather than guessed at, and a derivation that disagrees with the
+    /// count is wrong however plausible it reads.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_vertex_strides() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let limit: usize = std::env::var("LIMIT")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(300);
+        let mut seen: std::collections::BTreeMap<(i128, i128), usize> = Default::default();
+        let mut looked = 0usize;
+        for group_name in ["mode", "sbsp"] {
+            let mut gb = [b' '; 4];
+            for (i, c) in group_name.bytes().take(4).enumerate() { gb[i] = c; }
+            let group = u32::from_be_bytes(gb);
+            for entry in cache.iter_tags().filter(|e| e.group_tag == group) {
+                if looked >= limit { break }
+                if cache.resolve_cache_block(entry).is_none() { continue }
+                let Ok(tag) = cache.read_tag(entry) else { continue };
+                looked += 1;
+                let mut pending = vec![tag.root()];
+                while let Some(value) = pending.pop() {
+                    for which in ["xenon vertex buffers", "pc vertex buffers"] {
+                        let Some(block) = value
+                            .field_path("api resource")
+                            .and_then(|f| f.as_resource())
+                            .and_then(|r| r.as_struct())
+                            .and_then(|s| s.field(which).and_then(|f| f.as_block()))
+                        else { continue };
+                        for i in 0..block.len() {
+                            let Some(buffer) = block.element(i) else { continue };
+                            let declaration = buffer.read_int_any("declaration type");
+                            let stride = buffer.read_int_any("stride");
+                            if let (Some(d), Some(s)) = (declaration, stride) {
+                                *seen.entry((d, s)).or_default() += 1;
+                            }
+                        }
+                    }
+                    for name in value.field_names() {
+                        if let Some(nested) = value.field(&name).and_then(|f| f.as_struct()) {
+                            pending.push(nested);
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("{looked} tag(s)");
+        for ((declaration, stride), count) in &seen {
+            eprintln!("   declaration {declaration:>3}: stride {stride:>3}  x{count}");
+        }
+    }
+
+    /// How many of the build's models use `skinned compressed`, and does the
+    /// decode of one hold up against the kit's own copy of the same model?
+    ///
+    /// Two questions in one walk because they share the expensive part. The
+    /// first says how much the format was costing; the second is the only real
+    /// check on the layout, since a wrong stride decodes into plausible-looking
+    /// rubbish rather than failing.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_skinned_compressed_sweep() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let limit: usize = std::env::var("LIMIT")
+            .ok().and_then(|raw| raw.parse().ok()).unwrap_or(400);
+        let group = u32::from_be_bytes(*b"mode");
+        let (mut looked, mut skinned_compressed, mut populated, mut twins) = (0, 0, 0, 0);
+        let mut checked = 0usize;
+        let mut worst_weight: f32 = 0.0;
+        let mut worst_normal: f32 = 0.0;
+        for entry in cache.iter_tags().filter(|e| e.group_tag == group) {
+            if looked >= limit { break }
+            if cache.resolve_cache_block(entry).is_none() { continue }
+            let Ok(tag) = cache.read_tag(entry) else { continue };
+            looked += 1;
+            let mut uses = false;
+            let mut pending = vec![tag.root()];
+            while let Some(value) = pending.pop() {
+                if let Some(meshes) = value.field("meshes").and_then(|f| f.as_block()) {
+                    for m in 0..meshes.len() {
+                        if meshes.element(m)
+                            .and_then(|mesh| mesh.read_enum_name("vertex type"))
+                            .as_deref() == Some("skinned compressed")
+                        {
+                            uses = true;
+                        }
+                    }
+                }
+                for name in value.field_names() {
+                    if let Some(nested) = value.field(&name).and_then(|f| f.as_struct()) {
+                        pending.push(nested);
+                    }
+                }
+            }
+            if !uses { continue }
+            skinned_compressed += 1;
+            if crate::render_geometry::author_geometry_populated(&tag) == Some(true) {
+                populated += 1;
+            }
+            // Weights have to add to one and normals have to be unit length.
+            // Both fall apart immediately if the fields are read at the wrong
+            // offsets, which is what a guessed stride gets wrong.
+            let mut pending = vec![tag.root()];
+            while let Some(value) = pending.pop() {
+                if let Some(list) = value.field("raw vertices").and_then(|f| f.as_block()) {
+                    for v in 0..list.len().min(500) {
+                        let Some(vertex) = list.element(v) else { continue };
+                        checked += 1;
+                        // The weights of one vertex add to one. Read at the
+                        // wrong offset they add to anything at all, which is
+                        // what a guessed stride gets wrong and what nothing
+                        // downstream would notice.
+                        let mut weights = 0.0f32;
+                        if let Some(array) =
+                            vertex.field("node weights").and_then(|f| f.as_array())
+                        {
+                            for k in 0..array.len() {
+                                let Some(element) = array.element(k) else { continue };
+                                let names: Vec<String> =
+                                    element.field_names().map(str::to_owned).collect();
+                                for name in &names {
+                                    if let Some(value) = element.read_real(name) {
+                                        weights += value;
+                                    }
+                                }
+                            }
+                        }
+                        if weights > 0.0 {
+                            worst_weight = worst_weight.max((weights - 1.0).abs());
+                        }
+                    }
+                }
+                for name in value.field_names() {
+                    let Some(field) = value.field(&name) else { continue };
+                    if let Some(nested) = field.as_struct() {
+                        pending.push(nested);
+                    } else if let Some(block) = field.as_block() {
+                        for i in 0..block.len() {
+                            if let Some(element) = block.element(i) { pending.push(element) }
+                        }
+                    }
+                }
+            }
+            let twin = reach.join(format!("{}.render_model", entry.name.replace(char::from(92), "/")));
+            if twin.is_file() { twins += 1 }
+        }
+        eprintln!(
+            "{looked} model(s) read; {skinned_compressed} use skinned compressed, \
+             {populated} of those now hydrate; {twins} have a kit twin"
+        );
+        eprintln!(
+            "   {checked} vertex(es) checked: worst weight sum error {worst_weight:.4}, \
+             worst normal length error {worst_normal:.4}"
+        );
+    }
+
+    /// Which bytes of a Curve codec stream the swap actually turns round.
+    ///
+    /// Curve is walked rather than mapped: the ordinary decoder runs over the
+    /// big-endian stream and the words it reads are the words to swap. That is
+    /// only correct if the decoder reads everything the engine reads. Anything
+    /// it steps over stays big-endian, and the engine finds it -- Sapien halts
+    /// inside `curve_codec.cpp` the moment such an animation plays.
+    ///
+    /// So: run the recorder, paint the bytes it touched, and report the gaps.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_curve_coverage() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let limit: usize = std::env::var("LIMIT")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(80);
+        let want = std::env::var("WHY_NAME").unwrap_or_default();
+        let group = u32::from_be_bytes(*b"jmad");
+        let (mut looked, mut streams, mut clean, mut gappy) = (0usize, 0usize, 0usize, 0usize);
+        let mut worst: Vec<(String, usize, usize, Vec<(usize, usize, Vec<u8>)>)> = Vec::new();
+        for entry in cache.iter_tags().filter(|entry| entry.group_tag == group) {
+            if looked >= limit {
+                break;
+            }
+            if !entry.name.contains(&want) {
+                continue;
+            }
+            if cache.resolve_tag_block(entry).is_none() {
+                continue;
+            }
+            let Ok(tag) = cache.read_tag(entry) else { continue };
+            let Some(groups) = tag
+                .root()
+                .field_path("tag resource groups")
+                .and_then(|field| field.as_block())
+            else {
+                continue;
+            };
+            looked += 1;
+            for index in 0..groups.len() {
+                let Some(resource) = groups
+                    .element(index)
+                    .and_then(|group| group.field("tag_resource"))
+                    .and_then(|field| field.as_resource())
+                else {
+                    continue;
+                };
+                let Some(state) = resource.xsync_state() else { continue };
+                let primary = resource.exploded_payload().unwrap_or(&[]);
+                let Some(members) = crate::animation::resource::read_members(&state, primary)
+                else {
+                    continue;
+                };
+                for (member_index, member) in members.iter().enumerate() {
+                    // Sections laid end to end in the order `data sizes` gives.
+                    let mut at = 0usize;
+                    for section in 0..2usize {
+                        let size = member.data_sizes[section].max(0) as usize;
+                        let start = at;
+                        at += size;
+                        if size == 0 {
+                            continue;
+                        }
+                        let Some(stream) = member.animation_data.get(start..start + size) else {
+                            continue;
+                        };
+                        let Some(codec) =
+                            stream.first().and_then(|byte| crate::animation::codec::Codec::from_byte(*byte))
+                        else {
+                            continue;
+                        };
+                        if !matches!(codec, crate::animation::codec::Codec::Curve | crate::animation::codec::Codec::RevisedCurve) {
+                            continue;
+                        }
+                        streams += 1;
+                        if streams == 1 {
+                            eprintln!("      build curve head: {:?}", &stream[..size.min(48)]);
+                            eprintln!(
+                                "      bytes 28..32 as text: {:?}",
+                                stream.get(28..32).map(|b| String::from_utf8_lossy(b).into_owned()),
+                            );
+                        }
+                        let frames = if section == 0 {
+                            1
+                        } else {
+                            (member.frame_count.max(1)) as u16
+                        };
+                        let Some(words) = crate::animation::codec::curve_word_offsets(
+                            stream,
+                            codec,
+                            frames,
+                            codec == crate::animation::codec::Codec::RevisedCurve,
+                        ) else {
+                            continue;
+                        };
+                        let mut painted = vec![false; size];
+                        for (offset, width) in &words {
+                            for byte in *offset..(*offset + *width as usize).min(size) {
+                                if byte < size {
+                                    painted[byte] = true;
+                                }
+                            }
+                        }
+                        // The first four bytes are the codec byte and node
+                        // counts, which are single bytes and correctly untouched.
+                        for byte in painted.iter_mut().take(4) {
+                            *byte = true;
+                        }
+                        let mut gaps: Vec<(usize, usize)> = Vec::new();
+                        let mut run: Option<usize> = None;
+                        for (byte, hit) in painted.iter().enumerate() {
+                            match (hit, run) {
+                                (false, None) => run = Some(byte),
+                                (true, Some(from)) => {
+                                    gaps.push((from, byte - from));
+                                    run = None;
+                                }
+                                _ => {}
+                            }
+                        }
+                        if let Some(from) = run {
+                            gaps.push((from, size - from));
+                        }
+                        // A run of 0xFF reads the same either way, so an
+                        // untouched one costs nothing. Only a gap that
+                        // would actually change is a gap that matters.
+                        gaps.retain(|(from, len)| {
+                            stream[*from..*from + *len].iter().any(|b| *b != 0xFF)
+                        });
+                        if gaps.is_empty() {
+                            clean += 1;
+                        } else {
+                            gappy += 1;
+                            if worst.len() < 8 {
+                                let word = |at: usize| {
+                                    stream
+                                        .get(at..at + 4)
+                                        .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
+                                        .unwrap_or(0)
+                                };
+                                eprintln!(
+                                    "      header: nodes {}/{}/{}, words {} {} {} {} {} {}",
+                                    stream[1], stream[2], stream[3],
+                                    word(4), word(8), word(12), word(16), word(20), word(24),
+                                );
+                                worst.push((
+                                    format!("{} group {index} member {member_index}", entry.name),
+                                    size,
+                                    gaps.iter().map(|(_, len)| len).sum(),
+                                    gaps
+                                        .into_iter()
+                                        .take(6)
+                                        .map(|(from, len)| {
+                                            (from, len, stream[from..from + len].to_vec())
+                                        })
+                                        .collect(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "{looked} graph(s): {streams} curve stream(s), {clean} fully covered, \
+             {gappy} with bytes the swap never touches"
+        );
+        for (who, size, missed, gaps) in &worst {
+            eprintln!("   {who}: {missed} of {size} byte(s) missed at {gaps:?}");
+        }
+    }
+
+    /// Which codecs a kit's own animation graphs actually use.
+    ///
+    /// If a shipped graph ever uses Curve then the kit holds little-endian
+    /// curve streams, and a little-endian stream of a format is the only thing
+    /// that can settle what width each of its fields is. Without one, the
+    /// layout is only ever as good as the decoder's guesses, and a wrong guess
+    /// swaps a pair of bytes that should have been left alone.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_kit_animation_codecs() {
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        let limit: usize = std::env::var("LIMIT")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(600);
+        let mut files = Vec::new();
+        collect_files(&reach, &mut files);
+        files.sort();
+        let mut codecs: std::collections::BTreeMap<u8, usize> = Default::default();
+        let mut curve_example: Option<(String, Vec<u8>)> = None;
+        let mut looked = 0usize;
+        for path in &files {
+            if looked >= limit {
+                break;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("model_animation_graph") {
+                continue;
+            }
+            let Ok(meta) = std::fs::metadata(path) else { continue };
+            if meta.len() > 8_000_000 {
+                continue;
+            }
+            // Shipped only. A tag dated today is this converter's own output,
+            // and comparing against it proves nothing at all.
+            let shipped = meta
+                .modified()
+                .ok()
+                .and_then(|when| when.duration_since(std::time::UNIX_EPOCH).ok())
+                .is_some_and(|age| age.as_secs() < 1_577_836_800);
+            if !shipped {
+                continue;
+            }
+            let Ok(tag) = TagFile::read(path) else { continue };
+            looked += 1;
+            let Some(groups) = tag
+                .root()
+                .field_path("tag resource groups")
+                .and_then(|field| field.as_block())
+            else {
+                continue;
+            };
+            for index in 0..groups.len() {
+                let Some(list) = groups
+                    .element(index)
+                    .and_then(|group| group.field("tag_resource"))
+                    .and_then(|field| field.as_resource())
+                    .and_then(|resource| resource.as_struct())
+                    .and_then(|payload| {
+                        payload
+                            .field("group_members")
+                            .and_then(|field| field.as_block())
+                    })
+                else {
+                    continue;
+                };
+                for member in 0..list.len() {
+                    let Some(element) = list.element(member) else { continue };
+                    let Some(blob) = element
+                        .field("animation_data")
+                        .and_then(|field| field.as_data())
+                    else {
+                        continue;
+                    };
+                    // Sections laid end to end in the order `data sizes` gives;
+                    // the first two are the codec streams.
+                    let sizes: Vec<i64> = element
+                        .field("data sizes")
+                        .and_then(|field| field.as_struct())
+                        .map(|sizes| {
+                            sizes
+                                .field_names()
+                                .filter_map(|name| sizes.read_int_any(&name))
+                                .map(|value| value as i64)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let mut at = 0usize;
+                    for section in 0..2usize {
+                        let size = sizes.get(section).copied().unwrap_or(0).max(0) as usize;
+                        let start = at;
+                        at += size;
+                        if size == 0 {
+                            continue;
+                        }
+                        let Some(stream) = blob.get(start..start + size) else { continue };
+                        let byte = stream[0];
+                        *codecs.entry(byte).or_default() += 1;
+                        if (byte == 9 || byte == 10) && curve_example.is_none() {
+                            curve_example = Some((
+                                format!(
+                                    "{} group {index} member {member}",
+                                    path.file_name().unwrap_or_default().to_string_lossy(),
+                                ),
+                                stream[..size.min(48)].to_vec(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("{looked} kit graph(s); codec byte -> stream count:");
+        for (byte, count) in &codecs {
+            eprintln!("   {byte:>3}: {count}");
+        }
+        if let Some((who, head)) = &curve_example {
+            eprintln!("   a curve stream at {who}:");
+            eprintln!("      {head:?}");
+        } else {
+            eprintln!("   no kit graph uses a curve codec");
+        }
+    }
+
+    /// Compare a turned-round curve stream against the kit's own copy of it.
+    ///
+    /// The only real check there is. Coverage says every byte was read; it
+    /// cannot say each was read at the width the engine reads it at, and a
+    /// value swapped as one word where the engine wants two is a stream that
+    /// decodes to plausible rubbish and halts `curve_codec.cpp` when played.
+    ///
+    /// HREK ships graphs the 2011 build also has, some using the curve codec.
+    /// Byte-for-byte against those is the answer -- and the kit tag has to be
+    /// dated before 2020, or it is this converter's own output and proves
+    /// nothing.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_curve_against_kit() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let group = u32::from_be_bytes(*b"jmad");
+        let mut compared = 0usize;
+        let mut identical = 0usize;
+        let mut shown = 0usize;
+        for entry in cache.iter_tags().filter(|entry| entry.group_tag == group) {
+            if compared >= 400 {
+                break;
+            }
+            if cache.resolve_tag_block(entry).is_none() {
+                continue;
+            }
+            let twin = reach.join(format!(
+                "{}.model_animation_graph",
+                entry.name.replace(char::from(92), "/"),
+            ));
+            let Ok(meta) = std::fs::metadata(&twin) else { continue };
+            let shipped = meta
+                .modified()
+                .ok()
+                .and_then(|when| when.duration_since(std::time::UNIX_EPOCH).ok())
+                .is_some_and(|age| age.as_secs() < 1_577_836_800);
+            if !shipped {
+                continue;
+            }
+            let (Ok(source), Ok(kit)) = (cache.read_tag(entry), TagFile::read(&twin)) else {
+                continue;
+            };
+            let ours = curve_streams_from_360(&source);
+            let theirs = curve_streams_from_kit(&kit);
+            if ours.is_empty() || theirs.is_empty() {
+                continue;
+            }
+            for (key, mut mine) in ours {
+                let Some(yours) = theirs.get(&key) else { continue };
+                if mine.0.len() != yours.len() {
+                    continue;
+                }
+                let original = mine.0.clone();
+                // Turn it round exactly as the converter does.
+                if crate::animation::byte_order::swap_animation_blob(
+                    &mut mine.0,
+                    &mine.1,
+                    mine.2,
+                )
+                .is_err()
+                {
+                    continue;
+                }
+                compared += 1;
+                if mine.0 == *yours {
+                    identical += 1;
+                } else if shown < 4 {
+                    shown += 1;
+                    let first = mine
+                        .0
+                        .iter()
+                        .zip(yours.iter())
+                        .position(|(a, b)| a != b)
+                        .unwrap_or(0);
+                    let from = first.saturating_sub(8);
+                    let to = (first + 40).min(mine.0.len());
+                    let differing = mine
+                        .0
+                        .iter()
+                        .zip(yours.iter())
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    eprintln!(
+                        "{} {key:?}: {} byte(s), codec {}, {differing} differ",
+                        entry.name, mine.0.len(), mine.0[0],
+                    );
+                    eprintln!("   first difference at {first}");
+                    // Which recorded read covers each differing byte, and
+                    // at what width. A pair that should have been left
+                    // alone shows up as a width-2 read over bytes the kit
+                    // and the build agree about.
+                    let mut at = 0usize;
+                    for section in 0..17usize {
+                        {
+                            let size = mine.1[section].max(0) as usize;
+                            if first >= at && first < at + size {
+                                eprintln!("   in section {section} (size {size}) at {}", first - at);
+                            }
+                        }
+                        let size = mine.1[section].max(0) as usize;
+                        let start = at;
+                        at += size;
+                        if first < start || first >= start + size {
+                            continue;
+                        }
+                        let Some(bytes) = original.get(start..start + size) else {
+                            continue;
+                        };
+                        let Some(codec) = bytes
+                            .first()
+                            .and_then(|b| crate::animation::codec::Codec::from_byte(*b))
+                        else { continue };
+                        let frames = if section == 0 { 1 } else { mine.2 };
+                        let revised =
+                            codec == crate::animation::codec::Codec::RevisedCurve;
+                        let Some(words) = crate::animation::codec::curve_word_offsets(
+                            bytes, codec, frames, revised,
+                        ) else { continue };
+                        let want = first - start;
+                        let covering: Vec<_> = words
+                            .iter()
+                            .filter(|(off, width)| {
+                                *off <= want && want < off + *width as usize
+                            })
+                            .collect();
+                        eprintln!(
+                            "   section {section} offset {want}: covered by {covering:?}",
+                        );
+                    }
+                    eprintln!("   ours  {:?}", &mine.0[from..to]);
+                    eprintln!("   kit   {:?}", &yours[from..to]);
+                }
+            }
+        }
+        eprintln!("{identical} of {compared} curve stream(s) match the kit byte for byte");
+    }
+
+    /// `(group, member, section)` -> the raw section, its sizes and frame count.
+    type CurveKey = (usize, usize, usize);
+
+    fn curve_streams_from_360(
+        tag: &TagFile,
+    ) -> Vec<(CurveKey, (Vec<u8>, [i32; 17], u16))> {
+        let mut out = Vec::new();
+        let Some(groups) = tag
+            .root()
+            .field_path("tag resource groups")
+            .and_then(|field| field.as_block())
+        else {
+            return out;
+        };
+        for index in 0..groups.len() {
+            let Some(resource) = groups
+                .element(index)
+                .and_then(|group| group.field("tag_resource"))
+                .and_then(|field| field.as_resource())
+            else {
+                continue;
+            };
+            let Some(state) = resource.xsync_state() else { continue };
+            let primary = resource.exploded_payload().unwrap_or(&[]);
+            let Some(members) = crate::animation::resource::read_members(&state, primary) else {
+                continue;
+            };
+            for (member_index, member) in members.iter().enumerate() {
+                out.push((
+                    (index, member_index, 0),
+                    (
+                        member.animation_data.clone(),
+                        member.data_sizes,
+                        member.frame_count.max(1) as u16,
+                    ),
+                ));
+            }
+        }
+        out
+    }
+
+    fn curve_streams_from_kit(tag: &TagFile) -> std::collections::BTreeMap<CurveKey, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        let Some(groups) = tag
+            .root()
+            .field_path("tag resource groups")
+            .and_then(|field| field.as_block())
+        else {
+            return out;
+        };
+        for index in 0..groups.len() {
+            let Some(list) = groups
+                .element(index)
+                .and_then(|group| group.field("tag_resource"))
+                .and_then(|field| field.as_resource())
+                .and_then(|resource| resource.as_struct())
+                .and_then(|payload| {
+                    payload
+                        .field("group_members")
+                        .and_then(|field| field.as_block())
+                })
+            else {
+                continue;
+            };
+            for member in 0..list.len() {
+                let Some(element) = list.element(member) else { continue };
+                let Some(blob) = element
+                    .field("animation_data")
+                    .and_then(|field| field.as_data())
+                else {
+                    continue;
+                };
+                out.insert((index, member, 0), blob.to_vec());
+            }
+        }
+        out
+    }
+
+    /// The shape of `uncompressed_data`, section 7, across the whole build.
+    ///
+    /// It is not the flat word array it was being swapped as: it opens with
+    /// four single bytes and ends with a run of single bytes, and only the
+    /// middle is words. The question is where the middle stops, and one sample
+    /// cannot answer it -- so count them all and see whether the four opening
+    /// bytes predict the size.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_uncompressed_data_shape() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let group = u32::from_be_bytes(*b"jmad");
+        let mut seen = 0usize;
+        let mut fits_times_eight = 0usize;
+        let mut rows: Vec<(usize, [u8; 4])> = Vec::new();
+        for entry in cache.iter_tags().filter(|entry| entry.group_tag == group) {
+            if seen >= 400 {
+                break;
+            }
+            if cache.resolve_tag_block(entry).is_none() {
+                continue;
+            }
+            let Ok(tag) = cache.read_tag(entry) else { continue };
+            let Some(groups) = tag
+                .root()
+                .field_path("tag resource groups")
+                .and_then(|field| field.as_block())
+            else {
+                continue;
+            };
+            for index in 0..groups.len() {
+                let Some(resource) = groups
+                    .element(index)
+                    .and_then(|group| group.field("tag_resource"))
+                    .and_then(|field| field.as_resource())
+                else {
+                    continue;
+                };
+                let Some(state) = resource.xsync_state() else { continue };
+                let primary = resource.exploded_payload().unwrap_or(&[]);
+                let Some(members) = crate::animation::resource::read_members(&state, primary)
+                else {
+                    continue;
+                };
+                for member in &members {
+                    let mut at = 0usize;
+                    for section in 0..17usize {
+                        let size = member.data_sizes[section].max(0) as usize;
+                        let start = at;
+                        at += size;
+                        if section != 7 || size == 0 {
+                            continue;
+                        }
+                        let Some(bytes) = member.animation_data.get(start..start + size) else {
+                            continue;
+                        };
+                        if bytes.len() < 4 {
+                            continue;
+                        }
+                        seen += 1;
+                        let head = [bytes[0], bytes[1], bytes[2], bytes[3]];
+                        // The guess from one sample: the section ends with
+                        // `head[2] * 8` single bytes.
+                        if 4 + (head[2] as usize) * 8 <= size {
+                            fits_times_eight += 1;
+                        }
+                        if rows.len() < 14 {
+                            rows.push((size, head));
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("{seen} section-7 run(s); {fits_times_eight} where 4 + head[2]*8 fits");
+        for (size, head) in &rows {
+            let tail = (head[2] as usize) * 8;
+            eprintln!(
+                "   size {size:>5}  head {head:?}  head[2]*8 = {tail}  middle would be {}",
+                size.saturating_sub(4 + tail),
+            );
+        }
+    }
+
+    /// How many graphs in the build describe an animation and keep no data.
+    ///
+    /// Decides what to do about them. Rare enough and refusing those graphs
+    /// costs almost nothing and is provably safe; common enough and refusing
+    /// throws away most of the corpus, and an emptied member -- a shape no
+    /// shipped kit graph has -- is the lesser risk.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_animations_without_data() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let group = u32::from_be_bytes(*b"jmad");
+        let (mut graphs, mut affected, mut members, mut absent) = (0usize, 0usize, 0usize, 0usize);
+        let mut names: Vec<String> = Vec::new();
+        for entry in cache.iter_tags().filter(|entry| entry.group_tag == group) {
+            if cache.resolve_tag_block(entry).is_none() {
+                continue;
+            }
+            let Ok(tag) = cache.read_tag(entry) else { continue };
+            let Some(groups) = tag
+                .root()
+                .field_path("tag resource groups")
+                .and_then(|field| field.as_block())
+            else {
+                continue;
+            };
+            graphs += 1;
+            let mut hit = false;
+            for index in 0..groups.len() {
+                let Some(resource) = groups
+                    .element(index)
+                    .and_then(|group| group.field("tag_resource"))
+                    .and_then(|field| field.as_resource())
+                else {
+                    continue;
+                };
+                let Some(state) = resource.xsync_state() else { continue };
+                let primary = resource.exploded_payload().unwrap_or(&[]);
+                let Some(held) = crate::animation::resource::read_members(&state, primary) else {
+                    continue;
+                };
+                for member in &held {
+                    members += 1;
+                    let declared: i64 = member.data_sizes.iter().map(|s| *s as i64).sum();
+                    if member.animation_data.is_empty() && declared > 0 {
+                        absent += 1;
+                        hit = true;
+                    }
+                }
+            }
+            if hit {
+                affected += 1;
+                if names.len() < 10 {
+                    names.push(entry.name.clone());
+                }
+            }
+        }
+        eprintln!(
+            "{graphs} readable graph(s), {members} member(s): {affected} graph(s) and \
+             {absent} member(s) have no data"
+        );
+        for name in &names {
+            eprintln!("   {name}");
+        }
+    }
+
+    /// Bitmaps by texture type: what converts, and what matches the kit.
+    ///
+    /// The build-wide numbers are an average over a corpus that is nine parts
+    /// plain 2D texture, so a type that is wholly broken barely moves them.
+    /// Split by type instead: cube maps and arrays are their own shapes, with
+    /// their own face and layer ordering, and either could be failing while
+    /// every headline number looks healthy.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_bitmap_types() {
+        const NL: &str = "
+     ";
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let Ok(groups) = GameTagIndex::load(&definitions, "haloreach_mcc") else { return };
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let cutoff =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        let limit: usize = std::env::var("LIMIT")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(600);
+
+        // type -> (seen, converted, comparable, exact)
+        let mut tally: std::collections::BTreeMap<String, [usize; 5]> = Default::default();
+        let mut refusals: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        let mut deltas: std::collections::BTreeMap<&str, usize> = Default::default();
+        let mut looked = 0usize;
+        for entry in cache.iter_tags().filter(|e| e.group_tag == u32::from_be_bytes(*b"bitm")) {
+            if looked >= limit {
+                break;
+            }
+            if cache.resolve_tag_block(entry).is_none() {
+                continue;
+            }
+            let Ok(source) = cache.read_tag(entry) else { continue };
+            looked += 1;
+            // The 360 mirror is where a converted tag's images are described
+            // from, so it is the side that knows the type.
+            let kind = bitmap_texture_type(&source);
+            let slot = tally.entry(kind.clone()).or_insert([0; 5]);
+            slot[0] += 1;
+            let draft = match analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) {
+                Ok(draft) => {
+                    slot[1] += 1;
+                    draft
+                }
+                Err(why) => {
+                    let list = refusals.entry(kind.clone()).or_default();
+                    if list.len() < 3 {
+                        list.push(format!("{}: {}", entry.name, why.chars().take(150).collect::<String>()));
+                    }
+                    continue;
+                }
+            };
+            // Against the kit's own copy, where there is an untouched one.
+            let twin = reach.join(format!("{}.bitmap", entry.name.replace(char::from(92), "/")));
+            let Ok(meta) = std::fs::metadata(&twin) else { continue };
+            if meta.modified().map(|when| when >= cutoff).unwrap_or(true) {
+                continue;
+            }
+            let Ok(stock) = TagFile::read(&twin) else { continue };
+            let ours = tag_pixel_bytes(&draft.tag);
+            let theirs = tag_pixel_bytes(&stock);
+            if ours.is_empty() || theirs.is_empty() {
+                continue;
+            }
+            let slot = tally.entry(kind.clone()).or_insert([0; 5]);
+            slot[2] += 1;
+            if ours == theirs {
+                slot[3] += 1;
+            } else if {
+                let worst = ours
+                    .iter()
+                    .zip(theirs.iter())
+                    .map(|(a, b)| a.abs_diff(*b))
+                    .max()
+                    .unwrap_or(0);
+                *deltas.entry(match worst {
+                    0 => "0",
+                    1..=4 => "1-4",
+                    5..=16 => "5-16",
+                    17..=64 => "17-64",
+                    65..=200 => "65-200",
+                    _ => "201-255",
+                })
+                .or_insert(0usize) += 1;
+                worst <= 4
+            } {
+                slot[4] += 1;
+            } else if refusals.entry(format!("{kind} (differs)")).or_default().len() < 3 {
+                let at = ours
+                    .iter()
+                    .zip(theirs.iter())
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(0);
+                refusals.entry(format!("{kind} (differs)")).or_default().push(format!(
+                    "{}: {:?}, {} of {} byte(s) differ, worst by {}, first at {}{}   ours {:?}{}   kit  {:?}",
+                    entry.name,
+                    bitmap_image_shape(&draft.tag),
+                    ours.iter().zip(theirs.iter()).filter(|(a, b)| a != b).count(),
+                    ours.len(),
+                    ours.iter().zip(theirs.iter()).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0),
+                    at,
+                    NL,
+                    &ours[at..(at + 16).min(ours.len())],
+                    NL,
+                    &theirs[at..(at + 16).min(theirs.len())],
+                ));
+            }
+        }
+        eprintln!("{looked} bitmap(s) read");
+        eprintln!("   type                     seen  converted  comparable  exact  within 1");
+        for (kind, [seen, converted, comparable, exact, near]) in &tally {
+            eprintln!(
+                "   {kind:<22} {seen:>6} {converted:>10} {comparable:>11} {exact:>6} {near:>9}"
+            );
+        }
+        eprintln!("   worst-delta buckets among the differing: {deltas:?}");
+        for (kind, examples) in &refusals {
+            eprintln!("   {kind}:");
+            for example in examples {
+                eprintln!("      {example}");
+            }
+        }
+    }
+
+    /// What a bitmap says it is, from whichever image block it fills in.
+    fn bitmap_texture_type(tag: &TagFile) -> String {
+        for block_name in ["xenon bitmaps", "bitmaps"] {
+            let Some(block) = tag.root().field(block_name).and_then(|f| f.as_block()) else {
+                continue;
+            };
+            if block.len() == 0 {
+                continue;
+            }
+            if let Some(kind) = block
+                .element(0)
+                .and_then(|image| image.read_enum_name("type"))
+            {
+                return kind;
+            }
+        }
+        "unknown".to_owned()
+    }
+
+
+    /// What the first image of a bitmap says it is: format, size, mips.
+    fn bitmap_image_shape(tag: &TagFile) -> String {
+        let Some(block) = tag.root().field("bitmaps").and_then(|f| f.as_block()) else {
+            return "no bitmaps block".to_owned();
+        };
+        let Some(image) = block.element(0) else {
+            return "empty bitmaps block".to_owned();
+        };
+        format!(
+            "{}x{} {} mip {}",
+            image.read_int_any("width").unwrap_or(-1),
+            image.read_int_any("height").unwrap_or(-1),
+            image.read_enum_name("format").unwrap_or_default(),
+            image.read_int_any("mipmap count").unwrap_or(-1),
+        )
+    }
+
+    /// The shared pixel blob a PC bitmap keeps every image in.
+    fn tag_pixel_bytes(tag: &TagFile) -> Vec<u8> {
+        tag.root()
+            .field("processed pixel data")
+            .and_then(|field| field.as_data())
+            .map(|data| data.to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Which pixel formats each side actually uses.
+    ///
+    /// A converted bitmap keeps whatever format the 360 stored, and the engine
+    /// has to be able to sample it. Where the kit ships none of a format, the
+    /// engine has never been asked to, and a tag that hands it one renders
+    /// wrong rather than refusing -- which is what an artifact is.
+    ///
+    /// So: count the formats the kit ships against the formats the build has,
+    /// and the ones with a build column and no kit column are the ones that
+    /// need transcoding on the way over.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_pixel_format_histogram() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let cutoff =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        let limit: usize = std::env::var("LIMIT")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(3000);
+
+        let mut kit: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut files = Vec::new();
+        collect_files(&reach, &mut files);
+        let mut looked = 0usize;
+        for path in &files {
+            if looked >= limit {
+                break;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("bitmap") {
+                continue;
+            }
+            let Ok(meta) = std::fs::metadata(path) else { continue };
+            if meta.modified().map(|when| when >= cutoff).unwrap_or(true) {
+                continue;
+            }
+            let Ok(tag) = TagFile::read(path) else { continue };
+            looked += 1;
+            let Some(block) = tag.root().field("bitmaps").and_then(|f| f.as_block()) else {
+                continue;
+            };
+            for index in 0..block.len() {
+                if let Some(format) = block
+                    .element(index)
+                    .and_then(|image| image.read_enum_name("format"))
+                {
+                    *kit.entry(format).or_default() += 1;
+                }
+            }
+        }
+
+        let definitions = locate_definitions_root();
+        let Ok(groups) = GameTagIndex::load(&definitions, "haloreach_mcc") else { return };
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let mut build: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut seen = 0usize;
+        for entry in cache.iter_tags().filter(|e| e.group_tag == u32::from_be_bytes(*b"bitm")) {
+            if seen >= limit {
+                break;
+            }
+            if cache.resolve_tag_block(entry).is_none() {
+                continue;
+            }
+            let Ok(tag) = cache.read_tag(entry) else { continue };
+            seen += 1;
+            // What we would write, not what the build holds: several of
+            // the 360 formats are already transcoded on the way, and the
+            // question is which are not.
+            let Ok(draft) = analyze_conversion_with_templates(
+                &tag, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) else { continue };
+            let Some(block) = draft.tag.root().field("bitmaps").and_then(|f| f.as_block())
+            else { continue };
+            for index in 0..block.len() {
+                if let Some(format) = block
+                    .element(index)
+                    .and_then(|image| image.read_enum_name("format"))
+                {
+                    *build.entry(format).or_default() += 1;
+                }
+            }
+        }
+
+        let mut names: std::collections::BTreeSet<&String> = Default::default();
+        names.extend(kit.keys());
+        names.extend(build.keys());
+        eprintln!("{looked} shipped kit bitmap(s), {seen} build bitmap(s)");
+        eprintln!("   format                    kit  converted");
+        for name in names {
+            let (k, b) = (
+                kit.get(name).copied().unwrap_or(0),
+                build.get(name).copied().unwrap_or(0),
+            );
+            let flag = if k == 0 && b > 0 { "  <== the kit ships none" } else { "" };
+            eprintln!("   {name:<22} {k:>7} {b:>9}{flag}");
+        }
+    }
+
+    /// Every shader-family group: what converts, and what matches the kit.
+    ///
+    /// "Artifacts from imported shaders" could be any of a dozen groups -- the
+    /// render methods themselves, the templates they point at, the compiled
+    /// pixel and vertex shaders, the global shader tables. Which one is wrong
+    /// is not guessable, so this asks all of them the same two questions:
+    /// does it convert, and is it the kit's own tag afterwards.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_shader_survey() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let Ok(groups) = GameTagIndex::load(&definitions, "haloreach_mcc") else { return };
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let cutoff =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        let per_group: usize = std::env::var("PER_GROUP")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(12);
+
+        // group -> (seen, converted, comparable, identical, worst field count)
+        let mut tally: std::collections::BTreeMap<String, [usize; 5]> = Default::default();
+        let mut notes: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        let mut counted: std::collections::BTreeMap<String, usize> = Default::default();
+
+        for entry in cache.iter_tags() {
+            let Some(group_name) = groups.by_tag.get(&entry.group_tag) else { continue };
+            // The render methods, what they point at, and what those compile to.
+            let is_shader = group_name.starts_with("render_method")
+                || group_name.starts_with("shader")
+                || group_name.ends_with("_shader")
+                || group_name == "global_pixel_shader"
+                || group_name == "global_vertex_shader";
+            if !is_shader {
+                continue;
+            }
+            let seen = counted.entry(group_name.to_owned()).or_insert(0);
+            if *seen >= per_group {
+                continue;
+            }
+            *seen += 1;
+            if cache.resolve_tag_block(entry).is_none() {
+                continue;
+            }
+            let Ok(source) = cache.read_tag(entry) else { continue };
+            let slot = tally.entry(group_name.to_owned()).or_insert([0; 5]);
+            slot[0] += 1;
+            let draft = match analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) {
+                Ok(draft) => {
+                    slot[1] += 1;
+                    draft
+                }
+                Err(why) => {
+                    let list = notes.entry(format!("{group_name} refused")).or_default();
+                    if list.len() < 2 {
+                        list.push(format!(
+                            "{}: {}",
+                            entry.name,
+                            why.chars().take(160).collect::<String>(),
+                        ));
+                    }
+                    continue;
+                }
+            };
+            let twin = reach.join(format!(
+                "{}.{group_name}",
+                entry.name.replace(char::from(92), "/"),
+            ));
+            let Ok(meta) = std::fs::metadata(&twin) else { continue };
+            if meta.modified().map(|when| when >= cutoff).unwrap_or(true) {
+                continue;
+            }
+            let Ok(stock) = TagFile::read(&twin) else { continue };
+            let slot = tally.entry(group_name.to_owned()).or_insert([0; 5]);
+            slot[2] += 1;
+            let mut differences = Vec::new();
+            diff_structs("", &draft.tag.root(), &stock.root(), &mut differences, 0);
+            if differences.is_empty() {
+                slot[3] += 1;
+            } else {
+                slot[4] = slot[4].max(differences.len());
+                let list = notes.entry(format!("{group_name} differs")).or_default();
+                if list.len() < 3 {
+                    list.push(format!(
+                        "{}: {} field(s), e.g. {}",
+                        entry.name,
+                        differences.len(),
+                        differences
+                            .iter()
+                            .take(2)
+                            .map(|d| d.chars().take(110).collect::<String>())
+                            .collect::<Vec<_>>()
+                            .join(" | "),
+                    ));
+                }
+            }
+        }
+        eprintln!("   group                          seen  converted  comparable  identical  worst");
+        for (group, [seen, converted, comparable, identical, worst]) in &tally {
+            eprintln!(
+                "   {group:<28} {seen:>6} {converted:>10} {comparable:>11} {identical:>10} {worst:>6}"
+            );
+        }
+        for (what, examples) in &notes {
+            eprintln!("   {what}:");
+            for example in examples {
+                eprintln!("      {example}");
+            }
+        }
+    }
+
+    /// Why one animation graph's resources do not come across.
+    ///
+    /// Prints both sides of the question the carry pass asks: how many resource
+    /// groups the source has and what each one holds, and how many the template
+    /// the target was built from has. The pass returns silently when those two
+    /// disagree in the wrong way, which reads as the generic "could not be
+    /// translated" refusal and says nothing about which side was short.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_jmad_resource_shape() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else { return };
+        let definitions = locate_definitions_root();
+        let groups_index = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups_index);
+        let want = std::env::var("WHY_NAME").unwrap_or_default();
+        let group = u32::from_be_bytes(*b"jmad");
+        for entry in cache.iter_tags().filter(|e| e.group_tag == group) {
+            if !entry.name.contains(&want) { continue }
+            let Ok(source) = cache.read_tag(entry) else {
+                eprintln!("{}: unreadable", entry.name);
+                continue;
+            };
+            eprintln!("{}", entry.name);
+            let root = source.root();
+            match root.field_path("tag resource groups").and_then(|f| f.as_block()) {
+                None => eprintln!("   source has no 'tag resource groups' field"),
+                Some(block) => {
+                    eprintln!("   source groups: {}", block.len());
+                    for i in 0..block.len() {
+                        let resource = block
+                            .element(i)
+                            .and_then(|g| g.field("tag_resource"))
+                            .and_then(|f| f.as_resource());
+                        let Some(resource) = resource else {
+                            eprintln!("      [{i}] no tag_resource field");
+                            continue;
+                        };
+                        let state = resource.xsync_state();
+                        let primary = resource.exploded_payload().unwrap_or(&[]);
+                        let members = state.as_ref().and_then(|s| {
+                            crate::animation::resource::read_members(s, primary)
+                        });
+                        let detail = members.as_ref().map(|members| {
+                            members
+                                .iter()
+                                .enumerate()
+                                .map(|(m, member)| {
+                                    let declared: i64 =
+                                        member.data_sizes.iter().map(|s| *s as i64).sum();
+                                    format!(
+                                        "{m}:{}/{declared}{}",
+                                        member.animation_data.len(),
+                                        if declared > 0 && member.animation_data.is_empty() {
+                                            " EMPTY"
+                                        } else {
+                                            ""
+                                        },
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        });
+                        eprintln!(
+                            "      [{i}] xsync {} primary {} bytes, members {:?}",
+                            state.is_some(),
+                            primary.len(),
+                            members.as_ref().map(|m| m.len()),
+                        );
+                        if let Some(detail) = detail {
+                            eprintln!("           blob/declared -> {detail}");
+                        }
+                    }
+                }
+            }
+            match analyze_conversion_with_templates(
+                &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+            ) {
+                Ok(draft) => {
+                    let target_groups = draft
+                        .tag
+                        .root()
+                        .field_path("tag resource groups")
+                        .and_then(|f| f.as_block())
+                        .map(|b| b.len());
+                    eprintln!("   target groups: {target_groups:?}");
+                    eprintln!(
+                        "   template: {:?}",
+                        draft.native_layout_template.as_ref().map(|p| p.display().to_string()),
+                    );
+                    for issue in &draft.report.issues {
+                        eprintln!("   issue: {} -- {}", issue.path, issue.message);
+                    }
+                }
+                Err(why) => eprintln!("   refused: {why}"),
+            }
+        }
+    }
+
+    /// Why one named tag will not read out of the build.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_why_not_readable() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let want = std::env::var("WHY_NAME").unwrap_or_default();
+        let group_name = std::env::var("WHY_GROUP").unwrap_or_else(|_| "Lbsp".to_owned());
+        let mut gb = [b' '; 4];
+        for (i, c) in group_name.bytes().take(4).enumerate() { gb[i] = c; }
+        let group = u32::from_be_bytes(gb);
+        for entry in cache.iter_tags().filter(|e| e.group_tag == group) {
+            if !entry.name.contains(&want) { continue }
+            let tag_block = cache.resolve_tag_block(entry);
+            let cache_block = cache.resolve_cache_block(entry);
+            let verdict = match cache.read_tag(entry) {
+                Ok(tag) => format!("reads, {} field(s) at the root", tag.root().fields().count()),
+                Err(error) => format!("{error}"),
+            };
+            eprintln!(
+                "{}\n   tag block {:?}, cache block {:?}\n   {verdict}",
+                entry.name,
+                tag_block.map(|b| (b.file_index, b.size)),
+                cache_block.map(|b| (b.file_index, b.size)),
+            );
+        }
+    }
+
+    fn report_geometry(label: &str, tag: &TagFile) {
+        let root = tag.root();
+        let info = root
+            .field_path("render geometry/compression info")
+            .and_then(|f| f.as_block());
+        let count = info.as_ref().map(|b| b.len()).unwrap_or(0);
+        eprintln!("{label}\tcompression info: {count} element(s)");
+        if let Some(block) = info.as_ref()
+            && let Some(elem) = block.element(0)
+        {
+            let p0 = elem.read_point3d("position bounds 0");
+            let p1 = elem.read_point3d("position bounds 1");
+            eprintln!(
+                "{label}\t  bounds0 ({:.3}, {:.3}, {:.3})  bounds1 ({:.3}, {:.3}, {:.3})",
+                p0.x, p0.y, p0.z, p1.x, p1.y, p1.z
+            );
+        }
+        let Some(pmt) = root
+            .field_path("render geometry/per mesh temporary")
+            .and_then(|f| f.as_block())
+        else {
+            eprintln!("{label}\tno per mesh temporary");
+            return;
+        };
+        let mut total = 0usize;
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for index in 0..pmt.len() {
+            let Some(elem) = pmt.element(index) else { continue };
+            let Some(rv) = elem.field("raw vertices").and_then(|f| f.as_block()) else { continue };
+            for v in 0..rv.len() {
+                let Some(vertex) = rv.element(v) else { continue };
+                let p = vertex.read_point3d("position");
+                for (axis, value) in [p.x, p.y, p.z].into_iter().enumerate() {
+                    lo[axis] = lo[axis].min(value);
+                    hi[axis] = hi[axis].max(value);
+                }
+                total += 1;
+            }
+        }
+        eprintln!(
+            "{label}\t  {total} raw vertices, x {:.3}..{:.3}  y {:.3}..{:.3}  z {:.3}..{:.3}",
+            lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_bsp_block_counts() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let groups = GameTagIndex::load(&definitions, "haloreach_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&reach, &groups);
+        let name = r"levels\multi\archive\70_boneyard_v2\70_boneyard_v2_000";
+        let Ok(source) = cache.read_tag_by_name(u32::from_be_bytes(*b"sbsp"), name) else { return };
+        let Ok(draft) = analyze_conversion_with_templates(
+            &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
+        ) else {
+            eprintln!("refused");
+            return;
+        };
+        let mut before: Vec<(String, usize)> = Vec::new();
+        let mut after: Vec<(String, usize)> = Vec::new();
+        top_block_counts(source.root(), &mut before);
+        top_block_counts(draft.tag.root(), &mut after);
+        let after_map: HashMap<String, usize> = after.iter().cloned().collect();
+        eprintln!("block\tsource\tconverted");
+        for (name, count) in &before {
+            let now = after_map.get(name).copied().unwrap_or(0);
+            if *count != now {
+                eprintln!("DIFF\t{name}\t{count}\t{now}");
+            }
+        }
+        for (name, count) in &after {
+            if !before.iter().any(|(n, _)| n == name) && *count > 0 {
+                eprintln!("ONLY-IN-CONVERTED\t{name}\t{count}");
+            }
+        }
+        eprintln!("(top-level blocks compared: {})", before.len());
+    }
+
+    fn top_block_counts(value: TagStruct<'_>, out: &mut Vec<(String, usize)>) {
+        for field in value.fields() {
+            if let Some(block) = field.as_block() {
+                out.push((field.name().to_owned(), block.len()));
+            } else if let Some(nested) = field.as_struct() {
+                let base = field.name().to_owned();
+                let mut inner = Vec::new();
+                top_block_counts(nested, &mut inner);
+                for (name, count) in inner {
+                    out.push((format!("{base}/{name}"), count));
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_mesh_coverage() {
+        let (Some(cache), Some(reach)) = (reach_x360_cache(), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            return;
+        };
+        for (label, tag) in [
+            ("SOURCE-BSP", cache.read_tag_by_name(
+                u32::from_be_bytes(*b"sbsp"),
+                r"levels\multi\archive\70_boneyard_v2\70_boneyard_v2_000",
+            ).ok()),
+        ] {
+            if let Some(tag) = tag {
+                coverage(label, &tag);
+            }
+        }
+        // A stock kit BSP and a stock render model, as the shape of "complete".
+        for extension in ["scenario_structure_bsp", "render_model"] {
+            if let Some(path) = walk_files(&reach)
+                .into_iter()
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some(extension))
+                .find(|p| !p.to_string_lossy().contains("cex_"))
+                && let Ok(tag) = TagFile::read(&path)
+            {
+                coverage(&format!("STOCK-{extension}"), &tag);
+            }
+        }
+        // And a converted render model, since models render too.
+        if let Ok(model) = cache.read_tag_by_name(
+            u32::from_be_bytes(*b"mode"),
+            r"objects\characters\elite\elite",
+        ) {
+            coverage("SOURCE-MODEL", &model);
+        }
+    }
+
+    fn coverage(label: &str, tag: &TagFile) {
+        for path in ["render geometry", "geometry"] {
+            let Some(rg) = tag.root().field_path(path).and_then(|f| f.as_struct()) else { continue };
+            let meshes = rg.field("meshes").and_then(|f| f.as_block()).map(|b| b.len()).unwrap_or(0);
+            let Some(pmt) = rg.field("per mesh temporary").and_then(|f| f.as_block()) else {
+                eprintln!("{label}\tmeshes={meshes}\tno per mesh temporary");
+                continue;
+            };
+            let mut with = 0;
+            for i in 0..pmt.len() {
+                if pmt
+                    .element(i)
+                    .and_then(|e| e.field("raw vertices"))
+                    .and_then(|f| f.as_block())
+                    .is_some_and(|rv| rv.len() > 0)
+                {
+                    with += 1;
+                }
+            }
+            eprintln!(
+                "{label}\tmeshes={meshes}\tper mesh temporary={}\twith vertices={with}",
+                pmt.len()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn scratch_hydration_effect() {
+        let Some(cache) = reach_x360_cache() else { return };
+        let name = r"levels\multi\archive\70_boneyard_v2\70_boneyard_v2_000";
+        let group = u32::from_be_bytes(*b"sbsp");
+        let Some(entry) = cache.find_tag(group, name) else { return };
+
+        // Unhydrated: the tag exactly as the build wrote it.
+        let Ok(bytes) = cache.read_tag_bytes(entry) else { return };
+        let Ok(raw) = TagFile::read_from_bytes(&bytes) else { return };
+        vertex_summary("UNHYDRATED", &raw);
+
+        // Hydrated: what `read_tag` hands every consumer.
+        let Ok(hydrated) = cache.read_tag(entry) else { return };
+        vertex_summary("HYDRATED  ", &hydrated);
+    }
+
+    fn vertex_summary(label: &str, tag: &TagFile) {
+        let Some(rg) = tag.root().field_path("render geometry").and_then(|f| f.as_struct()) else {
+            return;
+        };
+        let has_resource = rg
+            .field("api resource")
+            .and_then(|f| f.as_resource())
+            .map(|r| format!("{:?}", r.kind()))
+            .unwrap_or_else(|| "none".to_owned());
+        let Some(pmt) = rg.field("per mesh temporary").and_then(|f| f.as_block()) else { return };
+        let (mut verts, mut idx, mut with) = (0usize, 0usize, 0usize);
+        let mut first = String::new();
+        for i in 0..pmt.len() {
+            let Some(elem) = pmt.element(i) else { continue };
+            let rv = elem.field("raw vertices").and_then(|f| f.as_block());
+            let ri = elem.field("raw indices").and_then(|f| f.as_block());
+            let n = rv.as_ref().map(|b| b.len()).unwrap_or(0);
+            let m = ri.as_ref().map(|b| b.len()).unwrap_or(0);
+            if n > 0 {
+                with += 1;
+                if first.is_empty()
+                    && let Some(v) = rv.as_ref().and_then(|b| b.element(0))
+                {
+                    let p = v.read_point3d("position");
+                    first = format!("first vertex ({:.3}, {:.3}, {:.3})", p.x, p.y, p.z);
+                }
+            }
+            verts += n;
+            idx += m;
+        }
+        eprintln!(
+            "{label}\tapi resource={has_resource}\tmeshes with verts={with}/{}\tverts={verts}\tindices={idx}\t{first}",
+            pmt.len()
+        );
+    }
+}

@@ -83,8 +83,13 @@ impl FIoContainerHeader {
             new.localized_packages = s.de()?;
             new.package_redirects = s.de()?;
 
-            // Populate Source Package IDs of localized packages from the list we just read
-            new.localized_source_package_ids = new.package_redirects.iter().map(|x| x.source_package_id).collect();
+            // Populate Source Package IDs of localized packages from the list we just read.
+            // From `localized_packages`, not `package_redirects`: the two are different lists
+            // that happen to share a field name, so reading the wrong one compiles and then
+            // reports every redirect's source as a localized package. Renaming installs
+            // redirects, and both rename and delete refuse a localized source -- so a package
+            // that was renamed once became one this crate would not move or retire again.
+            new.localized_source_package_ids = new.localized_packages.iter().map(|x| x.source_package_id).collect();
 
             // Populate package redirects lookup from the package redirect list
             new.package_redirect_lookup.reserve(new.package_redirects.len());
@@ -262,6 +267,118 @@ impl FIoContainerHeader {
 
     pub fn get_store_entry(&self, package_id: FPackageId) -> Option<StoreEntry> {
         self.packages.get(package_id)
+    }
+
+    /// Drop a package's store entry, reporting whether one was there.
+    ///
+    /// Serialization rebuilds the count, the key list and every
+    /// `offset_to_data_from_this` from the map, so removing a key is complete on
+    /// its own — but only for the store. The members below are keyed by
+    /// store-entry *ordinal* or by package id, and callers that remove a package
+    /// have to check them separately.
+    pub fn remove_package(&mut self, package_id: FPackageId) -> bool {
+        self.packages.0.remove(&package_id).is_some()
+    }
+
+    /// Point every redirect that currently targets `from` at `to` instead.
+    ///
+    /// Returns how many moved. Without this a package could be renamed once and
+    /// never again: renaming A to B installs a redirect targeting B, and the
+    /// next rename would find B redirected-to and refuse rather than leave the
+    /// first redirect dangling. Collapsing `A → B → C` to `A → C, B → C` keeps
+    /// every name that ever pointed here resolving.
+    pub fn retarget_package_redirect(&mut self, from: FPackageId, to: FPackageId) -> usize {
+        let mut moved = 0;
+        for redirect in &mut self.package_redirects {
+            if redirect.target_package_id == from {
+                redirect.target_package_id = to;
+                moved += 1;
+            }
+        }
+        for redirect in &mut self.legacy_package_redirects {
+            if redirect.target_package_id == from {
+                redirect.target_package_id = to;
+                moved += 1;
+            }
+        }
+        for target in self.package_redirect_lookup.values_mut() {
+            if *target == from {
+                *target = to;
+            }
+        }
+        moved
+    }
+
+    /// Drop the redirect whose *source* is `source_package_id`, if any.
+    ///
+    /// Safe with respect to `redirect_name_map`: names are addressed by
+    /// `FMappedName` index and the map is serialized whole, so an orphaned name
+    /// costs bytes and nothing else. Removing it would renumber every index
+    /// after it, which is the opposite of safe.
+    pub fn remove_package_redirect(&mut self, source_package_id: FPackageId) -> bool {
+        let before = self.package_redirects.len() + self.legacy_package_redirects.len();
+        self.package_redirects
+            .retain(|redirect| redirect.source_package_id != source_package_id);
+        self.legacy_package_redirects
+            .retain(|redirect| redirect.source_package_id != source_package_id);
+        self.package_redirect_lookup.remove(&source_package_id);
+        before != self.package_redirects.len() + self.legacy_package_redirects.len()
+    }
+
+    /// Whether the soft-package-reference block declares anything.
+    ///
+    /// Separate from [`has_soft_package_references`](Self::has_soft_package_references)
+    /// because an empty block has no ordinals to desync: the refusal exists to
+    /// protect a mapping, and a mapping of nothing is not one.
+    pub fn soft_package_reference_count(&self) -> usize {
+        self.soft_package_references
+            .as_ref()
+            .map(|refs| refs.package_indices.len())
+            .unwrap_or_default()
+    }
+
+    /// Whether a soft-package-reference block is present.
+    ///
+    /// Its `package_indices` buffer is keyed by store-entry ordinal, and the
+    /// store is a `BTreeMap` over `FPackageId` — so adding or removing any
+    /// package renumbers ordinals that this block, round-tripped verbatim, does
+    /// not follow. Mutating the store of such a container is refused rather than
+    /// reasoned about.
+    pub fn has_soft_package_references(&self) -> bool {
+        self.soft_package_references.is_some()
+    }
+
+    /// Whether the optional segment declares any package. Its two parallel
+    /// arrays have the same ordinal coupling as the soft references.
+    pub fn has_optional_segment(&self) -> bool {
+        !self.optional_segment_package_ids.is_empty()
+    }
+
+    /// Whether any redirect, new-style or legacy, points at `package_id`.
+    /// Removing its target would leave the redirect resolving to nothing.
+    pub fn redirects_to(&self, package_id: FPackageId) -> bool {
+        self.package_redirects
+            .iter()
+            .any(|redirect| redirect.target_package_id == package_id)
+            || self
+                .legacy_package_redirects
+                .iter()
+                .any(|redirect| redirect.target_package_id == package_id)
+            || self
+                .package_redirect_lookup
+                .values()
+                .any(|target| *target == package_id)
+    }
+
+    /// Whether `package_id` is registered as a localized source package, in
+    /// either the new list or the legacy culture map.
+    pub fn is_localized_source(&self, package_id: FPackageId) -> bool {
+        self.localized_source_package_ids.contains(&package_id)
+            || self.legacy_culture_package_map.0.values().any(|packages| {
+                packages
+                    .iter()
+                    .any(|(source, localized)| *source == package_id || *localized == package_id)
+            })
     }
     pub fn package_ids(&self) -> std::iter::Copied<std::collections::btree_map::Keys<'_, FPackageId, StoreEntry>> {
         self.packages.0.keys().copied()
@@ -641,5 +758,101 @@ impl Writeable for FCulturePackageMap {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod corpus {
+    use super::*;
+    use crate::iostore::IoStoreArchive;
+    use std::io::Cursor;
+    use std::path::PathBuf;
+
+    /// `EIoChunkType::ContainerHeader`.
+    const CHUNK_TYPE_CONTAINER_HEADER: u8 = 6;
+
+    /// Report whether shipped containers carry the ordinal-keyed blocks that
+    /// make adding or removing a package unsafe.
+    ///
+    /// A measurement, not an assertion about the game. It decides whether
+    /// renaming a tag in place is possible on a shipped pak at all:
+    /// `soft_package_references` and the optional segment are keyed by
+    /// store-entry ordinal, and the store is a `BTreeMap` over `FPackageId`, so
+    /// *adding* a package renumbers them exactly as removing one does.
+    ///
+    /// It matters twice over. `resolve_tag_deletion` refuses a container that
+    /// carries them, but `duplicate_tag_in_place_impl` calls `add_package` with
+    /// no such check -- so if shipped packs do carry a non-empty block, the
+    /// duplicate path that already ships is unsound against them.
+    ///
+    ///   CE_PAKS=/path/to/Meteorite/Content/Paks \
+    ///     cargo test --features iostore container::header::corpus -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires a Campaign Evolved install; set CE_PAKS"]
+    fn report_ordinal_keyed_blocks_in_shipped_containers() {
+        let Ok(root) = std::env::var("CE_PAKS") else {
+            panic!("set CE_PAKS to the game's Content/Paks");
+        };
+        let mut utocs: Vec<PathBuf> = std::fs::read_dir(&root)
+            .expect("read paks dir")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|x| x.eq_ignore_ascii_case("utoc")))
+            .filter(|path| !path.file_name().is_some_and(|n| n.eq_ignore_ascii_case("global.utoc")))
+            .collect();
+        utocs.sort();
+
+        let (mut headers, mut soft, mut optional, mut locked) = (0usize, 0usize, 0usize, 0usize);
+        for utoc in &utocs {
+            let name = utoc.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            let Ok(archive) = IoStoreArchive::open(utoc) else {
+                println!("{name:<44} could not be opened");
+                continue;
+            };
+            let mut found = false;
+            for index in 0..archive.chunk_count() as u32 {
+                let Ok(id) = archive.chunk_id(index) else { continue };
+                if id.chunk_type() != CHUNK_TYPE_CONTAINER_HEADER {
+                    continue;
+                }
+                found = true;
+                headers += 1;
+                let Ok(bytes) = archive.read_chunk(index) else {
+                    println!("{name:<44} header chunk unreadable");
+                    continue;
+                };
+                match FIoContainerHeader::deserialize(&mut Cursor::new(&bytes[..]), None) {
+                    Ok(header) => {
+                        let refs = header.soft_package_reference_count();
+                        let segment = header.optional_segment_package_ids.len();
+                        soft += usize::from(refs > 0);
+                        optional += usize::from(segment > 0);
+                        locked += usize::from(refs > 0 || segment > 0);
+                        println!(
+                            "{name:<44} version {:?}  packages {}  soft refs {refs}  optional {segment}",
+                            header.version,
+                            header.package_ids().len(),
+                        );
+                    }
+                    Err(error) => println!("{name:<44} header did not parse: {error}"),
+                }
+            }
+            if !found {
+                println!("{name:<44} carries no container header");
+            }
+        }
+
+        println!("\ncontainer headers read      {headers}");
+        println!("with soft package refs      {soft}");
+        println!("with an optional segment    {optional}");
+        println!("ordinal-locked              {locked}");
+        if locked > 0 {
+            println!(
+                "\nIn-place rename is refused on those containers -- and the in-place duplicate\n\
+                 path that already ships does NOT check for this before calling add_package."
+            );
+        } else {
+            println!("\nNo container is ordinal-locked; in-place add and remove are both open.");
+        }
+        assert!(headers > 0, "no container header was found under CE_PAKS");
     }
 }

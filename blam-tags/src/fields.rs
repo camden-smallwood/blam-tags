@@ -530,9 +530,12 @@ impl TagFieldData {
 // raw_data. The 1-byte helpers don't take endian — endianness is
 // meaningless for a single byte.
 //
-// Writers always emit little-endian because we never serialize a BE
-// tag back to disk (Phase 1 set scope to read-only for X360). If that
-// ever changes, mirror the reader dispatch in the writer.
+// Writers dispatch on `endian` the same way, so an edit to a BE tag stays
+// big-endian in memory. What is *not* symmetric is the file: `TagFile::write`
+// emits little-endian headers and chunk wrappers unconditionally, so a BE tag
+// has no round trip. Moving one to PC goes through `crate::convert`, which
+// reads BE fields and writes LE ones into a fresh target rather than swapping
+// this buffer in place.
 //================================================================================
 
 #[inline] fn read_i8(raw: &[u8], o: usize) -> i8 { raw[o] as i8 }
@@ -683,7 +686,25 @@ pub(crate) fn field_option_names<'a>(
     layout: &'a TagLayout,
     field: &TagFieldLayout,
 ) -> impl Iterator<Item = &'a str> + 'a {
-    let string_list = layout.string_lists.get(field.definition as usize);
+    // Only an enum or a plain flags field names a string list. The block-shaped
+    // relatives — `*_block_flags`, `*_block_index` — put a *block* index in the
+    // same slot, and their options are that block's elements at runtime, which
+    // a layout cannot know. Reading `string_lists` at a block index returns
+    // whichever list happens to sit there: `manual bsp flags` came back with
+    // the fifteen options of `scenario_type_enum`, and a cross-game comparison
+    // that pairs options by name then reported every one of them lost.
+    let names_a_string_list = matches!(
+        field.field_type,
+        TagFieldType::CharEnum
+            | TagFieldType::ShortEnum
+            | TagFieldType::LongEnum
+            | TagFieldType::LongFlags
+            | TagFieldType::WordFlags
+            | TagFieldType::ByteFlags,
+    );
+    let string_list = names_a_string_list
+        .then(|| layout.string_lists.get(field.definition as usize))
+        .flatten();
     let range = match string_list {
         Some(sl) => sl.first..sl.first + sl.count,
         None => 0..0,
@@ -972,12 +993,28 @@ pub(crate) fn deserialize_field(
             }
             _ => None,
         }),
-        TagFieldType::OldStringId => sub_chunk.and_then(|c| match c {
-            TagSubChunkContent::OldStringId(payload) => {
-                Some(TagFieldData::OldStringId(StringIdData::from_bytes(payload)))
+        TagFieldType::OldStringId => {
+            // The legacy classic engines (`ambl` / `LAMB`) keep this as a
+            // 32-byte inline null-padded string in the fixed bytes and emit no
+            // sub-chunk at all, so there is nothing for the branch below to
+            // find and every name read back empty. `read_classic_tag_file`
+            // records that width on the field type, which is what says "inline"
+            // to a reader that has no engine in hand; every other layout leaves
+            // it at the modern 4-byte slot and takes the sub-chunk path.
+            if layout.field_types[field.type_index as usize].size == 32 {
+                return (offset + 32 <= raw_struct.len()).then(|| {
+                    TagFieldData::OldStringId(StringIdData {
+                        string: decode_null_padded_string(&raw_struct[offset..offset + 32]),
+                    })
+                });
             }
-            _ => None,
-        }),
+            sub_chunk.and_then(|c| match c {
+                TagSubChunkContent::OldStringId(payload) => {
+                    Some(TagFieldData::OldStringId(StringIdData::from_bytes(payload)))
+                }
+                _ => None,
+            })
+        }
         TagFieldType::TagReference => sub_chunk.and_then(|c| match c {
             TagSubChunkContent::TagReference(payload) => Some(TagFieldData::TagReference(
                 TagReferenceData::from_bytes(payload, endian),
