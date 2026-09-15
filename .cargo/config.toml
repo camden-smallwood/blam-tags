@@ -1,0 +1,11 @@
+# The `blam-tags-py` cdylib uses PyO3's `extension-module` feature, which
+# deliberately does not link libpython — the Python C-API symbols are resolved
+# at runtime when the interpreter loads the module. On macOS a plain
+# `cargo build` still needs `-undefined dynamic_lookup` so the linker defers
+# those symbols instead of erroring. (maturin passes these itself; this keeps
+# `cargo build --workspace` green outside maturin.)
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
