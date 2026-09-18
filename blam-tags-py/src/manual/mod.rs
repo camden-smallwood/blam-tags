@@ -12,7 +12,10 @@
 mod handles;
 mod value;
 
-pub use handles::{PyTagBlock, PyTagField, PyTagFile, PyTagStruct};
+pub use handles::{
+    PyTagArray, PyTagBlock, PyTagBlockElement, PyTagField, PyTagFile, PyTagFunction, PyTagOptions,
+    PyTagResource, PyTagStruct,
+};
 
 use pyo3::prelude::*;
 
@@ -22,5 +25,10 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTagStruct>()?;
     m.add_class::<PyTagField>()?;
     m.add_class::<PyTagBlock>()?;
+    m.add_class::<PyTagArray>()?;
+    m.add_class::<PyTagResource>()?;
+    m.add_class::<PyTagOptions>()?;
+    m.add_class::<PyTagFunction>()?;
+    m.add_class::<PyTagBlockElement>()?;
     Ok(())
 }

@@ -698,7 +698,7 @@ impl PyRealQuaternion {
     /// anti-parallel inputs) collapse to identity or a 180° rotation
     /// around an arbitrary perpendicular axis.
     #[staticmethod]
-    fn shortest_arc(from: PyRealVector3d, to: PyRealVector3d) -> PyRealQuaternion { PyRealQuaternion(blam_tags::math::RealQuaternion::shortest_arc(from.0, to.0)) }
+    fn shortest_arc(from_: PyRealVector3d, to: PyRealVector3d) -> PyRealQuaternion { PyRealQuaternion(blam_tags::math::RealQuaternion::shortest_arc(from_.0, to.0)) }
     /// Normalized linear interpolation, short-arc. If `self.dot(other) < 0`
     /// the second quat is flipped so the interpolation takes the shorter
     /// rotational path.

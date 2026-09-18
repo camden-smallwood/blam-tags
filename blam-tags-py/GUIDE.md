@@ -196,7 +196,7 @@ What `.value` returns, and what `.set(...)` accepts, per field kind:
 | char/short/long/int64/byte/word/dword/qword integer | `int` | `int` (range-checked to the field's width) |
 | tag (group) | `int` | `int` |
 | angle, real, real slider, real fraction | `float` | `float` |
-| enum (char/short/long) | `str` variant name if the schema names it, else `int` | `int` index, or the *current* name (see [Enums](#enums)) |
+| enum (char/short/long) | `str` variant name if the schema names it, else `int` | `int` index or `str` variant name (see [Enums](#enums)) |
 | flags (byte/word/long) | `list[str]` of set-bit names | use `set_flag` — see [Flags](#flags) |
 | block flags (byte/word/long) | `int` | `int` |
 | block index (char/short/long, incl. custom) | `int` | `int` |
@@ -232,22 +232,28 @@ f = root.field("some enum")
 f.value                     # e.g. "standing"
 ```
 
-Writing an enum:
+Writing an enum works **by numeric index or by variant name**:
 
-- **By numeric index** — always works:
+```python
+f.set(2)                    # by index — the third option
+f.set("standing")           # by name — resolved against the schema's options
+```
 
-  ```python
-  f.set(2)                  # set the third option
-  ```
+An unknown name raises `ValueError`. To discover the valid options, use
+`.options()` (see below).
 
-- **By name** — only confirms the value it already holds. The parsed value
-  carries the *current* variant's name, not the full option list, so you cannot
-  switch to a different variant by name; use the index for that.
+### Discovering options
 
-  ```python
-  f.set(f.value)            # OK: no-op
-  f.set("some other name")  # ValueError: assign the numeric option index instead
-  ```
+`field.options()` returns the field's full option catalog — every defined
+variant, not just the current one — or `None` for non-enum/flags fields:
+
+```python
+o = f.options()
+o.is_enum         # True
+o.names           # ['normal', 'slaved to primary', ...] — index == stored value
+o.current         # 0 (the stored index), or None if it didn't resolve
+o.current_name    # 'normal'
+```
 
 ---
 
@@ -266,8 +272,17 @@ f.set_flag("turns without animating", True)   # set one bit
 f.get_flag("turns without animating")         # True
 f.value                                        # ["turns without animating"]
 f.set_flag("turns without animating", False)  # clear it
+```
 
-f.flag_names()   # [(bit_index, name), ...] — every bit the schema defines
+`flag_names()` lists only the bits that are currently **set**. To enumerate
+*every* bit the schema defines — which is what you need to know what
+`set_flag` accepts — use `.options()`:
+
+```python
+o = f.options()
+o.is_flags        # True
+o.flags           # [(bit, name, is_set), ...] — every defined bit
+o.names           # just the names, in bit order
 ```
 
 An unknown flag name raises `KeyError` (from `get_flag`/`set_flag`).
@@ -324,7 +339,47 @@ unit.path                                 # e.g. "unit#0"
 ```
 
 From there it's the same `field` / `field_path` / `as_block` navigation as the
-root.
+root. A struct also exposes:
+
+```python
+unit.descend("object")        # a nested TagStruct by path (not a field), or None
+unit.fields_all()             # like fields(), but including padding/skip entries
+unit.raw                      # the struct's raw on-disk bytes
+```
+
+---
+
+## Arrays, resources, and functions
+
+Beyond blocks and structs, a field can be a **fixed-count array**, a
+**pageable resource**, or a **tag function** (`mapping_function`). Each has its
+own accessor, returning `None` when the field is not that shape:
+
+```python
+arr = field.as_array()        # TagArray — like a block but fixed count
+len(arr); arr[0]              # indexable; swap(i, j) / replace(i, snap) to edit
+
+res = field.as_resource()     # TagResource
+res.kind                      # "null" | "exploded" | "xsync"
+res.inline_bytes              # the 8 inline engine bytes
+res.exploded_payload          # the tgdt payload bytes, or None
+
+if field.is_function_data():
+    fn = field.as_function()  # TagFunction
+    fn.function_type          # e.g. "Constant", "Linear"
+    fn.evaluate(0.5, 1.0)     # sample the curve
+```
+
+### Copying block/array elements
+
+`snapshot(i)` captures an element; `paste(i, snap)` (blocks) or
+`replace(i, snap)` (arrays) writes it back — including across different blocks
+of the same element type:
+
+```python
+snap = src_block.snapshot(0)
+dst_block.paste(len(dst_block), snap)
+```
 
 ---
 
@@ -427,7 +482,28 @@ tag.recompute_checksum()       # recompute and store the header checksum
 
 tag.add_dependency_list("definitions/halo3_mcc/biped.json")  # attach a `want` stream
 tag.remove_dependency_list()   # drop it, if present
+
+tag.group_version              # the group's version number
+tag.endian                     # bt.Endian.Le / bt.Endian.Be
+tag.classic_engine             # engine name for a classic tag, else None
+
+# Read just a tag's dependency references without parsing the whole file:
+bt.TagFile.read_dependency_references("some.biped")  # [(group, path), ...] or None
 ```
+
+### Side structs (anchors)
+
+Besides `root()`, a tag can carry three separate top-level structs. Each is
+navigable and editable exactly like the root, or `None` when absent:
+
+```python
+tag.dependency_list()       # the `want` stream struct
+tag.import_info()           # the source-asset import-info struct
+tag.asset_depot_storage()   # the asset-depot-storage struct
+```
+
+Each has an `add_*` / `remove_*` counterpart on `TagFile`
+(`add_import_info`, `remove_asset_depot_storage`, …).
 
 ---
 

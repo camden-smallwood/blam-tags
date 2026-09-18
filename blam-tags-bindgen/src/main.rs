@@ -40,9 +40,21 @@ fn run() -> Result<(), String> {
     let policy = policy::Policy::load(&manifest)?;
 
     let mut emitter = emit::Emitter::new(&krate, &policy);
-    let (rs, pyi, coverage) = emitter.run();
+    let (rs, mut pyi, coverage) = emitter.run();
 
     let out = root.join("blam-tags-py");
+
+    // The `manual/` facade types are skipped by the generator (they carry
+    // lifetimes that cannot be mechanically wrapped), so their stubs are
+    // hand-written. Append them verbatim so the `.pyi` covers the whole module.
+    let manual_pyi = out.join("manual.pyi");
+    if manual_pyi.exists() {
+        let stubs = std::fs::read_to_string(&manual_pyi)
+            .map_err(|e| format!("reading {}: {e}", manual_pyi.display()))?;
+        pyi.push('\n');
+        pyi.push_str(&stubs);
+    }
+
     write(&out.join("src/generated.rs"), &rs)?;
     write(&out.join("blam_tags.pyi"), &pyi)?;
     write(&out.join("COVERAGE.md"), &coverage)?;

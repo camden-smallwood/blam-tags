@@ -131,7 +131,16 @@ pub fn to_py(py: Python<'_>, data: &TagFieldData) -> PyResult<Py<PyAny>> {
 /// The variant is never chosen from the Python value — it comes from what is
 /// already stored — so writing can change a field's contents but never its
 /// type.
-pub fn apply(data: &mut TagFieldData, value: &Bound<'_, PyAny>) -> PyResult<()> {
+/// Assign `value` into `data`, preserving the field's on-disk variant.
+///
+/// `enum_names` is the schema's full option list for an enum field, letting a
+/// name be resolved to its index even when the stored value differs; pass
+/// `None` for non-enum fields or when the catalog is unavailable.
+pub fn apply_with_enum_names(
+    data: &mut TagFieldData,
+    value: &Bound<'_, PyAny>,
+    enum_names: Option<&[String]>,
+) -> PyResult<()> {
     use TagFieldData as D;
 
     /// Extract, reporting the field's expected shape rather than a bare
@@ -178,9 +187,9 @@ pub fn apply(data: &mut TagFieldData, value: &Bound<'_, PyAny>) -> PyResult<()> 
 
         // An enum accepts either the raw value or a variant name, matching
         // what `to_py` produced.
-        D::CharEnum { value: v, name } => set_enum(value, v, name)?,
-        D::ShortEnum { value: v, name } => set_enum(value, v, name)?,
-        D::LongEnum { value: v, name } => set_enum(value, v, name)?,
+        D::CharEnum { value: v, name } => set_enum(value, v, name, enum_names)?,
+        D::ShortEnum { value: v, name } => set_enum(value, v, name, enum_names)?,
+        D::LongEnum { value: v, name } => set_enum(value, v, name, enum_names)?,
 
         D::ByteFlags { .. } | D::WordFlags { .. } | D::LongFlags { .. } => {
             return Err(pyo3::exceptions::PyNotImplementedError::new_err(
@@ -226,7 +235,12 @@ pub fn apply(data: &mut TagFieldData, value: &Bound<'_, PyAny>) -> PyResult<()> 
 }
 
 /// Assign an enum field from either its raw value or its schema name.
-fn set_enum<T>(value: &Bound<'_, PyAny>, slot: &mut T, name: &Option<String>) -> PyResult<()>
+fn set_enum<T>(
+    value: &Bound<'_, PyAny>,
+    slot: &mut T,
+    name: &Option<String>,
+    enum_names: Option<&[String]>,
+) -> PyResult<()>
 where
     T: for<'a, 'p> FromPyObject<'a, 'p>,
 {
@@ -239,9 +253,33 @@ where
             "an enum field expects an int or a variant name",
         ));
     };
-    // Only the *current* variant's name is carried in the parsed value, so a
-    // name-based assignment can confirm a no-op but cannot resolve a
-    // different variant without the schema's option list.
+    // With the schema's full option list, a name resolves to its declaration
+    // index — the enum's stored value.
+    if let Some(names) = enum_names {
+        if let Some(idx) = names.iter().position(|n| n == &wanted) {
+            // `into_pyobject` for an integer is infallible. The generic slot's
+            // `FromPyObject::Error` isn't known to convert to `PyErr`, so map a
+            // width overflow explicitly rather than using `?`.
+            let obj = (idx as i64).into_pyobject(value.py()).unwrap();
+            match obj.extract::<T>() {
+                Ok(v) => {
+                    *slot = v;
+                    return Ok(());
+                }
+                Err(_) => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "enum option index {idx} does not fit this field's width"
+                    )))
+                }
+            }
+        }
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown enum name {wanted:?}; valid options: {}",
+            names.join(", ")
+        )));
+    }
+    // Without the option list, only the *current* variant's name is known, so
+    // a name-based assignment can confirm a no-op but cannot resolve another.
     match name {
         Some(current) if *current == wanted => Ok(()),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
