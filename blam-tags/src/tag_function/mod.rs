@@ -909,7 +909,7 @@ impl ExponentCompact {
 
 /// Decoded per-type function curve. All 11 function types parse +
 /// evaluate. This is the internal curve representation; the public
-/// [`TagFunction`] wraps one (or two, for RANGE-flagged functions).
+/// [`BlobFunction`] wraps one (or two, for RANGE-flagged functions).
 #[derive(Debug, Clone)]
 pub enum FunctionKind {
     Identity { header: TagFunctionHeader },
@@ -943,6 +943,8 @@ pub enum TagFunctionError {
     TooShort { len: usize },
     UnknownFunctionType { byte: u8 },
     UnknownColorGraphType { byte: u8 },
+    /// A Halo 2 classic byte-block failed to decode.
+    H2(H2FunctionError),
 }
 
 impl std::fmt::Display for TagFunctionError {
@@ -951,6 +953,7 @@ impl std::fmt::Display for TagFunctionError {
             Self::TooShort { len } => write!(f, "TagFunction data too short: {len} bytes (need 32)"),
             Self::UnknownFunctionType { byte } => write!(f, "unknown function_type byte: 0x{byte:02x}"),
             Self::UnknownColorGraphType { byte } => write!(f, "unknown color_graph_type byte: 0x{byte:02x}"),
+            Self::H2(e) => e.fmt(f),
         }
     }
 }
@@ -1086,7 +1089,7 @@ impl FunctionKind {
     /// re-expansion and BEFORE output-range remapping. This is the body of
     /// the engine `c_function_definition::evaluate_legacy @0x1804F9390`
     /// per-type `switch`. The exclusion + range-lerp steps are applied by
-    /// the public [`TagFunction::evaluate_legacy`].
+    /// the public [`BlobFunction::evaluate_legacy`].
     fn eval_legacy(&self, input: f32, range: f32) -> f32 {
         match self {
             Self::Identity { .. } => input,
@@ -1116,18 +1119,19 @@ impl FunctionKind {
 }
 
 // ---------------------------------------------------------------------------
-// TagFunction — public wrapper (single curve, or two for RANGE-flagged)
+// BlobFunction — the H3+ blob encoding (single curve, or two for RANGE-flagged)
 // ---------------------------------------------------------------------------
 
-/// Public decoded `mapping_function`. Wraps the primary [`FunctionKind`]
+/// A `mapping_function` in the H3+ blob encoding (32-byte header + typed
+/// compacts; see the module docs). Wraps the primary [`FunctionKind`]
 /// curve plus, for RANGE-flagged non-Constant functions, an optional
 /// second curve of the same type — the engine blends the two by the
 /// `range` argument (`first + (second - first) * range`).
 #[derive(Debug, Clone)]
-pub struct TagFunction {
+pub struct BlobFunction {
     kind: FunctionKind,
     /// Second back-to-back compact for RANGE-flagged non-Constant
-    /// functions; `None` otherwise. Boxed to keep `TagFunction` small.
+    /// functions; `None` otherwise. Boxed to keep `BlobFunction` small.
     ranged_second: Option<Box<FunctionKind>>,
     /// Raw **editor-data trailer**: the bytes that follow the compact
     /// region on-disk. Present when the OPTIMIZED flag (bit `0x10`) is
@@ -1148,7 +1152,7 @@ pub struct TagFunction {
     dirty: bool,
 }
 
-impl TagFunction {
+impl BlobFunction {
     /// Parse a `mapping_function` `data` blob. Reads the 32-byte header, the
     /// per-graph compact(s), and preserves the editor-data trailer.
     ///
@@ -1689,6 +1693,205 @@ impl TagFunction {
     }
 }
 
+// ---------------------------------------------------------------------------
+// TagFunction — a function in whichever on-disk encoding its game uses
+// ---------------------------------------------------------------------------
+
+/// The on-disk encoding of a function's `data` byte-block. The function
+/// *model* (types, periodic/transition tables) is shared across the lineage;
+/// only the byte layout differs, and the bytes alone don't say which layout
+/// they are in — the caller knows from the game and the field's struct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionEncoding {
+    /// H3+ `function_definition_data` (Halo 3, ODST, Reach, Halo 4, H2A,
+    /// Campaign Evolved): see [`BlobFunction`].
+    Blob,
+    /// Halo 2 classic `mapping_function` v1 byte-block: see [`H2Function`].
+    H2,
+}
+
+/// A decoded `mapping_function`, in its game's encoding.
+///
+/// The read/evaluate surface is shared and dispatches per encoding. Editing,
+/// and the blob's own structure (header, compacts, linear-key points), are
+/// reached through [`Self::as_blob`] / [`Self::as_blob_mut`].
+#[derive(Debug, Clone)]
+pub enum TagFunction {
+    Blob(BlobFunction),
+    H2(H2Function),
+}
+
+impl From<BlobFunction> for TagFunction {
+    fn from(f: BlobFunction) -> Self {
+        Self::Blob(f)
+    }
+}
+
+impl From<H2Function> for TagFunction {
+    fn from(f: H2Function) -> Self {
+        Self::H2(f)
+    }
+}
+
+impl TagFunction {
+    /// Parse an H3+ blob. Shorthand for
+    /// `parse_encoded(FunctionEncoding::Blob, data)`.
+    pub fn parse(data: &[u8]) -> Result<Self, TagFunctionError> {
+        BlobFunction::parse(data).map(Self::Blob)
+    }
+
+    /// Parse `data` in the given encoding.
+    pub fn parse_encoded(encoding: FunctionEncoding, data: &[u8]) -> Result<Self, TagFunctionError> {
+        match encoding {
+            FunctionEncoding::Blob => Self::parse(data),
+            FunctionEncoding::H2 => H2Function::parse(data).map(Self::H2).map_err(TagFunctionError::H2),
+        }
+    }
+
+    pub fn encoding(&self) -> FunctionEncoding {
+        match self {
+            Self::Blob(_) => FunctionEncoding::Blob,
+            Self::H2(_) => FunctionEncoding::H2,
+        }
+    }
+
+    pub fn as_blob(&self) -> Option<&BlobFunction> {
+        match self {
+            Self::Blob(f) => Some(f),
+            Self::H2(_) => None,
+        }
+    }
+
+    pub fn as_blob_mut(&mut self) -> Option<&mut BlobFunction> {
+        match self {
+            Self::Blob(f) => Some(f),
+            Self::H2(_) => None,
+        }
+    }
+
+    pub fn as_h2(&self) -> Option<&H2Function> {
+        match self {
+            Self::H2(f) => Some(f),
+            Self::Blob(_) => None,
+        }
+    }
+
+    /// Serialize back to the `data` byte-block in the encoding it was parsed
+    /// from. Byte-identical for an unedited function.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Blob(f) => f.to_bytes(),
+            Self::H2(f) => f.to_bytes(),
+        }
+    }
+
+    pub fn function_type(&self) -> FunctionType {
+        match self {
+            Self::Blob(f) => f.function_type(),
+            Self::H2(f) => f.function_type(),
+        }
+    }
+
+    pub fn is_ranged(&self) -> bool {
+        match self {
+            Self::Blob(f) => f.is_ranged(),
+            Self::H2(f) => f.is_ranged(),
+        }
+    }
+
+    /// Number of graph slots: 2 when ranged, else 1.
+    pub fn graph_count(&self) -> usize {
+        1 + self.is_ranged() as usize
+    }
+
+    /// The function type of graph `slot` (0 = primary, 1 = ranged second).
+    pub fn graph_kind(&self, slot: usize) -> Option<FunctionType> {
+        match self {
+            Self::Blob(f) => f.graph_kind(slot),
+            Self::H2(f) => (slot < self.graph_count()).then(|| f.function_type()),
+        }
+    }
+
+    /// Number of populated color slots (0 = scalar).
+    pub fn color_count(&self) -> usize {
+        match self {
+            Self::Blob(f) => f.color_count(),
+            Self::H2(f) => f.color_count(),
+        }
+    }
+
+    /// Scalar vs N-color. Halo 2 stores a color *count* (flag bits 5-7) rather
+    /// than a graph type; counts past four have no graph type and read as
+    /// `Scalar`.
+    pub fn color_graph_type(&self) -> ColorGraphType {
+        match self {
+            Self::Blob(f) => f.color_graph_type(),
+            Self::H2(f) => ColorGraphType::from_byte(f.color_count() as u8).unwrap_or(ColorGraphType::Scalar),
+        }
+    }
+
+    // Halo 2 functions have no clamped/cyclic/exclusion flags.
+
+    pub fn is_clamped(&self) -> bool {
+        self.as_blob().is_some_and(BlobFunction::is_clamped)
+    }
+
+    pub fn is_cyclic(&self) -> bool {
+        self.as_blob().is_some_and(BlobFunction::is_cyclic)
+    }
+
+    pub fn is_exclusion(&self) -> bool {
+        self.as_blob().is_some_and(BlobFunction::is_exclusion)
+    }
+
+    /// Evaluate at `(input, range)` to the final scalar value.
+    pub fn evaluate(&self, input: f32, range: f32) -> f32 {
+        match self {
+            Self::Blob(f) => f.evaluate(input, range),
+            Self::H2(f) => f.evaluate(input, range),
+        }
+    }
+
+    /// The normalized curve before output-range remapping. Halo 2 has no
+    /// output range, so this is [`Self::evaluate`] there.
+    pub fn evaluate_legacy(&self, input: f32, range: f32) -> f32 {
+        match self {
+            Self::Blob(f) => f.evaluate_legacy(input, range),
+            Self::H2(f) => f.evaluate(input, range),
+        }
+    }
+
+    /// Alias for [`Self::evaluate_legacy`] for editors that draw the raw curve.
+    pub fn evaluate_shape(&self, input: f32, range: f32) -> f32 {
+        self.evaluate_legacy(input, range)
+    }
+
+    /// Color output. Halo 2 color evaluation is not ported yet: its functions
+    /// return the scalar curve as grayscale.
+    pub fn evaluate_color(&self, input: f32, range: f32) -> RealRgbColor {
+        match self {
+            Self::Blob(f) => f.evaluate_color(input, range),
+            Self::H2(f) => {
+                let n = f.evaluate(input, range);
+                RealRgbColor { red: n, green: n, blue: n }
+            }
+        }
+    }
+
+    /// `Some` when the value does not depend on the inputs.
+    pub fn as_constant(&self) -> Option<f32> {
+        match self {
+            Self::Blob(f) => f.as_constant(),
+            Self::H2(f) => (f.function_type() == FunctionType::Constant && !f.is_ranged())
+                .then(|| f.evaluate(0.0, 0.0)),
+        }
+    }
+
+    pub fn is_constant(&self) -> bool {
+        self.as_constant().is_some()
+    }
+}
+
 /// Count active non-padding points in a LinearKey graph.
 fn active_lk_count(pts: &[(f32, f32); 4]) -> usize {
     let mut n = 4;
@@ -1835,24 +2038,94 @@ mod tests {
         data
     }
 
+    /// H2 v1 byte-block: 4-byte header + LE f32 values.
+    fn h2_block(ty: u8, flags: u8, fn1: u8, values: &[f32]) -> Vec<u8> {
+        let mut b = vec![ty, flags, fn1, 0];
+        for v in values {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn tag_function_dispatches_on_the_stated_encoding() {
+        // Linear, slope 0.5 offset 0.2 at values[4..6].
+        let bytes = h2_block(4, 0, 0, &[0.0, 0.0, 0.0, 0.0, 0.5, 0.2]);
+        let f = TagFunction::parse_encoded(FunctionEncoding::H2, &bytes).unwrap();
+        assert_eq!(f.encoding(), FunctionEncoding::H2);
+        assert!(f.as_blob().is_none());
+        assert_eq!(f.function_type(), FunctionType::Linear);
+        assert_eq!(f.graph_count(), 1);
+        assert!((f.evaluate(0.4, 0.0) - 0.4).abs() < 1e-6);
+        assert_eq!(f.to_bytes(), bytes);
+
+        // The same 28 bytes are too short to be a blob: the encoding is the
+        // caller's to state, not something parse guesses.
+        assert!(matches!(
+            TagFunction::parse_encoded(FunctionEncoding::Blob, &bytes),
+            Err(TagFunctionError::TooShort { len: 28 })
+        ));
+        assert!(matches!(
+            TagFunction::parse_encoded(FunctionEncoding::H2, &[99, 0, 0, 0]),
+            Err(TagFunctionError::H2(H2FunctionError::BadFunctionType { byte: 99 }))
+        ));
+
+        let blob = linear_blob(0, &[(1.0, 0.0)]);
+        let f = TagFunction::parse(&blob).unwrap();
+        assert_eq!(f.encoding(), FunctionEncoding::Blob);
+        assert!(f.as_blob().is_some());
+        assert_eq!(f.to_bytes(), blob);
+    }
+
+    #[test]
+    fn h2_constant_is_constant_and_color_count_maps_to_graph_type() {
+        let f = TagFunction::parse_encoded(FunctionEncoding::H2, &h2_block(1, 0, 0, &[0.25, 0.0])).unwrap();
+        assert_eq!(f.as_constant(), Some(0.25));
+        assert_eq!(f.color_graph_type(), ColorGraphType::Scalar);
+
+        // Ranged: depends on `range`, so not constant.
+        let f = TagFunction::parse_encoded(FunctionEncoding::H2, &h2_block(1, 1, 0, &[0.25, 0.75])).unwrap();
+        assert_eq!(f.as_constant(), None);
+        assert_eq!(f.graph_count(), 2);
+        assert_eq!(f.graph_kind(1), Some(FunctionType::Constant));
+
+        // Two colors (flag bits 5-7 = 2).
+        let f = TagFunction::parse_encoded(FunctionEncoding::H2, &h2_block(1, 2 << 5, 0, &[0.0])).unwrap();
+        assert_eq!(f.color_graph_type(), ColorGraphType::TwoColor);
+    }
+
+    #[test]
+    fn editor_refuses_h2_edits_instead_of_dropping_them() {
+        let bytes = h2_block(3, 0, 2, &[1.0, 0.0, 0.0, 1.0]);
+        let mut e = editor::TagFunctionEditor::from_function(
+            TagFunction::parse_encoded(FunctionEncoding::H2, &bytes).unwrap(),
+        );
+        assert_eq!(e.function_type(), FunctionType::Periodic);
+        assert!(e.set_ranged(true).is_err());
+        assert!(e.set_master_type(editor::FoundationMasterType::Basic).is_err());
+        assert!(e.set_color_graph_type(ColorGraphType::OneColor).is_err());
+        assert!(e.set_color(0, 0xFFFF_FFFF).is_err());
+        assert_eq!(e.to_bytes(), bytes, "a refused edit leaves the bytes untouched");
+    }
+
     #[test]
     fn to_bytes_roundtrips_simple_linear() {
         let data = linear_blob(0, &[(2.0, 0.5)]);
-        let f = TagFunction::parse(&data).unwrap();
+        let f = BlobFunction::parse(&data).unwrap();
         let out = f.to_bytes();
         assert_eq!(out, data);
-        assert_eq!(TagFunction::parse(&out).unwrap().function_type(), FunctionType::Linear);
+        assert_eq!(BlobFunction::parse(&out).unwrap().function_type(), FunctionType::Linear);
     }
 
     #[test]
     fn to_bytes_preserves_range_second_curve() {
         // RANGE-flagged Linear: two compacts back-to-back behind one header.
         let data = linear_blob(FunctionFlags::RANGE, &[(1.0, 0.0), (3.0, 1.0)]);
-        let f = TagFunction::parse(&data).unwrap();
+        let f = BlobFunction::parse(&data).unwrap();
         assert!(f.ranged_second.is_some(), "second curve not parsed");
         // The whole blob (both compacts) must survive serialization.
         assert_eq!(f.to_bytes(), data, "RANGE second compact dropped on to_bytes");
-        assert!(TagFunction::parse(&f.to_bytes()).unwrap().ranged_second.is_some());
+        assert!(BlobFunction::parse(&f.to_bytes()).unwrap().ranged_second.is_some());
     }
 
     fn hexvec(s: &str) -> Vec<u8> {
@@ -1878,7 +2151,7 @@ mod tests {
     fn golden_ranged_periodic_parses_and_roundtrips_byte_exact() {
         let data = golden_ranged_periodic();
         assert_eq!(data.len(), 112);
-        let f = TagFunction::parse(&data).unwrap();
+        let f = BlobFunction::parse(&data).unwrap();
         assert_eq!(f.function_type(), FunctionType::Periodic);
         assert!(f.is_ranged());
         assert_eq!(f.graph_count(), 2);
@@ -1895,13 +2168,13 @@ mod tests {
         // The bug this guards: an edited non-trivial function must NOT drop the
         // editor trailer (old to_bytes wrote header+compact only).
         let data = golden_ranged_periodic();
-        let mut f = TagFunction::parse(&data).unwrap();
+        let mut f = BlobFunction::parse(&data).unwrap();
         f.set_clamp_range(0.0, 2.0); // marks dirty → rebuild path
         let out = f.to_bytes();
         // header(32) + 2×20 compacts + 2×20 regenerated editors = 112.
         assert_eq!(out.len(), 112, "editor trailer dropped on edited save");
         // compact_size header field stays the TOTAL.
-        let reparsed = TagFunction::parse(&out).unwrap();
+        let reparsed = BlobFunction::parse(&out).unwrap();
         assert_eq!(reparsed.header().compact_size, 40);
         assert!(reparsed.is_ranged());
         assert_eq!(reparsed.editor_data().len(), 40);
@@ -1921,7 +2194,7 @@ mod tests {
         let editor = data[32..52].to_vec();
         data.extend_from_slice(&editor); // 20-byte editor mirror
         assert_eq!(data.len(), 72);
-        let mut f = TagFunction::parse(&data).unwrap();
+        let mut f = BlobFunction::parse(&data).unwrap();
         assert_eq!(f.editor_data().len(), 20);
         assert_eq!(f.to_bytes(), data, "unranged periodic byte-exact");
         // Even after an edit the length holds (32+20+20).
@@ -1931,7 +2204,7 @@ mod tests {
 
     #[test]
     fn set_function_type_clears_range_second_and_resizes() {
-        let mut f = TagFunction::parse(&linear_blob(FunctionFlags::RANGE, &[(1.0, 0.0), (3.0, 1.0)]))
+        let mut f = BlobFunction::parse(&linear_blob(FunctionFlags::RANGE, &[(1.0, 0.0), (3.0, 1.0)]))
             .unwrap();
         assert!(f.ranged_second.is_some());
         f.set_function_type(FunctionType::Spline);
@@ -1939,7 +2212,7 @@ mod tests {
         assert!(f.ranged_second.is_none(), "stale second curve survived a type change");
         assert_eq!(f.header().compact_size, 16);
         // Still serializes to a valid, re-parseable blob.
-        assert_eq!(TagFunction::parse(&f.to_bytes()).unwrap().function_type(), FunctionType::Spline);
+        assert_eq!(BlobFunction::parse(&f.to_bytes()).unwrap().function_type(), FunctionType::Spline);
     }
 
     #[test]
@@ -1950,13 +2223,13 @@ mod tests {
         let mut blob = kind.to_bytes();
         assert_eq!(len, 80);
         blob[28..32].copy_from_slice(&(len as i32).to_le_bytes());
-        let mut f = TagFunction::parse(&blob).unwrap();
+        let mut f = BlobFunction::parse(&blob).unwrap();
 
         // Move the last key down to y=0; evaluation near x=1 should follow.
         f.set_linear_key_point(1, 1.0, 0.0);
         assert_eq!(f.linear_key_points().unwrap()[1], (1.0, 0.0));
         // Round-trips and the cached vectors were recomputed (no panic, parses back).
-        assert_eq!(TagFunction::parse(&f.to_bytes()).unwrap().function_type(), FunctionType::LinearKey);
+        assert_eq!(BlobFunction::parse(&f.to_bytes()).unwrap().function_type(), FunctionType::LinearKey);
     }
 
     /// grunt_armor.shader parameters[3] (`diffuse_coefficient`):
@@ -1995,7 +2268,7 @@ mod tests {
 
     #[test]
     fn parses_constant_diffuse_coefficient() {
-        let f = TagFunction::parse(&DIFFUSE_COEFFICIENT).unwrap();
+        let f = BlobFunction::parse(&DIFFUSE_COEFFICIENT).unwrap();
         assert_eq!(f.function_type(), FunctionType::Constant);
         assert!(f.flags().is_gpu());
         assert!(!f.flags().is_ranged());
@@ -2007,7 +2280,7 @@ mod tests {
 
     #[test]
     fn unranged_constant_uses_min_not_max() {
-        let f = TagFunction::parse(&SPECULAR_COEFFICIENT).unwrap();
+        let f = BlobFunction::parse(&SPECULAR_COEFFICIENT).unwrap();
         // The operative value for an UNRANGED constant function is
         // clamp_range_min (bytes 4-7), NOT max (bytes 8-11).
         // evaluate_legacy returns 0.0 unranged → maps to min.
@@ -2018,7 +2291,7 @@ mod tests {
 
     #[test]
     fn roughness_returns_min() {
-        let f = TagFunction::parse(&ROUGHNESS).unwrap();
+        let f = BlobFunction::parse(&ROUGHNESS).unwrap();
         assert!((f.as_constant().unwrap() - 0.2).abs() < 1e-6);
         assert!((f.evaluate(0.5, 0.5) - 0.2).abs() < 1e-6);
     }
@@ -2030,7 +2303,7 @@ mod tests {
         // clamp_range maps normalized → output
         bytes[4..8].copy_from_slice(&0.0f32.to_le_bytes());     // min
         bytes[8..12].copy_from_slice(&10.0f32.to_le_bytes());   // max
-        let f = TagFunction::parse(&bytes).unwrap();
+        let f = BlobFunction::parse(&bytes).unwrap();
         assert_eq!(f.function_type(), FunctionType::Identity);
         assert_eq!(f.as_constant(), None);
         // identity returns input as normalized → mapped through [0, 10]
@@ -2044,7 +2317,7 @@ mod tests {
         bytes[0] = 0x03; // Periodic — Phase 3
         bytes[4..8].copy_from_slice(&5.0f32.to_le_bytes());
         bytes[8..12].copy_from_slice(&7.0f32.to_le_bytes());
-        let f = TagFunction::parse(&bytes).unwrap();
+        let f = BlobFunction::parse(&bytes).unwrap();
         assert_eq!(f.function_type(), FunctionType::Periodic);
         // Unsupported normalized = 0 → maps to min
         assert_eq!(f.evaluate(0.0, 0.0), 5.0);
@@ -2054,7 +2327,7 @@ mod tests {
     #[test]
     fn rejects_short_data() {
         assert!(matches!(
-            TagFunction::parse(&[0u8; 31]),
+            BlobFunction::parse(&[0u8; 31]),
             Err(TagFunctionError::TooShort { len: 31 })
         ));
     }
@@ -2064,7 +2337,7 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0] = 0xff;
         assert!(matches!(
-            TagFunction::parse(&bytes),
+            BlobFunction::parse(&bytes),
             Err(TagFunctionError::UnknownFunctionType { byte: 0xff })
         ));
     }
@@ -2084,7 +2357,7 @@ mod tests {
         let mut blob = header_with(4, 0.0, 1.0).to_vec();
         blob.extend_from_slice(&2.0f32.to_le_bytes());  // slope
         blob.extend_from_slice(&5.0f32.to_le_bytes());  // offset
-        let f = TagFunction::parse(&blob).unwrap();
+        let f = BlobFunction::parse(&blob).unwrap();
         assert_eq!(f.function_type(), FunctionType::Linear);
         // evaluate(x) = 2x + 5; clamp [0, 1] → linear remap from
         // normalized [0, 1] to [0, 1] is identity. So 2*0 + 5 = 5
@@ -2101,7 +2374,7 @@ mod tests {
         let mut blob = header_with(4, 0.0, 1.0).to_vec();
         blob.extend_from_slice(&0.0f32.to_le_bytes());
         blob.extend_from_slice(&3.0f32.to_le_bytes());
-        let f = TagFunction::parse(&blob).unwrap();
+        let f = BlobFunction::parse(&blob).unwrap();
         // map_to_output_range(3) when clamp=[0,1] is 0 + 3*(1-0) = 3.
         assert_eq!(f.as_constant(), Some(3.0));
     }
@@ -2114,7 +2387,7 @@ mod tests {
         blob.extend_from_slice(&0.0f32.to_le_bytes()); // j
         blob.extend_from_slice(&0.0f32.to_le_bytes()); // k
         blob.extend_from_slice(&0.0f32.to_le_bytes()); // l
-        let f = TagFunction::parse(&blob).unwrap();
+        let f = BlobFunction::parse(&blob).unwrap();
         assert_eq!(f.function_type(), FunctionType::Spline);
         assert!((f.evaluate(0.5, 0.0) - 0.125).abs() < 1e-5);
         assert!((f.evaluate(2.0, 0.0) - 8.0).abs() < 1e-5);
@@ -2128,7 +2401,7 @@ mod tests {
         blob.extend_from_slice(&0.0f32.to_le_bytes());
         blob.extend_from_slice(&0.0f32.to_le_bytes());
         blob.extend_from_slice(&4.0f32.to_le_bytes());
-        let f = TagFunction::parse(&blob).unwrap();
+        let f = BlobFunction::parse(&blob).unwrap();
         assert_eq!(f.as_constant(), Some(4.0));
     }
 
@@ -2145,7 +2418,7 @@ mod tests {
         blob.extend_from_slice(&0.2f32.to_le_bytes()); // left_x
         blob.extend_from_slice(&0.5f32.to_le_bytes()); // width
         blob.extend_from_slice(&0.5f32.to_le_bytes()); // bias = linear
-        let f = TagFunction::parse(&blob).unwrap();
+        let f = BlobFunction::parse(&blob).unwrap();
         assert_eq!(f.function_type(), FunctionType::Spline2);
         // Engine `c_spline2_function_compact::evaluate @0x1804FBD40`:
         //   u  = (input - left_x) / width             (NOT clamped)
@@ -2166,7 +2439,7 @@ mod tests {
         blob.extend_from_slice(&0.0f32.to_le_bytes());
         blob.extend_from_slice(&1.0f32.to_le_bytes());
         blob.extend_from_slice(&2.0f32.to_le_bytes());
-        let f = TagFunction::parse(&blob).unwrap();
+        let f = BlobFunction::parse(&blob).unwrap();
         assert_eq!(f.function_type(), FunctionType::Exponent);
         assert!((f.evaluate(0.5, 0.0) - 0.25).abs() < 1e-5);
         assert!((f.evaluate(0.7, 0.0) - 0.49).abs() < 1e-5);
@@ -2179,7 +2452,7 @@ mod tests {
         blob.push(0); blob.extend_from_slice(&[0, 0, 0]); // linear + padding
         blob.extend_from_slice(&0.0f32.to_le_bytes());
         blob.extend_from_slice(&1.0f32.to_le_bytes());
-        let f = TagFunction::parse(&blob).unwrap();
+        let f = BlobFunction::parse(&blob).unwrap();
         assert_eq!(f.function_type(), FunctionType::Transition);
         // linear ramp 0..1
         assert!((f.evaluate(0.0, 0.0) - 0.0).abs() < 1e-5);
@@ -2194,7 +2467,7 @@ mod tests {
         blob.push(3); blob.extend_from_slice(&[0, 0, 0]);
         blob.extend_from_slice(&0.0f32.to_le_bytes());
         blob.extend_from_slice(&1.0f32.to_le_bytes());
-        let f = TagFunction::parse(&blob).unwrap();
+        let f = BlobFunction::parse(&blob).unwrap();
         // "late" (engine LUT row 3) eases in ≈ t² → ~0.25 at the midpoint.
         // Tolerance covers the 1024-entry byte quantization (±1/255 + interp).
         let mid = f.evaluate(0.5, 0.0);
@@ -2209,7 +2482,7 @@ mod tests {
         blob.push(6); blob.extend_from_slice(&[0, 0, 0]);
         blob.extend_from_slice(&0.5f32.to_le_bytes()); // amp_min
         blob.extend_from_slice(&3.0f32.to_le_bytes()); // amp_max
-        let f = TagFunction::parse(&blob).unwrap();
+        let f = BlobFunction::parse(&blob).unwrap();
         // (3 - 0.5) * 1.0 + 0.5 = 3.0
         assert!((f.evaluate(0.42, 0.0) - 3.0).abs() < 1e-5);
     }
@@ -2223,7 +2496,7 @@ mod tests {
         blob.extend_from_slice(&0.0f32.to_le_bytes()); // phase
         blob.extend_from_slice(&0.0f32.to_le_bytes()); // amp_min (compact)
         blob.extend_from_slice(&1.0f32.to_le_bytes()); // amp_max (compact)
-        let f = TagFunction::parse(&blob).unwrap();
+        let f = BlobFunction::parse(&blob).unwrap();
         assert_eq!(f.function_type(), FunctionType::Periodic);
         // Engine periodic LUT (row 2): the cosine starts at the table TOP
         // (byte[0]=0xff → 1.0), unlike the old `0.5-0.5cos` approximation
@@ -2250,7 +2523,7 @@ mod tests {
         blob.extend_from_slice(&0.0f32.to_le_bytes());
         blob.extend_from_slice(&0.0f32.to_le_bytes());
         blob.extend_from_slice(&1.0f32.to_le_bytes());
-        let f = TagFunction::parse(&blob).unwrap();
+        let f = BlobFunction::parse(&blob).unwrap();
         // Engine periodic LUT (row 4): the diagonal/triangle wave starts at
         // the table bottom (byte[0]=0x00 → 0.0) at input 0 (clean grid hit).
         assert!(f.evaluate(0.0, 0.0).abs() < 1e-2, "triangle@0");
@@ -2284,7 +2557,7 @@ mod tests {
         for &v in &[0.0_f32, 4.0, 4.0, 0.0] { blob.extend_from_slice(&v.to_le_bytes()); }
         // y_delta_vector: [base_y, +rise, -fall, unused].
         for &v in &[0.0_f32, 1.0, -1.0, 0.0] { blob.extend_from_slice(&v.to_le_bytes()); }
-        let f = TagFunction::parse(&blob).unwrap();
+        let f = BlobFunction::parse(&blob).unwrap();
         assert_eq!(f.function_type(), FunctionType::LinearKey);
         // Ramp up: at t=0.125 → halfway between (0,0) and (0.25,1) = 0.5
         assert!((f.evaluate(0.125, 0.0) - 0.5).abs() < 1e-5);
@@ -2316,7 +2589,7 @@ mod tests {
         blob.extend_from_slice(&1.0_f32.to_le_bytes()); // ending_x
         blob.extend_from_slice(&(-2.0_f32).to_le_bytes()); // slope
         blob.extend_from_slice(&2.0_f32.to_le_bytes()); // offset
-        let f = TagFunction::parse(&blob).unwrap();
+        let f = BlobFunction::parse(&blob).unwrap();
         assert_eq!(f.function_type(), FunctionType::MultiSpline);
         // Part 1 at x=0.25 → 0.5
         assert!((f.evaluate(0.25, 0.0) - 0.5).abs() < 1e-5);
@@ -2336,7 +2609,7 @@ mod tests {
         blob.extend_from_slice(&0.0f32.to_le_bytes());
         blob.extend_from_slice(&5.0f32.to_le_bytes());
         blob.extend_from_slice(&0.0f32.to_le_bytes()); // exponent ≈ 0
-        let f = TagFunction::parse(&blob).unwrap();
+        let f = BlobFunction::parse(&blob).unwrap();
         // Exponent collapses to 1.0 via compact.evaluate, then maps
         // through clamp [0, 10] → 0 + 1.0*(10-0) = 10.
         assert!((f.evaluate(0.5, 0.0) - 10.0).abs() < 1e-4);
@@ -2351,7 +2624,7 @@ mod tests {
         hdr[1] = 0x08; // EXCLUSION flag
         hdr[20..24].copy_from_slice(&0.5f32.to_le_bytes()); // exclusion_min
         hdr[24..28].copy_from_slice(&1.5f32.to_le_bytes()); // exclusion_max
-        let f = TagFunction::parse(&hdr).unwrap();
+        let f = BlobFunction::parse(&hdr).unwrap();
         // 0.3 <= min → unchanged
         assert!((f.evaluate(0.3, 0.0) - 0.3).abs() < 1e-5);
         // 0.7 > min → 0.7 + (1.5 - 0.5) = 1.7
@@ -2375,7 +2648,7 @@ mod tests {
         blob.extend_from_slice(&0.0f32.to_le_bytes()); // slope
         blob.extend_from_slice(&1.0f32.to_le_bytes()); // offset
 
-        let f = TagFunction::parse(&blob).unwrap();
+        let f = BlobFunction::parse(&blob).unwrap();
         assert_eq!(f.function_type(), FunctionType::Linear);
         assert!(f.flags().is_ranged());
         // Confirm the header's compact_size field decoded as 8.
@@ -2444,7 +2717,7 @@ mod byte_order_tests {
         let misread = TagFunctionHeader::parse(&original).expect("the header is 32 bytes either way");
         assert_ne!(misread.compact_size, 20, "the source is not little-endian");
         let swapped = swap_function_definition(&original).expect("a real curve swaps");
-        let parsed = TagFunction::parse(&swapped).expect("and then reads");
+        let parsed = BlobFunction::parse(&swapped).expect("and then reads");
         let header = parsed.header();
         assert_eq!(header.function_type, FunctionType::MultiSpline);
         assert_eq!(header.compact_size, 20);

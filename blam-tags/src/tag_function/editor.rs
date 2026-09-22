@@ -18,8 +18,8 @@
 
 use super::curve::{CurveGraph, CurvePointMode, CurveSegmentType, EDITOR_SIZE};
 use super::{
-    build_identity_multipart_bytes, ColorGraphType, FunctionFlags, FunctionKind, FunctionType,
-    TagFunction, TagFunctionError,
+    build_identity_multipart_bytes, BlobFunction, ColorGraphType, FunctionFlags, FunctionKind,
+    FunctionType, TagFunction, TagFunctionError,
 };
 
 /// Foundation's periodic-function option table (numeric index → label).
@@ -165,6 +165,8 @@ impl std::fmt::Display for FunctionEditError {
 
 impl std::error::Error for FunctionEditError {}
 
+const H2_NOT_EDITABLE: &str = "halo 2 functions are not editable yet";
+
 /// Editable `mapping_function`. Wraps a [`TagFunction`]; structural edits
 /// rebuild a complete, valid blob (compact + editor trailer) and re-parse,
 /// so [`Self::to_bytes`] always yields a round-trippable result.
@@ -189,6 +191,16 @@ impl TagFunctionEditor {
 
     pub fn into_function(self) -> TagFunction {
         self.func
+    }
+
+    /// The blob every structural edit rebuilds. Halo 2 functions are not
+    /// editable yet, so every edit refuses them.
+    fn blob(&self) -> Result<&BlobFunction, FunctionEditError> {
+        self.func.as_blob().ok_or(FunctionEditError::InvalidOperation(H2_NOT_EDITABLE))
+    }
+
+    fn blob_mut(&mut self) -> Result<&mut BlobFunction, FunctionEditError> {
+        self.func.as_blob_mut().ok_or(FunctionEditError::InvalidOperation(H2_NOT_EDITABLE))
     }
 
     /// Serialize to a complete `mapping_function` `data` blob.
@@ -249,9 +261,7 @@ impl TagFunctionEditor {
         let ftype = self.func.function_type();
         if matches!(ftype, FunctionType::Constant | FunctionType::Identity) {
             // No compact/editor to duplicate — just flip the flag.
-            let mut func = self.func.clone();
-            func.set_flag(FunctionFlags::RANGE, ranged);
-            self.func = func;
+            self.blob_mut()?.set_flag(FunctionFlags::RANGE, ranged);
             return Ok(());
         }
         self.rebuild(self.master_type(), ranged)
@@ -293,7 +303,7 @@ impl TagFunctionEditor {
     /// `c_function_definition::get_color @0x82e8c978`.
     pub fn get_color(&self, index: usize) -> Option<u32> {
         let slot = *color_slots(self.color_graph_type()).get(index)?;
-        Some(self.func.header().colors[slot])
+        Some(self.func.as_blob()?.header().colors[slot])
     }
 
     /// Set the color at logical index `index`, preserving all untouched color
@@ -302,20 +312,21 @@ impl TagFunctionEditor {
         let slot = *color_slots(self.color_graph_type())
             .get(index)
             .ok_or(FunctionEditError::InvalidOperation("color index out of range"))?;
-        self.func.set_color(slot, argb);
+        self.blob_mut()?.set_color(slot, argb);
         Ok(())
     }
 
     /// Change the color-graph type (scalar / N-color).
-    pub fn set_color_graph_type(&mut self, cgt: ColorGraphType) {
-        self.func.set_color_graph_type(cgt);
+    pub fn set_color_graph_type(&mut self, cgt: ColorGraphType) -> Result<(), FunctionEditError> {
+        self.blob_mut()?.set_color_graph_type(cgt);
+        Ok(())
     }
 
     // -- Typed compact params per graph (doc item 3). --
 
     /// Periodic parameters for graph `slot` (0 = primary, 1 = ranged second).
     pub fn periodic_params(&self, slot: usize) -> Option<PeriodicParams> {
-        match self.func.graph(slot)? {
+        match self.func.as_blob()?.graph(slot)? {
             FunctionKind::Periodic { compact, .. } => Some(PeriodicParams {
                 function_index: compact.function_index,
                 frequency: compact.frequency,
@@ -336,7 +347,7 @@ impl TagFunctionEditor {
     }
 
     pub fn exponent_params(&self, slot: usize) -> Option<ExponentParams> {
-        match self.func.graph(slot)? {
+        match self.func.as_blob()?.graph(slot)? {
             FunctionKind::Exponent { compact, .. } => Some(ExponentParams {
                 exponent: compact.exponent,
                 amplitude_min: compact.amplitude_min,
@@ -355,7 +366,7 @@ impl TagFunctionEditor {
     }
 
     pub fn transition_params(&self, slot: usize) -> Option<TransitionParams> {
-        match self.func.graph(slot)? {
+        match self.func.as_blob()?.graph(slot)? {
             FunctionKind::Transition { compact, .. } => Some(TransitionParams {
                 function_index: compact.function_index,
                 amplitude_min: compact.amplitude_min,
@@ -390,12 +401,13 @@ impl TagFunctionEditor {
         if slot >= graphs {
             return Err(FunctionEditError::InvalidOperation("graph slot out of range"));
         }
+        let func = self.blob()?;
         let mut compacts: Vec<Vec<u8>> = (0..graphs)
-            .map(|g| self.func.graph_compact_bytes(g).unwrap_or_default())
+            .map(|g| func.graph_compact_bytes(g).unwrap_or_default())
             .collect();
         compacts[slot] = new_compact;
 
-        let mut header = self.func.header_bytes();
+        let mut header = func.header_bytes();
         let mut flags = FunctionFlags(header[1]);
         flags.0 &= !FunctionFlags::OPTIMIZED;
         header[1] = flags.0;
@@ -423,7 +435,7 @@ impl TagFunctionEditor {
         if self.func.function_type() != FunctionType::MultiSpline {
             return None;
         }
-        let data = self.func.editor_data();
+        let data = self.func.as_blob()?.editor_data();
         let graphs = self.graph_count();
         let mut out = Vec::with_capacity(graphs);
         for g in 0..graphs {
@@ -446,7 +458,7 @@ impl TagFunctionEditor {
             compact_region.extend_from_slice(&compact);
             editor_region.extend_from_slice(&g.to_editor_bytes());
         }
-        let mut header = self.func.header_bytes();
+        let mut header = self.blob()?.header_bytes();
         header[0] = FunctionType::MultiSpline as u8;
         let mut flags = FunctionFlags(header[1]);
         flags.0 &= !FunctionFlags::OPTIMIZED;
@@ -602,7 +614,7 @@ impl TagFunctionEditor {
         }
 
         // Header: preserve everything, override type/flags/compact_size.
-        let mut header = self.func.header_bytes(); // 32-byte snapshot
+        let mut header = self.blob()?.header_bytes(); // 32-byte snapshot
         header[0] = ftype as u8;
         // RANGE flag reflects graph count; OPTIMIZED cleared (we write a
         // trailer), matching c_function_definition_editor::postprocess.
@@ -730,7 +742,7 @@ mod tests {
         assert_eq!(e.graph_count(), 2);
         // 32 + 2×20 compact + 2×20 editor = 112.
         assert_eq!(e.to_bytes().len(), 112);
-        assert!(e.function().ranged_second().is_some());
+        assert!(e.function().as_blob().unwrap().ranged_second().is_some());
 
         e.set_ranged(false).unwrap();
         assert!(!e.is_ranged());
@@ -749,7 +761,7 @@ mod tests {
         let mut e = TagFunctionEditor::parse(&blob).unwrap();
 
         e.set_master_type(FoundationMasterType::Periodic).unwrap();
-        let h = e.function().header();
+        let h = e.function().as_blob().unwrap().header();
         assert_eq!(h.clamp_range_min, 0.25);
         assert_eq!(h.clamp_range_max, 0.75);
         assert_eq!(h.colors[3], 0xAABBCCDD);
@@ -893,7 +905,7 @@ mod tests {
         e.set_color(1, 0x00AABBCC).unwrap();
         assert_eq!(e.get_color(0), Some(0x00112233));
         assert_eq!(e.get_color(1), Some(0x00AABBCC));
-        let h = e.function().header();
+        let h = e.function().as_blob().unwrap().header();
         assert_eq!(h.colors[0], 0x00112233); // physical slot 0
         assert_eq!(h.colors[3], 0x00AABBCC); // physical slot 3
         // Round-trips, both logical colors preserved.
@@ -980,7 +992,7 @@ mod tests {
                 assert_eq!(re.get_color(i), Some(c), "{cgt:?} logical color {i}");
             }
             // Physical slots line up with the mapping.
-            let h = re.function().header();
+            let h = re.function().as_blob().unwrap().header();
             for (i, &slot) in slots.iter().enumerate() {
                 assert_eq!(h.colors[slot], colors[i]);
             }
@@ -997,7 +1009,7 @@ mod tests {
         blob[24..28].copy_from_slice(&0.8f32.to_le_bytes()); // exclusion_max
         let mut e = TagFunctionEditor::parse(&blob).unwrap();
         e.set_master_type(FoundationMasterType::Periodic).unwrap();
-        let h = e.function().header();
+        let h = e.function().as_blob().unwrap().header();
         assert_eq!(h.exclusion_min, 0.2);
         assert_eq!(h.exclusion_max, 0.8);
         assert!(h.flags.is_clamped() && h.flags.is_cyclic());
@@ -1018,6 +1030,6 @@ mod tests {
         assert_eq!(e.graph_count(), 2);
         // 32 + 2×20 compact + 2×148 editor.
         assert_eq!(e.to_bytes().len(), 32 + 40 + 296);
-        assert!(e.function().ranged_second().is_some());
+        assert!(e.function().as_blob().unwrap().ranged_second().is_some());
     }
 }

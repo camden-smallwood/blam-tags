@@ -136,7 +136,7 @@ impl H2Function {
     pub fn evaluate(&self, input: f32, range: f32) -> f32 {
         let v = |i: usize| self.value(i);
         let ranged = self.is_ranged();
-        let mut out = 0.0f32;
+        let mut out: f32;
         match self.function_type {
             FunctionType::Identity => out = input,
             FunctionType::Constant => {
