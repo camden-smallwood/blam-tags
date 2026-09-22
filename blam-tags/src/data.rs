@@ -372,7 +372,9 @@ mod dirty_tests {
             .position(|block| {
                 layout
                     .get_string(block.name_offset)
-                    .is_some_and(|name| name == "model_variant_block_2")
+                    // `model_variant_block_2` in the HABT-derived definitions;
+                    // the tool.exe-extracted ones (a4ea1ff) drop the suffix.
+                    .is_some_and(|name| name == "model_variant_block")
             })
             .unwrap();
 
