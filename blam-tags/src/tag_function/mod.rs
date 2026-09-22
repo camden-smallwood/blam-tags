@@ -1776,6 +1776,13 @@ impl TagFunction {
         }
     }
 
+    pub fn as_h2_mut(&mut self) -> Option<&mut H2Function> {
+        match self {
+            Self::H2(f) => Some(f),
+            Self::Blob(_) => None,
+        }
+    }
+
     /// Serialize back to the `data` byte-block in the encoding it was parsed
     /// from. Byte-identical for an unedited function.
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -1816,17 +1823,16 @@ impl TagFunction {
     pub fn color_count(&self) -> usize {
         match self {
             Self::Blob(f) => f.color_count(),
-            Self::H2(f) => f.color_count(),
+            Self::H2(_) => self.color_graph_type() as usize,
         }
     }
 
-    /// Scalar vs N-color. Halo 2 stores a color *count* (flag bits 5-7) rather
-    /// than a graph type; counts past four have no graph type and read as
-    /// `Scalar`.
+    /// Scalar vs N-color. Halo 2 values past four (which its engine asserts
+    /// against) read as `Scalar`.
     pub fn color_graph_type(&self) -> ColorGraphType {
         match self {
             Self::Blob(f) => f.color_graph_type(),
-            Self::H2(f) => ColorGraphType::from_byte(f.color_count() as u8).unwrap_or(ColorGraphType::Scalar),
+            Self::H2(f) => ColorGraphType::from_byte(f.color_graph_type()).unwrap_or(ColorGraphType::Scalar),
         }
     }
 
@@ -1848,12 +1854,11 @@ impl TagFunction {
     pub fn evaluate(&self, input: f32, range: f32) -> f32 {
         match self {
             Self::Blob(f) => f.evaluate(input, range),
-            Self::H2(f) => f.evaluate(input, range),
+            Self::H2(f) => f.evaluate_scalar(input, range),
         }
     }
 
-    /// The normalized curve before output-range remapping. Halo 2 has no
-    /// output range, so this is [`Self::evaluate`] there.
+    /// The normalized curve before output-range remapping.
     pub fn evaluate_legacy(&self, input: f32, range: f32) -> f32 {
         match self {
             Self::Blob(f) => f.evaluate_legacy(input, range),
@@ -1866,14 +1871,15 @@ impl TagFunction {
         self.evaluate_legacy(input, range)
     }
 
-    /// Color output. Halo 2 color evaluation is not ported yet: its functions
-    /// return the scalar curve as grayscale.
+    /// Color output at `(input, range)`: the color gradient indexed by the
+    /// normalized curve.
     pub fn evaluate_color(&self, input: f32, range: f32) -> RealRgbColor {
         match self {
             Self::Blob(f) => f.evaluate_color(input, range),
             Self::H2(f) => {
-                let n = f.evaluate(input, range);
-                RealRgbColor { red: n, green: n, blue: n }
+                let argb = f.evaluate_color(f.evaluate(input, range));
+                let channel = |shift: u32| ((argb >> shift) & 0xFF) as f32 / 255.0;
+                RealRgbColor { red: channel(16), green: channel(8), blue: channel(0) }
             }
         }
     }
@@ -1882,8 +1888,7 @@ impl TagFunction {
     pub fn as_constant(&self) -> Option<f32> {
         match self {
             Self::Blob(f) => f.as_constant(),
-            Self::H2(f) => (f.function_type() == FunctionType::Constant && !f.is_ranged())
-                .then(|| f.evaluate(0.0, 0.0)),
+            Self::H2(f) => f.is_constant().then(|| f.evaluate_scalar(0.0, 0.0)),
         }
     }
 
@@ -2038,32 +2043,39 @@ mod tests {
         data
     }
 
-    /// H2 v1 byte-block: 4-byte header + LE f32 values.
-    fn h2_block(ty: u8, flags: u8, fn1: u8, values: &[f32]) -> Vec<u8> {
+    /// H2 byte-block: header, clamp range `[min, max]` (the union), zero
+    /// padding to byte 20, then graph floats; sized as the engine sizes it.
+    fn h2_block(ty: u8, flags: u8, fn1: u8, min_max: [f32; 2], graph: &[f32]) -> Vec<u8> {
         let mut b = vec![ty, flags, fn1, 0];
-        for v in values {
+        for v in min_max {
             b.extend_from_slice(&v.to_le_bytes());
         }
+        b.resize(h2::HEADER_SIZE, 0);
+        for v in graph {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.resize(h2::block_size(FunctionType::from_byte(ty).unwrap()).max(b.len()), 0);
         b
     }
 
     #[test]
     fn tag_function_dispatches_on_the_stated_encoding() {
-        // Linear, slope 0.5 offset 0.2 at values[4..6].
-        let bytes = h2_block(4, 0, 0, &[0.0, 0.0, 0.0, 0.0, 0.5, 0.2]);
+        // Linear, points (0,0.2) (1,0.7) → slope 0.5 offset 0.2, output range [0, 10].
+        let bytes = h2_block(4, 0, 0, [0.0, 10.0], &[0.0, 0.2, 1.0, 0.7, 0.5, 0.2]);
         let f = TagFunction::parse_encoded(FunctionEncoding::H2, &bytes).unwrap();
         assert_eq!(f.encoding(), FunctionEncoding::H2);
         assert!(f.as_blob().is_none());
         assert_eq!(f.function_type(), FunctionType::Linear);
         assert_eq!(f.graph_count(), 1);
-        assert!((f.evaluate(0.4, 0.0) - 0.4).abs() < 1e-6);
+        assert!((f.evaluate_shape(0.4, 0.0) - 0.4).abs() < 1e-6);
+        assert!((f.evaluate(0.4, 0.0) - 4.0).abs() < 1e-5, "mapped through the clamp range");
         assert_eq!(f.to_bytes(), bytes);
 
-        // The same 28 bytes are too short to be a blob: the encoding is the
+        // A 16-byte block is too short to be a blob: the encoding is the
         // caller's to state, not something parse guesses.
         assert!(matches!(
-            TagFunction::parse_encoded(FunctionEncoding::Blob, &bytes),
-            Err(TagFunctionError::TooShort { len: 28 })
+            TagFunction::parse_encoded(FunctionEncoding::Blob, &bytes[..16]),
+            Err(TagFunctionError::TooShort { len: 16 })
         ));
         assert!(matches!(
             TagFunction::parse_encoded(FunctionEncoding::H2, &[99, 0, 0, 0]),
@@ -2079,33 +2091,55 @@ mod tests {
 
     #[test]
     fn h2_constant_is_constant_and_color_count_maps_to_graph_type() {
-        let f = TagFunction::parse_encoded(FunctionEncoding::H2, &h2_block(1, 0, 0, &[0.25, 0.0])).unwrap();
+        let f = TagFunction::parse_encoded(FunctionEncoding::H2, &h2_block(1, 0, 0, [0.25, 0.0], &[1.0, 1.0])).unwrap();
         assert_eq!(f.as_constant(), Some(0.25));
         assert_eq!(f.color_graph_type(), ColorGraphType::Scalar);
 
-        // Ranged: depends on `range`, so not constant.
-        let f = TagFunction::parse_encoded(FunctionEncoding::H2, &h2_block(1, 1, 0, &[0.25, 0.75])).unwrap();
+        // Ranged: lerps the clamp range by `range`, so not constant.
+        let f = TagFunction::parse_encoded(FunctionEncoding::H2, &h2_block(1, 1, 0, [0.25, 0.75], &[1.0, 1.0])).unwrap();
         assert_eq!(f.as_constant(), None);
+        assert!((f.evaluate(0.0, 0.5) - 0.5).abs() < 1e-6);
         assert_eq!(f.graph_count(), 2);
         assert_eq!(f.graph_kind(1), Some(FunctionType::Constant));
 
-        // Two colors (flag bits 5-7 = 2).
-        let f = TagFunction::parse_encoded(FunctionEncoding::H2, &h2_block(1, 2 << 5, 0, &[0.0])).unwrap();
+        // Two colors: the color graph type is the flags' high nibble.
+        let f = TagFunction::parse_encoded(FunctionEncoding::H2, &h2_block(1, 2 << 4, 0, [0.0, 0.0], &[1.0, 1.0])).unwrap();
         assert_eq!(f.color_graph_type(), ColorGraphType::TwoColor);
+        assert_eq!(f.color_count(), 2);
     }
 
     #[test]
-    fn editor_refuses_h2_edits_instead_of_dropping_them() {
-        let bytes = h2_block(3, 0, 2, &[1.0, 0.0, 0.0, 1.0]);
-        let mut e = editor::TagFunctionEditor::from_function(
-            TagFunction::parse_encoded(FunctionEncoding::H2, &bytes).unwrap(),
-        );
+    fn editor_edits_h2_through_the_engine_setters() {
+        use editor::{FoundationMasterType, PeriodicParams, TagFunctionEditor};
+        let bytes = h2_block(3, 0, 2, [0.0, 1.0], &[1.0, 0.0, 0.0, 1.0]);
+        let mut e = TagFunctionEditor::from_function(TagFunction::parse_encoded(FunctionEncoding::H2, &bytes).unwrap());
         assert_eq!(e.function_type(), FunctionType::Periodic);
-        assert!(e.set_ranged(true).is_err());
-        assert!(e.set_master_type(editor::FoundationMasterType::Basic).is_err());
-        assert!(e.set_color_graph_type(ColorGraphType::OneColor).is_err());
-        assert!(e.set_color(0, 0xFFFF_FFFF).is_err());
-        assert_eq!(e.to_bytes(), bytes, "a refused edit leaves the bytes untouched");
+        let p = e.periodic_params(0).unwrap();
+        assert_eq!((p.function_index, p.frequency, p.amplitude_max), (2, 1.0, 1.0));
+        assert!(e.periodic_params(1).is_none(), "no second graph until ranged");
+
+        let edit = PeriodicParams { function_index: 8, frequency: 3.0, phase: 0.5, amplitude_min: 0.2, amplitude_max: 0.4 };
+        e.set_periodic_params(0, edit).unwrap();
+        assert_eq!(e.periodic_params(0), Some(edit));
+        assert_eq!(e.to_bytes().len(), bytes.len(), "edited in place");
+
+        // A refused index leaves the block untouched.
+        let before = e.to_bytes();
+        assert!(e.set_periodic_params(0, PeriodicParams { function_index: 12, ..edit }).is_err());
+        assert_eq!(e.to_bytes(), before);
+
+        e.set_ranged(true).unwrap();
+        assert!(e.periodic_params(1).is_some());
+
+        e.set_color_graph_type(ColorGraphType::TwoColor).unwrap();
+        e.set_color(1, 0xFF11_2233).unwrap();
+        assert_eq!(e.get_color(1), Some(0xFF11_2233));
+        assert!(e.set_color(2, 0).is_err());
+
+        assert!(e.set_master_type(FoundationMasterType::Curve).is_err());
+        e.set_master_type(FoundationMasterType::Exponent).unwrap();
+        assert_eq!(e.to_bytes().len(), h2::block_size(FunctionType::Exponent));
+        assert_eq!(e.exponent_params(0).unwrap().exponent, 5.0, "the engine seeds exponent 5");
     }
 
     #[test]

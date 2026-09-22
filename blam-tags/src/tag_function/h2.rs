@@ -1,37 +1,70 @@
 //! Halo 2 classic function — the byte-block `c_function_definition` encoding
 //! (`mapping_function` v1, Family B).
 //!
-//! Unlike the H3+ blob ([`super::TagFunction`], a 32-byte header + typed
-//! compacts), a Halo 2 function on disk is a **4-byte header** followed by a
-//! flat `f32` array:
+//! Unlike the H3+ blob ([`super::BlobFunction`], a 32-byte header + typed
+//! compacts), a Halo 2 function on disk is a flat byte-block that the engine
+//! reads and edits in place:
 //!
 //! ```text
-//!   byte 0  function_type   (shared FunctionType enum, 0..10)
-//!   byte 1  flags           (bit0 = RANGE; bits 5-7 = color count)
-//!   byte 2  function 1       (periodic/transition selector, graph 0)
-//!   byte 3  function 2       (periodic/transition selector, graph 1 / range)
-//!   +4..    f32 values[]     (per-type parameters; values[i] at byte 4+4*i)
+//!   byte 0     function_type       (shared FunctionType enum, 0..10)
+//!   byte 1     flags               bit 0 = RANGE, bits 4-7 = color graph type
+//!   byte 2     function 1          periodic/transition index, or point count
+//!   byte 3     function 2            for spline/multi types (graph 1)
+//!   bytes 4-19 union               scalar: clamp_range min (4), max (8)
+//!                                   color:  four ARGB slots (4, 8, 12, 16)
+//!   bytes 20.. graph data          two graphs of `floats_per_graph(type)` f32s
+//!                                   each; graph 1 starts at 20 + 4*n
 //! ```
 //!
-//! The per-type value layout and evaluation are ported verbatim from the engine
-//! `c_function_definition::evaluate` (halo2symbols.xbe.i64 @ 0x30a940); the
-//! periodic/transition selectors index the SAME 12/4-entry tables the H3+ path
-//! uses ([`super::periodic_function_evaluate`] /
-//! [`super::transition_function_evaluate`]).
+//! The block is `20 + 8 * floats_per_graph(type)` bytes (room for both graphs,
+//! ranged or not). Everything here is ported from the MCC Halo 2 tool
+//! (`halo2_mcc_tool.exe`, `prjh2a2/original/source/math/function_definitions.cpp`):
+//! `evaluate` @0x80EC50, `map_to_output_range` @0x810500, `evaluate_color`
+//! @0x80F670, `is_constant` @0x810020, the type initializer @0x80EA20, the
+//! postprocess @0x810650 and the setters beside them. The 2003 Xbox build kept
+//! the graph data in a separate tag block, so its offsets do not apply to MCC.
 //!
-//! Byte-identical round-trip: the exact parsed bytes are retained in [`raw`]
-//! and returned verbatim by [`H2Function::to_bytes`] until an edit sets `dirty`
-//! (mirrors [`super::TagFunction`]).
+//! [`H2Function::to_bytes`] returns the block as it stands: an unedited
+//! function round-trips byte-identically, and an edit is exactly the engine's
+//! in-place write.
 
-use super::{periodic_function_evaluate, transition_function_evaluate, FunctionType};
+use super::tables::FUNCTION_TABLES;
+use super::FunctionType;
+
+/// Size of the fixed header + union that precedes the graph data.
+pub const HEADER_SIZE: usize = 20;
 
 /// Flag bits at header byte 1 (distinct from the H3+ `FunctionFlags` layout).
 pub mod flags {
     /// A second (range) graph is present, blended by the second eval input.
     pub const RANGE: u8 = 1 << 0;
-    /// Color count occupies the top three bits.
-    pub const COLOR_COUNT_SHIFT: u8 = 5;
-    pub const COLOR_COUNT_MASK: u8 = 0b111;
+    /// The color graph type occupies the top four bits.
+    pub const COLOR_GRAPH_TYPE_SHIFT: u8 = 4;
+}
+
+/// `g_constant_count_by_function_type` (0xDD58AC): f32s per graph.
+const FLOATS_PER_GRAPH: [usize; 11] = [0, 1, 2, 4, 6, 20, 32, 12, 4, 3, 12];
+
+/// Default control-point count by type (0xDD58A0).
+const DEFAULT_POINT_COUNT: [usize; 11] = [0, 0, 0, 0, 2, 4, 16, 4, 16, 0, 4];
+
+/// Logical color index → physical union slot, by color graph type (0xDD58B8).
+const COLOR_SLOTS: [[usize; 4]; 5] = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 3, 0, 0], [0, 1, 3, 0], [0, 1, 2, 3]];
+
+const EPSILON: f32 = 0.000_1;
+const LUT_LEN: usize = 1024;
+const TRANSITION_ROWS: usize = 7;
+const PERIODIC_BASE: usize = TRANSITION_ROWS * LUT_LEN;
+const PERIODIC_ROWS: usize = 11;
+
+/// f32s per graph for a function type.
+pub fn floats_per_graph(function_type: FunctionType) -> usize {
+    FLOATS_PER_GRAPH[function_type as usize]
+}
+
+/// The byte-block size the engine keeps for a function type.
+pub fn block_size(function_type: FunctionType) -> usize {
+    HEADER_SIZE + 8 * floats_per_graph(function_type)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +73,8 @@ pub enum H2FunctionError {
     TooShort { len: usize },
     /// Byte 0 is not a known [`FunctionType`].
     BadFunctionType { byte: u8 },
+    /// An edit the engine asserts against (wrong type, index out of range).
+    InvalidEdit(&'static str),
 }
 
 impl std::fmt::Display for H2FunctionError {
@@ -47,214 +82,783 @@ impl std::fmt::Display for H2FunctionError {
         match self {
             Self::TooShort { len } => write!(f, "h2 function data too short: {len} bytes (need >= 4)"),
             Self::BadFunctionType { byte } => write!(f, "unknown h2 function type byte {byte}"),
+            Self::InvalidEdit(m) => write!(f, "invalid h2 function edit: {m}"),
         }
     }
 }
 
 impl std::error::Error for H2FunctionError {}
 
-/// A Halo 2 classic `c_function_definition`, decoded from its byte-block form.
+/// A Halo 2 classic `c_function_definition` byte-block.
 #[derive(Debug, Clone)]
 pub struct H2Function {
-    /// Exact on-disk bytes; returned verbatim by [`Self::to_bytes`] until `dirty`.
-    raw: Vec<u8>,
-    dirty: bool,
-    function_type: FunctionType,
-    flags: u8,
-    function_1: u8,
-    function_2: u8,
+    data: Vec<u8>,
 }
 
 impl H2Function {
-    /// Decode the 4-byte header and retain the raw bytes. The `f32` value array
-    /// is read on demand from `raw` (see [`Self::value`]).
+    /// Take ownership of a byte-block, checking only the header's type byte.
     pub fn parse(data: &[u8]) -> Result<Self, H2FunctionError> {
         if data.len() < 4 {
             return Err(H2FunctionError::TooShort { len: data.len() });
         }
-        let function_type = FunctionType::from_byte(data[0])
-            .ok_or(H2FunctionError::BadFunctionType { byte: data[0] })?;
-        Ok(Self {
-            raw: data.to_vec(),
-            dirty: false,
-            function_type,
-            flags: data[1],
-            function_1: data[2],
-            function_2: data[3],
-        })
+        FunctionType::from_byte(data[0]).ok_or(H2FunctionError::BadFunctionType { byte: data[0] })?;
+        Ok(Self { data: data.to_vec() })
     }
 
-    /// Serialize to the on-disk byte-block. Byte-identical to the parsed input
-    /// until an edit dirties the function.
+    /// The byte-block as it stands (byte-identical to the input until edited).
     pub fn to_bytes(&self) -> Vec<u8> {
-        // No mutators re-serialize yet; unedited functions are byte-identical.
-        debug_assert!(!self.dirty, "h2 function re-serialization not yet implemented");
-        self.raw.clone()
+        self.data.clone()
     }
 
     pub fn function_type(&self) -> FunctionType {
-        self.function_type
+        FunctionType::from_byte(self.data[0]).expect("checked at parse and on every type change")
     }
 
-    /// True when the RANGE flag is set — a second graph blended by the second
+    /// True when the RANGE flag is set: a second graph blended by the second
     /// evaluation input.
     pub fn is_ranged(&self) -> bool {
-        self.flags & flags::RANGE != 0
+        self.data[1] & flags::RANGE != 0
     }
 
-    /// Number of color graphs (0 = scalar), from flag bits 5-7.
-    pub fn color_count(&self) -> usize {
-        ((self.flags >> flags::COLOR_COUNT_SHIFT) & flags::COLOR_COUNT_MASK) as usize
+    /// The raw color graph type (0 = scalar, 1..4 = N-color). The engine
+    /// asserts it is below 5.
+    pub fn color_graph_type(&self) -> u8 {
+        self.data[1] >> flags::COLOR_GRAPH_TYPE_SHIFT
     }
 
-    /// Periodic/transition selector for graph 0 (indexes the shared tables).
-    pub fn function_1(&self) -> u8 {
-        self.function_1
+    /// Periodic/transition index (or point count, for spline/multi types) of
+    /// `graph` (0 or 1).
+    pub fn function_index(&self, graph: usize) -> u8 {
+        self.data[2 + graph.min(1)]
     }
 
-    /// Periodic/transition selector for graph 1 (range graph).
-    pub fn function_2(&self) -> u8 {
-        self.function_2
+    /// The f32 at byte `offset`; 0.0 past the end of a short block.
+    fn f32_at(&self, offset: usize) -> f32 {
+        f32::from_bits(self.u32_at(offset))
     }
 
-    /// `values[i]` — the i-th `f32` after the 4-byte header. Out-of-range reads
-    /// return `0.0` (matches the engine's tolerance of short data).
-    pub fn value(&self, i: usize) -> f32 {
-        let off = 4 + i * 4;
-        self.raw
-            .get(off..off + 4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .unwrap_or(0.0)
+    fn u32_at(&self, offset: usize) -> u32 {
+        self.data
+            .get(offset..offset + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .unwrap_or(0)
     }
 
-    /// Evaluate at `input` (primary) and `range` (blend for the second graph).
-    ///
-    /// A direct port of `c_function_definition::evaluate` (0x30a940). The result
-    /// is clamped to `[0, 1]` exactly as the engine does. Curve types (LinearKey/
-    /// Spline/Spline2) are not yet evaluated here — they return `input`
-    /// (identity) pending the curve-editor port; every other type is exact.
+    fn put_u32(&mut self, offset: usize, value: u32) {
+        if self.data.len() < offset + 4 {
+            self.data.resize(offset + 4, 0);
+        }
+        self.data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_f32(&mut self, offset: usize, value: f32) {
+        self.put_u32(offset, value.to_bits());
+    }
+
+    /// Byte offset of float `k` of `graph`.
+    fn graph_offset(&self, graph: usize, k: usize) -> usize {
+        HEADER_SIZE + 4 * (graph * floats_per_graph(self.function_type()) + k)
+    }
+
+    /// Float `k` of `graph`'s parameters.
+    pub fn graph_value(&self, graph: usize, k: usize) -> f32 {
+        self.f32_at(self.graph_offset(graph, k))
+    }
+
+    /// `get_clamp_range_min` (0x80FC60): 0 for color graphs.
+    pub fn clamp_range_min(&self) -> f32 {
+        if self.color_graph_type() != 0 { 0.0 } else { self.f32_at(4) }
+    }
+
+    /// `get_clamp_range_max` (0x80FC00): 1 for color graphs.
+    pub fn clamp_range_max(&self) -> f32 {
+        if self.color_graph_type() != 0 { 1.0 } else { self.f32_at(8) }
+    }
+
+    /// ARGB of logical color `index` (0..color graph type) through the slot
+    /// remap; `None` for a scalar function or an index past the color count.
+    pub fn color(&self, index: usize) -> Option<u32> {
+        let cgt = self.color_graph_type() as usize;
+        (cgt < COLOR_SLOTS.len() && index < cgt).then(|| self.u32_at(4 + 4 * COLOR_SLOTS[cgt][index]))
+    }
+
+    /// Number of control points of `graph` (`get_control_point_count`, 0x80FDC0).
+    pub fn control_point_count(&self, graph: usize) -> usize {
+        match self.function_type() {
+            FunctionType::Linear => 2,
+            FunctionType::LinearKey | FunctionType::Spline | FunctionType::Spline2 => 4,
+            FunctionType::MultiLinearKey | FunctionType::MultiSpline => self.function_index(graph) as usize,
+            _ => 0,
+        }
+    }
+
+    /// Control point `point` of `graph` (`get_control_point`, 0x80FD20).
+    pub fn control_point(&self, graph: usize, point: usize) -> Option<(f32, f32)> {
+        if graph > 1 || point >= self.control_point_count(graph) {
+            return None;
+        }
+        Some((self.graph_value(graph, 2 * point), self.graph_value(graph, 2 * point + 1)))
+    }
+
+    // -- Evaluation -----------------------------------------------------------
+
+    /// The normalized curve at (`input`, `range`), clamped to `[0, 1]`: MCC
+    /// `c_function_definition::evaluate` (0x80EC50). Multi-linear-key and
+    /// multi-spline evaluate to 0 there, and so here.
     pub fn evaluate(&self, input: f32, range: f32) -> f32 {
-        let v = |i: usize| self.value(i);
+        let x = input;
         let ranged = self.is_ranged();
-        let mut out: f32;
-        match self.function_type {
-            FunctionType::Identity => out = input,
+        let f = |offset: usize| self.f32_at(offset);
+        let blend = |first: f32, second: f32| first * (1.0 - range) + second * range;
+        let v = match self.function_type() {
+            FunctionType::Identity => x,
             FunctionType::Constant => {
-                out = v(0);
-                if ranged {
-                    out = (1.0 - range) * out + range * v(1);
-                }
+                if ranged { range } else { 0.0 }
             }
             FunctionType::Transition => {
-                let t = transition_function_evaluate(self.function_1, input);
-                out = (v(1) - v(0)) * t + v(0);
+                let t = transition_evaluate(self.function_index(0), x);
+                let first = (f(24) - f(20)) * t + f(20);
                 if ranged {
-                    let t2 = transition_function_evaluate(self.function_2, input);
-                    let g2 = (v(3) - v(2)) * t2 + v(2);
-                    out = (1.0 - range) * out + g2 * range;
+                    let t = transition_evaluate(self.function_index(1), x);
+                    blend(first, (f(32) - f(28)) * t + f(28))
+                } else {
+                    first
                 }
             }
             FunctionType::Periodic => {
-                let x = input * v(0) + v(1);
-                let p = periodic_function_evaluate(self.function_1, x);
-                out = (v(3) - v(2)) * p + v(2);
+                let p = periodic_evaluate(self.function_index(0), f(20) * x + f(24));
+                let first = (f(32) - f(28)) * p + f(28);
                 if ranged {
-                    // graph 1 parameters begin at values[4].
-                    let x2 = input * v(4) + v(5);
-                    let p2 = periodic_function_evaluate(self.function_2, x2);
-                    let g2 = (v(7) - v(6)) * p2 + v(6);
-                    out = (1.0 - range) * out + g2 * range;
+                    let p = periodic_evaluate(self.function_index(1), f(36) * x + f(40));
+                    blend(first, (f(48) - f(44)) * p + f(44))
+                } else {
+                    first
                 }
             }
             FunctionType::Linear => {
-                out = input * v(4) + v(5);
+                let first = f(36) * x + f(40);
+                if ranged { blend(first, f(60) * x + f(64)) } else { first }
+            }
+            FunctionType::LinearKey => {
+                let graph = |base: usize| {
+                    let t = |i: usize| saturate((x - f(base + 36 + 4 * i)) * f(base + 52 + 4 * i));
+                    ((f(base + 68) * t(0) + f(base + 64)) + f(base + 72) * t(1)) + f(base + 76) * t(2)
+                };
+                let first = graph(HEADER_SIZE);
+                if ranged { blend(first, graph(HEADER_SIZE + 80)) } else { first }
+            }
+            FunctionType::Spline | FunctionType::Spline2 => {
+                let warp = self.function_type() == FunctionType::Spline2;
+                let t0 = if warp { self.spline2_warp(0, x, x) } else { x };
+                let cubic = |t: f32, c: usize| {
+                    let t2 = t * t;
+                    ((f(c + 4) * t2 + t2 * t * f(c)) + f(c + 8) * t) + f(c + 12)
+                };
+                let first = cubic(t0, 52);
                 if ranged {
-                    out = (1.0 - range) * out + (input * v(10) + v(11)) * range;
+                    let t1 = if warp { self.spline2_warp(1, x, t0) } else { x };
+                    blend(first, cubic(t1, 100))
+                } else {
+                    first
                 }
             }
-            // Curve family — byte-identity holds, but shape eval is pending the
-            // curve-editor port (Phase 1b). Approximate as identity for preview.
-            FunctionType::LinearKey
-            | FunctionType::MultiLinearKey
-            | FunctionType::Spline
-            | FunctionType::MultiSpline
-            | FunctionType::Exponent
-            | FunctionType::Spline2 => out = input,
-        }
-        out.clamp(0.0, 1.0)
+            FunctionType::Exponent => {
+                let graph = |min: f32, max: f32, exponent: f32| {
+                    if exponent.abs() < EPSILON || (exponent < 0.0 && x.abs() < EPSILON) {
+                        1.0
+                    } else {
+                        ((x as f64).powf(exponent as f64) as f32) * (max - min) + min
+                    }
+                };
+                let first = graph(f(20), f(24), f(28));
+                if ranged { blend(first, graph(f(32), f(36), f(40))) } else { first }
+            }
+            FunctionType::MultiLinearKey | FunctionType::MultiSpline => 0.0,
+        };
+        clamp_tail(v)
     }
+
+    /// The x-warp spline2 applies before its cubic: `x` raised to roughly
+    /// |p0 - p1| / |p2 - p3|, computed with the engine's bit-trick square root
+    /// and one Newton step of reciprocal square root. `fallback` is what the
+    /// engine keeps when the warp is degenerate (graph 0's result, for graph 1).
+    fn spline2_warp(&self, graph: usize, x: f32, fallback: f32) -> f32 {
+        let p = |i: usize| (self.graph_value(graph, 2 * i), self.graph_value(graph, 2 * i + 1));
+        let (p0, p1, p2, p3) = (p(0), p(1), p(2), p(3));
+        let far = (p2.0 - p3.0) * (p2.0 - p3.0) + (p2.1 - p3.1) * (p2.1 - p3.1);
+        if !(far > EPSILON) {
+            return fallback;
+        }
+        let near = (p0.0 - p1.0) * (p0.0 - p1.0) + (p0.1 - p1.1) * (p0.1 - p1.1);
+        if EPSILON > near.abs() {
+            return 1.0;
+        }
+        if EPSILON > (near - far).abs() {
+            return fallback;
+        }
+        let sqrt_bits = |v: f32| ((v.to_bits() as i32) >> 1).wrapping_add(0x1FC0_0000);
+        let sqrt_near = f32::from_bits(sqrt_bits(near) as u32);
+        let sqrt_far = sqrt_bits(far);
+        let reciprocal = if sqrt_far == 0 {
+            0.0
+        } else {
+            let guess = f32::from_bits(0x7F00_0000i32.wrapping_sub(sqrt_far) as u32);
+            (2.0 - guess * f32::from_bits(sqrt_far as u32)) * guess
+        };
+        clamp_tail((x as f64).powf((reciprocal * sqrt_near) as f64) as f32)
+    }
+
+    /// `map_to_output_range` (0x810500): scalar functions lerp the normalized
+    /// value through the clamp range; color functions pass it through.
+    pub fn map_to_output_range(&self, normalized: f32) -> f32 {
+        if self.color_graph_type() != 0 {
+            return normalized;
+        }
+        let (min, max) = (self.clamp_range_min(), self.clamp_range_max());
+        (max - min) * saturate(normalized) + min
+    }
+
+    /// The final scalar value: [`Self::evaluate`] mapped through the clamp
+    /// range (MCC `evaluate_scalar`, 0x80F500).
+    pub fn evaluate_scalar(&self, input: f32, range: f32) -> f32 {
+        self.map_to_output_range(self.evaluate(input, range))
+    }
+
+    /// ARGB at an already-evaluated normalized position (`evaluate_color`,
+    /// 0x80F670), including its fixed-point channel lerp.
+    pub fn evaluate_color(&self, normalized: f32) -> u32 {
+        let cgt = self.color_graph_type();
+        if self.function_type() == FunctionType::Constant && (!self.is_ranged() || cgt <= 1) {
+            return self.u32_at(4);
+        }
+        let t = saturate(normalized);
+        match cgt {
+            0 => {
+                let g = ((t * 255.0).round_ties_even() as i32 as u32) & 0xFF;
+                g | (g << 8) | (g << 16) | 0xFF00_0000
+            }
+            1 => self.u32_at(4),
+            2 => lerp_argb(self.u32_at(4), self.u32_at(16), t),
+            3 => {
+                let scaled = t * 2.0;
+                let mut n = scaled.floor() as i32;
+                let frac = if n >= 2 {
+                    n = 1;
+                    1.0
+                } else {
+                    scaled - n as f32
+                };
+                let (a, b) = if n != 0 { (8, 16) } else { (4, 8) };
+                lerp_argb(self.u32_at(a), self.u32_at(b), frac)
+            }
+            4 => {
+                let scaled = t * 3.0;
+                let mut n = scaled.floor() as i32;
+                let frac = if n >= 3 {
+                    n = 2;
+                    1.0
+                } else {
+                    scaled - n as f32
+                };
+                let slot = 4 + 4 * n as usize;
+                lerp_argb(self.u32_at(slot), self.u32_at(slot + 4), frac)
+            }
+            _ => 0xFFFF_FFFF,
+        }
+    }
+
+    /// `is_constant` (0x810020): the output cannot vary with the inputs.
+    pub fn is_constant(&self) -> bool {
+        let f = |offset: usize| self.f32_at(offset);
+        let flat = |a: f32, b: f32| (a - b).abs() < EPSILON;
+        let ranged = self.is_ranged();
+        let curve = match self.function_type() {
+            FunctionType::Constant => !ranged,
+            FunctionType::Transition => {
+                let first = flat(f(24), f(20));
+                if ranged { first && flat(f(32), f(28)) && flat(f(32), f(24)) } else { first }
+            }
+            FunctionType::Periodic => {
+                let trivial = self.function_index(0) <= 1;
+                let first = flat(f(32), f(28));
+                if ranged {
+                    (first && flat(f(48), f(44)) && flat(f(48), f(32))) || (trivial && self.function_index(1) <= 1)
+                } else {
+                    first || trivial
+                }
+            }
+            FunctionType::Linear => {
+                let first = flat(f(36), 0.0);
+                if ranged { first && flat(f(60), 0.0) && flat(f(40), f(64)) } else { first }
+            }
+            FunctionType::LinearKey => {
+                let first = flat(f(88), 0.0) && flat(f(92), 0.0) && flat(f(96), 0.0);
+                if ranged {
+                    first && flat(f(168), 0.0) && flat(f(172), 0.0) && flat(f(176), 0.0) && flat(f(84), f(164))
+                } else {
+                    first
+                }
+            }
+            FunctionType::Exponent => {
+                let first = flat(f(24), f(20));
+                if ranged { first && flat(f(36), f(32)) && flat(f(36), f(24)) } else { first }
+            }
+            _ => false,
+        };
+        let u = |offset: usize| self.u32_at(offset);
+        match self.color_graph_type() {
+            0 => curve || flat(f(4), f(8)),
+            1 => true,
+            2 => curve || u(4) == u(16),
+            3 => curve || (u(4) == u(16) && u(4) == u(8)),
+            4 => curve || (u(4) == u(16) && u(4) == u(8) && u(4) == u(12)),
+            _ => false,
+        }
+    }
+
+    // -- Editing (the engine's setters, writing the block in place) -----------
+
+    /// The engine grows any block shorter than the header before an edit.
+    fn ensure_header(&mut self) {
+        if self.data.len() < HEADER_SIZE {
+            self.data.resize(HEADER_SIZE, 0);
+        }
+    }
+
+    fn check_graph(graph: usize) -> Result<(), H2FunctionError> {
+        if graph < 2 { Ok(()) } else { Err(H2FunctionError::InvalidEdit("graph index out of range")) }
+    }
+
+    /// `set_function_type` (0x811120): retype, resize to the type's block size
+    /// and seed that type's defaults. A no-op when both already match.
+    pub fn set_function_type(&mut self, function_type: FunctionType) {
+        self.ensure_header();
+        let size = block_size(function_type);
+        if self.function_type() == function_type && self.data.len() == size {
+            return;
+        }
+        self.data[0] = function_type as u8;
+        self.data.resize(size, 0);
+        self.initialize_graphs();
+    }
+
+    /// The type initializer (0x80EA20), then [`Self::postprocess`].
+    fn initialize_graphs(&mut self) {
+        let function_type = self.function_type();
+        for graph in 0..2 {
+            let at = |k: usize| HEADER_SIZE + 4 * (graph * floats_per_graph(function_type) + k);
+            let defaults: &[f32] = match function_type {
+                FunctionType::Constant => &[1.0],
+                FunctionType::Transition => &[0.0, 1.0],
+                FunctionType::Periodic => &[1.0, 0.0, 0.0, 1.0],
+                FunctionType::Spline | FunctionType::Spline2 => {
+                    &[0.0, 1.0, 0.333_333_34, 0.0, 0.666_666_7, 0.0, 1.0, 1.0]
+                }
+                FunctionType::Exponent => &[0.0, 1.0, 5.0],
+                _ => &[],
+            };
+            for (k, &v) in defaults.iter().enumerate() {
+                self.put_f32(at(k), v);
+            }
+            match function_type {
+                FunctionType::Linear | FunctionType::LinearKey => {
+                    let points = DEFAULT_POINT_COUNT[function_type as usize];
+                    let step = 1.0 / (points as f32 - 1.0);
+                    for i in 0..points {
+                        self.put_f32(at(2 * i), i as f32 * step);
+                        self.put_f32(at(2 * i + 1), 1.0);
+                    }
+                }
+                FunctionType::Spline | FunctionType::Spline2 => self.data[2 + graph] = 4,
+                FunctionType::Transition
+                | FunctionType::Periodic
+                | FunctionType::MultiLinearKey
+                | FunctionType::MultiSpline
+                | FunctionType::Exponent => self.data[2 + graph] = 0,
+                _ => {}
+            }
+        }
+        self.postprocess();
+    }
+
+    /// The postprocess (0x810650): rebuild each graph's derived data from its
+    /// control points: linear slope/offset, linear-key knot tables, and the
+    /// spline/spline2 cubic (Hermite) coefficients.
+    pub fn postprocess(&mut self) {
+        let function_type = self.function_type();
+        let n = floats_per_graph(function_type);
+        for graph in 0..2 {
+            let at = |k: usize| HEADER_SIZE + 4 * (graph * n + k);
+            let f = |this: &Self, k: usize| this.f32_at(at(k));
+            match function_type {
+                FunctionType::Linear => {
+                    let (y0, y1) = (f(self, 1), f(self, 3));
+                    self.put_f32(at(5), y0);
+                    self.put_f32(at(4), y1 - y0);
+                }
+                FunctionType::LinearKey => {
+                    let (x1, x2) = (f(self, 2), f(self, 4));
+                    let (y0, y1, y2, y3) = (f(self, 1), f(self, 3), f(self, 5), f(self, 7));
+                    self.put_f32(at(8), -1.0);
+                    self.put_f32(at(9), 0.0);
+                    self.put_f32(at(10), x1);
+                    self.put_f32(at(11), x2);
+                    self.put_f32(at(12), 1.0);
+                    self.put_f32(at(13), if x1 <= 0.0 { 0.0 } else { 1.0 / x1 });
+                    self.put_f32(at(14), if x2 <= x1 { 0.0 } else { 1.0 / (x2 - x1) });
+                    self.put_f32(at(15), if x2 >= 1.0 { 0.0 } else { 1.0 / (1.0 - x2) });
+                    self.put_f32(at(16), y0);
+                    self.put_f32(at(17), y1 - y0);
+                    self.put_f32(at(18), y2 - y1);
+                    self.put_f32(at(19), y3 - y2);
+                }
+                FunctionType::Spline | FunctionType::Spline2 => {
+                    let (x1, y0, y1) = (f(self, 2), f(self, 1), f(self, 3));
+                    let (x2, y2, y3) = (f(self, 4), f(self, 5), f(self, 7));
+                    let start = if x1 <= EPSILON { 0.0 } else { (y1 - y0) / x1 };
+                    let span = 1.0 - x2;
+                    let end = if span <= EPSILON { 0.0 } else { (y3 - y2) / span };
+                    self.put_f32(at(10), start);
+                    self.put_f32(at(11), y0);
+                    self.put_f32(at(8), (((y0 + y0) - (y3 + y3)) + start) + end);
+                    self.put_f32(at(9), (((y3 * 3.0) - (y0 * 3.0)) - (start + start)) - end);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// `set_ranged` (0x811200).
+    pub fn set_ranged(&mut self, ranged: bool) {
+        self.ensure_header();
+        if ranged {
+            self.data[1] |= flags::RANGE;
+        } else {
+            self.data[1] &= !flags::RANGE;
+        }
+    }
+
+    /// `set_color_graph_type` (0x810CD0): 0 = scalar, 1..4 = N-color.
+    pub fn set_color_graph_type(&mut self, color_graph_type: u8) -> Result<(), H2FunctionError> {
+        if color_graph_type >= 5 {
+            return Err(H2FunctionError::InvalidEdit("color graph type out of range"));
+        }
+        self.ensure_header();
+        self.data[1] = (self.data[1] & 0x0F) | (color_graph_type << flags::COLOR_GRAPH_TYPE_SHIFT);
+        Ok(())
+    }
+
+    /// `set_color` (0x810C00): logical color `index` → its physical slot.
+    pub fn set_color(&mut self, index: usize, argb: u32) -> Result<(), H2FunctionError> {
+        self.ensure_header();
+        let cgt = self.color_graph_type() as usize;
+        if cgt >= COLOR_SLOTS.len() || index >= 4 {
+            return Err(H2FunctionError::InvalidEdit("color index out of range"));
+        }
+        self.put_u32(4 + 4 * COLOR_SLOTS[cgt][index], argb);
+        Ok(())
+    }
+
+    /// `set_clamp_range_min` / `_max` (0x810BC0 / 0x810B80): scalar only; a
+    /// color function's union holds colors, so the engine skips these.
+    pub fn set_clamp_range(&mut self, min: f32, max: f32) -> Result<(), H2FunctionError> {
+        self.ensure_header();
+        if self.color_graph_type() != 0 {
+            return Err(H2FunctionError::InvalidEdit("a color function has no clamp range"));
+        }
+        self.put_f32(4, min);
+        self.put_f32(8, max);
+        Ok(())
+    }
+
+    /// `set_constant` (0x810D90): a constant's per-graph value, stored in the
+    /// clamp-range union (graph 0 at byte 4, graph 1 at byte 8).
+    pub fn set_constant(&mut self, graph: usize, value: f32) -> Result<(), H2FunctionError> {
+        Self::check_graph(graph)?;
+        self.ensure_header();
+        if self.function_type() != FunctionType::Constant {
+            return Err(H2FunctionError::InvalidEdit("set_constant needs a constant function"));
+        }
+        self.put_f32(4 + 4 * graph, value);
+        Ok(())
+    }
+
+    /// `set_function_index` (0x810F80): transition 0..7, periodic 0..11.
+    pub fn set_function_index(&mut self, graph: usize, index: u8) -> Result<(), H2FunctionError> {
+        Self::check_graph(graph)?;
+        self.ensure_header();
+        let limit = match self.function_type() {
+            FunctionType::Transition => 8,
+            FunctionType::Periodic => 12,
+            _ => return Err(H2FunctionError::InvalidEdit("function index needs a transition or periodic function")),
+        };
+        if index >= limit {
+            return Err(H2FunctionError::InvalidEdit("function index out of range"));
+        }
+        self.data[2 + graph] = index;
+        Ok(())
+    }
+
+    /// Byte offset of `graph`'s amplitude minimum (the maximum follows at +4),
+    /// for the types `set_amplitude_range_min/max` (0x810A50 / 0x810910) accept.
+    fn amplitude_offset(&self, graph: usize) -> Result<usize, H2FunctionError> {
+        Self::check_graph(graph)?;
+        match self.function_type() {
+            FunctionType::Transition => Ok(20 + 8 * graph),
+            FunctionType::Periodic => Ok(28 + 16 * graph),
+            FunctionType::Exponent => Ok(20 + 12 * graph),
+            _ => Err(H2FunctionError::InvalidEdit("amplitude needs a transition, periodic or exponent function")),
+        }
+    }
+
+    /// `graph`'s `(amplitude min, amplitude max)`.
+    pub fn amplitude_range(&self, graph: usize) -> Option<(f32, f32)> {
+        let at = self.amplitude_offset(graph).ok()?;
+        Some((self.f32_at(at), self.f32_at(at + 4)))
+    }
+
+    pub fn set_amplitude_range(&mut self, graph: usize, min: f32, max: f32) -> Result<(), H2FunctionError> {
+        self.ensure_header();
+        let at = self.amplitude_offset(graph)?;
+        self.put_f32(at, min);
+        self.put_f32(at + 4, max);
+        Ok(())
+    }
+
+    /// A periodic graph's `(frequency, phase)`, at the offsets `evaluate` reads.
+    pub fn periodic_frequency_phase(&self, graph: usize) -> Option<(f32, f32)> {
+        (graph < 2 && self.function_type() == FunctionType::Periodic)
+            .then(|| (self.f32_at(20 + 16 * graph), self.f32_at(24 + 16 * graph)))
+    }
+
+    /// Set a periodic graph's frequency and phase. The engine has no setter for
+    /// these (Guerilla writes the fields); the offsets are the ones `evaluate`
+    /// reads.
+    pub fn set_periodic_frequency_phase(&mut self, graph: usize, frequency: f32, phase: f32) -> Result<(), H2FunctionError> {
+        Self::check_graph(graph)?;
+        if self.function_type() != FunctionType::Periodic {
+            return Err(H2FunctionError::InvalidEdit("frequency/phase needs a periodic function"));
+        }
+        self.put_f32(20 + 16 * graph, frequency);
+        self.put_f32(24 + 16 * graph, phase);
+        Ok(())
+    }
+
+    /// An exponent graph's exponent, at the offset `evaluate` reads.
+    pub fn exponent(&self, graph: usize) -> Option<f32> {
+        (graph < 2 && self.function_type() == FunctionType::Exponent).then(|| self.f32_at(28 + 12 * graph))
+    }
+
+    /// Set an exponent graph's exponent. Like frequency/phase this has no
+    /// engine setter; the offset is the one `evaluate` reads.
+    pub fn set_exponent(&mut self, graph: usize, exponent: f32) -> Result<(), H2FunctionError> {
+        Self::check_graph(graph)?;
+        if self.function_type() != FunctionType::Exponent {
+            return Err(H2FunctionError::InvalidEdit("exponent needs an exponent function"));
+        }
+        self.put_f32(28 + 12 * graph, exponent);
+        Ok(())
+    }
+
+    /// `set_control_point_y` (0x810E90), then [`Self::postprocess`] so the
+    /// derived data stays consistent with the points.
+    pub fn set_control_point_y(&mut self, graph: usize, point: usize, y: f32) -> Result<(), H2FunctionError> {
+        Self::check_graph(graph)?;
+        self.ensure_header();
+        if point >= self.control_point_count(graph) {
+            return Err(H2FunctionError::InvalidEdit("control point index out of range"));
+        }
+        let at = self.graph_offset(graph, 2 * point + 1);
+        self.put_f32(at, y);
+        self.postprocess();
+        Ok(())
+    }
+}
+
+/// `v >= 0 ? min(1, v) : 0` — NaN goes to 0.
+fn saturate(v: f32) -> f32 {
+    if v >= 0.0 { v.min(1.0) } else { 0.0 }
+}
+
+/// The SSE tail `0 > v ? 0 : minss(1, v)` — NaN passes through.
+fn clamp_tail(v: f32) -> f32 {
+    if 0.0 > v {
+        0.0
+    } else if 1.0 < v {
+        1.0
+    } else {
+        v
+    }
+}
+
+#[inline]
+fn lut(base: usize, k: usize) -> f32 {
+    FUNCTION_TABLES[base + k] as f32 * (1.0 / 255.0)
+}
+
+/// MCC `transition_function_evaluate` (0x80CC70). The table rows match the
+/// H3+ ones byte for byte; the index arithmetic differs (it truncates).
+pub fn transition_evaluate(index: u8, value: f32) -> f32 {
+    let x = saturate(value);
+    if index == 0 {
+        return x;
+    }
+    let base = (index.min(TRANSITION_ROWS as u8) as usize - 1) * LUT_LEN;
+    let scaled = x * 1023.0;
+    let frac = scaled % 1.0;
+    let i = ((scaled as f64 - 0.1) as f32) as i32 as usize;
+    let mut v = lut(base, i);
+    if i != LUT_LEN - 1 {
+        v = v * (1.0 - frac) + lut(base, i + 1) * frac;
+    }
+    saturate(v)
+}
+
+/// MCC `periodic_function_evaluate` (0x80CAE0).
+pub fn periodic_evaluate(index: u8, value: f32) -> f32 {
+    if index == 0 {
+        return 1.0;
+    }
+    let base = PERIODIC_BASE + (index.min(PERIODIC_ROWS as u8) as usize - 1) * LUT_LEN;
+    let scaled = (value * 36.571_43) % 1024.0;
+    let frac = scaled % 1.0;
+    let i = ((scaled - frac) as i32 & 0x3FF) as usize;
+    let a = lut(base, i);
+    let mut b = lut(base, (i + 1) & 0x3FF);
+    if !matches!(index, 6 | 7) {
+        return (1.0 - frac) * a + b * frac;
+    }
+    if a > 0.75 && b < 0.25 {
+        b += 1.0;
+    }
+    let v = (1.0 - frac) * a + b * frac;
+    if v > 1.0 { v - 1.0 } else { v }
+}
+
+/// The engine's MMX channel lerp: each byte moves by `round((b - a) * t)` in
+/// 1/16384 fixed point, saturated to a byte.
+fn lerp_argb(a: u32, b: u32, t: f32) -> u32 {
+    let weight = (t * 16384.0).round_ties_even() as i32 as i16 as i32;
+    let mut out = 0u32;
+    for shift in [0, 8, 16, 24] {
+        let from = ((a >> shift) & 0xFF) as i16;
+        let to = ((b >> shift) & 0xFF) as i16;
+        let delta = to.wrapping_sub(from).wrapping_shl(3) as i32;
+        let high = ((delta * weight) >> 16) as i16;
+        let step = high.wrapping_add(1) >> 1;
+        out |= (from.wrapping_add(step).clamp(0, 255) as u32) << shift;
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Build a byte-block: 4-byte header + LE f32 values.
-    fn blob(ty: u8, flags: u8, fn1: u8, fn2: u8, values: &[f32]) -> Vec<u8> {
-        let mut b = vec![ty, flags, fn1, fn2];
-        for v in values {
+    /// A block of `function_type`'s engine size: the header, the union (clamp
+    /// min/max or colors), then graph floats from byte 20.
+    fn block(function_type: FunctionType, flags: u8, fns: [u8; 2], union: [u32; 4], graph: &[f32]) -> Vec<u8> {
+        let mut b = vec![function_type as u8, flags, fns[0], fns[1]];
+        for u in union {
+            b.extend_from_slice(&u.to_le_bytes());
+        }
+        for v in graph {
             b.extend_from_slice(&v.to_le_bytes());
         }
+        b.resize(block_size(function_type).max(b.len()), 0);
         b
     }
 
-    #[test]
-    fn parses_real_constant_particle_functions() {
-        // iac_engine_fire.effect particle "emission rate": constant, fn1=fn2=4,
-        // 28 bytes = 4-byte header + 6 f32s (subagent corpus dump).
-        let emission = blob(1, 0, 4, 4, &[1.0, 1.0, 0.0, 0.0, 1.0, 1.0]);
-        assert_eq!(emission.len(), 28);
-        let f = H2Function::parse(&emission).unwrap();
-        assert_eq!(f.function_type(), FunctionType::Constant);
-        assert!(!f.is_ranged());
-        assert_eq!(f.function_1(), 4);
-        assert_eq!(f.value(0), 1.0);
-        // Constant, not ranged: output is values[0] regardless of input.
-        assert_eq!(f.evaluate(0.3, 0.0), 1.0);
-        // Byte-identical round-trip.
-        assert_eq!(f.to_bytes(), emission);
-
-        // "particle velocity": constant 0.01.
-        let velocity = blob(1, 0, 0, 0, &[0.01, 0.0, 0.0, 0.0, 1.0, 1.0]);
-        let f = H2Function::parse(&velocity).unwrap();
-        assert_eq!(f.function_type(), FunctionType::Constant);
-        assert!((f.evaluate(0.7, 0.0) - 0.01).abs() < 1e-6);
+    fn range(min: f32, max: f32) -> [u32; 4] {
+        [min.to_bits(), max.to_bits(), 0, 0]
     }
 
     #[test]
-    fn decodes_color_and_curve_headers() {
-        // "particle tint": constant color function, flags 0x20 (color bit set).
-        let tint = blob(1, 0x20, 4, 4, &[f32::from_bits(0xFFFFFFFF), 1.0, 0.0, f32::from_bits(0xFFFFFFFF), 1.0, 1.0]);
-        let f = H2Function::parse(&tint).unwrap();
-        assert_eq!(f.function_type(), FunctionType::Constant);
-        assert_ne!(f.color_count(), 0, "color bit should be seen");
-        assert_eq!(f.to_bytes(), tint);
+    fn real_constant_particle_functions() {
+        // iac_engine_fire.effect "emission rate": constant, 28 bytes. The
+        // value is the clamp range (bytes 4/8); byte 20 is the initializer's 1.0.
+        let bytes = block(FunctionType::Constant, 0, [4, 4], range(1.0, 1.0), &[1.0, 1.0]);
+        assert_eq!(bytes.len(), 28);
+        let f = H2Function::parse(&bytes).unwrap();
+        assert_eq!(f.evaluate(0.3, 0.0), 0.0, "a constant is normalized 0 unranged");
+        assert_eq!(f.evaluate_scalar(0.3, 0.0), 1.0);
+        assert!(f.is_constant());
+        assert_eq!(f.to_bytes(), bytes);
 
-        // "particle alpha": a curve (Spline2 = type 10), 116 bytes.
-        let mut alpha = blob(10, 0, 4, 4, &[0.0, 1.0]);
-        alpha.resize(116, 0);
-        let f = H2Function::parse(&alpha).unwrap();
-        assert_eq!(f.function_type(), FunctionType::Spline2);
-        assert_eq!(f.to_bytes(), alpha); // byte-identity holds even for unported eval
+        // "particle velocity": 0.01 to 0.0 (min above max), unranged.
+        let f = H2Function::parse(&block(FunctionType::Constant, 0, [0, 0], range(0.01, 0.0), &[1.0, 1.0])).unwrap();
+        assert_eq!(f.evaluate_scalar(0.7, 0.0), 0.01);
     }
 
     #[test]
-    fn periodic_eval_matches_the_engine_formula() {
-        // Periodic (type 3): x = input*freq + phase; out = (ampMax-ampMin)*P(fn1,x) + ampMin.
-        // values = [freq, phase, ampMin, ampMax]. fn1 = 0 = "one" (P(x) == 1.0),
-        // so out == ampMax regardless of x.
-        let f = H2Function::parse(&blob(3, 0, 0, 0, &[2.0, 0.25, 0.1, 0.9])).unwrap();
-        assert_eq!(f.function_type(), FunctionType::Periodic);
-        let out = f.evaluate(0.5, 0.0);
-        assert!((out - 0.9).abs() < 1e-3, "P('one')==1 -> ampMax=0.9, got {out}");
+    fn color_graph_type_is_the_high_nibble() {
+        // "particle tint": flags 0x20 = two-color; colors in slots 0 and 3.
+        let bytes = block(FunctionType::Constant, 0x20, [4, 4], [0xFFFF_FFFF, 1.0f32.to_bits(), 0, 0xFFFF_FFFF], &[1.0, 1.0]);
+        let f = H2Function::parse(&bytes).unwrap();
+        assert_eq!(f.color_graph_type(), 2);
+        assert_eq!(f.color(0), Some(0xFFFF_FFFF));
+        assert_eq!(f.color(1), Some(0xFFFF_FFFF), "logical 1 of two-color is physical slot 3");
+        assert_eq!(f.color(2), None);
+        assert_eq!(f.clamp_range_min(), 0.0, "color functions have no clamp range");
+        assert_eq!(f.evaluate_color(0.5), 0xFFFF_FFFF);
     }
 
     #[test]
-    fn linear_eval_uses_slope_offset_at_values_4_5() {
-        // Linear (type 4): out = input*values[4] + values[5].
-        let f = H2Function::parse(&blob(4, 0, 0, 0, &[0.0, 0.0, 0.0, 0.0, 0.5, 0.2])).unwrap();
-        assert_eq!(f.function_type(), FunctionType::Linear);
-        assert!((f.evaluate(0.4, 0.0) - (0.4 * 0.5 + 0.2)).abs() < 1e-6);
+    fn periodic_reads_its_graph_after_the_union() {
+        // freq 2, phase 0.25, amp 0.1..0.9 at byte 20; index 0 = "one" (P == 1).
+        let f = H2Function::parse(&block(FunctionType::Periodic, 0, [0, 0], range(0.0, 1.0), &[2.0, 0.25, 0.1, 0.9])).unwrap();
+        assert!((f.evaluate(0.5, 0.0) - 0.9).abs() < 1e-6);
+        assert_eq!(f.periodic_frequency_phase(0), Some((2.0, 0.25)));
+        assert_eq!(f.amplitude_range(0), Some((0.1, 0.9)));
+    }
+
+    #[test]
+    fn linear_uses_its_postprocessed_slope_and_offset() {
+        let mut f = H2Function::parse(&block(FunctionType::Linear, 0, [0, 0], range(0.0, 10.0), &[])).unwrap();
+        f.set_control_point_y(0, 0, 0.2).unwrap();
+        f.set_control_point_y(0, 1, 0.7).unwrap();
+        assert!((f.evaluate(0.4, 0.0) - (0.2 + 0.4 * 0.5)).abs() < 1e-6);
+        assert!((f.evaluate_scalar(0.4, 0.0) - 4.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn set_function_type_seeds_engine_defaults() {
+        let mut f = H2Function::parse(&block(FunctionType::Identity, 0, [0, 0], range(0.0, 1.0), &[])).unwrap();
+        f.set_function_type(FunctionType::Spline2);
+        assert_eq!(f.to_bytes().len(), block_size(FunctionType::Spline2));
+        assert_eq!(f.function_index(0), 4);
+        assert_eq!(f.control_point(0, 1), Some((0.333_333_34, 0.0)));
+        // The seeded curve runs (0,1) → (1,1) through a dip.
+        assert!((f.evaluate(0.0, 0.0) - 1.0).abs() < 1e-6);
+        assert!((f.evaluate(1.0, 0.0) - 1.0).abs() < 1e-5);
+        assert!(f.evaluate(0.5, 0.0) < 0.5);
+
+        f.set_function_type(FunctionType::Exponent);
+        assert_eq!(f.exponent(0), Some(5.0));
+        assert!((f.evaluate(0.5, 0.0) - 0.5f32.powi(5)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn two_color_lerp_is_the_engine_fixed_point() {
+        let f = H2Function::parse(&block(FunctionType::Linear, 0x20, [0, 0], [0xFF00_0000, 0, 0, 0xFFFF_FFFF], &[])).unwrap();
+        assert_eq!(f.evaluate_color(0.0), 0xFF00_0000);
+        assert_eq!(f.evaluate_color(1.0), 0xFFFF_FFFF);
+        // Halfway, each channel moves by (255*8 * 8192 >> 16) + 1 >> 1 = 128.
+        assert_eq!(f.evaluate_color(0.5), 0xFF80_8080);
+    }
+
+    #[test]
+    fn edits_the_engine_refuses() {
+        let mut f = H2Function::parse(&block(FunctionType::Linear, 0, [0, 0], range(0.0, 1.0), &[])).unwrap();
+        assert!(f.set_constant(0, 1.0).is_err());
+        assert!(f.set_function_index(0, 1).is_err());
+        assert!(f.set_color_graph_type(5).is_err());
+        assert!(f.set_control_point_y(0, 2, 0.5).is_err(), "linear has two points");
+        f.set_function_type(FunctionType::Transition);
+        assert!(f.set_function_index(0, 8).is_err());
+        assert!(f.set_function_index(1, 7).is_ok());
+        f.set_color_graph_type(2).unwrap();
+        assert!(f.set_clamp_range(0.0, 1.0).is_err(), "a color function's union is colors");
     }
 
     #[test]

@@ -19,7 +19,7 @@
 use super::curve::{CurveGraph, CurvePointMode, CurveSegmentType, EDITOR_SIZE};
 use super::{
     build_identity_multipart_bytes, BlobFunction, ColorGraphType, FunctionFlags, FunctionKind,
-    FunctionType, TagFunction, TagFunctionError,
+    FunctionType, H2Function, H2FunctionError, TagFunction, TagFunctionError,
 };
 
 /// Foundation's periodic-function option table (numeric index → label).
@@ -152,6 +152,8 @@ pub enum FunctionEditError {
     Serialize(TagFunctionError),
     /// The operation isn't valid for this graph slot / function type.
     InvalidOperation(&'static str),
+    /// The Halo 2 engine refuses the edit.
+    H2(H2FunctionError),
 }
 
 impl std::fmt::Display for FunctionEditError {
@@ -159,13 +161,20 @@ impl std::fmt::Display for FunctionEditError {
         match self {
             Self::Serialize(e) => write!(f, "function editor serialize error: {e}"),
             Self::InvalidOperation(m) => write!(f, "invalid function edit: {m}"),
+            Self::H2(e) => e.fmt(f),
         }
     }
 }
 
 impl std::error::Error for FunctionEditError {}
 
-const H2_NOT_EDITABLE: &str = "halo 2 functions are not editable yet";
+impl From<H2FunctionError> for FunctionEditError {
+    fn from(e: H2FunctionError) -> Self {
+        Self::H2(e)
+    }
+}
+
+const H2_NOT_EDITABLE: &str = "not available for halo 2 functions";
 
 /// Editable `mapping_function`. Wraps a [`TagFunction`]; structural edits
 /// rebuild a complete, valid blob (compact + editor trailer) and re-parse,
@@ -193,14 +202,40 @@ impl TagFunctionEditor {
         self.func
     }
 
-    /// The blob every structural edit rebuilds. Halo 2 functions are not
-    /// editable yet, so every edit refuses them.
+    /// The blob the Foundation-shaped edits rebuild. Halo 2 functions take the
+    /// edits their engine has setters for (see the `H2` branches) and refuse
+    /// the rest here.
     fn blob(&self) -> Result<&BlobFunction, FunctionEditError> {
         self.func.as_blob().ok_or(FunctionEditError::InvalidOperation(H2_NOT_EDITABLE))
     }
 
     fn blob_mut(&mut self) -> Result<&mut BlobFunction, FunctionEditError> {
         self.func.as_blob_mut().ok_or(FunctionEditError::InvalidOperation(H2_NOT_EDITABLE))
+    }
+
+    /// The Halo 2 function when graph `slot` exists (slot 1 only when ranged)
+    /// and is of type `expected`.
+    fn h2_graph(&self, slot: usize, expected: FunctionType) -> Option<&H2Function> {
+        let f = self.func.as_h2()?;
+        (slot < self.graph_count() && f.function_type() == expected).then_some(f)
+    }
+
+    /// As [`Self::h2_graph`] for an edit: `Ok(None)` for a blob, an error for
+    /// a missing slot or the wrong type.
+    fn h2_graph_mut(
+        &mut self,
+        slot: usize,
+        expected: FunctionType,
+    ) -> Result<Option<&mut H2Function>, FunctionEditError> {
+        let graphs = self.graph_count();
+        let Some(f) = self.func.as_h2_mut() else { return Ok(None) };
+        if f.function_type() != expected {
+            return Err(FunctionEditError::InvalidOperation("wrong function type for params"));
+        }
+        if slot >= graphs {
+            return Err(FunctionEditError::InvalidOperation("graph slot out of range"));
+        }
+        Ok(Some(f))
     }
 
     /// Serialize to a complete `mapping_function` `data` blob.
@@ -258,6 +293,11 @@ impl TagFunctionEditor {
         if self.is_ranged() == ranged {
             return Ok(());
         }
+        if let Some(f) = self.func.as_h2_mut() {
+            // The block always holds both graphs; the flag is the whole edit.
+            f.set_ranged(ranged);
+            return Ok(());
+        }
         let ftype = self.func.function_type();
         if matches!(ftype, FunctionType::Constant | FunctionType::Identity) {
             // No compact/editor to duplicate — just flip the flag.
@@ -272,8 +312,19 @@ impl TagFunctionEditor {
     /// exclusion) and the ranged state where representable. Converting to
     /// `Curve` produces a valid one-segment identity `MultiSpline`
     /// (`f(x) = x`), not the empty compact the old path produced.
+    ///
+    /// A Halo 2 function retypes through its engine's `set_function_type`,
+    /// except to `Curve`: that serializes as `MultiSpline`, which Halo 2
+    /// evaluates to 0, so it is refused rather than mapped to a guessed type.
     pub fn set_master_type(&mut self, target: FoundationMasterType) -> Result<(), FunctionEditError> {
         if self.master_type() == target {
+            return Ok(());
+        }
+        if let Some(f) = self.func.as_h2_mut() {
+            if target == FoundationMasterType::Curve {
+                return Err(FunctionEditError::InvalidOperation("halo 2 has no single curve type"));
+            }
+            f.set_function_type(target.function_type());
             return Ok(());
         }
         let ranged = self.is_ranged() && target != FoundationMasterType::Basic;
@@ -302,6 +353,9 @@ impl TagFunctionEditor {
     /// resolving the non-contiguous physical slot. Ports
     /// `c_function_definition::get_color @0x82e8c978`.
     pub fn get_color(&self, index: usize) -> Option<u32> {
+        if let Some(f) = self.func.as_h2() {
+            return f.color(index);
+        }
         let slot = *color_slots(self.color_graph_type()).get(index)?;
         Some(self.func.as_blob()?.header().colors[slot])
     }
@@ -309,6 +363,12 @@ impl TagFunctionEditor {
     /// Set the color at logical index `index`, preserving all untouched color
     /// slots and unrelated header bytes.
     pub fn set_color(&mut self, index: usize, argb: u32) -> Result<(), FunctionEditError> {
+        if let Some(f) = self.func.as_h2_mut() {
+            if index >= f.color_graph_type() as usize {
+                return Err(FunctionEditError::InvalidOperation("color index out of range"));
+            }
+            return Ok(f.set_color(index, argb)?);
+        }
         let slot = *color_slots(self.color_graph_type())
             .get(index)
             .ok_or(FunctionEditError::InvalidOperation("color index out of range"))?;
@@ -318,6 +378,9 @@ impl TagFunctionEditor {
 
     /// Change the color-graph type (scalar / N-color).
     pub fn set_color_graph_type(&mut self, cgt: ColorGraphType) -> Result<(), FunctionEditError> {
+        if let Some(f) = self.func.as_h2_mut() {
+            return Ok(f.set_color_graph_type(cgt as u8)?);
+        }
         self.blob_mut()?.set_color_graph_type(cgt);
         Ok(())
     }
@@ -326,6 +389,18 @@ impl TagFunctionEditor {
 
     /// Periodic parameters for graph `slot` (0 = primary, 1 = ranged second).
     pub fn periodic_params(&self, slot: usize) -> Option<PeriodicParams> {
+        if self.func.as_h2().is_some() {
+            let f = self.h2_graph(slot, FunctionType::Periodic)?;
+            let (frequency, phase) = f.periodic_frequency_phase(slot)?;
+            let (amplitude_min, amplitude_max) = f.amplitude_range(slot)?;
+            return Some(PeriodicParams {
+                function_index: f.function_index(slot),
+                frequency,
+                phase,
+                amplitude_min,
+                amplitude_max,
+            });
+        }
         match self.func.as_blob()?.graph(slot)? {
             FunctionKind::Periodic { compact, .. } => Some(PeriodicParams {
                 function_index: compact.function_index,
@@ -343,10 +418,23 @@ impl TagFunctionEditor {
         slot: usize,
         params: PeriodicParams,
     ) -> Result<(), FunctionEditError> {
+        if let Some(f) = self.h2_graph_mut(slot, FunctionType::Periodic)? {
+            // The index is the only setter that can refuse; it goes first so a
+            // refusal leaves the block untouched.
+            f.set_function_index(slot, params.function_index)?;
+            f.set_periodic_frequency_phase(slot, params.frequency, params.phase)?;
+            f.set_amplitude_range(slot, params.amplitude_min, params.amplitude_max)?;
+            return Ok(());
+        }
         self.set_typed_graph(slot, FunctionType::Periodic, params.to_compact())
     }
 
     pub fn exponent_params(&self, slot: usize) -> Option<ExponentParams> {
+        if self.func.as_h2().is_some() {
+            let f = self.h2_graph(slot, FunctionType::Exponent)?;
+            let (amplitude_min, amplitude_max) = f.amplitude_range(slot)?;
+            return Some(ExponentParams { exponent: f.exponent(slot)?, amplitude_min, amplitude_max });
+        }
         match self.func.as_blob()?.graph(slot)? {
             FunctionKind::Exponent { compact, .. } => Some(ExponentParams {
                 exponent: compact.exponent,
@@ -362,10 +450,20 @@ impl TagFunctionEditor {
         slot: usize,
         params: ExponentParams,
     ) -> Result<(), FunctionEditError> {
+        if let Some(f) = self.h2_graph_mut(slot, FunctionType::Exponent)? {
+            f.set_exponent(slot, params.exponent)?;
+            f.set_amplitude_range(slot, params.amplitude_min, params.amplitude_max)?;
+            return Ok(());
+        }
         self.set_typed_graph(slot, FunctionType::Exponent, params.to_compact())
     }
 
     pub fn transition_params(&self, slot: usize) -> Option<TransitionParams> {
+        if self.func.as_h2().is_some() {
+            let f = self.h2_graph(slot, FunctionType::Transition)?;
+            let (amplitude_min, amplitude_max) = f.amplitude_range(slot)?;
+            return Some(TransitionParams { function_index: f.function_index(slot), amplitude_min, amplitude_max });
+        }
         match self.func.as_blob()?.graph(slot)? {
             FunctionKind::Transition { compact, .. } => Some(TransitionParams {
                 function_index: compact.function_index,
@@ -381,6 +479,11 @@ impl TagFunctionEditor {
         slot: usize,
         params: TransitionParams,
     ) -> Result<(), FunctionEditError> {
+        if let Some(f) = self.h2_graph_mut(slot, FunctionType::Transition)? {
+            f.set_function_index(slot, params.function_index)?;
+            f.set_amplitude_range(slot, params.amplitude_min, params.amplitude_max)?;
+            return Ok(());
+        }
         self.set_typed_graph(slot, FunctionType::Transition, params.to_compact())
     }
 
@@ -895,7 +998,7 @@ mod tests {
         // A 2-color periodic; set color 1 (physical slot 3), color 0 (slot 0)
         // must be untouched, and slots 1/2 stay zero.
         let mut e = constant_0_1();
-        e.set_color_graph_type(ColorGraphType::TwoColor);
+        e.set_color_graph_type(ColorGraphType::TwoColor).unwrap();
         e.set_master_type(FoundationMasterType::Periodic).unwrap();
         assert_eq!(e.color_count(), 2);
         // Setting logical color 1 (physical slot 3) must not disturb logical
@@ -980,7 +1083,7 @@ mod tests {
             (ColorGraphType::FourColor, 4, vec![0, 1, 2, 3]),
         ] {
             let mut e = constant_0_1();
-            e.set_color_graph_type(cgt);
+            e.set_color_graph_type(cgt).unwrap();
             e.set_master_type(FoundationMasterType::Periodic).unwrap();
             assert_eq!(e.color_count(), count);
             let colors: Vec<u32> = (0..count).map(|i| 0x00100000 * (i as u32 + 1)).collect();
