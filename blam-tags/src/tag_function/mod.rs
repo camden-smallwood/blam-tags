@@ -2109,6 +2109,40 @@ mod tests {
     }
 
     #[test]
+    fn editor_moves_h2_points_by_the_engine_rules() {
+        use editor::TagFunctionEditor;
+        let mut e = TagFunctionEditor::from_function(TagFunction::H2(H2Function::new(FunctionType::LinearKey)));
+        assert_eq!(e.curve_control_point_count(0), Some(4));
+        assert_eq!(e.curve_control_point_count(1), None, "no second graph until ranged");
+        assert!(!e.curve_points_are_editable_structure(), "fixed points: no add/delete/segments");
+        assert!(e.insert_curve_point(0, 0.5).is_err());
+        assert!(!e.curve_point_x_movable(0, 0) && e.curve_point_x_movable(0, 1));
+
+        // Dragging an end point moves y only; an interior point is held
+        // between its neighbours.
+        e.set_curve_control_point(0, 0, (0.7, 0.2)).unwrap();
+        assert_eq!(e.curve_control_point(0, 0), Some((0.0, 0.2)));
+        e.set_curve_control_point(0, 1, (0.95, 0.4)).unwrap();
+        let (x1, y1) = e.curve_control_point(0, 1).unwrap();
+        assert_eq!((x1, y1), (e.curve_control_point(0, 2).unwrap().0, 0.4));
+
+        e.set_ranged(true).unwrap();
+        assert_eq!(e.curve_control_point_count(1), Some(4));
+
+        // Per-game option lists and output range.
+        assert_eq!(e.transition_functions().len(), 8);
+        assert_eq!(e.clamp_range(), Some((0.0, 0.0)));
+        e.set_clamp_range(0.5, 2.0).unwrap();
+        assert_eq!(e.clamp_range(), Some((0.5, 2.0)));
+        e.set_function_type(FunctionType::MultiSpline).unwrap();
+        assert_eq!(e.function_type(), FunctionType::MultiSpline);
+
+        let mut blob = TagFunctionEditor::from_function(TagFunction::parse(&linear_blob(0, &[(1.0, 0.0)])).unwrap());
+        assert_eq!(blob.transition_functions().len(), 4);
+        assert!(blob.set_function_type(FunctionType::Spline).is_err(), "H3+ retypes by master type");
+    }
+
+    #[test]
     fn editor_edits_h2_through_the_engine_setters() {
         use editor::{FoundationMasterType, PeriodicParams, TagFunctionEditor};
         let bytes = h2_block(3, 0, 2, [0.0, 1.0], &[1.0, 0.0, 0.0, 1.0]);

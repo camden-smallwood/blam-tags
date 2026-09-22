@@ -255,12 +255,44 @@ impl H2Function {
         }
     }
 
+    /// Whether control point `point` of `graph` lies inside the block. The
+    /// multi types take their point count from the header, which can name more
+    /// points than their block holds; those are never read or written.
+    fn point_in_block(&self, graph: usize, point: usize) -> bool {
+        graph < 2
+            && point < self.control_point_count(graph)
+            && self.graph_offset(graph, 2 * point + 1) + 4 <= self.data.len()
+    }
+
     /// Control point `point` of `graph` (`get_control_point`, 0x80FD20).
     pub fn control_point(&self, graph: usize, point: usize) -> Option<(f32, f32)> {
-        if graph > 1 || point >= self.control_point_count(graph) {
+        self.point_in_block(graph, point)
+            .then(|| (self.graph_value(graph, 2 * point), self.graph_value(graph, 2 * point + 1)))
+    }
+
+    /// The x range control point `point` of `graph` may move within, or `None`
+    /// when its x is fixed. Guerilla's `set_control_point_x` (2003 build
+    /// @0x498910): only interior points move; a linear key's are held between
+    /// their neighbours, a spline's anywhere between its end points. The 2003
+    /// build predates spline2; shipped MCC spline2 points behave like spline's
+    /// (interior x moved in 353 of 360 graphs, crossing in 37).
+    pub fn control_point_x_range(&self, graph: usize, point: usize) -> Option<(f32, f32)> {
+        if !self.point_in_block(graph, point) || point == 0 || point + 1 >= self.control_point_count(graph) {
             return None;
         }
-        Some((self.graph_value(graph, 2 * point), self.graph_value(graph, 2 * point + 1)))
+        let x = |p: usize| self.graph_value(graph, 2 * p);
+        let bounds = |lo: usize, hi: usize| {
+            (self.point_in_block(graph, lo) && self.point_in_block(graph, hi)).then(|| (x(lo), x(hi)))
+        };
+        match self.function_type() {
+            FunctionType::LinearKey | FunctionType::MultiLinearKey => bounds(point - 1, point + 1),
+            FunctionType::Spline | FunctionType::Spline2 => bounds(0, 3),
+            FunctionType::MultiSpline => {
+                let start = 3 * (point / 3);
+                bounds(start, start + 3)
+            }
+            _ => None,
+        }
     }
 
     // -- Evaluation -----------------------------------------------------------
@@ -728,11 +760,31 @@ impl H2Function {
     pub fn set_control_point_y(&mut self, graph: usize, point: usize, y: f32) -> Result<(), H2FunctionError> {
         Self::check_graph(graph)?;
         self.ensure_header();
-        if point >= self.control_point_count(graph) {
+        if !self.point_in_block(graph, point) {
             return Err(H2FunctionError::InvalidEdit("control point index out of range"));
         }
         let at = self.graph_offset(graph, 2 * point + 1);
         self.put_f32(at, y);
+        self.postprocess();
+        Ok(())
+    }
+
+    /// `set_control_point_x`, then [`Self::postprocess`]. The x is held to
+    /// [`Self::control_point_x_range`] with Guerilla's comparisons (below the
+    /// range takes the low bound, above takes the high); a point whose x is
+    /// fixed refuses.
+    pub fn set_control_point_x(&mut self, graph: usize, point: usize, x: f32) -> Result<(), H2FunctionError> {
+        Self::check_graph(graph)?;
+        let (lo, hi) = self
+            .control_point_x_range(graph, point)
+            .ok_or(H2FunctionError::InvalidEdit("this control point's x is fixed"))?;
+        let x = if x >= lo {
+            if x <= hi { x } else { hi }
+        } else {
+            lo
+        };
+        let at = self.graph_offset(graph, 2 * point);
+        self.put_f32(at, x);
         self.postprocess();
         Ok(())
     }
@@ -939,6 +991,42 @@ mod tests {
         assert_eq!(f.evaluate_color(f.evaluate(0.5, 0.0)), 0xFF11_2233);
 
         assert_eq!(H2Function::new(FunctionType::Identity).to_bytes(), vec![0; HEADER_SIZE]);
+    }
+
+    #[test]
+    fn control_point_x_follows_guerillas_rules() {
+        let mut f = H2Function::new(FunctionType::Linear);
+        assert_eq!(f.control_point_x_range(0, 0), None, "linear x is fixed");
+        assert!(f.set_control_point_x(0, 1, 0.5).is_err());
+
+        // Linear key: interior points held between their neighbours.
+        let mut f = H2Function::new(FunctionType::LinearKey);
+        let x = |f: &H2Function, p: usize| f.control_point(0, p).unwrap().0;
+        assert_eq!(f.control_point_x_range(0, 0), None, "end points are fixed");
+        f.set_control_point_x(0, 1, 0.9).unwrap();
+        assert_eq!(x(&f, 1), x(&f, 2), "cannot pass the next point");
+        f.set_control_point_x(0, 2, 0.1).unwrap();
+        assert!(x(&f, 2) >= x(&f, 1), "cannot pass the previous point");
+
+        // Spline: interior points may cross, held to the end points.
+        let mut f = H2Function::new(FunctionType::Spline2);
+        f.set_control_point_x(0, 1, 0.9).unwrap();
+        assert_eq!(x(&f, 1), 0.9, "may pass point 2");
+        f.set_control_point_x(0, 2, -1.0).unwrap();
+        assert_eq!(x(&f, 2), 0.0, "held to p0.x");
+        // The cubic was rebuilt from the moved points.
+        let before = f.clone();
+        f.set_control_point_x(0, 1, 0.5).unwrap();
+        assert_ne!(f.to_bytes()[52..68], before.to_bytes()[52..68]);
+
+        // Multi types name their point count in the header; points past the
+        // block are never touched, so the block never grows.
+        let mut f = H2Function::new(FunctionType::MultiSpline);
+        f.data[2] = 16;
+        let size = f.to_bytes().len();
+        assert!(f.control_point(0, 15).is_none());
+        assert!(f.set_control_point_y(0, 15, 0.5).is_err());
+        assert_eq!(f.to_bytes().len(), size);
     }
 
     #[test]

@@ -19,7 +19,7 @@
 use super::curve::{CurveGraph, CurvePointMode, CurveSegmentType, EDITOR_SIZE};
 use super::{
     build_identity_multipart_bytes, BlobFunction, ColorGraphType, FunctionFlags, FunctionKind,
-    FunctionType, H2Function, H2FunctionError, TagFunction, TagFunctionError,
+    FunctionEncoding, FunctionType, H2Function, H2FunctionError, TagFunction, TagFunctionError,
 };
 
 /// Foundation's periodic-function option table (numeric index → label).
@@ -333,20 +333,72 @@ impl TagFunctionEditor {
 
     // -- Option tables + color slots (doc item 5 + 6). --
 
+    /// Periodic function names this function's game offers, by index.
+    pub fn periodic_functions(&self) -> &'static [&'static str] {
+        match self.func.encoding() {
+            FunctionEncoding::H2 => &super::h2::PERIODIC_FUNCTION_NAMES,
+            FunctionEncoding::Blob => &PERIODIC_FUNCTIONS,
+        }
+    }
+
+    /// Transition function names this function's game offers, by index
+    /// (Halo 2 offers all eight; the H3+ tools four).
+    pub fn transition_functions(&self) -> &'static [&'static str] {
+        match self.func.encoding() {
+            FunctionEncoding::H2 => &super::h2::TRANSITION_FUNCTION_NAMES,
+            FunctionEncoding::Blob => &TRANSITION_FUNCTIONS,
+        }
+    }
+
     pub fn periodic_function_count(&self) -> usize {
-        PERIODIC_FUNCTIONS.len()
+        self.periodic_functions().len()
     }
 
     pub fn periodic_function_text(&self, index: usize) -> Option<&'static str> {
-        PERIODIC_FUNCTIONS.get(index).copied()
+        self.periodic_functions().get(index).copied()
     }
 
     pub fn transition_function_count(&self) -> usize {
-        TRANSITION_FUNCTIONS.len()
+        self.transition_functions().len()
     }
 
     pub fn transition_function_text(&self, index: usize) -> Option<&'static str> {
-        TRANSITION_FUNCTIONS.get(index).copied()
+        self.transition_functions().get(index).copied()
+    }
+
+    /// The output range `(min, max)` a scalar function maps through; `None`
+    /// for a color function, whose header holds colors instead.
+    pub fn clamp_range(&self) -> Option<(f32, f32)> {
+        if self.color_graph_type() != ColorGraphType::Scalar {
+            return None;
+        }
+        match &self.func {
+            TagFunction::Blob(f) => Some((f.header().clamp_range_min, f.header().clamp_range_max)),
+            TagFunction::H2(f) => Some((f.clamp_range_min(), f.clamp_range_max())),
+        }
+    }
+
+    pub fn set_clamp_range(&mut self, min: f32, max: f32) -> Result<(), FunctionEditError> {
+        if self.color_graph_type() != ColorGraphType::Scalar {
+            return Err(FunctionEditError::InvalidOperation("a color function has no output range"));
+        }
+        match &mut self.func {
+            TagFunction::Blob(f) => f.set_clamp_range(min, max),
+            TagFunction::H2(f) => f.set_clamp_range(min, max)?,
+        }
+        Ok(())
+    }
+
+    /// Retype a Halo 2 function to any of its eleven raw types, as Guerilla's
+    /// type picker does. H3+ functions change type through
+    /// [`Self::set_master_type`].
+    pub fn set_function_type(&mut self, function_type: FunctionType) -> Result<(), FunctionEditError> {
+        let f = self
+            .func
+            .as_h2_mut()
+            .ok_or(FunctionEditError::InvalidOperation("h3+ functions change type by master type"))?;
+        f.set_function_type(function_type);
+        Ok(())
     }
 
     /// The ARGB color at logical color index `index` (0..`color_count`),
@@ -594,16 +646,48 @@ impl TagFunctionEditor {
         Some(self.graph(graph).ok()?.segments.get(segment)?.seg_type)
     }
 
+    /// Control points of curve `graph`. A Halo 2 curve (linear, linear key,
+    /// spline, spline2, and the multi types) has a fixed set; `None` when the
+    /// function has none or the graph slot is absent.
     pub fn curve_control_point_count(&self, graph: usize) -> Option<usize> {
+        if let Some(f) = self.func.as_h2() {
+            let count = (0..f.control_point_count(graph))
+                .take_while(|&point| f.control_point(graph, point).is_some())
+                .count();
+            return (graph < self.graph_count() && count > 0).then_some(count);
+        }
         Some(self.graph(graph).ok()?.control_point_count())
     }
 
     pub fn curve_control_point(&self, graph: usize, point: usize) -> Option<(f32, f32)> {
+        if let Some(f) = self.func.as_h2() {
+            return (graph < self.graph_count()).then(|| f.control_point(graph, point)).flatten();
+        }
         self.graph(graph).ok()?.get_control_point(point)
     }
 
+    /// Whether `point` is a point on the curve (as opposed to an off-curve
+    /// tangent handle). Every Halo 2 control point is on the curve.
     pub fn curve_is_graph_point(&self, graph: usize, point: usize) -> Option<bool> {
+        if self.func.as_h2().is_some() {
+            return self.curve_control_point(graph, point).map(|_| true);
+        }
         self.graph(graph).ok()?.is_graph_point(point)
+    }
+
+    /// Whether `point` can move in x. A Halo 2 end point, and every point of a
+    /// linear function, is fixed in x ([`H2Function::control_point_x_range`]).
+    pub fn curve_point_x_movable(&self, graph: usize, point: usize) -> bool {
+        match self.func.as_h2() {
+            Some(f) => graph < self.graph_count() && f.control_point_x_range(graph, point).is_some(),
+            None => self.curve_control_point(graph, point).is_some(),
+        }
+    }
+
+    /// Whether points can be added and removed and segments retyped (the H3+
+    /// multi-part curve). Halo 2 curves have a fixed set of points.
+    pub fn curve_points_are_editable_structure(&self) -> bool {
+        self.func.as_h2().is_none() && self.curve_graphs().is_some()
     }
 
     /// Move a control point. `graph` slot, global `point` index (see
@@ -614,6 +698,18 @@ impl TagFunctionEditor {
         point: usize,
         value: (f32, f32),
     ) -> Result<(), FunctionEditError> {
+        if self.func.as_h2().is_some() {
+            if graph >= self.graph_count() || self.curve_control_point(graph, point).is_none() {
+                return Err(FunctionEditError::InvalidOperation("no such control point"));
+            }
+            let movable_x = self.curve_point_x_movable(graph, point);
+            let f = self.func.as_h2_mut().expect("checked above");
+            if movable_x {
+                f.set_control_point_x(graph, point, value.0)?;
+            }
+            f.set_control_point_y(graph, point, value.1)?;
+            return Ok(());
+        }
         let mut graphs = self
             .curve_graphs()
             .ok_or(FunctionEditError::InvalidOperation("not a curve"))?;
