@@ -1420,6 +1420,45 @@ impl<'a> TagFlag<'a> {
 // Write-side: mirrors of the read types
 //================================================================================
 
+/// Initialize every block-index field in a freshly created element to `NONE`
+/// (-1) instead of the raw zero-fill's `0`.
+///
+/// A new element's bytes are zero-filled, but `0` is a *valid* index — it
+/// claims a reference to element 0 of the target block. When that block is
+/// empty, the engine's load-time postprocess still indexes it and trips
+/// `valid_index` (`wrapped_arrays.h`). This is the reported `physics_model`
+/// crash: a stock tag stores `NONE` for `materials[].phantom type` and
+/// `pills[].base/phantom`, but an importer that left the zero-fill stored `0`
+/// into the empty `phantom types` / `phantoms` blocks, and the tag fatally
+/// failed to load. `NONE` is the sentinel the loader treats as "no reference",
+/// so it is the correct — and strictly safer — default for an unassigned index.
+///
+/// Recurses into inline `Struct` fields (e.g. a shape's `base`) and `Array`
+/// elements. Child `Block`s are left empty; their own elements get the same
+/// treatment as they are added. All six block-index variants (char/short/long,
+/// plain and custom) are covered, each written at its own width.
+fn default_new_element_block_indices(mut element: TagStructMut<'_>) {
+    element.for_each_field_mut(|mut field| match field.as_ref().field_type() {
+        TagFieldType::CharBlockIndex => { let _ = field.set(TagFieldData::CharBlockIndex(-1)); }
+        TagFieldType::CustomCharBlockIndex => { let _ = field.set(TagFieldData::CustomCharBlockIndex(-1)); }
+        TagFieldType::ShortBlockIndex => { let _ = field.set(TagFieldData::ShortBlockIndex(-1)); }
+        TagFieldType::CustomShortBlockIndex => { let _ = field.set(TagFieldData::CustomShortBlockIndex(-1)); }
+        TagFieldType::LongBlockIndex => { let _ = field.set(TagFieldData::LongBlockIndex(-1)); }
+        TagFieldType::CustomLongBlockIndex => { let _ = field.set(TagFieldData::CustomLongBlockIndex(-1)); }
+        TagFieldType::Struct => {
+            if let Some(sub) = field.as_struct_mut() {
+                default_new_element_block_indices(sub);
+            }
+        }
+        TagFieldType::Array => {
+            if let Some(mut array) = field.as_array_mut() {
+                array.for_each_element_mut(|element| default_new_element_block_indices(element));
+            }
+        }
+        _ => {}
+    });
+}
+
 /// Mutable counterpart of [`TagStruct`].
 pub struct TagStructMut<'a> {
     layout: &'a TagLayout,
@@ -1923,19 +1962,32 @@ impl<'a> TagBlockMut<'a> {
     }
 
     /// Append a default-initialized element. Returns its new index.
+    ///
+    /// Block-index fields are initialized to `NONE` (-1), not the raw zero-fill's
+    /// `0` — see [`default_new_element_block_indices`].
     pub fn add_element(&mut self) -> usize {
         self.block_data.add_element(self.layout);
-        self.block_data.elements.len() - 1
+        let index = self.block_data.elements.len() - 1;
+        if let Some(element) = self.element_mut(index) {
+            default_new_element_block_indices(element);
+        }
+        index
     }
 
     /// Insert a default element at `index`. Error on out-of-range
     /// (valid range is `0..=len`).
+    ///
+    /// Block-index fields are initialized to `NONE` (-1), not the raw zero-fill's
+    /// `0` — see [`default_new_element_block_indices`].
     pub fn insert_element(&mut self, index: usize) -> Result<(), TagIndexError> {
         let len = self.block_data.elements.len();
         if index > len {
             return Err(TagIndexError::OutOfRange { index, len });
         }
         self.block_data.insert_element(self.layout, index);
+        if let Some(element) = self.element_mut(index) {
+            default_new_element_block_indices(element);
+        }
         Ok(())
     }
 

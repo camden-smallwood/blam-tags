@@ -1625,3 +1625,56 @@ mod new_function_default_tests {
         }
     }
 }
+
+/// A freshly added block element must initialize its block-index fields to
+/// `NONE` (-1), not the raw zero-fill's `0`. This is the reported `physics_model`
+/// load crash (issue #66): a `0` in `materials[].phantom type` /
+/// `pills[].base/phantom` points at element 0 of an *empty* block, and the
+/// engine's load-time postprocess indexes it and trips `valid_index`.
+#[cfg(test)]
+mod new_element_block_index_default_tests {
+    use crate::{TagFieldData, TagFile};
+
+    fn definition(game: &str, group: &str) -> String {
+        format!("../definitions/{game}/{group}.json")
+    }
+
+    /// Read a `/`-path block-index field as its raw integer, or `None` if the
+    /// field isn't a block index / doesn't resolve.
+    fn block_index_at(tag: &TagFile, path: &str) -> Option<i128> {
+        match tag.root().field_path(path)?.value()? {
+            TagFieldData::CharBlockIndex(v) | TagFieldData::CustomCharBlockIndex(v) => Some(v as i128),
+            TagFieldData::ShortBlockIndex(v) | TagFieldData::CustomShortBlockIndex(v) => Some(v as i128),
+            TagFieldData::LongBlockIndex(v) | TagFieldData::CustomLongBlockIndex(v) => Some(v as i128),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn new_element_block_indices_default_to_none() {
+        let mut tag = TagFile::new(definition("haloreach_mcc", "physics_model"))
+            .expect("haloreach physics_model schema");
+
+        // Add one element to each block, through the same public API the
+        // importers use.
+        for block in ["materials", "pills"] {
+            let mut root = tag.root_mut();
+            let mut field = root.field_path_mut(block).expect("block field resolves");
+            field.as_block_mut().expect("is a block").add_element();
+        }
+
+        // Top-level block index (`short_block_index` -> empty `phantom types`).
+        assert_eq!(
+            block_index_at(&tag, "materials[0]/phantom type"),
+            Some(-1),
+            "materials[0]/phantom type should default to NONE, not 0",
+        );
+        // Block index inside an inline sub-struct (`char_block_index` ->
+        // empty `phantoms`) — exercises the recursion into `Struct` fields.
+        assert_eq!(
+            block_index_at(&tag, "pills[0]/base/phantom"),
+            Some(-1),
+            "pills[0]/base/phantom (inside inline `base` struct) should default to NONE, not 0",
+        );
+    }
+}
