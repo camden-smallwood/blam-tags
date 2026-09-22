@@ -416,9 +416,6 @@ impl TagFunctionEditor {
     /// slots and unrelated header bytes.
     pub fn set_color(&mut self, index: usize, argb: u32) -> Result<(), FunctionEditError> {
         if let Some(f) = self.func.as_h2_mut() {
-            if index >= f.color_graph_type() as usize {
-                return Err(FunctionEditError::InvalidOperation("color index out of range"));
-            }
             return Ok(f.set_color(index, argb)?);
         }
         let slot = *color_slots(self.color_graph_type())
@@ -431,7 +428,8 @@ impl TagFunctionEditor {
     /// Change the color-graph type (scalar / N-color).
     pub fn set_color_graph_type(&mut self, cgt: ColorGraphType) -> Result<(), FunctionEditError> {
         if let Some(f) = self.func.as_h2_mut() {
-            return Ok(f.set_color_graph_type(cgt as u8)?);
+            f.set_color_graph_type(cgt);
+            return Ok(());
         }
         self.blob_mut()?.set_color_graph_type(cgt);
         Ok(())

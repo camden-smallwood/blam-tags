@@ -150,6 +150,31 @@ pub enum RenderMethodAnimatedParameterType {
     #[strum(serialize = "alpha")]         Alpha         = 8,
 }
 
+/// What a classic Halo 2 shader animation property drives: the halo2_mcc
+/// `shader_animation_property_block` `type` enum (`type_2`, extracted from
+/// tool.exe). Resolved by option name, so the stored index never matters.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash,
+         num_derive::FromPrimitive, num_derive::ToPrimitive,
+         strum::EnumString, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(ascii_case_insensitive)]
+pub enum Halo2ShaderAnimationType {
+    #[strum(serialize = "bitmap scale uniform")]   BitmapScaleUniform  = 0,
+    #[strum(serialize = "bitmap scale x")]         BitmapScaleX        = 1,
+    #[strum(serialize = "bitmap scale y")]         BitmapScaleY        = 2,
+    #[strum(serialize = "bitmap scale z")]         BitmapScaleZ        = 3,
+    #[strum(serialize = "bitmap translation x")]   BitmapTranslationX  = 4,
+    #[strum(serialize = "bitmap translation y")]   BitmapTranslationY  = 5,
+    #[strum(serialize = "bitmap translation z")]   BitmapTranslationZ  = 6,
+    #[strum(serialize = "bitmap rotation angle")]  BitmapRotationAngle = 7,
+    #[strum(serialize = "bitmap rotation axis x")] BitmapRotationAxisX = 8,
+    #[strum(serialize = "bitmap rotation axis y")] BitmapRotationAxisY = 9,
+    #[strum(serialize = "bitmap rotation axis z")] BitmapRotationAxisZ = 10,
+    #[strum(serialize = "value")]                  Value               = 11,
+    #[strum(serialize = "color")]                  Color               = 12,
+    #[strum(serialize = "bitmap index")]           BitmapIndex         = 13,
+}
+
 /// Engine-bound parameter source. Mirrors Ares `e_render_method_extern`
 /// — 49 H3 entries — then the Gen3 remaster additions, then the names the
 /// shipped H3 tags turn out to offer that Ares' list does not.

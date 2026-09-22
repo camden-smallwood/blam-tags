@@ -28,8 +28,9 @@
 //! function round-trips byte-identically, and an edit is exactly the engine's
 //! in-place write.
 
+use super::editor::color_slots;
 use super::tables::FUNCTION_TABLES;
-use super::FunctionType;
+use super::{ColorGraphType, FunctionType};
 
 /// Size of the fixed header + union that precedes the graph data.
 pub const HEADER_SIZE: usize = 20;
@@ -48,8 +49,10 @@ const FLOATS_PER_GRAPH: [usize; 11] = [0, 1, 2, 4, 6, 20, 32, 12, 4, 3, 12];
 /// Default control-point count by type (0xDD58A0).
 const DEFAULT_POINT_COUNT: [usize; 11] = [0, 0, 0, 0, 2, 4, 16, 4, 16, 0, 4];
 
-/// Logical color index → physical union slot, by color graph type (0xDD58B8).
-const COLOR_SLOTS: [[usize; 4]; 5] = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 3, 0, 0], [0, 1, 3, 0], [0, 1, 2, 3]];
+/// Periodic functions whose table wraps (the engine blends across the wrap
+/// rather than through it): "slide" and "slide (variable period)".
+const PERIODIC_SLIDE: u8 = 6;
+const PERIODIC_SLIDE_VARIABLE_PERIOD: u8 = 7;
 
 const EPSILON: f32 = 0.000_1;
 const LUT_LEN: usize = 1024;
@@ -57,25 +60,50 @@ const TRANSITION_ROWS: usize = 7;
 const PERIODIC_BASE: usize = TRANSITION_ROWS * LUT_LEN;
 const PERIODIC_ROWS: usize = 11;
 
-/// Guerilla's names for the function types, by type byte (MCC tool string
-/// list @0x101A4F0).
-pub const FUNCTION_TYPE_NAMES: [&str; 11] = [
-    "identity",
-    "constant",
-    "transition",
-    "periodic",
-    "linear",
-    "linear key",
-    "multi linear key",
-    "spline",
-    "multi spline",
-    "exponent",
-    "spline2",
+/// Every function type, in Guerilla's picker order (the MCC tool's string list
+/// @0x101A4F0 names them in type order).
+pub const FUNCTION_TYPES: [FunctionType; 11] = [
+    FunctionType::Identity,
+    FunctionType::Constant,
+    FunctionType::Transition,
+    FunctionType::Periodic,
+    FunctionType::Linear,
+    FunctionType::LinearKey,
+    FunctionType::MultiLinearKey,
+    FunctionType::Spline,
+    FunctionType::MultiSpline,
+    FunctionType::Exponent,
+    FunctionType::Spline2,
 ];
 
-/// Names for the color graph type (flags high nibble), from the same list.
-/// Type 1 is a single color, which Guerilla calls "constant".
-pub const COLOR_GRAPH_TYPE_NAMES: [&str; 5] = ["scalar (intensity)", "constant", "2-color", "3-color", "4-color"];
+/// Guerilla's name for a function type.
+pub fn function_type_name(function_type: FunctionType) -> &'static str {
+    match function_type {
+        FunctionType::Identity => "identity",
+        FunctionType::Constant => "constant",
+        FunctionType::Transition => "transition",
+        FunctionType::Periodic => "periodic",
+        FunctionType::Linear => "linear",
+        FunctionType::LinearKey => "linear key",
+        FunctionType::MultiLinearKey => "multi linear key",
+        FunctionType::Spline => "spline",
+        FunctionType::MultiSpline => "multi spline",
+        FunctionType::Exponent => "exponent",
+        FunctionType::Spline2 => "spline2",
+    }
+}
+
+/// Guerilla's name for a color graph type (the same string list). A single
+/// color is "constant".
+pub fn color_graph_type_name(color_graph_type: ColorGraphType) -> &'static str {
+    match color_graph_type {
+        ColorGraphType::Scalar => "scalar (intensity)",
+        ColorGraphType::OneColor => "constant",
+        ColorGraphType::TwoColor => "2-color",
+        ColorGraphType::ThreeColor => "3-color",
+        ColorGraphType::FourColor => "4-color",
+    }
+}
 
 /// Periodic function names by index (MCC tool @0x1019208; the same twelve as
 /// the H3+ table).
@@ -102,6 +130,9 @@ pub enum H2FunctionError {
     TooShort { len: usize },
     /// Byte 0 is not a known [`FunctionType`].
     BadFunctionType { byte: u8 },
+    /// The flags' color graph type is not one the engine accepts (it asserts
+    /// below 5).
+    BadColorGraphType { value: u8 },
     /// An edit the engine asserts against (wrong type, index out of range).
     InvalidEdit(&'static str),
 }
@@ -111,6 +142,7 @@ impl std::fmt::Display for H2FunctionError {
         match self {
             Self::TooShort { len } => write!(f, "h2 function data too short: {len} bytes (need >= 4)"),
             Self::BadFunctionType { byte } => write!(f, "unknown h2 function type byte {byte}"),
+            Self::BadColorGraphType { value } => write!(f, "unknown h2 color graph type {value}"),
             Self::InvalidEdit(m) => write!(f, "invalid h2 function edit: {m}"),
         }
     }
@@ -131,6 +163,8 @@ impl H2Function {
             return Err(H2FunctionError::TooShort { len: data.len() });
         }
         FunctionType::from_byte(data[0]).ok_or(H2FunctionError::BadFunctionType { byte: data[0] })?;
+        let color_graph_type = data[1] >> flags::COLOR_GRAPH_TYPE_SHIFT;
+        ColorGraphType::from_byte(color_graph_type).ok_or(H2FunctionError::BadColorGraphType { value: color_graph_type })?;
         Ok(Self { data: data.to_vec() })
     }
 
@@ -158,7 +192,7 @@ impl H2Function {
     /// slot is written (a shape 221 shipped constants have).
     pub fn new_constant_color(argb: u32) -> Self {
         let mut f = Self::new(FunctionType::Constant);
-        f.data[1] = 2 << flags::COLOR_GRAPH_TYPE_SHIFT;
+        f.set_color_graph_type(ColorGraphType::TwoColor);
         f.put_u32(4, argb);
         f
     }
@@ -183,10 +217,10 @@ impl H2Function {
         self.data[1] & flags::RANGE != 0
     }
 
-    /// The raw color graph type (0 = scalar, 1..4 = N-color). The engine
-    /// asserts it is below 5.
-    pub fn color_graph_type(&self) -> u8 {
-        self.data[1] >> flags::COLOR_GRAPH_TYPE_SHIFT
+    /// Scalar, or how many colors (the flags' high nibble; checked at parse).
+    pub fn color_graph_type(&self) -> ColorGraphType {
+        ColorGraphType::from_byte(self.data[1] >> flags::COLOR_GRAPH_TYPE_SHIFT)
+            .expect("checked at parse and on every change")
     }
 
     /// Periodic/transition index (or point count, for spline/multi types) of
@@ -230,19 +264,19 @@ impl H2Function {
 
     /// `get_clamp_range_min` (0x80FC60): 0 for color graphs.
     pub fn clamp_range_min(&self) -> f32 {
-        if self.color_graph_type() != 0 { 0.0 } else { self.f32_at(4) }
+        if self.color_graph_type() != ColorGraphType::Scalar { 0.0 } else { self.f32_at(4) }
     }
 
     /// `get_clamp_range_max` (0x80FC00): 1 for color graphs.
     pub fn clamp_range_max(&self) -> f32 {
-        if self.color_graph_type() != 0 { 1.0 } else { self.f32_at(8) }
+        if self.color_graph_type() != ColorGraphType::Scalar { 1.0 } else { self.f32_at(8) }
     }
 
     /// ARGB of logical color `index` (0..color graph type) through the slot
     /// remap; `None` for a scalar function or an index past the color count.
     pub fn color(&self, index: usize) -> Option<u32> {
-        let cgt = self.color_graph_type() as usize;
-        (cgt < COLOR_SLOTS.len() && index < cgt).then(|| self.u32_at(4 + 4 * COLOR_SLOTS[cgt][index]))
+        let slot = color_slots(self.color_graph_type()).get(index)?;
+        Some(self.u32_at(4 + 4 * slot))
     }
 
     /// Number of control points of `graph` (`get_control_point_count`, 0x80FDC0).
@@ -406,7 +440,7 @@ impl H2Function {
     /// `map_to_output_range` (0x810500): scalar functions lerp the normalized
     /// value through the clamp range; color functions pass it through.
     pub fn map_to_output_range(&self, normalized: f32) -> f32 {
-        if self.color_graph_type() != 0 {
+        if self.color_graph_type() != ColorGraphType::Scalar {
             return normalized;
         }
         let (min, max) = (self.clamp_range_min(), self.clamp_range_max());
@@ -423,18 +457,19 @@ impl H2Function {
     /// 0x80F670), including its fixed-point channel lerp.
     pub fn evaluate_color(&self, normalized: f32) -> u32 {
         let cgt = self.color_graph_type();
-        if self.function_type() == FunctionType::Constant && (!self.is_ranged() || cgt <= 1) {
+        let at_most_one_color = matches!(cgt, ColorGraphType::Scalar | ColorGraphType::OneColor);
+        if self.function_type() == FunctionType::Constant && (!self.is_ranged() || at_most_one_color) {
             return self.u32_at(4);
         }
         let t = saturate(normalized);
         match cgt {
-            0 => {
+            ColorGraphType::Scalar => {
                 let g = ((t * 255.0).round_ties_even() as i32 as u32) & 0xFF;
                 g | (g << 8) | (g << 16) | 0xFF00_0000
             }
-            1 => self.u32_at(4),
-            2 => lerp_argb(self.u32_at(4), self.u32_at(16), t),
-            3 => {
+            ColorGraphType::OneColor => self.u32_at(4),
+            ColorGraphType::TwoColor => lerp_argb(self.u32_at(4), self.u32_at(16), t),
+            ColorGraphType::ThreeColor => {
                 let scaled = t * 2.0;
                 let mut n = scaled.floor() as i32;
                 let frac = if n >= 2 {
@@ -446,7 +481,7 @@ impl H2Function {
                 let (a, b) = if n != 0 { (8, 16) } else { (4, 8) };
                 lerp_argb(self.u32_at(a), self.u32_at(b), frac)
             }
-            4 => {
+            ColorGraphType::FourColor => {
                 let scaled = t * 3.0;
                 let mut n = scaled.floor() as i32;
                 let frac = if n >= 3 {
@@ -458,7 +493,6 @@ impl H2Function {
                 let slot = 4 + 4 * n as usize;
                 lerp_argb(self.u32_at(slot), self.u32_at(slot + 4), frac)
             }
-            _ => 0xFFFF_FFFF,
         }
     }
 
@@ -502,12 +536,11 @@ impl H2Function {
         };
         let u = |offset: usize| self.u32_at(offset);
         match self.color_graph_type() {
-            0 => curve || flat(f(4), f(8)),
-            1 => true,
-            2 => curve || u(4) == u(16),
-            3 => curve || (u(4) == u(16) && u(4) == u(8)),
-            4 => curve || (u(4) == u(16) && u(4) == u(8) && u(4) == u(12)),
-            _ => false,
+            ColorGraphType::Scalar => curve || flat(f(4), f(8)),
+            ColorGraphType::OneColor => true,
+            ColorGraphType::TwoColor => curve || u(4) == u(16),
+            ColorGraphType::ThreeColor => curve || (u(4) == u(16) && u(4) == u(8)),
+            ColorGraphType::FourColor => curve || (u(4) == u(16) && u(4) == u(8) && u(4) == u(12)),
         }
     }
 
@@ -633,24 +666,19 @@ impl H2Function {
         }
     }
 
-    /// `set_color_graph_type` (0x810CD0): 0 = scalar, 1..4 = N-color.
-    pub fn set_color_graph_type(&mut self, color_graph_type: u8) -> Result<(), H2FunctionError> {
-        if color_graph_type >= 5 {
-            return Err(H2FunctionError::InvalidEdit("color graph type out of range"));
-        }
+    /// `set_color_graph_type` (0x810CD0).
+    pub fn set_color_graph_type(&mut self, color_graph_type: ColorGraphType) {
         self.ensure_header();
-        self.data[1] = (self.data[1] & 0x0F) | (color_graph_type << flags::COLOR_GRAPH_TYPE_SHIFT);
-        Ok(())
+        self.data[1] = (self.data[1] & 0x0F) | ((color_graph_type as u8) << flags::COLOR_GRAPH_TYPE_SHIFT);
     }
 
     /// `set_color` (0x810C00): logical color `index` → its physical slot.
     pub fn set_color(&mut self, index: usize, argb: u32) -> Result<(), H2FunctionError> {
         self.ensure_header();
-        let cgt = self.color_graph_type() as usize;
-        if cgt >= COLOR_SLOTS.len() || index >= 4 {
-            return Err(H2FunctionError::InvalidEdit("color index out of range"));
-        }
-        self.put_u32(4 + 4 * COLOR_SLOTS[cgt][index], argb);
+        let slot = *color_slots(self.color_graph_type())
+            .get(index)
+            .ok_or(H2FunctionError::InvalidEdit("color index out of range"))?;
+        self.put_u32(4 + 4 * slot, argb);
         Ok(())
     }
 
@@ -658,7 +686,7 @@ impl H2Function {
     /// color function's union holds colors, so the engine skips these.
     pub fn set_clamp_range(&mut self, min: f32, max: f32) -> Result<(), H2FunctionError> {
         self.ensure_header();
-        if self.color_graph_type() != 0 {
+        if self.color_graph_type() != ColorGraphType::Scalar {
             return Err(H2FunctionError::InvalidEdit("a color function has no clamp range"));
         }
         self.put_f32(4, min);
@@ -840,7 +868,7 @@ pub fn periodic_evaluate(index: u8, value: f32) -> f32 {
     let i = ((scaled - frac) as i32 & 0x3FF) as usize;
     let a = lut(base, i);
     let mut b = lut(base, (i + 1) & 0x3FF);
-    if !matches!(index, 6 | 7) {
+    if !matches!(index, PERIODIC_SLIDE | PERIODIC_SLIDE_VARIABLE_PERIOD) {
         return (1.0 - frac) * a + b * frac;
     }
     if a > 0.75 && b < 0.25 {
@@ -910,10 +938,10 @@ mod tests {
         // "particle tint": flags 0x20 = two-color; colors in slots 0 and 3.
         let bytes = block(FunctionType::Constant, 0x20, [4, 4], [0xFFFF_FFFF, 1.0f32.to_bits(), 0, 0xFFFF_FFFF], &[1.0, 1.0]);
         let f = H2Function::parse(&bytes).unwrap();
-        assert_eq!(f.color_graph_type(), 2);
+        assert_eq!(f.color_graph_type(), ColorGraphType::TwoColor);
         assert_eq!(f.color(0), Some(0xFFFF_FFFF));
         assert_eq!(f.color(1), Some(0xFFFF_FFFF), "logical 1 of two-color is physical slot 3");
-        assert_eq!(f.color(2), None);
+        assert_eq!(f.color(2), None, "two colors");
         assert_eq!(f.clamp_range_min(), 0.0, "color functions have no clamp range");
         assert_eq!(f.evaluate_color(0.5), 0xFFFF_FFFF);
     }
@@ -967,12 +995,15 @@ mod tests {
         let mut f = H2Function::parse(&block(FunctionType::Linear, 0, [0, 0], range(0.0, 1.0), &[])).unwrap();
         assert!(f.set_constant(0, 1.0).is_err());
         assert!(f.set_function_index(0, 1).is_err());
-        assert!(f.set_color_graph_type(5).is_err());
+        assert!(matches!(
+            H2Function::parse(&block(FunctionType::Constant, 5 << 4, [0, 0], range(0.0, 1.0), &[])),
+            Err(H2FunctionError::BadColorGraphType { value: 5 })
+        ));
         assert!(f.set_control_point_y(0, 2, 0.5).is_err(), "linear has two points");
         f.set_function_type(FunctionType::Transition);
         assert!(f.set_function_index(0, 8).is_err());
         assert!(f.set_function_index(1, 7).is_ok());
-        f.set_color_graph_type(2).unwrap();
+        f.set_color_graph_type(ColorGraphType::TwoColor);
         assert!(f.set_clamp_range(0.0, 1.0).is_err(), "a color function's union is colors");
     }
 

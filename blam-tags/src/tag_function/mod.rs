@@ -1823,16 +1823,15 @@ impl TagFunction {
     pub fn color_count(&self) -> usize {
         match self {
             Self::Blob(f) => f.color_count(),
-            Self::H2(_) => self.color_graph_type() as usize,
+            Self::H2(f) => editor::color_slots(f.color_graph_type()).len(),
         }
     }
 
-    /// Scalar vs N-color. Halo 2 values past four (which its engine asserts
-    /// against) read as `Scalar`.
+    /// Scalar vs N-color.
     pub fn color_graph_type(&self) -> ColorGraphType {
         match self {
             Self::Blob(f) => f.color_graph_type(),
-            Self::H2(f) => ColorGraphType::from_byte(f.color_graph_type()).unwrap_or(ColorGraphType::Scalar),
+            Self::H2(f) => f.color_graph_type(),
         }
     }
 
