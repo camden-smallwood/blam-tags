@@ -57,6 +57,35 @@ const TRANSITION_ROWS: usize = 7;
 const PERIODIC_BASE: usize = TRANSITION_ROWS * LUT_LEN;
 const PERIODIC_ROWS: usize = 11;
 
+/// Guerilla's names for the function types, by type byte (MCC tool string
+/// list @0x101A4F0).
+pub const FUNCTION_TYPE_NAMES: [&str; 11] = [
+    "identity",
+    "constant",
+    "transition",
+    "periodic",
+    "linear",
+    "linear key",
+    "multi linear key",
+    "spline",
+    "multi spline",
+    "exponent",
+    "spline2",
+];
+
+/// Names for the color graph type (flags high nibble), from the same list.
+/// Type 1 is a single color, which Guerilla calls "constant".
+pub const COLOR_GRAPH_TYPE_NAMES: [&str; 5] = ["scalar (intensity)", "constant", "2-color", "3-color", "4-color"];
+
+/// Periodic function names by index (MCC tool @0x1019208; the same twelve as
+/// the H3+ table).
+pub const PERIODIC_FUNCTION_NAMES: [&str; 12] = super::editor::PERIODIC_FUNCTIONS;
+
+/// Transition function names by index, following the periodic names in the
+/// same list. Halo 2 offers all eight.
+pub const TRANSITION_FUNCTION_NAMES: [&str; 8] =
+    ["linear", "early", "very early", "late", "very late", "cosine", "one", "zero"];
+
 /// f32s per graph for a function type.
 pub fn floats_per_graph(function_type: FunctionType) -> usize {
     FLOATS_PER_GRAPH[function_type as usize]
@@ -103,6 +132,40 @@ impl H2Function {
         }
         FunctionType::from_byte(data[0]).ok_or(H2FunctionError::BadFunctionType { byte: data[0] })?;
         Ok(Self { data: data.to_vec() })
+    }
+
+    /// A new function of `function_type`, built the way the engine builds one:
+    /// every setter first grows an empty block to a zeroed 20-byte header
+    /// (an identity function), and `set_function_type` then sizes and seeds it.
+    pub fn new(function_type: FunctionType) -> Self {
+        let mut f = Self { data: vec![0; HEADER_SIZE] };
+        f.set_function_type(function_type);
+        f
+    }
+
+    /// A new constant scalar `value`. Setting both graphs' constant gives the
+    /// shape most shipped constants have (16,958 of 37,995 in halo2_mcc):
+    /// flags 0, clamp min == max == value, graph tail [1, 1].
+    pub fn new_constant(value: f32) -> Self {
+        let mut f = Self::new(FunctionType::Constant);
+        f.put_f32(4, value);
+        f.put_f32(8, value);
+        f
+    }
+
+    /// A new constant color. Shipped color constants are two-color (Guerilla's
+    /// default), and a constant only ever reads the first color, so only that
+    /// slot is written (a shape 221 shipped constants have).
+    pub fn new_constant_color(argb: u32) -> Self {
+        let mut f = Self::new(FunctionType::Constant);
+        f.data[1] = 2 << flags::COLOR_GRAPH_TYPE_SHIFT;
+        f.put_u32(4, argb);
+        f
+    }
+
+    /// True when the block is the size the engine keeps for its type.
+    pub fn has_engine_size(&self) -> bool {
+        self.data.len() == block_size(self.function_type())
     }
 
     /// The byte-block as it stands (byte-identical to the input until edited).
@@ -859,6 +922,23 @@ mod tests {
         assert!(f.set_function_index(1, 7).is_ok());
         f.set_color_graph_type(2).unwrap();
         assert!(f.set_clamp_range(0.0, 1.0).is_err(), "a color function's union is colors");
+    }
+
+    #[test]
+    fn new_constants_match_shipped_shapes() {
+        // The dominant shipped scalar constant, byte for byte.
+        let expected = block(FunctionType::Constant, 0, [0, 0], range(0.25, 0.25), &[1.0, 1.0]);
+        let f = H2Function::new_constant(0.25);
+        assert_eq!(f.to_bytes(), expected);
+        assert_eq!(f.evaluate_scalar(0.7, 0.3), 0.25);
+        assert!(f.has_engine_size());
+
+        let f = H2Function::new_constant_color(0xFF11_2233);
+        let expected = block(FunctionType::Constant, 0x20, [0, 0], [0xFF11_2233, 0, 0, 0], &[1.0, 1.0]);
+        assert_eq!(f.to_bytes(), expected);
+        assert_eq!(f.evaluate_color(f.evaluate(0.5, 0.0)), 0xFF11_2233);
+
+        assert_eq!(H2Function::new(FunctionType::Identity).to_bytes(), vec![0; HEADER_SIZE]);
     }
 
     #[test]
