@@ -2664,6 +2664,20 @@ where
         .map(|geo| read_sorting_positions(&geo))
         .unwrap_or_default();
 
+    // Per-mesh node palettes. When a mesh has one, its raw vertices carry
+    // palette-LOCAL blend indices — the engine uploads `map[local]`'s
+    // transform, so global indices never appear in the vertex data. Halo 3
+    // loose tags ship the block empty (their raw vertices are global);
+    // Reach/H4 kits populate it on skinned meshes whenever the skeleton
+    // outgrows one hardware palette. Remapping here mirrors what
+    // `hydrate.rs` already does for the X360 packed buffers, so JMS/ASS
+    // export and previews stay unaware of the indirection.
+    let node_maps: Vec<Vec<u8>> = root
+        .field_path(path_prefix)
+        .and_then(|f| f.as_struct())
+        .map(|geo| read_per_mesh_node_map(&geo))
+        .unwrap_or_default();
+
     let count = meshes_block.len();
     let mut out = Vec::with_capacity(count);
     for mi in 0..count {
@@ -2767,6 +2781,21 @@ where
         for k in 0..raw_v.len() {
             let v = raw_v.element(k).unwrap();
             vertices.push(decode_render_vertex(&v, &bounds, rigid_node_index));
+        }
+        // Palette-local → global blend indices (see `node_maps` above). Only
+        // weighted influences remap: a rigid mesh's fallback influence is the
+        // mesh-level `rigid node index`, which is already global.
+        let node_map = node_maps.get(mi).map(|m| m.as_slice()).unwrap_or(&[]);
+        if !node_map.is_empty() && rigid_node_index.is_none() {
+            for vertex in vertices.iter_mut() {
+                for k in 0..4 {
+                    if vertex.node_weights[k] > 0.0 {
+                        let local = vertex.node_indices[k] as usize;
+                        vertex.node_indices[k] =
+                            node_map.get(local).copied().unwrap_or(vertex.node_indices[k]);
+                    }
+                }
+            }
         }
 
         let raw_index_list: Vec<u16> = (0..raw_i.len())

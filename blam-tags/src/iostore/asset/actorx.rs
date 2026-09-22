@@ -216,6 +216,7 @@ pub fn skeletal_mesh_to_jms(mesh: &SkeletalMesh, material_names: &[String]) -> J
                 x: vertex.uv[0],
                 y: 1.0 - vertex.uv[1],
             }],
+            color: None,
         })
         .collect();
     let mut triangles = Vec::new();
@@ -293,6 +294,7 @@ pub fn static_mesh_to_jms(mesh: &StaticMesh, material_names: &[String]) -> JmsFi
                 x: vertex.uv[0],
                 y: 1.0 - vertex.uv[1],
             }],
+            color: None,
         })
         .collect();
     let triangles = mesh

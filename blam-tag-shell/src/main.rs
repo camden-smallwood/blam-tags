@@ -78,6 +78,33 @@ enum Commands {
         output: Option<String>,
     },
 
+    /// Build a tag from a JMS or ASS source file. The importer is
+    /// chosen from the folder the source sits in (`render/`,
+    /// `collision/`, `physics/`), and an `.ass` is always a
+    /// `scenario_structure_bsp`; override with `--kind`.
+    Import {
+        /// Path to a `.JMS` or `.ASS` source file
+        source: String,
+        /// Output tag path (default: the source path with the group as
+        /// its extension)
+        #[arg(long)]
+        output: Option<String>,
+        /// render | collision | physics | structure
+        #[arg(long)]
+        kind: Option<String>,
+        /// Rays per vertex for PRT on a render_model. 0 turns PRT off.
+        #[arg(long)]
+        prt_samples: Option<usize>,
+        /// Treat every authored mesh as its own cluster instead of
+        /// writing instanced geometry. Still a correct scene, just a
+        /// much larger one.
+        #[arg(long)]
+        no_instanced_geometry: bool,
+        /// Replace an existing tag
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Show field tree
     Inspect {
         /// Path to a tag file
@@ -523,9 +550,251 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         limit: usize,
     },
+
+    /// Convert a glTF 2.0 file (`.gltf` or `.glb`) into Halo
+    /// intermediate geometry (`.jms`) that `tool.exe` can import.
+    ///
+    /// glTF is right-handed Y-up; Halo is right-handed Z-up, so axes are
+    /// rotated by default (`--keep-axes` disables it). Scale is NOT
+    /// guessed: a glTF records no real-world unit, so the default assumes
+    /// the file is already in JMS units. Use `--metres` for a model
+    /// authored in metres against Halo's 3.048 m world unit.
+    ///
+    /// `--split` chains into the section splitter, which is what gets a
+    /// mesh past tool's 32,767-vertices-per-section limit.
+    GltfToJms(Box<GltfToJmsArgs>),
+
+    /// Split a `.jms` whose sections exceed `tool.exe`'s per-section
+    /// vertex limit across extra regions, by rewriting material
+    /// definition lines. Geometry itself is not modified.
+    ///
+    /// Prints the section breakdown first, so it is also the quickest way
+    /// to see how a JMS divides into sections at all.
+    SplitJms(Box<SplitJmsArgs>),
+
+    /// Build a `.physics_model` from a JMS, without `tool.exe`.
+    ///
+    /// Reads the JMS's spheres, capsules, boxes and convex shapes,
+    /// rebuilds each convex hull, and writes a complete `phmo` tag.
+    /// Needs `--game` so the schema can be resolved.
+    ///
+    /// Refuses, rather than approximating, a rigid body with five or
+    /// more shapes — that is where Tool compiles a Havok MOPP, which
+    /// cannot be produced outside `tool.exe`.
+    ///
+    /// Constraints, phantoms and powered chains are not written; Tool
+    /// copies those from the tag it replaces rather than authoring
+    /// them, so there is nothing to copy from scratch.
+    JmsToPhysics(Box<JmsToPhysicsArgs>),
+
+    /// Build a `.render_model` from a JMS, without `tool.exe`.
+    ///
+    /// Needs `--game` so the schema can be resolved.
+    ///
+    /// Per-vertex PRT is not computed — every section is written
+    /// `No PRT`. That is a separate ray-traced solve; a model without
+    /// it lights flatly rather than wrongly.
+    JmsToRender(Box<JmsToRenderArgs>),
+
+    /// Build a `.collision_model` from a JMS, without `tool.exe`.
+    ///
+    /// Needs `--game` so the schema can be resolved.
+    ///
+    /// A bsp2d leaf holds exactly one surface, so coplanar faces
+    /// that no 2D line separates cannot all be kept. The count is
+    /// reported rather than lost silently; Tool drops them too.
+    JmsToCollision(Box<JmsToCollisionArgs>),
+
+    /// Check that a collision BSP can find its own surfaces.
+    ///
+    /// Casts rays at the surface polygons directly and the same rays
+    /// through the bsp3d tree, and reports where they disagree. A wrong
+    /// collision tree is otherwise silent — the tag loads, the model
+    /// looks right, and shots pass through walls.
+    ///
+    /// Works on any `collision_model`, tool's included; that is how the
+    /// check itself was validated.
+    CollisionBspTest(Box<CollisionBspTestArgs>),
 }
 
+/// Arguments for [`Commands::GltfToJms`].
+#[derive(clap::Args)]
+pub struct GltfToJmsArgs {
+    /// Input `.gltf` or `.glb`. External `.bin` buffers are resolved
+    /// next to it.
+    pub input: String,
+    /// Output `.jms` path.
+    pub output: String,
+    /// Multiply every position by this. Default 1.0.
+    #[arg(long)]
+    pub scale: Option<f32>,
+    /// Treat glTF units as metres against Halo's 3.048 m world unit.
+    /// Mutually exclusive with `--scale`.
+    #[arg(long)]
+    pub metres: bool,
+    /// Do not rotate Y-up into Z-up. Only for sources already authored
+    /// in Halo's orientation.
+    #[arg(long)]
+    pub keep_axes: bool,
+    /// Region name written into every material label.
+    #[arg(long, default_value = "default")]
+    pub region: String,
+    /// Permutation name written into every material label.
+    #[arg(long, default_value = "default")]
+    pub permutation: String,
+    /// Split oversized sections across extra regions after converting.
+    #[arg(long)]
+    pub split: bool,
+    /// Assumed built-vertices per source triangle, used only with
+    /// `--split`. Default 1.6.
+    #[arg(long)]
+    pub ratio: Option<f32>,
+    /// JMS version to write. Default 8213, the modern format.
+    #[arg(long, default_value_t = 8213)]
+    pub version: u16,
+}
+
+/// Arguments for [`Commands::JmsToPhysics`].
+#[derive(clap::Args)]
+pub struct JmsToPhysicsArgs {
+    /// Input `.jms` — the one under the model's `physics\` folder.
+    pub input: String,
+    /// Output path. Defaults to `<stem>.physics_model` in the cwd.
+    #[arg(long)]
+    pub output: Option<String>,
+    /// JMS-to-world scale. Default 0.01, which is what Tool applies.
+    #[arg(long)]
+    pub scale: Option<f32>,
+    /// Havok convex radius — the shell every convex shape is
+    /// inflated by. Default 0.0164, the value shipped tags carry.
+    #[arg(long)]
+    pub convex_radius: Option<f32>,
+    /// Overwrite the output if it already exists.
+    #[arg(long)]
+    pub overwrite: bool,
+}
+
+/// Arguments for [`Commands::JmsToRender`].
+#[derive(clap::Args)]
+pub struct JmsToRenderArgs {
+    /// Input `.jms` — the one under the model's `render\` folder.
+    pub input: String,
+    /// Output path. Defaults to `<stem>.render_model` in the cwd.
+    #[arg(long)]
+    pub output: Option<String>,
+    /// JMS-to-world scale. Default 0.01, which is what Tool applies.
+    #[arg(long)]
+    pub scale: Option<f32>,
+    /// Welded-vertex ceiling per mesh. Default 32767, tool's own
+    /// limit; the format holds 65535.
+    ///
+    /// Raise it and the index run binds instead, at about 32500
+    /// source triangles. Whether that is a gain depends on the mesh:
+    /// tool stops at 32767 vertices, which on split geometry is only
+    /// ~20500 triangles, but on well-welded geometry tool never
+    /// reaches its vertex wall and its index-bound 35900 beats this
+    /// by ~10%.
+    #[arg(long)]
+    pub max_vertices: Option<usize>,
+    /// Cut sections over the ceiling into extra regions rather than
+    /// failing.
+    #[arg(long)]
+    pub split: bool,
+    /// Rays per vertex for the ambient PRT solve. Default 64.
+    #[arg(long)]
+    pub prt_samples: Option<usize>,
+    /// Write every mesh as `No PRT` instead of solving it. 21% of
+    /// shipped meshes are `No PRT`, so this is a real option and not
+    /// only a way to save time.
+    #[arg(long)]
+    pub no_prt: bool,
+    /// PRT order: 0 ambient, 1 linear, 2 quadratic. Default 0, which
+    /// is also what 48% of shipped meshes use.
+    #[arg(long)]
+    pub prt_order: Option<u32>,
+    /// Overwrite the output if it already exists.
+    #[arg(long)]
+    pub overwrite: bool,
+}
+
+/// Arguments for [`Commands::JmsToCollision`].
+#[derive(clap::Args)]
+pub struct JmsToCollisionArgs {
+    /// Input `.jms` — the one under the model's `collision\` folder.
+    pub input: String,
+    /// Output path. Defaults to `<stem>.collision_model` in the cwd.
+    #[arg(long)]
+    pub output: Option<String>,
+    /// JMS-to-world scale. Default 0.01, which is what Tool applies.
+    #[arg(long)]
+    pub scale: Option<f32>,
+    /// Overwrite the output if it already exists.
+    #[arg(long)]
+    pub overwrite: bool,
+}
+
+/// Arguments for [`Commands::CollisionBspTest`].
+#[derive(clap::Args)]
+pub struct CollisionBspTestArgs {
+    /// A `.collision_model`, or a directory to walk for them.
+    pub input: String,
+    /// Random rays per BSP, on top of one per surface. Default 64.
+    #[arg(long)]
+    pub rays: Option<usize>,
+    /// List the models that pass, not just the ones that do not.
+    #[arg(long)]
+    pub verbose: bool,
+}
+
+/// Arguments for [`Commands::SplitJms`].
+#[derive(clap::Args)]
+pub struct SplitJmsArgs {
+    /// Input `.jms`.
+    pub input: String,
+    /// Where to write. Defaults to overwriting the input.
+    #[arg(long)]
+    pub output: Option<String>,
+    /// Assumed built-vertices per source triangle. Default 1.6 — just
+    /// above the worst case measured on shipped content for sections
+    /// large enough to need splitting. Raise it if `tool` still rejects
+    /// a section.
+    #[arg(long)]
+    pub ratio: Option<f32>,
+    /// Vertex ceiling per section. Default 32767, tool's own limit.
+    #[arg(long)]
+    pub max_vertices: Option<usize>,
+    /// Report what would change and write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// Stack for the worker thread `main` hands off to. See [`main`].
+const STACK_SIZE: usize = 16 * 1024 * 1024;
+
+/// Run everything on a thread with a large stack.
+///
+/// `Subcommand`'s derive builds every subcommand and every argument of
+/// this CLI inside one generated function, so the frame grows with the
+/// verb count and is at its largest in an unoptimised build — where
+/// nothing is inlined away. On Windows the main thread gets 1 MB by
+/// default, and this crate had quietly reached the edge of it: adding two
+/// verbs was enough to overflow it before `--help` could print. Release
+/// builds were never affected, which is exactly what makes it a trap —
+/// it breaks for whoever is developing, not for whoever is shipping.
+///
+/// Boxing the argument structs shrinks `Commands` but not that function's
+/// frame, so it does not help. Giving the work a bigger stack removes the
+/// cliff instead of moving one verb back from it.
 fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .stack_size(STACK_SIZE)
+        .spawn(run)
+        .expect("failed to spawn the worker thread")
+        .join()
+        .unwrap_or_else(|_| std::process::exit(101))
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     let mut ctx = CliContext::new(cli.game.as_deref(), cli.cache.as_deref())?;
 
@@ -546,6 +815,23 @@ pub(crate) fn dispatch(ctx: &mut CliContext, cmd: Commands, reload_tag: bool) ->
         Commands::New { group, output } => {
             commands::new::run(ctx, &group, output.as_deref())
         }
+
+        Commands::Import {
+            source,
+            output,
+            kind,
+            prt_samples,
+            no_instanced_geometry,
+            force,
+        } => commands::import::run(
+            ctx,
+            &source,
+            output.as_deref(),
+            kind.as_deref(),
+            prt_samples,
+            !no_instanced_geometry,
+            force,
+        ),
 
         Commands::Inspect { file, path, all, full, json, filter, filter_not, filter_value } => {
             ensure_loaded(ctx, &file, reload_tag)?;
@@ -702,6 +988,60 @@ pub(crate) fn dispatch(ctx: &mut CliContext, cmd: Commands, reload_tag: bool) ->
 
         Commands::ListCache { groups, filter, limit } => {
             list_cache(ctx, &groups, filter.as_deref(), limit)
+        }
+
+        Commands::GltfToJms(a) => commands::gltf_to_jms::run(
+            &a.input,
+            &a.output,
+            a.scale,
+            a.metres,
+            a.keep_axes,
+            &a.region,
+            &a.permutation,
+            a.split,
+            a.ratio,
+            a.version,
+        ),
+
+        Commands::SplitJms(a) => commands::split_jms::run(
+            &a.input,
+            a.output.as_deref(),
+            a.ratio,
+            a.max_vertices,
+            a.dry_run,
+        ),
+
+        Commands::JmsToPhysics(a) => commands::jms_to_physics::run(
+            ctx,
+            &a.input,
+            a.output.as_deref(),
+            a.scale,
+            a.convex_radius,
+            a.overwrite,
+        ),
+
+        Commands::JmsToRender(a) => commands::jms_to_render::run(
+            ctx,
+            &a.input,
+            a.output.as_deref(),
+            a.scale,
+            a.max_vertices,
+            a.split,
+            a.overwrite,
+            if a.no_prt { None } else { Some(a.prt_samples.unwrap_or(64)) },
+            a.prt_order.unwrap_or(0),
+        ),
+
+        Commands::JmsToCollision(a) => commands::jms_to_collision::run(
+            ctx,
+            &a.input,
+            a.output.as_deref(),
+            a.scale,
+            a.overwrite,
+        ),
+
+        Commands::CollisionBspTest(a) => {
+            commands::collision_bsp_test::run(&a.input, a.rays, a.verbose)
         }
     }
 }

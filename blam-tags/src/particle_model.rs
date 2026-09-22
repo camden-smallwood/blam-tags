@@ -466,6 +466,7 @@ fn mesh_to_jms(mesh: &ParticleObjectMesh) -> JmsFile {
         tangent: None,
         binormal: None,
         uvs: vec![RealPoint2d { x: v.texcoord.x, y: 1.0 - v.texcoord.y }],
+        color: None,
     };
 
     let mut vertices: Vec<JmsVertex> = Vec::with_capacity(mesh.indices.len());

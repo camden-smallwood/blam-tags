@@ -124,6 +124,13 @@ pub struct JmsVertex {
     pub binormal: Option<RealVector3d>,
     pub node_sets: Vec<(i16, f32)>,
     pub uvs: Vec<crate::math::RealPoint2d>,
+    /// Per-vertex colour, present from JMS 8211 on. `None` means the
+    /// source had no colour channel (pre-8211, or a tag-derived scene);
+    /// the writer emits black for it, which is what every tag-derived
+    /// vertex carries anyway. 67,589 of the 3.29M vertices in the
+    /// shipped H3EK corpus are non-black, so this is real authored data,
+    /// not always-zero padding.
+    pub color: Option<RealPoint3d>,
 }
 
 /// JMS triangle: material slot + 3 vertex indices into [`JmsFile::vertices`].
@@ -447,6 +454,7 @@ impl JmsFile {
                     binormal: None,
                     node_sets,
                     uvs: vec![crate::math::RealPoint2d { x: v.uv[0], y: 1.0 - v.uv[1] }],
+                    color: None,
                 }
             })
             .collect();
@@ -592,6 +600,7 @@ impl JmsFile {
                     binormal: None,
                     node_sets,
                     uvs: vec![crate::math::RealPoint2d { x: v.uv[0], y: 1.0 - v.uv[1] }],
+                    color: None,
                 });
             }
             for sec in &part.mesh.sections {
@@ -683,6 +692,7 @@ impl JmsFile {
                     binormal: None,
                     node_sets: vec![(bone, 1.0)],
                     uvs: vec![crate::math::RealPoint2d { x: v.uv[0], y: 1.0 - v.uv[1] }],
+                    color: None,
                 });
             }
             let matname = part
@@ -740,6 +750,7 @@ impl JmsFile {
                     binormal: None,
                     node_sets: vec![(node, 1.0)],
                     uvs: vec![crate::math::RealPoint2d { x: v.uv[0], y: 1.0 - v.uv[1] }],
+                    color: None,
                 });
             }
             for sec in &part.mesh.sections {
@@ -1415,6 +1426,7 @@ impl JmsFile {
                         binormal: None,
                         node_sets: vec![(node_idx, 1.0)],
                         uvs: vec![crate::math::RealPoint2d::ZERO],
+                        color: None,
                     });
                 }
                 triangles.push(JmsTriangle {
@@ -1499,6 +1511,7 @@ impl JmsFile {
                         tangent: Some(RealVector3d { i: f(9), j: f(10), k: f(11) }),
                         node_sets: vec![(0, 1.0)],
                         uvs: vec![crate::math::RealPoint2d { x: f(12), y: f(13) }],
+                        color: None,
                     });
                 }
 
@@ -1875,7 +1888,8 @@ impl JmsFile {
                 write_floats(w, &uv.to_array())?;
             }
             if has_vertex_color {
-                write_floats(w, &[0.0, 0.0, 0.0])?; // vertex color always zero per TagTool
+                let c = v.color.unwrap_or_default();
+                write_floats(w, &[c.x, c.y, c.z])?;
             }
             writeln!(w)?;
         }
@@ -3361,6 +3375,7 @@ fn read_vertex(v: &TagStruct<'_>, bounds: &CompressionBounds) -> JmsVertex {
         position, normal, node_sets,
         tangent: None, binormal: None,
         uvs: vec![crate::math::RealPoint2d { x: texcoord.x, y: 1.0 - texcoord.y }],
+        color: None,
     }
 }
 
@@ -3407,6 +3422,7 @@ pub(crate) fn read_h2_vertex(v: &TagStruct<'_>) -> JmsVertex {
         binormal: read_basis("binormal"),
         node_sets,
         uvs: vec![crate::math::RealPoint2d { x: uv.x, y: 1.0 - uv.y }],
+        color: None,
     }
 }
 
@@ -3433,6 +3449,7 @@ fn read_ce_vertex(v: &TagStruct<'_>) -> JmsVertex {
         binormal: None,
         node_sets,
         uvs: vec![crate::math::RealPoint2d { x: uv.x, y: 1.0 - uv.y }],
+        color: None,
     }
 }
 

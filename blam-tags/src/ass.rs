@@ -491,7 +491,24 @@ impl AssFile {
                     let comp_idx = def.read_int_any("compression index").unwrap_or(0).max(0) as usize;
                     if mesh_idx < 0 || (mesh_idx as usize) >= meshes.len() { continue; }
                     if (mesh_idx as usize) >= pmt.len() { continue; }
-                    let bounds = read_compression_bounds_at(&root, comp_idx);
+                    // The same rule the cluster path above uses, and it
+                    // is about the *mesh* index rather than the
+                    // compression one: a mesh at or past the compression
+                    // info count is already in world units. A definition
+                    // whose mesh is one of those must read identity too —
+                    // reading bounds out of an empty block hands back an
+                    // inverted box, and an odd number of negative spans
+                    // mirrors the geometry through the origin.
+                    let comp_count = root
+                        .field_path("render geometry/compression info")
+                        .and_then(|f| f.as_block())
+                        .map(|b| b.len())
+                        .unwrap_or(0);
+                    let bounds = if (mesh_idx as usize) >= comp_count {
+                        CompressionBounds::identity()
+                    } else {
+                        read_compression_bounds_at(&root, comp_idx)
+                    };
                     // Compression-bounds chirality: when an ODD number of
                     // axes have negative span (mx < mn), the unpacker's
                     // Jacobian flips sign and triangle winding inverts vs
@@ -531,7 +548,18 @@ impl AssFile {
                 let l = inst.read_vec3("left");
                 let u = inst.read_vec3("up");
                 let p = inst.read_point3d("position");
-                let rot = RealQuaternion::from_basis_columns(f, l, u);
+                // A mirrored placement has a basis with negative
+                // determinant, and no quaternion describes one. Levels
+                // mirror a prop rather than author its twin, so this is
+                // ordinary content: `construct` has three, and they came
+                // back ten metres from where they belong.
+                //
+                // An improper basis is a proper rotation with the sign
+                // pulled out -- B = -R, so `scale * B` is `(-scale) * R`.
+                // The rotation goes in the quaternion and the sign goes
+                // in the scale, which loses nothing and needs no field
+                // the format does not already have.
+                let (rot, scale) = rotation_and_signed_scale(f, l, u, scale);
                 let name = inst.read_string_id("name").unwrap_or_else(|| format!("instance_{ii}"));
                 instances.push(AssInstance {
                     object_index,
@@ -2193,6 +2221,28 @@ fn ensure_special_material(materials: &mut Vec<AssMaterial>, marker: &str) -> us
 /// byte-identical produce the same key, so we collapse them to one
 /// shared OBJECT. Non-MESH payloads return an empty key (no
 /// dedup — lights/spheres are all kept distinct).
+/// A basis and scale as a rotation and a possibly negative scale.
+///
+/// `from_basis_columns` assumes a proper rotation. A mirrored placement
+/// is not one: its basis has negative determinant, and no quaternion
+/// describes it. Since an improper basis is `-R` for a proper `R`, the
+/// mirror rides along in the sign of the scale and nothing is lost.
+fn rotation_and_signed_scale(
+    f: RealVector3d,
+    l: RealVector3d,
+    u: RealVector3d,
+    scale: f32,
+) -> (RealQuaternion, f32) {
+    let det = f.i * (l.j * u.k - l.k * u.j) - l.i * (f.j * u.k - f.k * u.j)
+        + u.i * (f.j * l.k - f.k * l.j);
+    if det < 0.0 {
+        let neg = |v: RealVector3d| RealVector3d { i: -v.i, j: -v.j, k: -v.k };
+        (RealQuaternion::from_basis_columns(neg(f), neg(l), neg(u)), -scale)
+    } else {
+        (RealQuaternion::from_basis_columns(f, l, u), scale)
+    }
+}
+
 fn object_content_key(obj: &AssObject) -> Vec<u8> {
     match &obj.payload {
         AssObjectPayload::Mesh { vertices, triangles } => {

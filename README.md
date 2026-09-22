@@ -67,6 +67,31 @@ cargo run --release -p blam-tag-shell -- --game halo3_mcc set    path/to/masterc
 
 Full command reference in [`blam-tag-shell/README.md`](./blam-tag-shell/README.md).
 
+### Importing source files
+
+`import` builds a tag from an artist source file. Which importer runs
+comes from the folder the source sits in, the way the kit files them —
+`render/`, `collision/`, `physics/` — and an `.ass` is always a
+`scenario_structure_bsp`. Use `--kind` for a file kept somewhere else.
+
+```sh
+cargo run --release -p blam-tag-shell -- -g halo3_mcc import data/objects/characters/masterchief/render/masterchief.JMS
+cargo run --release -p blam-tag-shell -- -g halo3_mcc import data/levels/multi/guardian/structure/guardian.ass
+```
+
+The tag is serialised and read back before it reaches disk, so a tag
+that would not parse is caught here rather than by the kit. Nothing is
+overwritten without `--force`.
+
+A `render_model` gets PRT by default, at 64 rays a vertex; `--prt-samples`
+changes that and `--prt-samples 0` turns it off. A structure writes its
+instanced geometry — one definition per distinct prop, one placement per
+copy — which the round trip checks by placing the scene and comparing
+where every vertex lands.
+
+Every source file in a stock H3EK — 255 JMS and 14 ASS — imports and
+round-trips, which `tests/pipeline_end_to_end.rs` checks.
+
 ## Use the library
 
 ```rust

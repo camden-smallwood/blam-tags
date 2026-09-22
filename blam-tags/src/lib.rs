@@ -71,11 +71,16 @@ pub mod layout;
 pub mod schema;
 pub mod schema_compare;
 pub mod schema_compat;
+pub mod collision_import;
+pub mod collision_verify;
+pub mod prt;
 pub mod convert;
 pub mod data;
 pub mod path;
 pub mod field_path;
 pub mod stream;
+pub mod tangent;
+pub mod strip;
 pub mod file;
 pub mod classic;
 pub mod api;
@@ -85,17 +90,26 @@ pub mod animation;
 pub mod geometry;
 pub mod game;
 pub mod jms;
+pub mod gltf;
+pub mod hull;
+pub mod jms_parse;
+pub mod jms_split;
 pub mod jmi;
 pub mod ass;
+pub mod ass_parse;
+pub mod sbsp_import;
 pub mod particle_model;
+pub mod physics_import;
 pub mod extract;
 pub mod render_geometry;
 pub mod render_model;
 pub mod monolithic;
 pub mod tag_function;
+pub mod render_import;
 pub mod render_method;
 pub mod paths;
 pub mod typed_enums;
+pub mod weld;
 
 // Both of these carry their own `//!` docs. An outer doc comment here would be
 // *merged* with those, and rustdoc then resolves the merged text against the
@@ -106,6 +120,7 @@ pub mod audio;
 
 #[cfg(feature = "iostore")]
 pub mod iostore;
+
 
 // Facade re-exports — the recommended surface for editing tags.
 pub use api::{
