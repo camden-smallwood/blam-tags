@@ -225,6 +225,8 @@ pub use tables::{periodic_function_evaluate, transition_function_evaluate, FUNCT
 
 pub mod curve;
 pub mod editor;
+pub mod h2;
+pub use h2::{H2Function, H2FunctionError};
 
 /// Build the `(compact, editor)` byte pair for an identity `MultiSpline`:
 /// a single Linear segment `(0,0)→(1,1)` (`f(x) = x`). The compact is the

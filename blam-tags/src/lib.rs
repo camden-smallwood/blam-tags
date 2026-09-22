@@ -172,8 +172,8 @@ pub use render_model::{
     RenderModel, RenderModelError, RenderVertex, Subpart,
 };
 pub use tag_function::{
-    ColorGraphType, FunctionFlags, FunctionKind, FunctionType, TagFunction, TagFunctionError,
-    TagFunctionHeader, default_function_definition_bytes,
+    ColorGraphType, FunctionFlags, FunctionKind, FunctionType, H2Function, H2FunctionError,
+    TagFunction, TagFunctionError, TagFunctionHeader, default_function_definition_bytes,
 };
 pub use tag_function::curve::{CurvePointMode, CurveSegmentType};
 pub use tag_function::editor::{
