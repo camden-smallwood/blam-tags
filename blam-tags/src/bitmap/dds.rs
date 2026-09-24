@@ -148,7 +148,7 @@ pub(crate) fn needs_decode_for_dds(format: BitmapFormat) -> bool {
         | X8r8g8b8 | A8r8g8b8 | A2r10g10b10
         | V8u8 | Q8w8v8u8 | A16b16g16r16
         | Abgrfp16 | Abgrfp32
-        | Dxt1 | Dxt3 | Dxt5 | Dxt5a | Dxn | DxnSnorm
+        | Dxt1 | Dxt3 | Dxt5 | Dxt5a | Dxn | DxnSnorm | Bc7
         | Signedr16g16b16a16
     )
 }
@@ -283,6 +283,7 @@ fn dxgi_format(format: BitmapFormat) -> u32 {
         Abgrfp32 => DXGI_FORMAT_R32G32B32A32_FLOAT,
         A16b16g16r16 => DXGI_FORMAT_R16G16B16A16_UNORM,
         Signedr16g16b16a16 => DXGI_FORMAT_R16G16B16A16_SNORM,
+        Bc7 => DXGI_FORMAT_BC7_UNORM,
         // Every other format is pre-decoded to RGBA8 before reaching
         // the DXT10 writer (see `needs_decode_for_dds`). Reaching
         // this arm for one of them indicates a missed dispatch.

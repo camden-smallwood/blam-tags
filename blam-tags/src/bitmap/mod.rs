@@ -948,8 +948,10 @@ impl<'a> BitmapImage<'a> {
         let bytes = self.pixel_bytes()?;
 
         // Formats with no clean legacy DDS pixelformat get decoded
-        // to RGBA8 per mip-and-face, then written as A8R8G8B8.
-        if needs_decode_for_dds(format) {
+        // to RGBA8 per mip-and-face, then written as A8R8G8B8. So do
+        // DXT10-only formats laid out as a cube map, which the DXT10
+        // writer can't express yet.
+        if needs_decode_for_dds(format) || (is_cube && format.requires_dxt10()) {
             let decoded = self.decode_all_to_rgba8(format, bytes)?;
             return self.write_dds_with_format(
                 out, BitmapFormat::A8r8g8b8, &decoded, is_cube, is_array,

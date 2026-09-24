@@ -161,6 +161,11 @@ pub enum BitmapFormat {
     /// storage and palette as [`Self::P8`] (the palette entries encode
     /// normal vectors). Kept distinct so the schema name round-trips.
     P8Bump,
+    /// BC7 (16 bytes per 4×4 block). Only the Halo CE MCC schema names it:
+    /// it is the last option of the classic `format` enum, which the MCC
+    /// toolset added for Anniversary-era textures. Standard DXGI block
+    /// layout, so the DDS writer emits it verbatim as `BC7_UNORM`.
+    Bc7,
 }
 
 impl BitmapFormat {
@@ -256,6 +261,7 @@ impl BitmapFormat {
             "depth 24" | "depth24" => Self::Depth24,
             "p8" => Self::P8,
             "p8-bump" | "p8_bump" => Self::P8Bump,
+            "bc7" => Self::Bc7,
             _ => return None,
         })
     }
@@ -283,17 +289,19 @@ impl BitmapFormat {
                 | Self::Dxt5Red
                 | Self::Dxt5Green
                 | Self::Dxt5Blue
+                | Self::Bc7
         )
     }
 
     /// Whether the format only has a clean DDS expression via the
-    /// DXT10 extension header. Currently just `signedr16g16b16a16`.
+    /// DXT10 extension header: `signedr16g16b16a16`, `DxnSnorm` and `Bc7`.
     pub fn requires_dxt10(self) -> bool {
         // `DxnSnorm` is here because the legacy `ATI2` fourcc says
         // nothing about signedness — readers assume BC5_UNORM — so the
         // only way to write those blocks verbatim and have them read
         // back correctly is the DXT10 header's `BC5_SNORM`.
-        matches!(self, Self::Signedr16g16b16a16 | Self::DxnSnorm)
+        // `Bc7` has no legacy fourcc at all.
+        matches!(self, Self::Signedr16g16b16a16 | Self::DxnSnorm | Self::Bc7)
     }
 
     /// Whether channel values are stored as signed integers and need
@@ -319,7 +327,7 @@ impl BitmapFormat {
     }
 
     /// Bytes per stored block for compressed formats. 8 for BC1 /
-    /// BC4-shaped, 16 for BC2 / BC3 / BC5-shaped. 0 for
+    /// BC4-shaped, 16 for BC2 / BC3 / BC5-shaped and BC7. 0 for
     /// uncompressed formats.
     pub fn block_bytes(self) -> u32 {
         match self {
@@ -340,7 +348,8 @@ impl BitmapFormat {
             | Self::DxnMonoAlpha
             | Self::Dxt5Red
             | Self::Dxt5Green
-            | Self::Dxt5Blue => 16,
+            | Self::Dxt5Blue
+            | Self::Bc7 => 16,
             _ => 0,
         }
     }

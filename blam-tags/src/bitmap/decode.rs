@@ -3,8 +3,7 @@
 //!
 //! Phase 1 covered the 14 uncompressed formats. Phase 3 wires in
 //! BC1/2/3/4/5 via `bcdec_rs` plus the Halo-specific
-//! `dxn_mono_alpha` codec. `ctx1` is the only block-compressed
-//! schema variant still unsupported (not observed in MCC corpora).
+//! `dxn_mono_alpha` codec, and BC7 (Halo CE MCC) via the same crate.
 //!
 //! Channel-mapping conventions matched to the engine pipeline:
 //! - Packed integer formats (`a8r8g8b8`, `x8r8g8b8`, `a4r4g4b4`,
@@ -108,6 +107,7 @@ pub fn decode_to_rgba8(
         Dxt5Green => decode_bc3_single_channel(&input[..need], width, height, &mut out, 1),
         Dxt5Blue => decode_bc3_single_channel(&input[..need], width, height, &mut out, 2),
         DxnMonoAlpha => decode_dxn_mono_alpha_rgba(&input[..need], width, height, &mut out),
+        Bc7 => decode_bc7(&input[..need], width, height, &mut out),
 
         // Schema-reserved / not-observed slots. Surface as an
         // explicit unsupported error rather than silently producing
@@ -165,6 +165,7 @@ pub fn decode_pixel_at(
         Dxt1 => bc_decode_pixel(mip, w, x, y, 8, |block, out| bcdec_rs::bc1(block, out, 16)),
         Dxt3 => bc_decode_pixel(mip, w, x, y, 16, |block, out| bcdec_rs::bc2(block, out, 16)),
         Dxt5 => bc_decode_pixel(mip, w, x, y, 16, |block, out| bcdec_rs::bc3(block, out, 16)),
+        Bc7 => bc_decode_pixel(mip, w, x, y, 16, |block, out| bcdec_rs::bc7(block, out, 16)),
         A8r8g8b8 => {
             // Stored little-endian as (B, G, R, A) per dword.
             let off = ((y * w + x) * 4) as usize;
@@ -546,6 +547,21 @@ fn decode_bc3(input: &[u8], width: u32, height: u32, out: &mut [u8]) {
             let block = &input[block_idx * 16..(block_idx + 1) * 16];
             let mut staging = [0u8; 64];
             bcdec_rs::bc3(block, &mut staging, 16);
+            blit_rgba_block(&staging, out, width, height, bx, by);
+        }
+    }
+}
+
+/// `bc7` → BC7. 16-byte block, RGBA8 straight out of bcdec_rs.
+fn decode_bc7(input: &[u8], width: u32, height: u32, out: &mut [u8]) {
+    let blocks_w = ((width + 3) / 4).max(1);
+    let blocks_h = ((height + 3) / 4).max(1);
+    for by in 0..blocks_h {
+        for bx in 0..blocks_w {
+            let block_idx = (by * blocks_w + bx) as usize;
+            let block = &input[block_idx * 16..(block_idx + 1) * 16];
+            let mut staging = [0u8; 64];
+            bcdec_rs::bc7(block, &mut staging, 16);
             blit_rgba_block(&staging, out, width, height, bx, by);
         }
     }
@@ -1436,6 +1452,67 @@ mod tests {
         let h1 = decode_to_rgba8(BitmapFormat::P8Bump, 2, 1, &[0x00, 0x7C], P8Palette::Halo1).unwrap();
         assert_eq!(&h1[0..4], &rgba(0x7A, 0x19, 0xCC, 0xFF)); // index 0
         assert_eq!(&h1[4..8], &rgba(0x80, 0x80, 0xFF, 0xFF)); // index 124, flat
+    }
+
+    /// A BC7 mode-6 block: one subset, 7-bit RGBA endpoints plus a p-bit
+    /// each, 4-bit indices (3 for the anchor pixel 0). The two colours are
+    /// `(20, 40, 60, 254)` and opaque white; index 0 picks one endpoint
+    /// exactly and index 15 (weight 64) the other, so every pixel's value
+    /// is known without re-deriving the interpolation. The anchor's index
+    /// has an implicit 0 top bit, so when pixel 0 is white the endpoints
+    /// swap — which is what a real encoder does too.
+    fn bc7_mode6_block(low_pixels: &[usize]) -> [u8; 16] {
+        let mut bits = 0u128;
+        let mut at = 0u32;
+        let mut put = |value: u128, width: u32| {
+            bits |= value << at;
+            at += width;
+        };
+        // (7-bit value, p-bit) per channel: `(v << 1) | p` is the colour.
+        let low = [(10, 0), (20, 0), (30, 0), (127, 0)];
+        let white = [(127, 1); 4];
+        let swap = !low_pixels.contains(&0);
+        let (e0, e1) = if swap { (white, low) } else { (low, white) };
+        put(1 << 6, 7); // mode 6
+        for channel in 0..4 {
+            put(e0[channel].0, 7);
+            put(e1[channel].0, 7);
+        }
+        put(e0[0].1, 1);
+        put(e1[0].1, 1);
+        for pixel in 0..16 {
+            let is_low = low_pixels.contains(&pixel);
+            let index = if is_low != swap { 0 } else { 15 };
+            put(index, if pixel == 0 { 3 } else { 4 });
+        }
+        assert_eq!(at, 128);
+        bits.to_le_bytes()
+    }
+
+    #[test]
+    fn bc7_decodes_endpoints_to_the_right_pixels() {
+        let low = rgba(20, 40, 60, 254);
+        let white = rgba(255, 255, 255, 255);
+        // Two blocks side by side: the left one has endpoint 0 at pixels 0
+        // and 6, the right one only at pixel 15. Catches a decoder that
+        // ignores indices, and a blit that drops blocks in the wrong place.
+        let mut input = Vec::new();
+        input.extend_from_slice(&bc7_mode6_block(&[0, 6]));
+        input.extend_from_slice(&bc7_mode6_block(&[15]));
+        let out = decode_to_rgba8(BitmapFormat::Bc7, 8, 4, &input, crate::bitmap::p8::P8Palette::Halo2).unwrap();
+        let at = |x: usize, y: usize| -> [u8; 4] { out[(y * 8 + x) * 4..][..4].try_into().unwrap() };
+        assert_eq!(at(0, 0), low);
+        assert_eq!(at(2, 1), low); // pixel 6 of the left block
+        assert_eq!(at(7, 3), low); // pixel 15 of the right block
+        assert_eq!(at(1, 0), white);
+        assert_eq!(at(4, 0), white); // pixel 0 of the right block
+        assert_eq!(at(3, 3), white);
+        let lows = out.chunks_exact(4).filter(|p| *p == low).count();
+        assert_eq!(lows, 3);
+
+        // The single-pixel sampler agrees with the full decode.
+        assert_eq!(decode_pixel_at(BitmapFormat::Bc7, 8, 4, &input, 0, 7, 3), Some(low));
+        assert_eq!(decode_pixel_at(BitmapFormat::Bc7, 8, 4, &input, 0, 6, 3), Some(white));
     }
 
     /// Sub-4-pixel mip (1×1) for a BC format: input is still one
