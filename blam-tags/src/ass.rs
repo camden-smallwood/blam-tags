@@ -39,7 +39,7 @@ use crate::api::TagStruct;
 use crate::file::TagFile;
 use crate::geometry::{
     index_start, mesh_is_triangle_strip, read_compression_bounds_at, read_mesh_indices,
-    strip_to_list_u32, CompressionBounds, SCALE,
+    strip_to_list_u32, write_floats, CompressionBounds, SCALE,
 };
 use crate::math::{RealPlane3d, RealPoint3d, RealQuaternion, RealRgbColor, RealVector3d};
 
@@ -1912,17 +1912,7 @@ fn build_collision_mesh(
         let surfaces = match bsp.field("surfaces").and_then(|f| f.as_block()) { Some(b) => b, None => continue };
         let edges = match bsp.field("edges").and_then(|f| f.as_block()) { Some(b) => b, None => continue };
         let bsp_verts = match bsp.field("vertices").and_then(|f| f.as_block()) { Some(b) => b, None => continue };
-        let edge_cache: Vec<crate::geometry::EdgeRow> = (0..edges.len()).map(|k| {
-            let e = edges.element(k).unwrap();
-            crate::geometry::EdgeRow {
-                start_vertex: e.read_int_any("start vertex").unwrap_or(-1) as i32,
-                end_vertex: e.read_int_any("end vertex").unwrap_or(-1) as i32,
-                forward_edge: e.read_int_any("forward edge").unwrap_or(-1) as i32,
-                reverse_edge: e.read_int_any("reverse edge").unwrap_or(-1) as i32,
-                left_surface: e.read_int_any("left surface").unwrap_or(-1) as i32,
-                right_surface: e.read_int_any("right surface").unwrap_or(-1) as i32,
-            }
-        }).collect();
+        let edge_cache = crate::geometry::read_edge_rows(&edges);
         let bsp_points: Vec<RealPoint3d> = (0..bsp_verts.len()).map(|k| {
             bsp_verts.element(k).unwrap().read_point3d("point") * SCALE
         }).collect();
@@ -2103,19 +2093,7 @@ fn append_collision_surfaces(
         return;
     };
 
-    let edge_cache: Vec<crate::geometry::EdgeRow> = (0..edges.len())
-        .map(|k| {
-            let e = edges.element(k).unwrap();
-            crate::geometry::EdgeRow {
-                start_vertex: e.read_int_any("start vertex").unwrap_or(-1) as i32,
-                end_vertex: e.read_int_any("end vertex").unwrap_or(-1) as i32,
-                forward_edge: e.read_int_any("forward edge").unwrap_or(-1) as i32,
-                reverse_edge: e.read_int_any("reverse edge").unwrap_or(-1) as i32,
-                left_surface: e.read_int_any("left surface").unwrap_or(-1) as i32,
-                right_surface: e.read_int_any("right surface").unwrap_or(-1) as i32,
-            }
-        })
-        .collect();
+    let edge_cache = crate::geometry::read_edge_rows(&edges);
     let bsp_points: Vec<RealPoint3d> = (0..bsp_verts.len())
         .map(|k| bsp_verts.element(k).unwrap().read_point3d("point") * SCALE)
         .collect();
@@ -2257,18 +2235,6 @@ fn compute_axis_flip(b: &CompressionBounds) -> bool {
         + (b.py_max < b.py_min) as u32
         + (b.pz_max < b.pz_min) as u32;
     flips % 2 == 1
-}
-
-fn write_floats<W: Write>(w: &mut W, values: &[f32]) -> io::Result<()> {
-    for (i, v) in values.iter().enumerate() {
-        let v = if *v == -0.0 { 0.0 } else { *v };
-        if i + 1 < values.len() {
-            write!(w, "{:.10}\t", v)?;
-        } else {
-            writeln!(w, "{:.10}", v)?;
-        }
-    }
-    Ok(())
 }
 
 /// One render_model node in the parent-relative form the tag stores.

@@ -403,6 +403,9 @@ Re-measure after each fix and add a row to the log at the bottom.
   - UE bake setup shared between `jms.rs:498` and `render_model.rs:918`;
     `jms.rs:392` `from_ue_skeletal_mesh` has no callers.
   - H3 vs H2 sbsp→ASS builders share 166 identical lines (`ass.rs:312-1095`).
+  - **Done**: `geometry::write_floats` (the JMS/ASS/JMA float line) and
+    `geometry::read_edge_rows` (a BSP `edges` block as `EdgeRow`s) replace
+    three copies each. Net −30 lines; 4,785 exports identical.
   - `write_floats` ×3, `EdgeRow` cache ×3, shader-basename extraction ×8
     with two different methods, material find-or-insert ×7.
   - Leave `collision_verify.rs`'s independent decode alone — it is the oracle.

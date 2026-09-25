@@ -253,6 +253,25 @@ pub(crate) struct EdgeRow {
     pub(crate) right_surface: i32,
 }
 
+/// A BSP's `edges` block as [`EdgeRow`]s, read once so the edge-ring walk
+/// doesn't go through the field API per step. Missing fields read as `-1`.
+pub(crate) fn read_edge_rows(edges: &crate::api::TagBlock<'_>) -> Vec<EdgeRow> {
+    (0..edges.len())
+        .map(|k| {
+            let e = edges.element(k).unwrap();
+            let int = |name: &str| e.read_int_any(name).unwrap_or(-1) as i32;
+            EdgeRow {
+                start_vertex: int("start vertex"),
+                end_vertex: int("end vertex"),
+                forward_edge: int("forward edge"),
+                reverse_edge: int("reverse edge"),
+                left_surface: int("left surface"),
+                right_surface: int("right surface"),
+            }
+        })
+        .collect()
+}
+
 /// Walk a single surface's edge ring and return the ordered list of
 /// vertex indices that bound it. Each edge belongs to two surfaces;
 /// the matching side decides which vertex (start vs end) to emit
@@ -289,6 +308,20 @@ pub(crate) fn walk_surface_ring(
         if steps > max_steps { return Vec::new(); }
     }
     out
+}
+
+/// Write `values` tab-separated on one line at the JMS / ASS / JMA text
+/// formats' ten decimal places, `-0` written as `0`.
+pub(crate) fn write_floats<W: std::io::Write>(w: &mut W, values: &[f32]) -> std::io::Result<()> {
+    for (i, v) in values.iter().enumerate() {
+        let v = if *v == -0.0 { 0.0 } else { *v };
+        if i + 1 < values.len() {
+            write!(w, "{:.10}\t", v)?;
+        } else {
+            writeln!(w, "{:.10}", v)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

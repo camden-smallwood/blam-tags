@@ -39,6 +39,7 @@
 //!
 //!   In all cases the final on-disk frame count is `codec_count + 1`.
 
+use crate::geometry::write_floats;
 use crate::math::{RealPoint3d, RealQuaternion, RealVector3d};
 
 use super::{MovementData, MovementFrame, NodeTransform, Pose, Skeleton};
@@ -321,14 +322,3 @@ fn write_transform<W: std::io::Write>(writer: &mut W, t: NodeTransform) -> std::
     Ok(())
 }
 
-fn write_floats<W: std::io::Write>(writer: &mut W, values: &[f32]) -> std::io::Result<()> {
-    for (i, v) in values.iter().enumerate() {
-        let v = if *v == -0.0 { 0.0 } else { *v };
-        if i + 1 < values.len() {
-            write!(writer, "{:.10}\t", v)?;
-        } else {
-            writeln!(writer, "{:.10}", v)?;
-        }
-    }
-    Ok(())
-}

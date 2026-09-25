@@ -43,7 +43,7 @@ use crate::fields::TagFieldData;
 use crate::file::TagFile;
 use crate::geometry::{
     index_start, mesh_is_triangle_strip, read_compression_bounds, read_mesh_indices,
-    strip_to_list, strip_to_list_u32, walk_surface_ring, CompressionBounds, EdgeRow, SCALE,
+    strip_to_list, strip_to_list_u32, walk_surface_ring, write_floats, CompressionBounds, SCALE,
 };
 use crate::math::{RealPoint3d, RealQuaternion, RealVector3d};
 // Only the UE-mesh fusion paths below use a 4x4, and they are all `iostore`.
@@ -1345,17 +1345,7 @@ impl JmsFile {
         // Build a (start_vertex, end_vertex, forward, reverse,
         // left_surface, right_surface) cache to avoid hammering the
         // as_struct API in the hot edge-walk loop.
-        let edge_cache: Vec<EdgeRow> = (0..edges.len()).map(|k| {
-            let e = edges.element(k).unwrap();
-            EdgeRow {
-                start_vertex: e.read_int_any("start vertex").unwrap_or(-1) as i32,
-                end_vertex: e.read_int_any("end vertex").unwrap_or(-1) as i32,
-                forward_edge: e.read_int_any("forward edge").unwrap_or(-1) as i32,
-                reverse_edge: e.read_int_any("reverse edge").unwrap_or(-1) as i32,
-                left_surface: e.read_int_any("left surface").unwrap_or(-1) as i32,
-                right_surface: e.read_int_any("right surface").unwrap_or(-1) as i32,
-            }
-        }).collect();
+        let edge_cache = crate::geometry::read_edge_rows(&edges);
 
         // CE stores `point` as real_vector_3d, H2/H3 as real_point_3d
         // — read_point_or_vec accepts either.
@@ -3437,15 +3427,6 @@ fn read_ce_vertex(v: &TagStruct<'_>) -> JmsVertex {
 //================================================================================
 // Writer helpers
 //================================================================================
-
-fn write_floats<W: Write>(w: &mut W, values: &[f32]) -> io::Result<()> {
-    for (i, v) in values.iter().enumerate() {
-        let v = if *v == -0.0 { 0.0 } else { *v };
-        if i + 1 < values.len() { write!(w, "{:.10}\t", v)?; }
-        else                    { writeln!(w, "{:.10}", v)?; }
-    }
-    Ok(())
-}
 
 const EMPTY_SECTIONS_TRAILING: &[(&str, &[&str])] = &[
     ("CAR_WHEEL", &["<name>", "<chassis index>", "<wheel index>", "<chassis transform>", "<wheel transform>", "<suspension transform>", "<suspension min limit>", "<suspension max limit>"]),
