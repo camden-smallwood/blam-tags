@@ -227,15 +227,9 @@ pub fn convert_h3_player_responses_to_reach_companions(
         .min(classes.definition().max_count() as usize);
     for index in 0..count {
         let class_index = classes.add_element();
-        let Some(class) = classes.element_mut(class_index) else {
-            return Err(format!(
-                "Could not allocate Reach player response class {index}"
-            ));
-        };
-        initialize_block_index_defaults(class);
         let Some(mut class) = classes.element_mut(class_index) else {
             return Err(format!(
-                "Could not reopen Reach player response class {index}"
+                "Could not allocate Reach player response class {index}"
             ));
         };
         let source_response = responses.element(index).unwrap();
@@ -348,9 +342,6 @@ fn populate_response_class(
     {
         block.clear();
         let element_index = block.add_element();
-        if let Some(element) = block.element_mut(element_index) {
-            initialize_block_index_defaults(element);
-        }
         if let Some(mut element) = block.element_mut(element_index) {
             copy_named_field(sound, "effect name", &mut element, "effect name", context);
             if let Some(TagFieldData::Real(duration)) =

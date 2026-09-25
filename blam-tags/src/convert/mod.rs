@@ -2790,7 +2790,7 @@ fn build_target_from_definitions(schema_path: &Path, allow_template_hole: bool) 
             return None;
         }
         let mut target = TagFile::new(schema_path).ok()?;
-        initialize_block_index_defaults(target.root_mut());
+        crate::api::default_new_element_block_indices(target.root_mut());
         Some(target)
     })
     .ok()
@@ -4004,7 +4004,7 @@ fn create_companion_tag(
                 schema.display()
             )
         })?;
-        initialize_block_index_defaults(tag.root_mut());
+        crate::api::default_new_element_block_indices(tag.root_mut());
         (tag, None)
     };
     apply_editing_kit_mcc_header(&mut tag, context.target_game)?;
@@ -4381,50 +4381,6 @@ fn reset_struct_to_defaults(
 /// as its null value. Native post-processing treats zero as a real index, so
 /// leaving a target-only index at the allocator default can make an otherwise
 /// valid converted tag assert while loading.
-fn initialize_block_index_defaults(mut value: TagStructMut<'_>) {
-    let field_count = value.as_ref().fields().count();
-    for ordinal in 0..field_count {
-        let Some(mut field) = value.field_at_mut(ordinal) else {
-            continue;
-        };
-        match field.as_ref().field_type() {
-            TagFieldType::Struct => {
-                if let Some(nested) = field.as_struct_mut() {
-                    initialize_block_index_defaults(nested);
-                }
-            }
-            TagFieldType::Array => {
-                if let Some(mut array) = field.as_array_mut() {
-                    for index in 0..array.len() {
-                        if let Some(element) = array.element_mut(index) {
-                            initialize_block_index_defaults(element);
-                        }
-                    }
-                }
-            }
-            TagFieldType::CharBlockIndex => {
-                let _ = field.set(TagFieldData::CharBlockIndex(-1));
-            }
-            TagFieldType::CustomCharBlockIndex => {
-                let _ = field.set(TagFieldData::CustomCharBlockIndex(-1));
-            }
-            TagFieldType::ShortBlockIndex => {
-                let _ = field.set(TagFieldData::ShortBlockIndex(-1));
-            }
-            TagFieldType::CustomShortBlockIndex => {
-                let _ = field.set(TagFieldData::CustomShortBlockIndex(-1));
-            }
-            TagFieldType::LongBlockIndex => {
-                let _ = field.set(TagFieldData::LongBlockIndex(-1));
-            }
-            TagFieldType::CustomLongBlockIndex => {
-                let _ = field.set(TagFieldData::CustomLongBlockIndex(-1));
-            }
-            _ => {}
-        }
-    }
-}
-
 fn default_field_value(value: TagFieldData) -> Option<TagFieldData> {
     Some(match value {
         TagFieldData::String(_) => TagFieldData::String(String::new()),
@@ -4980,9 +4936,6 @@ fn convert_legacy_melee_to_block(
     for (index, pair) in pairs.iter().take(count).cloned().enumerate() {
         let target_index = target_block.add_element();
         if let Some(element) = target_block.element_mut(target_index) {
-            initialize_block_index_defaults(element);
-        }
-        if let Some(element) = target_block.element_mut(target_index) {
             convert_struct(
                 source_melee,
                 element,
@@ -5375,9 +5328,6 @@ fn convert_legacy_effect_looping_sound_to_block(
     target_block.clear();
     if has_sound {
         let index = target_block.add_element();
-        if let Some(element) = target_block.element_mut(index) {
-            initialize_block_index_defaults(element);
-        }
         if let Some(mut element) = target_block.element_mut(index) {
             for key in ["looping sound", "location", "bind scale to event"] {
                 let (Some(source_field), Some(target_ordinal)) = (
@@ -5472,10 +5422,6 @@ fn convert_local_animation_payload(
     };
     payload_block.clear();
     let payload_index = payload_block.add_element();
-    let Some(payload) = payload_block.element_mut(payload_index) else {
-        return transferred;
-    };
-    initialize_block_index_defaults(payload);
     let Some(mut payload) = payload_block.element_mut(payload_index) else {
         return transferred;
     };
@@ -5840,9 +5786,6 @@ fn convert_field(
             let count = source_block.len().min(maximum);
             for index in 0..count {
                 let target_index = target_block.add_element();
-                if let Some(target_element) = target_block.element_mut(target_index) {
-                    initialize_block_index_defaults(target_element);
-                }
                 if let (Some(source_element), Some(target_element)) = (
                     source_block.element(index),
                     target_block.element_mut(target_index),
@@ -9086,7 +9029,7 @@ mod tests {
         let mut responses = responses_field.as_block_mut().unwrap();
         let response_index = responses.add_element();
         let response = responses.element_mut(response_index).unwrap();
-        initialize_block_index_defaults(response);
+        crate::api::default_new_element_block_indices(response);
         let mut response = responses.element_mut(response_index).unwrap();
         let response_type = field_ordinal_by_key(response.as_ref(), "response type").unwrap();
         response

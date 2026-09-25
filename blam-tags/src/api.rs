@@ -1424,7 +1424,7 @@ impl<'a> TagFlag<'a> {
 /// elements. Child `Block`s are left empty; their own elements get the same
 /// treatment as they are added. All six block-index variants (char/short/long,
 /// plain and custom) are covered, each written at its own width.
-fn default_new_element_block_indices(mut element: TagStructMut<'_>) {
+pub(crate) fn default_new_element_block_indices(mut element: TagStructMut<'_>) {
     element.for_each_field_mut(|mut field| match field.as_ref().field_type() {
         TagFieldType::CharBlockIndex => { let _ = field.set(TagFieldData::CharBlockIndex(-1)); }
         TagFieldType::CustomCharBlockIndex => { let _ = field.set(TagFieldData::CustomCharBlockIndex(-1)); }

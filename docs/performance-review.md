@@ -432,6 +432,13 @@ Re-measure after each fix and add a row to the log at the bottom.
   - `initialize_block_index_defaults` (`4307`) duplicates
     `api.rs:1440 default_new_element_block_indices` and runs twice per new
     element.
+    **Done**: removed; the converter calls
+    `api::default_new_element_block_indices` (now `pub(crate)`), and the six
+    calls straight after `add_element` — which already applies it — are gone.
+    224 conversions identical (whitespace-normalized messages). The two
+    `companions.rs` sites are on the H3 → Reach damage-effect path, which
+    those conversions don't reach; there the change only drops a repeat of
+    what `add_element` just did.
   - Per-variant `TagFieldData` matches (`default_field_value`,
     `value_is_meaningful`, `integer_value`, `set_int_field`,
     `clear_flags_by_name`, `read_int_any`, …) → methods on `TagFieldData`
