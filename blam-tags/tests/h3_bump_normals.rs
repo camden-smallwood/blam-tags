@@ -20,10 +20,20 @@ use std::path::PathBuf;
 use blam_tags::bitmap::decode::decode_to_rgba8;
 use blam_tags::{Bitmap, BitmapFormat, TagFile};
 
-/// An H3EK install, via `BLAM_TEST_H3EK` or the conventional Steam roots.
+/// An H3EK install's `tags`, via `BLAM_TEST_H3EK` or the conventional Steam
+/// roots.
+///
+/// The variable names the kit, as it does for every other corpus test here;
+/// its `tags` directory is accepted too. This harness used to take only
+/// `tags`, so no one setting ran it alongside the others: with the kit root it
+/// found none of its bump maps and failed, reading like a kit that lacks them.
 fn h3ek_tags() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("BLAM_TEST_H3EK") {
         let p = PathBuf::from(p);
+        let tags = p.join("tags");
+        if tags.is_dir() {
+            return Some(tags);
+        }
         return p.is_dir().then_some(p);
     }
     [
@@ -57,7 +67,7 @@ fn fraction_within_unit_circle(rgba: &[u8]) -> f32 {
 #[test]
 fn shipped_h3_bump_bitmaps_decode_to_unit_normals() {
     let Some(tags) = h3ek_tags() else {
-        eprintln!("skipping: no H3 editing kit (set BLAM_TEST_H3EK to its `tags` directory)");
+        eprintln!("skipping: no H3 editing kit (set BLAM_TEST_H3EK to it)");
         return;
     };
 
