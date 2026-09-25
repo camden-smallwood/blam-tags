@@ -766,7 +766,7 @@ pub(super) fn convert_x360_bitmap_pixels(
         record_unsupported(
             context,
             "hardware textures".to_owned(),
-            "The Xbox 360 build has no resident pixel data for this bitmap: its texture              resources were never paged into the cache, so there is nothing to carry"
+            "The Xbox 360 build has no resident pixel data for this bitmap: its texture resources were never paged into the cache, so there is nothing to carry"
                 .to_owned(),
         );
         return;

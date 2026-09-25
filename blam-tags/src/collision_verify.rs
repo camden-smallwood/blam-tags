@@ -115,7 +115,7 @@ impl std::fmt::Display for VerifyError {
             Self::Malformed(m) => write!(f, "cannot read the collision structures: {m}"),
             Self::NoUsableTree { nodes, surfaces } => write!(
                 f,
-                "the bsp3d tree reaches no leaf: {nodes} nodes over {surfaces} surfaces,                  so none of this collision can be hit"
+                "the bsp3d tree reaches no leaf: {nodes} nodes over {surfaces} surfaces, so none of this collision can be hit"
             ),
         }
     }
@@ -1100,7 +1100,7 @@ fn check(d: &Decoded, rays: usize, report: &mut VerifyReport) {
                             extent,
                         );
                         report.examples.push(format!(
-                            "surface {si}: surfaces say {} at {:.5}, tree says {} at {:.5};                              missed one is in {anywhere} leaves, offered={offered},                              margin={margin:.6}, cell before={lb} knows={kb},                              cell after={la} knows={ka}",
+                            "surface {si}: surfaces say {} at {:.5}, tree says {} at {:.5}; missed one is in {anywhere} leaves, offered={offered}, margin={margin:.6}, cell before={lb} knows={kb}, cell after={la} knows={ka}",
                             a.surface, a.t, b.surface, b.t
                         ));
                     }
@@ -1144,7 +1144,7 @@ fn check(d: &Decoded, rays: usize, report: &mut VerifyReport) {
                         .filter(|l| l.contains(&a.surface))
                         .count();
                     report.examples.push(format!(
-                        "surface {si}: truth {} at {:.5}; indexed by {anywhere} leaves;                          the tree offered {n_cand}                          candidates {} include it; the hit point lands in leaf {} which                          {} index it",
+                        "surface {si}: truth {} at {:.5}; indexed by {anywhere} leaves; the tree offered {n_cand} candidates {} include it; the hit point lands in leaf {} which {} index it",
                         a.surface,
                         a.t,
                         if offered { "which DO" } else { "which do NOT" },

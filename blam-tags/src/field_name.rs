@@ -38,20 +38,20 @@
 
 use std::borrow::Cow;
 
-/// Markup characters that terminate the clean (addressable) portion of a field
-/// name. The first occurrence of any of these ends the clean name.
+/// Whether `byte` is a markup character that terminates the clean
+/// (addressable) portion of a field name. The first occurrence of any of these
+/// ends the clean name.
 ///
 /// `|` is included for the Halo 2 `model_animation_graph` dumper artifact: block
 /// names are stored as `animations|ABCDCC`, where the part after `|` is a
 /// name-code, not part of the addressable name. Cutting it here makes the clean
 /// name (`animations`) consistent across paths, display, and matching — so a
 /// path built from the clean name resolves against the stored raw name.
-const NAME_MARKERS: &[char] = &['&', '#', ':', '[', '{', '*', '!', '^', '|'];
-
-/// Whether `byte` is one of [`NAME_MARKERS`]. They are all ASCII, so a byte
-/// scan finds the first one at a char boundary — without decoding the name a
-/// character at a time, as a `&[char]` pattern does. Name lookups clean a
-/// stored name per candidate field, so this is on the hottest path there is.
+///
+/// They are all ASCII, so a byte scan finds the first one at a char boundary —
+/// without decoding the name a character at a time, as a `&[char]` pattern
+/// does. Name lookups clean a stored name per candidate field, so this is on
+/// the hottest path there is.
 fn is_name_marker(byte: u8) -> bool {
     matches!(byte, b'&' | b'#' | b':' | b'[' | b'{' | b'*' | b'!' | b'^' | b'|')
 }

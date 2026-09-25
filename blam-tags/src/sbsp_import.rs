@@ -79,7 +79,7 @@ impl std::fmt::Display for SbspError {
             ),
             Self::TooManyVertices { object, vertices } => write!(
                 f,
-                "object {object} has {vertices} vertices, over the 32,767 an index can name                  without going negative in a signed word"
+                "object {object} has {vertices} vertices, over the 32,767 an index can name without going negative in a signed word"
             ),
         }
     }

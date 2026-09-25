@@ -33,6 +33,21 @@ pub use resources::*;
 /// every alias table in here is keyed with it — keying with anything else silently
 /// loses every rename whose name carries a capital, an underscore or a hyphen.
 pub fn clean_field_key(name: &str) -> String {
+    // A plain field name — no path syntax, no markup — comes back from the
+    // parse/strip/render round trip trimmed at the end and nothing else. Nearly
+    // every name the converter keys is one, and it keys them per field per
+    // element, so skip the half-dozen allocations the round trip costs.
+    // `clean_field_key_is_the_round_trip_for_every_schema_name` holds the two
+    // together.
+    if !name.bytes().any(|b| {
+        matches!(b, b'/' | b':' | b'#' | b'[' | b']' | b'&' | b'{' | b'*' | b'!' | b'^' | b'|')
+    }) {
+        return name.trim_end().to_ascii_lowercase();
+    }
+    clean_field_key_round_trip(name)
+}
+
+fn clean_field_key_round_trip(name: &str) -> String {
     TagFieldPath::parse(name)
         .strip_node_indices()
         .to_string()
@@ -580,6 +595,8 @@ struct ConversionContext<'a> {
     /// element — so an uncached call would rewalk the same pair thousands of times
     /// for one tag.
     wire_identical: HashMap<(u32, u32), bool>,
+    /// [`MatchPlan`]s by [`struct_pair_shape_key`].
+    match_plans: HashMap<u64, std::rc::Rc<MatchPlan>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -744,7 +761,15 @@ struct OptionAliasRule {
 }
 
 impl ConversionMappingCatalog {
-    fn load() -> Result<Self, String> {
+    /// The embedded catalog, parsed and validated once per process — every
+    /// conversion consults it, and parsing it is not free.
+    fn load() -> Result<&'static Self, String> {
+        static CATALOG: std::sync::LazyLock<Result<ConversionMappingCatalog, String>> =
+            std::sync::LazyLock::new(ConversionMappingCatalog::parse);
+        CATALOG.as_ref().map_err(Clone::clone)
+    }
+
+    fn parse() -> Result<Self, String> {
         let catalog: Self = serde_json::from_str(CONVERSION_MAPPING_CATALOG)
             .map_err(|error| format!("Could not parse conversion_mappings.json: {error}"))?;
         if catalog.version != 1 {
@@ -1295,7 +1320,34 @@ struct SchemaFieldAliases {
     engine_managed: HashSet<String>,
 }
 
+type CachedAliases = (crate::schema::DefinitionStamp, std::sync::Arc<SchemaFieldAliases>);
+
+/// Alias tables already built, by canonical definition path — see
+/// [`SchemaFieldAliases::load_cached`].
+static SCHEMA_FIELD_ALIASES: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, CachedAliases>>> =
+    std::sync::LazyLock::new(Default::default);
+
 impl SchemaFieldAliases {
+    /// [`Self::load`], once per definition for the life of the process —
+    /// checked against the definition's and `_meta.json`'s size and
+    /// modification time, as `TagLayout::from_json` checks its cache. Every
+    /// conversion loads the tables for both its groups, and building them
+    /// re-parses the group and every ancestor schema.
+    fn load_cached(path: &Path) -> Result<std::sync::Arc<Self>, String> {
+        let key = fs::canonicalize(path)
+            .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+        let stamp = crate::schema::definition_stamp(&key);
+        let lock = || SCHEMA_FIELD_ALIASES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((cached_stamp, aliases)) = lock().get(&key)
+            && *cached_stamp == stamp
+        {
+            return Ok(aliases.clone());
+        }
+        let aliases = std::sync::Arc::new(Self::load(path)?);
+        lock().insert(key, (stamp, aliases.clone()));
+        Ok(aliases)
+    }
+
     fn load(path: &Path) -> Result<Self, String> {
         let bytes = fs::read(path)
             .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
@@ -1913,8 +1965,8 @@ fn analyze_conversion_inner(
     let schema_path = definitions_root
         .join(target_game)
         .join(format!("{target_group_name}.json"));
-    let source_field_aliases = SchemaFieldAliases::load(&source_schema_path)?;
-    let target_field_aliases = SchemaFieldAliases::load(&schema_path)?;
+    let source_field_aliases = SchemaFieldAliases::load_cached(&source_schema_path)?;
+    let target_field_aliases = SchemaFieldAliases::load_cached(&schema_path)?;
     let native_target = native_templates
         .map(|templates| {
             find_native_target_template(
@@ -2096,6 +2148,7 @@ fn analyze_conversion_inner(
         fatal_error: None,
         root_matches: 0,
         wire_identical: HashMap::new(),
+        match_plans: HashMap::new(),
         payloads_left_behind: Vec::new(),
         resources_left_behind: Vec::new(),
     };
@@ -3981,6 +4034,15 @@ pub fn collect_reference_values(
     values: &mut Vec<ReferenceValue>,
 ) {
     for field in structure.fields() {
+        // Only a reference or a container can hold one. Checking first skips
+        // building a key and a path for every other field — and decoding it,
+        // which copies a data field's whole payload.
+        if !matches!(
+            field.field_type(),
+            TagFieldType::TagReference | TagFieldType::Struct | TagFieldType::Block | TagFieldType::Array
+        ) {
+            continue;
+        }
         let key = clean_field_key(field.name());
         let field_path = join_path(
             parent_path,
@@ -4029,7 +4091,10 @@ fn validate_reference_fidelity(
 ) -> Result<(), String> {
     let mut source_values = Vec::new();
     collect_reference_values(source.root(), "", &mut source_values);
-    let mut expected = HashSet::<(u32, String, String)>::new();
+    // In the order the source walk found them, deduplicated: iterating a hash
+    // set here put the warnings below in a different order on every run.
+    let mut expected = Vec::<(u32, String, String)>::new();
+    let mut seen = HashSet::<(u32, String, String)>::new();
     for reference in source_values {
         if let Some(reason) = mapping_catalog.reference_drop_reason(
             group_name,
@@ -4056,7 +4121,7 @@ fn validate_reference_fidelity(
                 kind: ConversionIssueKind::Warning,
                 path: reference.field_path.clone(),
                 message: format!(
-                    "{source_game} does not name group {}, so the reference to {} was                      left empty — reconnect it by hand",
+                    "{source_game} does not name group {}, so the reference to {} was left empty — reconnect it by hand",
                     format_group_tag(reference.group_tag),
                     reference.tag_path,
                 ),
@@ -4095,7 +4160,10 @@ fn validate_reference_fidelity(
             report.dropped_references += 1;
             continue;
         };
-        expected.insert((target_group, reference.tag_path, reference.field_path));
+        let entry = (target_group, reference.tag_path, reference.field_path);
+        if seen.insert(entry.clone()) {
+            expected.push(entry);
+        }
     }
 
     let mut actual_values = Vec::new();
@@ -4116,22 +4184,31 @@ fn validate_reference_fidelity(
     // If nothing was reported, the field matched and the value vanished
     // anyway. That is a bug in field matching, and it is what this check
     // exists to catch, so it stays fatal.
+    //
+    // Every issue's path is parsed once, not once per missing reference: a
+    // scenario carries thousands of both. The list grows with each warning
+    // pushed below, as `report.issues` does, so it answers what a scan of the
+    // issues would.
+    let mut issue_paths: Vec<crate::TagFieldPath> = report
+        .issues
+        .iter()
+        .map(|issue| crate::TagFieldPath::parse(&clean_field_key(&issue.path)))
+        .collect();
     let mut unexplained = Vec::new();
     for (group, tag_path, field_path) in expected {
         if actual.contains(&(group, tag_path.clone())) {
             continue;
         }
-        let explained = report.issues.iter().any(|issue| {
-            crate::TagFieldPath::parse(&clean_field_key(&issue.path))
-                .is_ancestor_of(&crate::TagFieldPath::parse(&clean_field_key(&field_path)))
-        });
+        let reference_path = crate::TagFieldPath::parse(&clean_field_key(&field_path));
+        let explained = issue_paths.iter().any(|issue_path| issue_path.is_ancestor_of(&reference_path));
         if explained {
             report.dropped_references += 1;
+            issue_paths.push(reference_path);
             report.issues.push(ConversionIssue {
                 kind: ConversionIssueKind::Warning,
                 path: field_path,
                 message: format!(
-                    "Reference to {}:{tag_path} was left empty — reconnect it by hand if the                      target needs one",
+                    "Reference to {}:{tag_path} was left empty — reconnect it by hand if the target needs one",
                     format_group_tag(group),
                 ),
             });
@@ -4144,7 +4221,7 @@ fn validate_reference_fidelity(
         Ok(())
     } else {
         Err(format!(
-            "Conversion would lose {} tag reference(s) the target does have a field for,              which means field matching went wrong rather than the games differing: {}",
+            "Conversion would lose {} tag reference(s) the target does have a field for, which means field matching went wrong rather than the games differing: {}",
             unexplained.len(),
             unexplained.join(", ")
         ))
@@ -4451,8 +4528,6 @@ fn convert_struct(
 ) {
     let source_guid = source.definition().guid();
     let target_guid = target.as_ref().definition().guid();
-    let source_struct_name = source.definition().name().to_owned();
-    let target_struct_name = target.as_ref().definition().name().to_owned();
     // Two all-zero GUIDs are not evidence of anything: every classic struct has
     // one. Require a real GUID before treating the pair as the same type, which
     // is what unlocks empty-name matching and verbatim `Data`/`Custom` copies.
@@ -4514,8 +4589,133 @@ fn convert_struct(
             Err(error) => context.fatal_error = Some(error),
         }
     }
+    let plan = match_plan(source, target.as_ref(), source_guid, target_guid, same_guid, context);
+
+    for (source_field, planned) in source.fields().zip(plan.fields.iter()) {
+        let key = &planned.key;
+        let field_path = join_path(
+            path,
+            if key.is_empty() {
+                source_field.type_name()
+            } else {
+                key
+            },
+        );
+        let Some(matched) = planned.target else {
+            if !reparented_fields.contains(key) {
+                record_unmatched_field_values(source_field, &field_path, context);
+            }
+            continue;
+        };
+        if matched.aliased {
+            context.report.mapped_aliases += 1;
+        }
+        if root {
+            context.root_matches += 1;
+        }
+        let Some(target_field) = target.field_at_mut(matched.ordinal) else {
+            continue;
+        };
+        convert_field(
+            source_field,
+            target_field,
+            &field_path,
+            same_guid || structurally_identical,
+            context,
+        );
+    }
+
+    context.report.defaulted_target += plan.defaulted;
+}
+
+/// How one struct's fields map onto another's, for [`convert_struct`].
+///
+/// Everything the matcher reads is schema: the two structs' GUIDs and names,
+/// each field's name and type, and the conversion's group and games. So the
+/// answer is the same for every element of a block, and for every struct of
+/// the same pair of shapes anywhere in the tag — and working it out again for
+/// each one (every source field tried against every target field, cleaning and
+/// aliasing names as it goes) was most of what converting a big tag cost.
+struct MatchPlan {
+    /// One per source field, in `TagStruct::fields` order.
+    fields: Vec<PlannedField>,
+    /// Target fields left unmatched that count as defaulted.
+    defaulted: usize,
+}
+
+struct PlannedField {
+    /// The source field's [`clean_field_key`].
+    key: String,
+    target: Option<PlannedTarget>,
+}
+
+#[derive(Clone, Copy)]
+struct PlannedTarget {
+    /// Ordinal of the target field, as `TagStructMut::field_at_mut` takes it.
+    ordinal: usize,
+    /// Matched under a different key — an alias, not the same name.
+    aliased: bool,
+}
+
+/// The [`MatchPlan`] for a source/target struct pair, built once per pair of
+/// struct *shapes* and then reused. Keyed by content rather than by layout and
+/// index: one conversion also writes companion tags, each with its own layout,
+/// and a companion built on the stack and then moved away can leave a later
+/// one at the same address.
+fn match_plan(
+    source: TagStruct<'_>,
+    target: TagStruct<'_>,
+    source_guid: [u8; 16],
+    target_guid: [u8; 16],
+    same_guid: bool,
+    context: &mut ConversionContext<'_>,
+) -> std::rc::Rc<MatchPlan> {
+    // `BLAM_DEBUG_FIELD` prints from inside the matcher, so it has to run.
+    if DEBUG_FIELD.is_some() {
+        return std::rc::Rc::new(build_match_plan(source, target, source_guid, target_guid, same_guid, context));
+    }
+    let key = struct_pair_shape_key(source, target, source_guid, target_guid);
+    if let Some(plan) = context.match_plans.get(&key) {
+        return plan.clone();
+    }
+    let plan = std::rc::Rc::new(build_match_plan(source, target, source_guid, target_guid, same_guid, context));
+    context.match_plans.insert(key, plan.clone());
+    plan
+}
+
+/// A hash of everything [`build_match_plan`] reads from the two structs.
+fn struct_pair_shape_key(
+    source: TagStruct<'_>,
+    target: TagStruct<'_>,
+    source_guid: [u8; 16],
+    target_guid: [u8; 16],
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (guid, structure) in [(source_guid, source), (target_guid, target)] {
+        guid.hash(&mut hasher);
+        structure.definition().name().hash(&mut hasher);
+        for field in structure.fields() {
+            field.name().hash(&mut hasher);
+            std::mem::discriminant(&field.field_type()).hash(&mut hasher);
+        }
+        // Separates the two field lists, so fields can't slide between them.
+        u8::MAX.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn build_match_plan(
+    source: TagStruct<'_>,
+    target: TagStruct<'_>,
+    source_guid: [u8; 16],
+    target_guid: [u8; 16],
+    same_guid: bool,
+    context: &ConversionContext<'_>,
+) -> MatchPlan {
+    let source_struct_name = source.definition().name().to_owned();
+    let target_struct_name = target.definition().name().to_owned();
     let target_fields = target
-        .as_ref()
         .fields()
         .enumerate()
         .map(|(ordinal, field)| TargetFieldInfo {
@@ -4526,6 +4726,7 @@ fn convert_struct(
         })
         .collect::<Vec<_>>();
     let mut used = vec![false; target_fields.len()];
+    let mut fields = Vec::new();
 
     for source_field in source.fields() {
         let key = clean_field_key(source_field.name());
@@ -4604,37 +4805,11 @@ fn convert_struct(
                     ))
                 && (!key.is_empty() || same_guid)
         });
-        let field_path = join_path(
-            path,
-            if key.is_empty() {
-                source_field.type_name()
-            } else {
-                &key
-            },
-        );
-        let Some((target_index, target_info)) = matched else {
-            if !reparented_fields.contains(&key) {
-                record_unmatched_field_values(source_field, &field_path, context);
-            }
-            continue;
-        };
-        used[target_index] = true;
-        if key != target_info.key {
-            context.report.mapped_aliases += 1;
-        }
-        if root {
-            context.root_matches += 1;
-        }
-        let Some(target_field) = target.field_at_mut(target_info.ordinal) else {
-            continue;
-        };
-        convert_field(
-            source_field,
-            target_field,
-            &field_path,
-            same_guid || structurally_identical,
-            context,
-        );
+        let planned_target = matched.map(|(target_index, target_info)| {
+            used[target_index] = true;
+            PlannedTarget { ordinal: target_info.ordinal, aliased: key != target_info.key }
+        });
+        fields.push(PlannedField { key, target: planned_target });
     }
 
     let defaulted = used
@@ -4642,7 +4817,7 @@ fn convert_struct(
         .zip(&target_fields)
         .filter(|(used, field)| !**used && is_reportable_target_default(field.field_type))
         .count();
-    context.report.defaulted_target += defaulted;
+    MatchPlan { fields, defaulted }
 }
 
 fn convert_weapon_melee_layout(
@@ -6348,16 +6523,34 @@ fn option_name_aliases(name: &str) -> Vec<String> {
     aliases
 }
 
+/// An option name reduced to what two schemas can agree on: up to any `#`,
+/// without the `*`/`!`/`^` flags, `_` and `-` read as spaces, whitespace runs
+/// collapsed to one space and trimmed, ASCII-lowercased.
+///
+/// One pass into one string. Enum and flag values are matched option by
+/// option, so this runs for every option of every value converted; the chain
+/// of `replace`/`split`/`join`/`to_lowercase` it replaces allocated six times.
 fn normalize_option_name(name: &str) -> String {
-    name.split('#')
-        .next()
-        .unwrap_or(name)
-        .replace(['*', '!', '^'], "")
-        .replace(['_', '-'], " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
+    let head = name.split('#').next().unwrap_or(name);
+    let mut out = String::with_capacity(head.len());
+    let mut pending_space = false;
+    for character in head.chars() {
+        let character = match character {
+            '*' | '!' | '^' => continue,
+            '_' | '-' => ' ',
+            other => other,
+        };
+        if character.is_whitespace() {
+            pending_space = !out.is_empty();
+        } else {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(character.to_ascii_lowercase());
+        }
+    }
+    out
 }
 
 /// Byte width of an integer field type, or `None` if it is not one.
@@ -6771,6 +6964,77 @@ pub fn normalize_conversion_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    /// `normalize_option_name` against the chain it replaced, for every option
+    /// name and field name any schema declares.
+    #[test]
+    fn normalize_option_name_matches_the_replace_chain() {
+        fn chain(name: &str) -> String {
+            name.split('#')
+                .next()
+                .unwrap_or(name)
+                .replace(['*', '!', '^'], "")
+                .replace(['_', '-'], " ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase()
+        }
+        let mut names: Vec<String> = [
+            "", " ", "a", " A_b--c ", "x#y", "#", "*!^", "a*b", "a * b", "Tab\there", "é_Ü", "a\u{3000}b", "_a_",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        if let Ok(games) = std::fs::read_dir("../definitions") {
+            for game in games.flatten().filter(|g| g.path().is_dir()) {
+                for definition in walk_files(&game.path())
+                    .into_iter()
+                    .filter(|p| p.extension().is_some_and(|e| e == "json"))
+                    .filter(|p| !p.file_name().unwrap().to_string_lossy().starts_with('_'))
+                {
+                    let Ok(layout) = crate::layout::TagLayout::from_json(&definition) else { continue };
+                    for &offset in &layout.string_offsets {
+                        names.push(layout.get_string(offset).unwrap_or("").to_owned());
+                    }
+                    for field in &layout.fields {
+                        names.push(layout.get_string(field.name_offset).unwrap_or("").to_owned());
+                    }
+                }
+            }
+        }
+        for name in &names {
+            assert_eq!(normalize_option_name(name), chain(name), "{name:?}");
+        }
+        eprintln!("{} names checked", names.len());
+    }
+
+    /// The fast path in `clean_field_key` must agree with the full round trip
+    /// for every field name any schema declares.
+    #[test]
+    fn clean_field_key_is_the_round_trip_for_every_schema_name() {
+        let root = Path::new("../definitions");
+        let Ok(games) = std::fs::read_dir(root) else { return };
+        let mut checked = 0;
+        for game in games.flatten().filter(|g| g.path().is_dir()) {
+            for definition in walk_files(&game.path())
+                .into_iter()
+                .filter(|p| p.extension().is_some_and(|e| e == "json"))
+                .filter(|p| !p.file_name().unwrap().to_string_lossy().starts_with('_'))
+            {
+                let Ok(layout) = crate::layout::TagLayout::from_json(&definition) else { continue };
+                for field in &layout.fields {
+                    let name = layout.get_string(field.name_offset).unwrap_or("");
+                    assert_eq!(clean_field_key(name), clean_field_key_round_trip(name), "{name:?}");
+                    checked += 1;
+                }
+            }
+        }
+        for name in ["", "  ", "a ", "Foo Bar", "x}", "ambient color:[0,255]", "a/b", "t#1", "p[2]"] {
+            assert_eq!(clean_field_key(name), clean_field_key_round_trip(name), "{name:?}");
+        }
+        eprintln!("{checked} schema field names checked");
+    }
+
     use super::*;
 
     /// How many of the kit's particles the conversion sweep covers. The layout
@@ -7078,7 +7342,7 @@ mod tests {
         );
         assert_eq!(
             midpoint, landed,
-            "the Halo 3 to Reach hop changed the payload size; only the classic              blob carry into Halo 3 is reviewed for that"
+            "the Halo 3 to Reach hop changed the payload size; only the classic blob carry into Halo 3 is reviewed for that"
         );
     }
 
@@ -7268,7 +7532,7 @@ mod tests {
     fn scripts_are_only_stripped_when_the_engine_changes() {
         assert!(
             !conversion_pair_supported("halo3_mcc", "halo3_mcc"),
-            "a same-game pair is refused before any of this is reached, which is              what makes the guard in strip_cross_engine_scripts a belt-and-braces              check rather than the only thing standing between a scenario and its              own scripts"
+            "a same-game pair is refused before any of this is reached, which is what makes the guard in strip_cross_engine_scripts a belt-and-braces check rather than the only thing standing between a scenario and its own scripts"
         );
     }
 
@@ -10612,7 +10876,7 @@ mod tests {
         }
         assert!(
             cleared,
-            "could not clear the source definition; the sample changed and this test              no longer proves the fallback"
+            "could not clear the source definition; the sample changed and this test no longer proves the fallback"
         );
 
         let draft = analyze_conversion_with_templates(
@@ -12274,7 +12538,7 @@ mod tests {
                     .unwrap_or_else(|error| panic!("build {game}/{}: {error}", rule.group));
                 assert!(
                     schema_path_resolves(tag.definitions().root_struct(), &rule.source_path),
-                    "{game}/{}: `{}` does not resolve; the converter would report a                      different path and this rule would never fire",
+                    "{game}/{}: `{}` does not resolve; the converter would report a different path and this rule would never fire",
                     rule.group,
                     rule.source_path,
                 );
@@ -12942,7 +13206,7 @@ mod group_alias_regression {
             .expect("Reach's particle root declares `version`");
         assert_ne!(
             version, 0,
-            "{}: a converted particle claims version 0, which no shipped Reach              particle uses and which crashes the mod tools",
+            "{}: a converted particle claims version 0, which no shipped Reach particle uses and which crashes the mod tools",
             path.display()
         );
 

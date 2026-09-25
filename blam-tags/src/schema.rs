@@ -458,9 +458,9 @@ impl TagLayout {
 
 /// Size and modification time of a definition and of the `_meta.json` beside
 /// it — what a cached layout was built from, as far as is cheap to check.
-type DefinitionStamp = [Option<(u64, std::time::SystemTime)>; 2];
+pub(crate) type DefinitionStamp = [Option<(u64, std::time::SystemTime)>; 2];
 
-fn definition_stamp(path: &Path) -> DefinitionStamp {
+pub(crate) fn definition_stamp(path: &Path) -> DefinitionStamp {
     let stamp = |p: &Path| {
         let metadata = std::fs::metadata(p).ok()?;
         Some((metadata.len(), metadata.modified().ok()?))

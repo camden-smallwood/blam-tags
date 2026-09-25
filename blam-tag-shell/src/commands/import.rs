@@ -90,7 +90,7 @@ pub fn run(
         })?,
         None => Kind::of_path(&src).ok_or_else(|| {
             anyhow!(
-                "cannot tell what {} builds: it is not an .ass and sits in no                  render/collision/physics folder. Say which with --kind.",
+                "cannot tell what {} builds: it is not an .ass and sits in no render/collision/physics folder. Say which with --kind.",
                 src.display()
             )
         })?,

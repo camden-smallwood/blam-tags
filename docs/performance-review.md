@@ -233,7 +233,7 @@ Re-measure after each fix and add a row to the log at the bottom.
     left is float formatting in the JMS text writer (`{:.N}` through
     `grisu::format_exact`) — inherent to the format.
 
-- [ ] **P12. Converter hot spots** — Reported (measured by the review: 11 ms/effect … 278 ms/scenario)
+- [x] **P12. Converter hot spots** — Reported (measured by the review: 11 ms/effect … 278 ms/scenario)
   - `build_target_from_definitions` (`convert/mod.rs:2733`) runs
     `TagLayout::from_json` and then `TagFile::new` (a second full build), and
     the result is discarded when a kit template exists (`2030`). Build once,
@@ -254,6 +254,37 @@ Re-measure after each fix and add a row to the log at the bottom.
     `5678`, `5713`): use a push/truncate buffer.
   - `template_option_counts` (`2069`) re-reads and re-parses the chosen
     template every conversion.
+  - **Done** (uncommitted). Measured with `vbench` `conv` — H2 → halo3_mcc,
+    every output digested (converted tag and companions with layout guids
+    masked, report counts, sorted issues, route); identical to pre-P12 code
+    apart from B7's message whitespace, on 224 tags:
+    | | before P12 | after |
+    |---|---|---|
+    | mixed set (60 effect, 30 weapon, 40 projectile, 10 biped, 4 scenario, 20 model) | 870 ms | **301 ms** |
+    | 60 scenarios | 847 ms/tag | **116 ms/tag** |
+    | 963 effects | 2.64 ms/tag | **1.52 ms/tag** |
+    (The review's 278 ms/scenario was before P2/P4; those already halved it.)
+    - `validate_reference_fidelity`: issue paths parsed once (appended as
+      warnings are pushed, so it answers what the old scan did); `expected`
+      iterated in source order (B6).
+    - `clean_field_key` fast path for plain names (one allocation instead of
+      ~7); `clean_field_key_is_the_round_trip_for_every_schema_name` checks it
+      against the round trip on all 189,760 schema field names.
+    - `collect_reference_values` skips non-reference, non-container fields
+      before keying or decoding them.
+    - `MatchPlan`: field matching memoized per struct-pair *shape* (content
+      hash of both structs' guids, names, field names and types), reused for
+      every element and every same-shaped struct. Keyed by content, not
+      layout address, because companion tags are built on the stack and
+      moved. `BLAM_DEBUG_FIELD` bypasses it.
+    - `normalize_option_name` in one pass; checked against the old chain on
+      301,610 schema option and field names.
+    - `SchemaFieldAliases::load_cached` (process-wide, same stamp check as the
+      layout cache) and `ConversionMappingCatalog::load` parsed once
+      (`LazyLock`).
+    - Still open: `build_target_from_definitions` building twice (2.7% of an
+      effect now), `template_option_counts`, per-field path `String`s, and
+      the walker/value-match duplication (D3).
 
 - [ ] **P13. iostore hot spots** — Verified (code) / unmeasured
   - Oodle: `container/oodle.rs:61` builds a new `oozextract::Extractor` per
@@ -462,6 +493,15 @@ Re-measure after each fix and add a row to the log at the bottom.
   - vbench maps file extension → `definitions/halo2_mcc/<ext>.json`, which may
     explain the 540 failures, but 4 tags decoded and re-encoded differently.
     Identify them against the 28,195 / 28,195 gate.
+- [x] **B6. Conversion reports listed dropped references in a different order every run** — Fixed
+  - `validate_reference_fidelity` iterated a `HashSet`, so the same tag's
+    warnings came out in a different order per process. Now source-walk order,
+    deduplicated. Found because the converter A/B digests weren't stable.
+- [x] **B7. Lost `\` line continuations left space runs inside messages** — Fixed
+  - 13 string literals (converter warnings and errors, collision/sbsp import
+    errors, collision-verify diagnostics, a shell error) read like `was
+    <22 spaces> left empty`. Collapsed to one space; conversion output
+    otherwise identical.
 
 ---
 
@@ -474,5 +514,7 @@ Re-measure after each fix and add a row to the log at the bottom.
 | 2026-09-25 | + P4 + P5 + P6 | 1.12 s (path) / 0.79 s (bytes)¹ | 1.27 s¹ | 3.8 s | 4.2 s | 0.77 s | 0.60 s |
 | 2026-09-25 | + P7 | — | 0.49–0.73 s | — | — | — | — |
 | 2026-09-25 | + P14 (classic) | — | — | 3.06 s | 4.05 s | 0.58 s | 0.65 s |
+
+Conversion (H2 → halo3_mcc), separate from the table: see P12.
 
 ¹ Single runs of H3 vary ±5%; the P5 A/B over 3 reps is the reliable number (−3% read).
