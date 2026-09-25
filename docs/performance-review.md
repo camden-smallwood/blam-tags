@@ -15,6 +15,88 @@ classic CE / H2 decode → encode).
 
 ---
 
+## Outcome (2026-09-25 → 2026-09-26)
+
+29 commits, `be3634d` … `69b750b`. Every change was checked against real
+tags: byte-exact roundtrips, or digests of an output compared before and
+after. Where a corpus could not reach the code, a test or an equivalence
+argument stands in, and the commit and the item below say which.
+
+### Speed
+
+| Workload | Before | After |
+|---|---|---|
+| H3 `TagFile::read(path)`, 15,554 tags | 4.24 s | ~1.1 s |
+| H3 write, 15,554 tags | 1.24 s | ~0.5–0.7 s |
+| H2 classic read / write, 28,177 tags | 11.7 s / 26.6 s | 3.06 s / 4.05 s |
+| CE classic read / write, 11,539 tags | 6.9 s / 3.7 s | 0.58 s / 0.65 s |
+| Building every definition's layout (1,492) | 2.27 s | 0.66 s (then cached per process) |
+| Field lookup by name | ~116 ns | ~23 ns |
+| H2 → Halo 3 conversion: mixed set / per scenario | 870 ms / 847 ms | 301 ms / 116 ms |
+| JMS export, 1,614 H3 render models | ~10 s | ~7 s |
+| `Bitmap::new`, 3,210 H3 bitmaps | 113 ms | 6.8 ms |
+| Colour-plate inflate, H2 / CE | 4.1 s / 5.4 s | 2.8 s / ~2.0 s |
+| Render-model import, PRT off, 1,614 models | 13.9 s | 9.58 s |
+| Render-model import, PRT on, 300 models | 95.1 s | 84.3 s; 22.2 s with `prt_threads = 0` |
+| `cargo test --lib` (dev) / `target/debug` | 14.6 s / 66 GB | ~9 s / ~1 GB |
+
+Measured and turned down: fat LTO (no runtime gain, C2); a cursor over classic
+sub-chunks (made writes slower, P14); indexing sub-chunk lookups (~6 ns per
+field already, P9).
+
+### Duplication
+
+About 1,000 lines gone, among them: one block-codec walk for 12 bitmap
+decoders; one path-descent planner for the shared and mutable walks; one
+chunk-header validator and leaf-chunk table; one mesh-index reader; one
+tag-name helper; the importers' tag-writing helpers, vector math and
+quaternion math; the ASS BSP builders' placements; the converter's mutable
+walk and integer accessors; one LCS aligner, CRC, half-float, clamp,
+`write_floats`, edge-row read and yaw quaternion. Merges looked at and
+declined, with reasons, are marked **Decided against** below.
+
+### Bugs
+
+Found while measuring or merging copies — usually two copies that
+disagreed:
+
+- **Fixed:**
+  - B1 — JMS triangle indices corrupted after a missing vertex.
+  - B3 — JMS material cells matched by suffix, so `active shield` went out
+    as `inactive shield` on instantcover.
+  - B6 — conversion report order changed every run.
+  - B7 — 13 messages with lost line continuations.
+  - B9 — ASS sign-extended mesh indices past 32,767.
+  - B10 — `field_path_mut` could panic on truncated elements.
+  - B11, B12 — BSP and render-model imports not reproducible.
+  - B13 — H3 BSP ASS dropped every environment object (2,021 placements).
+  - B14 — H3 BSP ASS renamed 109 markers `marker_N`.
+- **Open:**
+  - B8 — `A4r4g4b4Font` decode panics on every image; needs format research.
+  - B2, B4 — reported by the review, not yet confirmed.
+  - B5 — four H2 roundtrip mismatches, unexplained; they predate the review
+    and are unchanged by it.
+
+### Open
+
+- **Needs Campaign Evolved content** to measure: P13, D1.
+- **Needs a decision:** the 56 `#[ignore] scratch_*` diagnostics in
+  `convert/mod.rs` (~4k lines). They use private converter internals, so
+  moving them to `examples/` would mean making those public.
+- **Smaller:**
+  - the rest of P15 (weld vertex clone, per-triangle section keys,
+    per-surface material lookup);
+  - P10's flag/enum allocations;
+  - D3's name normalizers and catalog;
+  - C4 (mimalloc, unmeasured).
+
+The benchmark harness (`vbench`: read/write, path, lookup, bitmap, export,
+import and conversion digests) lived in a session scratch directory and is
+not in the repo; each item below says what it measured, so it can be rebuilt
+from that.
+
+---
+
 ## Baseline
 
 Measured with `scratchpad/vbench` (standalone crate, path dependency, release +
