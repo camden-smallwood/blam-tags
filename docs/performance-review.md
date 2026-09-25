@@ -630,9 +630,15 @@ Re-measure after each fix and add a row to the log at the bottom.
     unchanged on all 1,614), so there is no corpus fixture for it.
 - [ ] **B2. `"PRT vertex type"` set twice** — Reported
   - `render_import.rs:~996` and `~1002`; the first write is dead.
-- [ ] **B3. Collision material match can false-match** — Reported
+- [x] **B3. JMS material slots matched cells by suffix** — Fixed (confirmed)
   - `jms.rs:~1400` / `ass.rs:~1951`: `ends_with(cell_label)` matches
     `"x perm region"` for `"perm region"`.
+  - Not just collision: the render-model and instance paths used it too.
+    Confirmed on `instantcover.render_model`: the `active shield` cell's
+    `instantcover_mainglow` triangles (600) matched `(2) inactive shield` and
+    went out under the inactive permutation's material. `jms::material_slot`
+    (one helper for the three copies) compares the cell exactly; that
+    render_model is the only one of 4,785 exports that changed.
 - [ ] **B4. `.utoc` directory-index parser can panic or loop on malformed input** — Reported
   - `iostore/mod.rs:~785-830`: unchecked `di[o..o + 4]` indexing and no cycle
     guard on the sibling / next-file chains.

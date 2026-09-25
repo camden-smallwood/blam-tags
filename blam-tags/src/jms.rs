@@ -922,19 +922,7 @@ impl JmsFile {
                         "default".to_owned()
                     };
                     let cell_label = format!("{perm_name} {region_name}");
-                    let jms_mat = match materials.iter().position(|m|
-                        m.name == shader_name && m.material_name.ends_with(&cell_label)
-                    ) {
-                        Some(idx) => idx as i32,
-                        None => {
-                            let slot = materials.len() + 1;
-                            materials.push(JmsMaterial {
-                                name: shader_name,
-                                material_name: format!("({slot}) {cell_label}"),
-                            });
-                            (materials.len() - 1) as i32
-                        }
-                    };
+                    let jms_mat = material_slot(&mut materials, shader_name, &cell_label);
 
                     let start = part.read_int_any("strip start index").unwrap_or(0).max(0) as usize;
                     let len = part.read_int_any("strip length").unwrap_or(0).max(0) as usize;
@@ -1384,19 +1372,7 @@ impl JmsFile {
             } else {
                 "default".to_owned()
             };
-            let jms_idx = match materials.iter().position(|m|
-                m.name == shader_name && m.material_name.ends_with(cell_label)
-            ) {
-                Some(i) => i as i32,
-                None => {
-                    let slot = materials.len() + 1;
-                    materials.push(JmsMaterial {
-                        name: shader_name,
-                        material_name: format!("({}) {}", slot, cell_label),
-                    });
-                    (materials.len() - 1) as i32
-                }
-            };
+            let jms_idx = material_slot(materials, shader_name, cell_label);
 
             // Triangle-fan the convex polygon.
             for k in 1..polygon.len() - 1 {
@@ -3006,19 +2982,7 @@ fn build_materials(root: &TagStruct<'_>)
                         "default".to_owned()
                     };
                     let cell_label = format!("{} {}", perm_name, region_name);
-                    let jms_idx = match materials.iter().position(|m|
-                        m.name == shader_name && m.material_name.ends_with(&cell_label)
-                    ) {
-                        Some(idx) => idx as i32,
-                        None => {
-                            let slot = materials.len() + 1;
-                            materials.push(JmsMaterial {
-                                name: shader_name,
-                                material_name: format!("({}) {}", slot, cell_label),
-                            });
-                            (materials.len() - 1) as i32
-                        }
-                    };
+                    let jms_idx = material_slot(&mut materials, shader_name, &cell_label);
                     part_material_map.insert((mi, part_i), jms_idx);
                 }
             }
@@ -3280,6 +3244,23 @@ fn append_instance_geometry(
 // raw_vertex_block reader
 //================================================================================
 
+/// The JMS material slot for `shader_name` in the cell `cell_label`
+/// (`"{permutation} {region}"`), added as `(slot) {cell_label}` if it is new.
+///
+/// The cell is compared exactly. Matching the stored name's *ending* made a
+/// `damaged base` cell reuse an `undamaged base` slot.
+fn material_slot(materials: &mut Vec<JmsMaterial>, shader_name: String, cell_label: &str) -> i32 {
+    let in_cell = |m: &JmsMaterial| {
+        m.material_name.split_once(") ").is_some_and(|(_, label)| label == cell_label)
+    };
+    if let Some(index) = materials.iter().position(|m| m.name == shader_name && in_cell(m)) {
+        return index as i32;
+    }
+    let slot = materials.len() + 1;
+    materials.push(JmsMaterial { name: shader_name, material_name: format!("({slot}) {cell_label}") });
+    (materials.len() - 1) as i32
+}
+
 /// A mesh's raw vertices, each decoded on first use and kept. The JMS output
 /// is unwelded — every triangle corner gets its own copy — and a strip mesh
 /// shares a vertex between ~6 triangles, so decoding per corner decoded (and
@@ -3439,8 +3420,21 @@ const EMPTY_SECTIONS_TRAILING: &[(&str, &[&str])] = &[
 #[cfg(test)]
 mod tests {
     use super::marker_display_name;
+    use super::material_slot;
     use super::{overlay_skeleton, JmsNode};
     use crate::math::{RealPoint3d, RealQuaternion};
+
+    /// A cell reuses only its own slot, not one whose label ends the same way
+    /// (`active shield` vs `inactive shield`, from instantcover).
+    #[test]
+    fn a_material_cell_is_matched_exactly() {
+        let mut materials = Vec::new();
+        assert_eq!(material_slot(&mut materials, "glow".into(), "inactive shield"), 0);
+        assert_eq!(material_slot(&mut materials, "glow".into(), "active shield"), 1);
+        assert_eq!(material_slot(&mut materials, "glow".into(), "inactive shield"), 0);
+        assert_eq!(material_slot(&mut materials, "base".into(), "active shield"), 2);
+        assert_eq!(materials[1].material_name, "(2) active shield");
+    }
 
     fn node(name: &str, x: f32) -> JmsNode {
         JmsNode {
