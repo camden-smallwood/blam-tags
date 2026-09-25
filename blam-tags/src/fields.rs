@@ -479,6 +479,74 @@ impl TagFieldData {
         Some((raw & (1u64 << bit)) != 0)
     }
 
+    /// The value of an integer-shaped variant — the integer types and every
+    /// block-index width — widened to `i128`. `None` for anything else.
+    pub(crate) fn integer(&self) -> Option<i128> {
+        use TagFieldData as D;
+        Some(match *self {
+            D::CharInteger(v) => v as i128,
+            D::ShortInteger(v) => v as i128,
+            D::LongInteger(v) => v as i128,
+            D::Int64Integer(v) => v as i128,
+            D::ByteInteger(v) => v as i128,
+            D::WordInteger(v) => v as i128,
+            D::DwordInteger(v) => v as i128,
+            D::QwordInteger(v) => v as i128,
+            D::CharBlockIndex(v) | D::CustomCharBlockIndex(v) => v as i128,
+            D::ShortBlockIndex(v) | D::CustomShortBlockIndex(v) => v as i128,
+            D::LongBlockIndex(v) | D::CustomLongBlockIndex(v) => v as i128,
+            _ => return None,
+        })
+    }
+
+    /// [`Self::integer`], also taking an enum's or flags' raw value.
+    pub(crate) fn int_any(&self) -> Option<i128> {
+        use TagFieldData as D;
+        self.integer().or(match *self {
+            D::CharEnum { value, .. } => Some(value as i128),
+            D::ShortEnum { value, .. } => Some(value as i128),
+            D::LongEnum { value, .. } => Some(value as i128),
+            D::ByteFlags { value, .. } | D::ByteBlockFlags(value) => Some(value as i128),
+            D::WordFlags { value, .. } | D::WordBlockFlags(value) => Some(value as i128),
+            D::LongFlags { value, .. } | D::LongBlockFlags(value) => Some(value as i128),
+            _ => None,
+        })
+    }
+
+    /// The same variant holding `value` instead, cut to its width as `as`
+    /// cuts. An enum's name is dropped — names are resolved from the layout on
+    /// read, so the next read names the new value; flags keep theirs. `None`
+    /// for a variant [`Self::int_any`] doesn't take.
+    pub(crate) fn with_int(&self, value: i64) -> Option<Self> {
+        use TagFieldData as D;
+        Some(match self {
+            D::CharInteger(_) => D::CharInteger(value as i8),
+            D::ByteInteger(_) => D::ByteInteger(value as u8),
+            D::ShortInteger(_) => D::ShortInteger(value as i16),
+            D::WordInteger(_) => D::WordInteger(value as u16),
+            D::LongInteger(_) => D::LongInteger(value as i32),
+            D::DwordInteger(_) => D::DwordInteger(value as u32),
+            D::Int64Integer(_) => D::Int64Integer(value),
+            D::QwordInteger(_) => D::QwordInteger(value as u64),
+            D::CharBlockIndex(_) => D::CharBlockIndex(value as i8),
+            D::ShortBlockIndex(_) => D::ShortBlockIndex(value as i16),
+            D::LongBlockIndex(_) => D::LongBlockIndex(value as i32),
+            D::CustomCharBlockIndex(_) => D::CustomCharBlockIndex(value as i8),
+            D::CustomShortBlockIndex(_) => D::CustomShortBlockIndex(value as i16),
+            D::CustomLongBlockIndex(_) => D::CustomLongBlockIndex(value as i32),
+            D::CharEnum { .. } => D::CharEnum { value: value as i8, name: None },
+            D::ShortEnum { .. } => D::ShortEnum { value: value as i16, name: None },
+            D::LongEnum { .. } => D::LongEnum { value: value as i32, name: None },
+            D::ByteFlags { names, .. } => D::ByteFlags { value: value as u8, names: names.clone() },
+            D::WordFlags { names, .. } => D::WordFlags { value: value as u16, names: names.clone() },
+            D::LongFlags { names, .. } => D::LongFlags { value: value as i32, names: names.clone() },
+            D::ByteBlockFlags(_) => D::ByteBlockFlags(value as u8),
+            D::WordBlockFlags(_) => D::WordBlockFlags(value as u16),
+            D::LongBlockFlags(_) => D::LongBlockFlags(value as i32),
+            _ => return None,
+        })
+    }
+
     /// Set or clear a single bit on a flags-shaped variant (including
     /// block-flags). Returns `true` on success, `false` if `self`
     /// isn't a flags variant. The bit is mutated in place; the
@@ -1233,6 +1301,52 @@ pub(crate) fn serialize_field(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `with_int` keeps the variant and cuts the value to its width; `int_any`
+    /// reads it back; `integer` takes only integers and block indices.
+    #[test]
+    fn integer_accessors_keep_the_variant_and_its_width() {
+        use TagFieldData as D;
+        let names = vec![(0u32, "a".to_owned())];
+        let cases = [
+            (D::CharInteger(0), -1i128, true),
+            (D::ByteInteger(0), 255, true),
+            (D::ShortInteger(0), -1, true),
+            (D::WordInteger(0), 65535, true),
+            (D::LongInteger(0), -1, true),
+            (D::DwordInteger(0), 4294967295, true),
+            (D::Int64Integer(0), -1, true),
+            (D::QwordInteger(0), u64::MAX as i128, true),
+            (D::CharBlockIndex(0), -1, true),
+            (D::CustomCharBlockIndex(0), -1, true),
+            (D::ShortBlockIndex(0), -1, true),
+            (D::CustomShortBlockIndex(0), -1, true),
+            (D::LongBlockIndex(0), -1, true),
+            (D::CustomLongBlockIndex(0), -1, true),
+            (D::CharEnum { value: 0, name: Some("x".into()) }, -1, false),
+            (D::ShortEnum { value: 0, name: None }, -1, false),
+            (D::LongEnum { value: 0, name: None }, -1, false),
+            (D::ByteFlags { value: 0, names: names.clone() }, 255, false),
+            (D::WordFlags { value: 0, names: names.clone() }, 65535, false),
+            (D::LongFlags { value: 0, names: names.clone() }, -1, false),
+            (D::ByteBlockFlags(0), 255, false),
+            (D::WordBlockFlags(0), 65535, false),
+            (D::LongBlockFlags(0), -1, false),
+        ];
+        for (original, expected, is_integer) in cases {
+            let written = original.with_int(-1).expect("integer-shaped");
+            assert_eq!(std::mem::discriminant(&written), std::mem::discriminant(&original));
+            assert_eq!(written.int_any(), Some(expected), "{written:?}");
+            assert_eq!(written.integer().is_some(), is_integer, "{written:?}");
+        }
+        // An enum's name is re-resolved on read; flags keep theirs.
+        assert!(matches!(D::CharEnum { value: 1, name: Some("x".into()) }.with_int(2),
+            Some(D::CharEnum { value: 2, name: None })));
+        assert!(matches!(D::ByteFlags { value: 1, names: names.clone() }.with_int(3),
+            Some(D::ByteFlags { value: 3, names: n }) if n == names));
+        assert!(D::Real(1.0).with_int(1).is_none());
+        assert_eq!(D::Real(1.0).int_any(), None);
+    }
 
     // A tag_reference's group FOURCC must survive a read -> edit -> write
     // round-trip in the file's wire endian. Halo CE tags are big-endian and

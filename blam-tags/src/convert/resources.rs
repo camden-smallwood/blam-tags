@@ -1277,33 +1277,22 @@ fn clear_flags_by_name(elem: &mut TagStructMut<'_>, field_name: &str, bits: &[&s
     let Some(mut field) = elem.field_mut(field_name) else {
         return;
     };
-    let cleared = match field.as_ref().value() {
-        Some(TagFieldData::ByteFlags { mut value, names }) => {
-            for (bit, name) in &names {
-                if bits.contains(&name.as_str()) {
-                    value &= !(1u8 << bit);
-                }
-            }
-            TagFieldData::ByteFlags { value, names }
-        }
-        Some(TagFieldData::WordFlags { mut value, names }) => {
-            for (bit, name) in &names {
-                if bits.contains(&name.as_str()) {
-                    value &= !(1u16 << bit);
-                }
-            }
-            TagFieldData::WordFlags { value, names }
-        }
-        Some(TagFieldData::LongFlags { mut value, names }) => {
-            for (bit, name) in &names {
-                if bits.contains(&name.as_str()) {
-                    value &= !(1i32 << bit);
-                }
-            }
-            TagFieldData::LongFlags { value, names }
-        }
+    let Some(mut cleared) = field.as_ref().value() else {
+        return;
+    };
+    let wanted: Vec<u32> = match &cleared {
+        TagFieldData::ByteFlags { names, .. }
+        | TagFieldData::WordFlags { names, .. }
+        | TagFieldData::LongFlags { names, .. } => names
+            .iter()
+            .filter(|(_, name)| bits.contains(&name.as_str()))
+            .map(|(bit, _)| *bit)
+            .collect(),
         _ => return,
     };
+    for bit in wanted {
+        cleared.set_flag_bit(bit, false);
+    }
     let _ = field.set(cleared);
 }
 
@@ -1348,51 +1337,8 @@ fn set_int_field(elem: &mut TagStructMut<'_>, name: &str, value: i64) {
     let Some(mut field) = elem.field_mut(name) else {
         return;
     };
-    let replacement = match field.as_ref().value() {
-        Some(TagFieldData::CharInteger(_)) => TagFieldData::CharInteger(value as i8),
-        Some(TagFieldData::ByteInteger(_)) => TagFieldData::ByteInteger(value as u8),
-        Some(TagFieldData::ShortInteger(_)) => TagFieldData::ShortInteger(value as i16),
-        Some(TagFieldData::WordInteger(_)) => TagFieldData::WordInteger(value as u16),
-        Some(TagFieldData::LongInteger(_)) => TagFieldData::LongInteger(value as i32),
-        Some(TagFieldData::DwordInteger(_)) => TagFieldData::DwordInteger(value as u32),
-        Some(TagFieldData::Int64Integer(_)) => TagFieldData::Int64Integer(value),
-        Some(TagFieldData::QwordInteger(_)) => TagFieldData::QwordInteger(value as u64),
-        Some(TagFieldData::CharBlockIndex(_)) => TagFieldData::CharBlockIndex(value as i8),
-        Some(TagFieldData::ShortBlockIndex(_)) => TagFieldData::ShortBlockIndex(value as i16),
-        Some(TagFieldData::LongBlockIndex(_)) => TagFieldData::LongBlockIndex(value as i32),
-        Some(TagFieldData::CustomCharBlockIndex(_)) => {
-            TagFieldData::CustomCharBlockIndex(value as i8)
-        }
-        Some(TagFieldData::CustomShortBlockIndex(_)) => {
-            TagFieldData::CustomShortBlockIndex(value as i16)
-        }
-        Some(TagFieldData::CustomLongBlockIndex(_)) => {
-            TagFieldData::CustomLongBlockIndex(value as i32)
-        }
-        // Names are resolved from the layout on read, so `None` here is not a
-        // loss -- the next read of this field resolves the new value's name.
-        Some(TagFieldData::CharEnum { .. }) => {
-            TagFieldData::CharEnum { value: value as i8, name: None }
-        }
-        Some(TagFieldData::ShortEnum { .. }) => {
-            TagFieldData::ShortEnum { value: value as i16, name: None }
-        }
-        Some(TagFieldData::LongEnum { .. }) => {
-            TagFieldData::LongEnum { value: value as i32, name: None }
-        }
-        Some(TagFieldData::ByteFlags { names, .. }) => {
-            TagFieldData::ByteFlags { value: value as u8, names }
-        }
-        Some(TagFieldData::WordFlags { names, .. }) => {
-            TagFieldData::WordFlags { value: value as u16, names }
-        }
-        Some(TagFieldData::LongFlags { names, .. }) => {
-            TagFieldData::LongFlags { value: value as i32, names }
-        }
-        Some(TagFieldData::ByteBlockFlags(_)) => TagFieldData::ByteBlockFlags(value as u8),
-        Some(TagFieldData::WordBlockFlags(_)) => TagFieldData::WordBlockFlags(value as u16),
-        Some(TagFieldData::LongBlockFlags(_)) => TagFieldData::LongBlockFlags(value as i32),
-        _ => return,
+    let Some(replacement) = field.as_ref().value().and_then(|v| v.with_int(value)) else {
+        return;
     };
     let _ = field.set(replacement);
 }

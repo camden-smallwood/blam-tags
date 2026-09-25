@@ -443,6 +443,17 @@ Re-measure after each fix and add a row to the log at the bottom.
     `value_is_meaningful`, `integer_value`, `set_int_field`,
     `clear_flags_by_name`, `read_int_any`, …) → methods on `TagFieldData`
     generated from one variant list.
+    **Integer part done**: `TagFieldData::integer` / `int_any` / `with_int`
+    (`pub(crate)`) replace `convert::integer_value`, the body of
+    `api::read_int_any` and the 25-arm `set_int_field`;
+    `clear_flags_by_name` uses the existing `set_flag_bit`. Only two copies
+    actually extracted integers (the shell/Python matches format or set, a
+    different job). Verified: 214 conversions (incl. 80 bitmaps, 40 render
+    models, 20 animation graphs), 4,785 exports and 3,210 bitmaps identical;
+    H2 sources carry no pageable resources, so the resource paths that call
+    `set_int_field` are pinned by `integer_accessors_keep_the_variant_and_its_width`
+    rather than the corpus. `default_field_value` / `value_is_meaningful`
+    keep their own matches — each variant's answer differs there.
   - 7 name normalizers (`clean_field_key`, `normalize_option_name`,
     `option_name_aliases`, `squashed_parameter_name`, the inline split in
     `field_names_match`, `typed_enums::fold`, `clean_field_name`); a

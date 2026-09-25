@@ -321,32 +321,7 @@ impl<'a> TagStruct<'a> {
     /// `i128` is wide enough to losslessly hold every variant —
     /// notably `QwordInteger(u64)` would wrap to negative under `i64`.
     pub fn read_int_any(&self, name: &str) -> Option<i128> {
-        match self.field(name)?.value()? {
-            TagFieldData::CharInteger(v) => Some(v as i128),
-            TagFieldData::ShortInteger(v) => Some(v as i128),
-            TagFieldData::LongInteger(v) => Some(v as i128),
-            TagFieldData::Int64Integer(v) => Some(v as i128),
-            TagFieldData::ByteInteger(v) => Some(v as i128),
-            TagFieldData::WordInteger(v) => Some(v as i128),
-            TagFieldData::DwordInteger(v) => Some(v as i128),
-            TagFieldData::QwordInteger(v) => Some(v as i128),
-            TagFieldData::CharBlockIndex(v) => Some(v as i128),
-            TagFieldData::ShortBlockIndex(v) => Some(v as i128),
-            TagFieldData::LongBlockIndex(v) => Some(v as i128),
-            TagFieldData::CustomCharBlockIndex(v) => Some(v as i128),
-            TagFieldData::CustomShortBlockIndex(v) => Some(v as i128),
-            TagFieldData::CustomLongBlockIndex(v) => Some(v as i128),
-            TagFieldData::CharEnum { value, .. } => Some(value as i128),
-            TagFieldData::ShortEnum { value, .. } => Some(value as i128),
-            TagFieldData::LongEnum { value, .. } => Some(value as i128),
-            TagFieldData::ByteFlags { value, .. } => Some(value as i128),
-            TagFieldData::WordFlags { value, .. } => Some(value as i128),
-            TagFieldData::LongFlags { value, .. } => Some(value as i128),
-            TagFieldData::ByteBlockFlags(v) => Some(v as i128),
-            TagFieldData::WordBlockFlags(v) => Some(v as i128),
-            TagFieldData::LongBlockFlags(v) => Some(v as i128),
-            _ => None,
-        }
+        self.field(name)?.value()?.int_any()
     }
 
     /// Read a real-shaped field as `f32`. Accepts `Real`,

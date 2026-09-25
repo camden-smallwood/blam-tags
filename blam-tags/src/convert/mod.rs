@@ -5165,7 +5165,7 @@ fn report_legacy_explicit_function(
     if !wants_blob || field_ordinal_by_key(target.as_ref(), "function type").is_some() {
         return consumed;
     }
-    let kind = function_type.value().and_then(integer_value).unwrap_or(-1);
+    let kind = function_type.value().and_then(|v| v.integer()).unwrap_or(-1);
     record_unsupported(
         context,
         path.to_owned(),
@@ -6117,7 +6117,7 @@ fn function_bytes_from_block(block: TagBlock<'_>) -> Option<Vec<u8>> {
             // More than one value per element means this is not a byte block.
             return None;
         }
-        bytes.push(u8::try_from(integer_value(only.value()?)? & 0xff).ok()?);
+        bytes.push(u8::try_from(only.value()?.integer()? & 0xff).ok()?);
     }
     Some(bytes)
 }
@@ -6560,7 +6560,7 @@ fn convert_integer(
     path: &str,
     context: &mut ConversionContext<'_>,
 ) {
-    let Some(value) = source.value().and_then(integer_value) else {
+    let Some(value) = source.value().and_then(|v| v.integer()) else {
         return;
     };
     let target_type = target.as_ref().field_type();
@@ -6821,29 +6821,6 @@ fn is_string_type(value: TagFieldType) -> bool {
 
 pub fn is_string_id_type(value: TagFieldType) -> bool {
     matches!(value, TagFieldType::StringId | TagFieldType::OldStringId)
-}
-
-fn integer_value(value: TagFieldData) -> Option<i128> {
-    match value {
-        TagFieldData::CharInteger(value) => Some(value as i128),
-        TagFieldData::ShortInteger(value) => Some(value as i128),
-        TagFieldData::LongInteger(value) => Some(value as i128),
-        TagFieldData::Int64Integer(value) => Some(value as i128),
-        TagFieldData::ByteInteger(value) => Some(value as i128),
-        TagFieldData::WordInteger(value) => Some(value as i128),
-        TagFieldData::DwordInteger(value) => Some(value as i128),
-        TagFieldData::QwordInteger(value) => Some(value as i128),
-        TagFieldData::CharBlockIndex(value) | TagFieldData::CustomCharBlockIndex(value) => {
-            Some(value as i128)
-        }
-        TagFieldData::ShortBlockIndex(value) | TagFieldData::CustomShortBlockIndex(value) => {
-            Some(value as i128)
-        }
-        TagFieldData::LongBlockIndex(value) | TagFieldData::CustomLongBlockIndex(value) => {
-            Some(value as i128)
-        }
-        _ => None,
-    }
 }
 
 fn integer_field_value(field_type: TagFieldType, value: i128) -> Option<TagFieldData> {
@@ -9576,7 +9553,7 @@ mod tests {
         // reported impossible types like 40 and 24.
         if let Some(function_type) = field_by_key(value, "function type")
             .and_then(|field| field.value())
-            .and_then(integer_value)
+            .and_then(|v| v.integer())
             && let Some(values) = field_by_key(value, "values").and_then(|field| field.as_block())
         {
             *explicit += 1;
@@ -11048,7 +11025,7 @@ mod tests {
                     block
                         .iter()
                         .filter_map(|element| {
-                            field_by_key(element, "pixels offset")?.value().and_then(integer_value)
+                            field_by_key(element, "pixels offset")?.value().and_then(|v| v.integer())
                         })
                         .collect()
                 })
@@ -11337,7 +11314,7 @@ mod tests {
                     block
                         .iter()
                         .filter_map(|element| {
-                            field_by_key(element, "pixels offset")?.value().and_then(integer_value)
+                            field_by_key(element, "pixels offset")?.value().and_then(|v| v.integer())
                         })
                         .collect()
                 })
@@ -11838,7 +11815,7 @@ mod tests {
             if let Some(data) = field.value() {
                 let number = match &data {
                     TagFieldData::Real(v) | TagFieldData::Angle(v) => Some((*v as f64, "real")),
-                    _ => integer_value(data).map(|v| (v as f64, "integer")),
+                    _ => data.integer().map(|v| (v as f64, "integer")),
                 };
                 if let Some((number, kind)) = number
                     && !key.is_empty()
@@ -11897,7 +11874,7 @@ mod tests {
                         let byte = element
                             .fields()
                             .find_map(|f| f.value())
-                            .and_then(integer_value)
+                            .and_then(|v| v.integer())
                             .unwrap_or(0);
                         bytes.push(byte as u8);
                     }
