@@ -499,14 +499,10 @@ impl TagFile {
         if !matches!(self.container, TagContainer::Mcc) {
             return self.write_to_bytes();
         }
-        // Same bytes as `write_to`, with the checksum taken over the `tag!`
-        // stream where it lands rather than over a second serialization of it.
+        // Same bytes as `write_to_bytes`, with the checksum taken over the
+        // `tag!` stream where it lands rather than over a second serialization.
         let mut bytes = Vec::new();
-        self.header.write(&mut bytes)?;
-        let main_stream_start = bytes.len();
-        self.tag_stream.write(u32::from_be_bytes(*b"tag!"), &mut bytes)?;
-        let main_stream = main_stream_start..bytes.len();
-        self.write_optional_streams(&mut bytes)?;
+        let main_stream = self.write_mcc_into(&mut bytes)?;
         patch_live_reload_checksum(&mut bytes, main_stream);
         Ok(bytes)
     }
@@ -525,37 +521,39 @@ impl TagFile {
     /// Serialize this tag to a `Vec<u8>`. Mirrors [`TagFile::write`];
     /// useful for fuzzing roundtrips and in-memory tag pipelines.
     pub fn write_to_bytes(&self) -> std::io::Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        self.write_to(&mut buf)?;
-        Ok(buf)
-    }
-
-    fn write_to<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
         // Classic (Halo CE / H2) tags serialize as flat bytes with a
         // reconstructed 64-byte header — no MCC chunking.
         if let TagContainer::Classic { engine, header } = &self.container {
-            let bytes = crate::classic::write_classic_tag(self, *engine, header);
-            return writer.write_all(&bytes);
+            return Ok(crate::classic::write_classic_tag(self, *engine, header));
         }
-
-        self.header.write(writer)?;
-        self.tag_stream.write(u32::from_be_bytes(*b"tag!"), writer)?;
-        self.write_optional_streams(writer)
+        let mut bytes = Vec::new();
+        self.write_mcc_into(&mut bytes)?;
+        Ok(bytes)
     }
 
-    /// The `want`, `info` and `assd` streams that follow `tag!`, in that order.
-    fn write_optional_streams<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        if let Some(dependency_list_stream) = &self.dependency_list_stream {
-            dependency_list_stream.write(u32::from_be_bytes(*b"want"), writer)?;
-        }
-        if let Some(import_info_stream) = &self.import_info_stream {
-            import_info_stream.write(u32::from_be_bytes(*b"info"), writer)?;
-        }
-        if let Some(asset_depot_storage_stream) = &self.asset_depot_storage_stream {
-            asset_depot_storage_stream.write(u32::from_be_bytes(*b"assd"), writer)?;
-        }
+    fn write_to<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        writer.write_all(&self.write_to_bytes()?)
+    }
 
-        Ok(())
+    /// The MCC file: header, `tag!`, then the `want`, `info` and `assd`
+    /// streams that are present, in that order. Returns where `tag!` landed,
+    /// which the live-reload checksum covers.
+    fn write_mcc_into(&self, out: &mut Vec<u8>) -> std::io::Result<std::ops::Range<usize>> {
+        self.header.write(out)?;
+        let main_stream_start = out.len();
+        self.tag_stream.write(u32::from_be_bytes(*b"tag!"), out)?;
+        let main_stream = main_stream_start..out.len();
+        let optional_streams = [
+            (&self.dependency_list_stream, *b"want"),
+            (&self.import_info_stream, *b"info"),
+            (&self.asset_depot_storage_stream, *b"assd"),
+        ];
+        for (stream, signature) in optional_streams {
+            if let Some(stream) = stream {
+                stream.write(u32::from_be_bytes(signature), out)?;
+            }
+        }
+        Ok(main_stream)
     }
 
     //

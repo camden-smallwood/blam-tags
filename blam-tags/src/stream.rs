@@ -4,7 +4,7 @@
 //! same structure, different content (main data, dependency list,
 //! import info, asset depot storage).
 
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Seek};
 
 use crate::data::TagBlockData;
 use crate::error::TagReadError;
@@ -126,22 +126,18 @@ impl TagStream {
     /// The payload is a `blay` chunk (block layout) followed by a
     /// `bdat` chunk (block data). Both the outer stream chunk and
     /// `blay` have version 0; `bdat` has version 1.
-    pub(crate) fn write<W: Write>(
-        &self,
-        chunk_signature: u32,
-        writer: &mut W,
-    ) -> std::io::Result<()> {
-        let mut stream_body = Vec::new();
+    pub(crate) fn write(&self, chunk_signature: u32, out: &mut Vec<u8>) -> std::io::Result<()> {
+        let stream = begin_tag_chunk(out, chunk_signature, 0);
 
         // blay chunk
-        self.layout.write(&mut stream_body)?;
+        self.layout.write(out)?;
 
         // bdat chunk — wraps the root TagBlockData chunk (tgbl).
-        let mut bdat_body = Vec::new();
-        self.data.write(&self.layout, &mut bdat_body)?;
-        write_tag_chunk_content(&mut stream_body, u32::from_be_bytes(*b"bdat"), 1, &bdat_body)?;
+        let bdat = begin_tag_chunk(out, u32::from_be_bytes(*b"bdat"), 1);
+        self.data.write(&self.layout, out)?;
+        end_tag_chunk(out, bdat);
 
-        write_tag_chunk_content(writer, chunk_signature, 0, &stream_body)?;
+        end_tag_chunk(out, stream);
         Ok(())
     }
 }

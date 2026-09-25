@@ -201,6 +201,29 @@ pub fn write_tag_chunk_content<W: Write>(
     Ok(())
 }
 
+/// Open a chunk in `out`: its header, with a size of zero for
+/// [`end_tag_chunk`] to fill in once the payload has been written after it.
+/// Returns where the chunk starts.
+///
+/// Nested chunks are written straight into the one buffer this way. Writing
+/// each into its own `Vec` and copying that into its parent re-copied every
+/// byte once per level of nesting.
+pub(crate) fn begin_tag_chunk(out: &mut Vec<u8>, signature: u32, version: u32) -> usize {
+    let start = out.len();
+    out.extend_from_slice(&signature.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    start
+}
+
+/// Close the chunk [`begin_tag_chunk`] opened at `start`: patch its size to
+/// cover everything written after its header. Returns that size.
+pub(crate) fn end_tag_chunk(out: &mut [u8], start: usize) -> u32 {
+    let size = (out.len() - start - 12) as u32;
+    out[start + 8..start + 12].copy_from_slice(&size.to_le_bytes());
+    size
+}
+
 /// Read a chunk header and verify its signature, then read the payload into a
 /// `Vec<u8>`. Returns the chunk's `version` (preserved for byte-exact roundtrip)
 /// and its `content`. The signature is implicit in the caller's

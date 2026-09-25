@@ -145,13 +145,23 @@ Re-measure after each fix and add a row to the log at the bottom.
 
 ## Tier 2 — structural
 
-- [ ] **P7. Each chunk level is written to its own buffer, then copied into its parent** — Verified
+- [x] **P7. Each chunk level is written to its own buffer, then copied into its parent** — Verified
   - Where: `stream.rs:134-144`, `data.rs:517-521` (tgst), `1284-1297` (tgbl),
     `1148-1151` (tgrc), `layout.rs:584-591`.
   - Cost: `_platform_memmove` tops the write profile; write is 1.6× read.
     Copying grows with nesting depth × tag size.
   - Fix: one output `Vec<u8>`; push a 12-byte placeholder header, write the
     body, patch the size in place. Or a size pre-pass.
+  - **Done** (uncommitted): `io::begin_tag_chunk` / `end_tag_chunk` open a
+    chunk with a zero size and patch it once its payload is written; tgst
+    (size also in the version slot), tgbl, tgrc, bdat and the stream chunk all
+    write into the one buffer. `TagStream::write` takes `&mut Vec<u8>`, and
+    `TagFile::write_mcc_into` is the single MCC write path behind
+    `write_to_bytes`, `write` and `write_atomic`. H3 write, A/B over 3 runs:
+    1.31 s → **0.49–0.73 s**, 0 mismatches on 15,554 tags; `write_atomic`
+    output byte-identical on 2,223. What `memmove` remains is the one
+    unavoidable copy of leaf data blobs (578 samples) — regrowth is 94.
+    Not done: `TagLayout::write` still buffers its body (small).
 
 - [ ] **P8. Field lookup by name re-cleans both names on every comparison** — Verified
   - Where: `data.rs:700` `find_field_by_name` → `field_name_matches`
@@ -409,5 +419,6 @@ Re-measure after each fix and add a row to the log at the bottom.
 | 2026-09-25 | baseline | 4.24 s (path) / 0.78 s (bytes) | 1.24 s | 11.7 s | 26.6 s | 6.9 s | 3.7 s |
 | 2026-09-25 | P1 + P2 + P3 | 1.05 s (path) / 0.75 s (bytes) | 1.18 s | 9.9 s | 4.1 s | 3.4 s | 0.59 s |
 | 2026-09-25 | + P4 + P5 + P6 | 1.12 s (path) / 0.79 s (bytes)¹ | 1.27 s¹ | 3.8 s | 4.2 s | 0.77 s | 0.60 s |
+| 2026-09-25 | + P7 | — | 0.49–0.73 s | — | — | — | — |
 
 ¹ Single runs of H3 vary ±5%; the P5 A/B over 3 reps is the reliable number (−3% read).

@@ -11,7 +11,7 @@
 //! This matches the on-disk `tgbl` chunk layout 1:1: `count + flags +
 //! concatenated element bytes + per-element tgst sub-chunks`.
 
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 
 use crate::error::TagReadError;
 use crate::fields::{deserialize_field, serialize_field, TagFieldData, TagFieldType};
@@ -509,16 +509,12 @@ impl TagStructData {
     /// Write this struct as a `tgst` chunk. Emits only the sub_chunks
     /// content; the struct's raw bytes flow out through the enclosing
     /// block's `raw_data` concatenation.
-    pub(crate) fn write<W: Write>(
-        &self,
-        layout: &TagLayout,
-        writer: &mut W,
-    ) -> std::io::Result<()> {
-        let mut content = Vec::new();
-        write_sub_chunks(&self.sub_chunks, layout, &mut content)?;
-        let size = content.len() as u32;
-        write_tag_chunk_header(writer, u32::from_be_bytes(*b"tgst"), size, size)?;
-        writer.write_all(&content)?;
+    pub(crate) fn write(&self, layout: &TagLayout, out: &mut Vec<u8>) -> std::io::Result<()> {
+        let start = begin_tag_chunk(out, u32::from_be_bytes(*b"tgst"), 0);
+        write_sub_chunks(&self.sub_chunks, layout, out)?;
+        // A tgst carries its size in the version slot as well.
+        let size = end_tag_chunk(out, start);
+        out[start + 4..start + 8].copy_from_slice(&size.to_le_bytes());
         Ok(())
     }
 
@@ -1093,10 +1089,10 @@ fn read_sub_chunks<R: Seek + Read>(
 
 /// Serialize a vec of sub-chunk entries in stored order. Mirrors
 /// `read_sub_chunks`.
-fn write_sub_chunks<W: Write>(
+fn write_sub_chunks(
     entries: &[TagSubChunkEntry],
     layout: &TagLayout,
-    writer: &mut W,
+    writer: &mut Vec<u8>,
 ) -> std::io::Result<()> {
     for entry in entries {
         match &entry.content {
@@ -1145,10 +1141,10 @@ fn write_sub_chunks<W: Write>(
             }
 
             TagSubChunkContent::Resource(TagResourceChunk::Exploded { exploded, struct_data, .. }) => {
-                let mut inner = Vec::new();
-                write_tag_chunk_content(&mut inner, u32::from_be_bytes(*b"tgdt"), 0, exploded)?;
-                struct_data.write(layout, &mut inner)?;
-                write_tag_chunk_content(writer, u32::from_be_bytes(*b"tgrc"), 0, &inner)?;
+                let start = begin_tag_chunk(writer, u32::from_be_bytes(*b"tgrc"), 0);
+                write_tag_chunk_content(writer, u32::from_be_bytes(*b"tgdt"), 0, exploded)?;
+                struct_data.write(layout, writer)?;
+                end_tag_chunk(writer, start);
             }
 
             TagSubChunkContent::Resource(TagResourceChunk::Xsync { version, payload }) => {
@@ -1276,24 +1272,20 @@ impl TagBlockData {
     }
 
     /// Write this block as a `tgbl` chunk.
-    pub(crate) fn write<W: Write>(
-        &self,
-        layout: &TagLayout,
-        writer: &mut W,
-    ) -> std::io::Result<()> {
-        let mut body = Vec::new();
+    pub(crate) fn write(&self, layout: &TagLayout, out: &mut Vec<u8>) -> std::io::Result<()> {
+        let start = begin_tag_chunk(out, u32::from_be_bytes(*b"tgbl"), 0);
         let element_count = self.elements.len() as u32;
-        body.extend_from_slice(&element_count.to_le_bytes());
-        body.extend_from_slice(&self.flags.to_le_bytes());
-        body.extend_from_slice(&self.raw_data);
+        out.extend_from_slice(&element_count.to_le_bytes());
+        out.extend_from_slice(&self.flags.to_le_bytes());
+        out.extend_from_slice(&self.raw_data);
 
         if (self.flags & 1) == 0 {
             for element in &self.elements {
-                element.write(layout, &mut body)?;
+                element.write(layout, out)?;
             }
         }
 
-        write_tag_chunk_content(writer, u32::from_be_bytes(*b"tgbl"), 0, &body)?;
+        end_tag_chunk(out, start);
         Ok(())
     }
 
