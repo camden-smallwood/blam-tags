@@ -429,6 +429,19 @@ Re-measure after each fix and add a row to the log at the bottom.
   - 14 hand-written recursive walkers (`convert/mod.rs` + `resources.rs`),
     many O(n²) via `fields().nth(i)` + `field_at_mut(i)` → one
     `visit_structs` / `visit_structs_mut` in `api.rs`. ≈250–300 lines.
+    **Mutable half done**: `resources::for_each_struct_mut` (visit, then
+    inline structs and block elements, optionally array elements, over
+    `for_each_field_mut` — O(n) per struct instead of `field_at_mut(i)`'s
+    O(n²)) carries `settle_geometry_in`, `swap_user_data_in`,
+    `clear_all_resources` and `swap_curves_in`; each keeps only its own
+    per-struct work. These run only on a byte-order upgrade (Xbox 360
+    sources), which no local corpus reaches, so they were checked against
+    verbatim copies of the old walkers in a throwaway test over all 15,554 H3
+    object tags: identical bytes and counts for every tag, with each walker
+    changing real tags (12 / 1,542 / 652 / 3,137). **Left as is:** the
+    read-only walkers — each builds its path differently (raw vs cleaned
+    names, with or without array indices), so one helper would need as many
+    options as there are walkers.
   - `initialize_block_index_defaults` (`4307`) duplicates
     `api.rs:1440 default_new_element_block_indices` and runs twice per new
     element.

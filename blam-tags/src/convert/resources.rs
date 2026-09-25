@@ -146,41 +146,27 @@ pub(super) fn settle_uncompiled_geometry(
 /// the groups that carry geometry, and a tag that grows another one should not
 /// need a list edited.
 fn settle_geometry_in(value: &mut TagStructMut<'_>, settled: &mut usize) {
-    let is_geometry = {
-        let view = value.as_ref();
-        view.field("meshes").and_then(|f| f.as_block()).is_some()
-            && view.field("runtime flags").is_some()
-    };
-    if is_geometry {
-        clear_processed_flag(value);
-        if let Some(mut field) = value.field_mut("meshes")
-            && let Some(mut meshes) = field.as_block_mut()
-        {
-            for index in 0..meshes.len() {
-                if let Some(mut mesh) = meshes.element_mut(index) {
-                    settle_mesh(&mut mesh);
-                    *settled += 1;
-                }
-            }
-        }
-    }
-    clear_compiled_buffer_blocks(value);
-    for index in 0..value.as_ref().fields().count() {
-        let Some(mut field) = value.field_at_mut(index) else {
-            continue;
+    for_each_struct_mut(value, false, &mut |value| {
+        let is_geometry = {
+            let view = value.as_ref();
+            view.field("meshes").and_then(|f| f.as_block()).is_some()
+                && view.field("runtime flags").is_some()
         };
-        if let Some(mut nested) = field.as_struct_mut() {
-            settle_geometry_in(&mut nested, settled);
-            continue;
-        }
-        if let Some(mut block) = field.as_block_mut() {
-            for element in 0..block.len() {
-                if let Some(mut element) = block.element_mut(element) {
-                    settle_geometry_in(&mut element, settled);
+        if is_geometry {
+            clear_processed_flag(value);
+            if let Some(mut field) = value.field_mut("meshes")
+                && let Some(mut meshes) = field.as_block_mut()
+            {
+                for index in 0..meshes.len() {
+                    if let Some(mut mesh) = meshes.element_mut(index) {
+                        settle_mesh(&mut mesh);
+                        *settled += 1;
+                    }
                 }
             }
         }
-    }
+        clear_compiled_buffer_blocks(value);
+    });
 }
 
 /// Blocks whose whole substance is a pointer into the compiled geometry
@@ -301,43 +287,29 @@ pub(super) fn swap_geometry_user_data(
 }
 
 fn swap_user_data_in(value: &mut TagStructMut<'_>, swapped: &mut usize) {
-    let is_word_payload = {
-        let view = value.as_ref();
-        view.field_path("user data header")
-            .and_then(|f| f.as_struct())
-            .and_then(|header| header.read_enum_name("data type"))
-            .is_some_and(|kind| kind == "PRT Info")
-    };
-    if is_word_payload
-        && let Some(mut field) = value.field_mut("user data")
-    {
-        let payload = field.as_ref().as_data().map(<[u8]>::to_vec);
-        if let Some(mut bytes) = payload
-            && bytes.len() % 4 == 0
-        {
-            for word in bytes.chunks_exact_mut(4) {
-                word.reverse();
-            }
-            let _ = field.set(TagFieldData::Data(bytes));
-            *swapped += 1;
-        }
-    }
-    for index in 0..value.as_ref().fields().count() {
-        let Some(mut field) = value.field_at_mut(index) else {
-            continue;
+    for_each_struct_mut(value, false, &mut |value| {
+        let is_word_payload = {
+            let view = value.as_ref();
+            view.field_path("user data header")
+                .and_then(|f| f.as_struct())
+                .and_then(|header| header.read_enum_name("data type"))
+                .is_some_and(|kind| kind == "PRT Info")
         };
-        if let Some(mut nested) = field.as_struct_mut() {
-            swap_user_data_in(&mut nested, swapped);
-            continue;
-        }
-        if let Some(mut block) = field.as_block_mut() {
-            for element in 0..block.len() {
-                if let Some(mut element) = block.element_mut(element) {
-                    swap_user_data_in(&mut element, swapped);
+        if is_word_payload
+            && let Some(mut field) = value.field_mut("user data")
+        {
+            let payload = field.as_ref().as_data().map(<[u8]>::to_vec);
+            if let Some(mut bytes) = payload
+                && bytes.len() % 4 == 0
+            {
+                for word in bytes.chunks_exact_mut(4) {
+                    word.reverse();
                 }
+                let _ = field.set(TagFieldData::Data(bytes));
+                *swapped += 1;
             }
         }
-    }
+    });
 }
 
 /// Bring a structure BSP's resource interface inline.
@@ -1097,26 +1069,13 @@ pub(super) fn forgive_externally_stored_payload(
 
 /// Null every pageable resource in a tag.
 fn clear_all_resources(value: &mut TagStructMut<'_>) {
-    for index in 0..value.as_ref().fields().count() {
-        let Some(mut field) = value.field_at_mut(index) else {
-            continue;
-        };
-        if field.as_ref().field_type() == TagFieldType::PageableResource {
-            let _ = field.clear_resource();
-            continue;
-        }
-        if let Some(mut nested) = field.as_struct_mut() {
-            clear_all_resources(&mut nested);
-            continue;
-        }
-        if let Some(mut block) = field.as_block_mut() {
-            for element in 0..block.len() {
-                if let Some(mut element) = block.element_mut(element) {
-                    clear_all_resources(&mut element);
-                }
+    for_each_struct_mut(value, false, &mut |value| {
+        value.for_each_field_mut(|mut field| {
+            if field.as_ref().field_type() == TagFieldType::PageableResource {
+                let _ = field.clear_resource();
             }
-        }
-    }
+        });
+    });
 }
 
 /// Put every curve in a converted tag into the destination's byte order.
@@ -1157,37 +1116,37 @@ pub(super) fn swap_function_curves(
 }
 
 fn swap_curves_in(value: &mut TagStructMut<'_>, swapped: &mut usize) {
-    for index in 0..value.as_ref().fields().count() {
-        let Some(mut field) = value.field_at_mut(index) else {
-            continue;
-        };
-        if let Some(bytes) = field.as_ref().as_data()
-            && let Some(fixed) = crate::tag_function::swap_function_definition(bytes)
-        {
-            let _ = field.set(TagFieldData::Data(fixed));
-            *swapped += 1;
-            continue;
-        }
+    for_each_struct_mut(value, true, &mut |value| {
+        value.for_each_field_mut(|mut field| {
+            if let Some(bytes) = field.as_ref().as_data()
+                && let Some(fixed) = crate::tag_function::swap_function_definition(bytes)
+            {
+                let _ = field.set(TagFieldData::Data(fixed));
+                *swapped += 1;
+            }
+        });
+    });
+}
+
+/// Run `visit` on `value` and then on every struct under it, depth first:
+/// inline structs and block elements, and array elements too when `arrays`.
+/// The resource passes each act on a struct's own fields and recurse the same
+/// way, so the walk lives here once.
+fn for_each_struct_mut(
+    value: &mut TagStructMut<'_>,
+    arrays: bool,
+    visit: &mut dyn FnMut(&mut TagStructMut<'_>),
+) {
+    visit(value);
+    value.for_each_field_mut(|mut field| {
         if let Some(mut nested) = field.as_struct_mut() {
-            swap_curves_in(&mut nested, swapped);
-            continue;
+            for_each_struct_mut(&mut nested, arrays, visit);
+        } else if let Some(mut block) = field.as_block_mut() {
+            block.for_each_element_mut(|mut element| for_each_struct_mut(&mut element, arrays, visit));
+        } else if arrays && let Some(mut array) = field.as_array_mut() {
+            array.for_each_element_mut(|mut element| for_each_struct_mut(&mut element, arrays, visit));
         }
-        if let Some(mut block) = field.as_block_mut() {
-            for element in 0..block.len() {
-                if let Some(mut element) = block.element_mut(element) {
-                    swap_curves_in(&mut element, swapped);
-                }
-            }
-            continue;
-        }
-        if let Some(mut array) = field.as_array_mut() {
-            for element in 0..array.len() {
-                if let Some(mut element) = array.element_mut(element) {
-                    swap_curves_in(&mut element, swapped);
-                }
-            }
-        }
-    }
+    });
 }
 
 /// Give a mirror-only bitmap the PC image block it never had.
