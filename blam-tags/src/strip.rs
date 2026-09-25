@@ -29,7 +29,6 @@
 //! triangle inside out, which is why there is a test that reconstructs
 //! the triangle set and compares it to the input.
 
-use std::collections::{HashMap, HashSet};
 
 /// Turn triangles into one strip index run.
 ///
@@ -88,7 +87,7 @@ fn build_strips(triangles: &[[u32; 3]]) -> Vec<Vec<u32>> {
     // Directed edge -> triangles carrying it in that direction. Matching
     // on direction is what preserves winding; an undirected map picks up
     // neighbours wound the other way and flips them.
-    let mut directed: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+    let mut directed: crate::fast_hash::IntMap<(u32, u32), Vec<usize>> = Default::default();
     for (i, t) in triangles.iter().enumerate() {
         for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
             directed.entry((a, b)).or_default().push(i);
@@ -114,7 +113,7 @@ fn build_strips(triangles: &[[u32; 3]]) -> Vec<Vec<u32>> {
     // live as the mesh is consumed.
     let mut neighbours: Vec<Vec<usize>> = vec![Vec::new(); triangles.len()];
     {
-        let mut undirected: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+        let mut undirected: crate::fast_hash::IntMap<(u32, u32), Vec<usize>> = Default::default();
         for (i, t) in triangles.iter().enumerate() {
             for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
                 let k = if a < b { (a, b) } else { (b, a) };
@@ -153,12 +152,15 @@ fn build_strips(triangles: &[[u32; 3]]) -> Vec<Vec<u32>> {
     }
 
     let mut strips: Vec<Vec<u32>> = Vec::new();
-    let mut taken: HashSet<usize> = HashSet::new();
+    // The triangles the strip being grown has taken: `taken.0[j] == taken.1`.
+    // Bumping the generation empties it, where clearing a set cost its whole
+    // capacity three times per seed.
+    let mut taken: (Vec<u32>, u32) = (vec![0; triangles.len()], 0);
 
     // Walk from the end of `strip`, taking triangles as adjacency allows.
     let grow = |strip: &mut Vec<u32>,
                 consumed: &mut Vec<usize>,
-                taken: &mut HashSet<usize>,
+                taken: &mut (Vec<u32>, u32),
                 used: &[bool]| {
         loop {
             let l = strip.len();
@@ -169,7 +171,7 @@ fn build_strips(triangles: &[[u32; 3]]) -> Vec<Vec<u32>> {
             let Some(list) = directed.get(&want) else { break };
             let mut next = None;
             for &j in list {
-                if used[j] || taken.contains(&j) {
+                if used[j] || taken.0[j] == taken.1 {
                     continue;
                 }
                 if let Some(c) = third(&triangles[j], a, b) {
@@ -178,7 +180,7 @@ fn build_strips(triangles: &[[u32; 3]]) -> Vec<Vec<u32>> {
                 }
             }
             let Some((j, c)) = next else { break };
-            taken.insert(j);
+            taken.0[j] = taken.1;
             consumed.push(j);
             strip.push(c);
         }
@@ -212,8 +214,8 @@ fn build_strips(triangles: &[[u32; 3]]) -> Vec<Vec<u32>> {
         for rot in 0..3 {
             let mut strip = vec![t[rot], t[(rot + 1) % 3], t[(rot + 2) % 3]];
             let mut consumed = vec![seed];
-            taken.clear();
-            taken.insert(seed);
+            taken.1 += 1;
+            taken.0[seed] = taken.1;
 
             grow(&mut strip, &mut consumed, &mut taken, &used);
 

@@ -373,6 +373,11 @@ Re-measure after each fix and add a row to the log at the bottom.
     — a running sum would change the float order and so the bits. Render
     import with PRT off, 1,614 H3 models: 13.9 s → **10.8 s**; all render,
     collision (1,218), physics (1,211) and BSP (26) re-imports identical.
+    Then the stripifier (22% of render import): its edge maps use the same
+    fast hash — now `crate::fast_hash::IntMap`, shared with the weld grid —
+    and its per-strip `taken` set is a generation-stamped array (the set's
+    `clear()` cost its capacity, three times per seed). 10.0 s → **9.58 s**;
+    render, collision and physics re-imports identical.
   - `weld.rs:326` clones every vertex to normalize normals; `:349`
     `Vec<Vec<u32>>`; `:453` allocates per candidate comparison.
   - `prt.rs:209` allocates a ray stack per ray; the per-vertex loop is

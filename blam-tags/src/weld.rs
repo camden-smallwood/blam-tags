@@ -171,38 +171,6 @@
 //! limit a mesh lands. It is recorded because a reader comparing output
 //! against a shipped tag will see it.
 
-use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
-
-/// A fast hash for the weld grid's integer cell keys. Every point probes 27
-/// cells, and the default SipHash — built to resist adversarial keys, which
-/// these are not — was a large share of welding. Lookups only; the buckets
-/// and the order they are searched in are unchanged.
-type CellHash = BuildHasherDefault<CellHasher>;
-
-#[derive(Default)]
-struct CellHasher(u64);
-
-impl Hasher for CellHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.write_u64(byte as u64);
-        }
-    }
-
-    fn write_i64(&mut self, value: i64) {
-        self.write_u64(value as u64);
-    }
-
-    fn write_u64(&mut self, value: u64) {
-        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x517c_c1b7_2722_0a95);
-    }
-
-    fn finish(&self) -> u64 {
-        self.0
-    }
-}
-
 use crate::math::{RealPoint2d, RealPoint3d, RealVector3d};
 
 /// `1/32768`, the tightest position tolerance `import_render_model` uses.
@@ -527,7 +495,8 @@ fn merge_points(
             )
         };
         let eps2 = (eps as f64) * (eps as f64);
-        let mut grid: HashMap<(i64, i64, i64), Vec<u32>, CellHash> = HashMap::default();
+        // Integer cell keys and 27 probes per point: see `fast_hash`.
+        let mut grid: crate::fast_hash::IntMap<(i64, i64, i64), Vec<u32>> = Default::default();
 
         for p in 0..positions.len() {
             if !alive[p] || !admits(p, point_precise, point_section) {
