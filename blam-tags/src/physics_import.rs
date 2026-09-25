@@ -73,10 +73,11 @@ use crate::hull::{convex_hull, HullError};
 use crate::jms::{JmsBox, JmsCapsule, JmsConvex, JmsFile, JmsSphere};
 use crate::jms_split::{material_base_name, MaterialLabel};
 use crate::math::{RealPoint3d, RealQuaternion};
+use crate::tag_writer::{node_links, string_id, try_set};
 use crate::{TagFieldData, TagFile};
 
 /// JMS units are hundredths of a world unit.
-pub const JMS_TO_WORLD: f32 = 0.01;
+pub use crate::geometry::JMS_TO_WORLD;
 
 /// Havok reference count written for a primitive shape — its "static,
 /// never free" marker.
@@ -139,6 +140,12 @@ pub enum PhysicsError {
     BadMaterial(i32),
     /// Nothing importable was found.
     Empty,
+}
+
+impl From<crate::tag_writer::MissingField> for PhysicsError {
+    fn from(missing: crate::tag_writer::MissingField) -> Self {
+        Self::MissingField(missing.0)
+    }
 }
 
 impl std::fmt::Display for PhysicsError {
@@ -696,23 +703,14 @@ fn thicken(points: &[RealPoint3d], t: f32) -> Vec<RealPoint3d> {
 
 // ---------------------------------------------------------------- writers
 
-/// Borrow a block for the duration of `f`.
-///
-/// `field_path_mut` borrows the struct and `as_block_mut` borrows the
-/// field, so the block cannot outlive either — it has to be used in
-/// place rather than returned.
+/// Borrow a block for the duration of `f` —
+/// [`crate::tag_writer::with_block`], failing with this importer's error.
 fn with_block<T>(
     root: &mut crate::TagStructMut<'_>,
     path: &str,
     f: impl FnOnce(&mut crate::TagBlockMut<'_>) -> R<T>,
 ) -> R<T> {
-    let mut fld = root
-        .field_path_mut(path)
-        .ok_or_else(|| PhysicsError::MissingField(path.into()))?;
-    let mut blk = fld
-        .as_block_mut()
-        .ok_or_else(|| PhysicsError::MissingField(format!("{path} (not a block)")))?;
-    f(&mut blk)
+    crate::tag_writer::with_block(root, path, f)
 }
 
 /// The same, for a nested struct field.
@@ -730,24 +728,11 @@ fn with_struct<T>(
     f(&mut st)
 }
 
-/// Set a field, ignoring absence. Used for the fields that differ
-/// between schema revisions or carry shipped typos.
-fn try_set(el: &mut crate::TagStructMut<'_>, field: &str, v: TagFieldData) -> bool {
-    match el.field_mut(field) {
-        Some(mut f) => f.set(v).is_ok(),
-        None => false,
-    }
-}
-
 fn set_required(el: &mut crate::TagStructMut<'_>, field: &str, v: TagFieldData) -> R<()> {
     let mut f = el
         .field_mut(field)
         .ok_or_else(|| PhysicsError::MissingField(field.into()))?;
     f.set(v).map_err(|e| PhysicsError::Schema(format!("{field}: {e:?}")))
-}
-
-fn string_id(v: &str) -> TagFieldData {
-    TagFieldData::StringId(crate::fields::StringIdData { string: v.to_owned() })
 }
 
 fn vec3(v: [f32; 3]) -> TagFieldData {
@@ -803,16 +788,8 @@ fn set_shape_reference(el: &mut crate::TagStructMut<'_>, ty: i16, index: i16) ->
 /// first-child / next-sibling tree.
 fn write_nodes(tag: &mut TagFile, jms: &JmsFile) -> R<()> {
     let n = jms.nodes.len();
-    let mut first_child = vec![-1i16; n.max(1)];
-    let mut sibling = vec![-1i16; n.max(1)];
-    // Backwards, so the lowest-numbered child ends up at the list head.
-    for i in (0..n).rev() {
-        let p = jms.nodes[i].parent;
-        if p >= 0 && (p as usize) < n {
-            sibling[i] = first_child[p as usize];
-            first_child[p as usize] = i as i16;
-        }
-    }
+    let parents: Vec<i16> = jms.nodes.iter().map(|node| node.parent).collect();
+    let (first_child, sibling) = node_links(&parents);
 
     let mut root = tag.root_mut();
     with_block(&mut root, "nodes", |block| {

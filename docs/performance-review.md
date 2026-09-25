@@ -404,6 +404,17 @@ Re-measure after each fix and add a row to the log at the bottom.
     shape). Net −61 lines. Verified identical: ASS for all 143 H3 BSPs, ASS
     and JMS for all 1,614 render_models, meshes of all 45 particle_models.
     Fixes B9 on the way.
+  - **Importer helpers done**: `tag_writer` (crate-private) holds
+    `with_block` (generic over each importer's error, which converts from
+    `MissingField`; each importer keeps a 3-line typed wrapper so `?`
+    infers), `try_set`, `string_id` and `node_links` (first-child /
+    next-sibling from JMS parents), replacing four copies across
+    `render_import`, `collision_import`, `physics_import` and `sbsp_import`.
+    `geometry::JMS_TO_WORLD` (`1.0 / SCALE`) is the one constant; the
+    importers' public `JMS_TO_WORLD` re-export it. Net −58 lines. Verified by
+    exporting and re-importing every H3 render (1,614), collision (1,218) and
+    physics (1,211) model and the 26 BSPs under 3 MB: 4,058 imports
+    identical; the other 11 vary between runs of identical code (B11, B12).
 
 - [ ] **D3. Converter walkers, value matches and normalizers** — Reported
   - 14 hand-written recursive walkers (`convert/mod.rs` + `resources.rs`),

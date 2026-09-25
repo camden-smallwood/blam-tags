@@ -35,6 +35,9 @@ use crate::math::{RealPoint2d, RealPoint3d};
 /// source format).
 pub(crate) const SCALE: f32 = 100.0;
 
+/// The inverse: JMS / ASS centimeters → world units, for the importers.
+pub const JMS_TO_WORLD: f32 = 1.0 / SCALE;
+
 //================================================================================
 // CompressionBounds
 //================================================================================

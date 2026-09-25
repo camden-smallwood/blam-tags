@@ -41,10 +41,11 @@ use std::path::Path;
 
 use crate::ass::{AssFile, AssObjectPayload};
 use crate::math::{RealPoint2d, RealPoint3d, RealVector3d};
+use crate::tag_writer::try_set;
 use crate::{TagFieldData, TagFile};
 
 /// ASS centimetres to world units.
-const ASS_TO_WORLD: f32 = 0.01;
+const ASS_TO_WORLD: f32 = crate::geometry::JMS_TO_WORLD;
 
 /// Triangles per part.
 ///
@@ -65,6 +66,12 @@ pub enum SbspError {
     TooManyIndices { object: usize, indices: usize },
     /// A mesh has more vertices than a signed-word index can name.
     TooManyVertices { object: usize, vertices: usize },
+}
+
+impl From<crate::tag_writer::MissingField> for SbspError {
+    fn from(missing: crate::tag_writer::MissingField) -> Self {
+        Self::MissingField(missing.0)
+    }
 }
 
 impl std::fmt::Display for SbspError {
@@ -1840,25 +1847,13 @@ impl Grid {
 }
 
 
+/// [`crate::tag_writer::with_block`], failing with this importer's error.
 fn with_block<T>(
     root: &mut crate::TagStructMut<'_>,
     path: &str,
     f: impl FnOnce(&mut crate::TagBlockMut<'_>) -> R<T>,
 ) -> R<T> {
-    let mut fld = root
-        .field_path_mut(path)
-        .ok_or_else(|| SbspError::MissingField(path.into()))?;
-    let mut blk = fld
-        .as_block_mut()
-        .ok_or_else(|| SbspError::MissingField(format!("{path} (not a block)")))?;
-    f(&mut blk)
-}
-
-fn try_set(el: &mut crate::TagStructMut<'_>, field: &str, v: TagFieldData) -> bool {
-    match el.field_mut(field) {
-        Some(mut f) => f.set(v).is_ok(),
-        None => false,
-    }
+    crate::tag_writer::with_block(root, path, f)
 }
 
 fn write_materials(tag: &mut TagFile, ass: &AssFile, report: &mut SbspReport) -> R<()> {

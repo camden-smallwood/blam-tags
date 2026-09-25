@@ -75,12 +75,13 @@ use crate::jms::JmsFile;
 use crate::jms_split::{material_base_name, material_is_precise, MaterialLabel};
 use crate::math::{RealPoint2d, RealPoint3d, RealVector3d};
 use crate::strip::stripify;
+use crate::tag_writer::{node_links, string_id, try_set};
 use crate::tangent;
 use crate::weld::{weld_sectioned, WeldTolerances, WeldVertex};
 use crate::{TagFieldData, TagFile};
 
 /// JMS units are hundredths of a world unit.
-pub const JMS_TO_WORLD: f32 = 0.01;
+pub use crate::geometry::JMS_TO_WORLD;
 /// The minimum width the compression bounds are widened to.
 pub const MIN_BOUND_WIDTH: f32 = 0.01;
 /// The per-mesh vertex ceiling.
@@ -156,6 +157,12 @@ pub enum RenderError {
     TooManyNodes(usize),
     BadMaterial(i32),
     Empty,
+}
+
+impl From<crate::tag_writer::MissingField> for RenderError {
+    fn from(missing: crate::tag_writer::MissingField) -> Self {
+        Self::MissingField(missing.0)
+    }
 }
 
 impl std::fmt::Display for RenderError {
@@ -628,29 +635,13 @@ pub fn render_model_from_jms(
 
 // ---------------------------------------------------------------- helpers
 
+/// [`crate::tag_writer::with_block`], failing with this importer's error.
 fn with_block<T>(
     root: &mut crate::TagStructMut<'_>,
     path: &str,
     f: impl FnOnce(&mut crate::TagBlockMut<'_>) -> R<T>,
 ) -> R<T> {
-    let mut fld = root
-        .field_path_mut(path)
-        .ok_or_else(|| RenderError::MissingField(path.into()))?;
-    let mut blk = fld
-        .as_block_mut()
-        .ok_or_else(|| RenderError::MissingField(format!("{path} (not a block)")))?;
-    f(&mut blk)
-}
-
-fn try_set(el: &mut crate::TagStructMut<'_>, field: &str, v: TagFieldData) -> bool {
-    match el.field_mut(field) {
-        Some(mut f) => f.set(v).is_ok(),
-        None => false,
-    }
-}
-
-fn string_id(v: &str) -> TagFieldData {
-    TagFieldData::StringId(crate::fields::StringIdData { string: v.to_owned() })
+    crate::tag_writer::with_block(root, path, f)
 }
 
 fn point3(p: RealPoint3d) -> TagFieldData {
@@ -658,16 +649,8 @@ fn point3(p: RealPoint3d) -> TagFieldData {
 }
 
 fn write_nodes(tag: &mut TagFile, jms: &JmsFile) -> R<()> {
-    let n = jms.nodes.len();
-    let mut first_child = vec![-1i16; n.max(1)];
-    let mut sibling = vec![-1i16; n.max(1)];
-    for i in (0..n).rev() {
-        let p = jms.nodes[i].parent;
-        if p >= 0 && (p as usize) < n {
-            sibling[i] = first_child[p as usize];
-            first_child[p as usize] = i as i16;
-        }
-    }
+    let parents: Vec<i16> = jms.nodes.iter().map(|node| node.parent).collect();
+    let (first_child, sibling) = node_links(&parents);
     let mut root = tag.root_mut();
     with_block(&mut root, "nodes", |block| {
         for (i, node) in jms.nodes.iter().enumerate() {

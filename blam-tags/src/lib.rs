@@ -110,6 +110,7 @@ pub mod render_method;
 pub mod paths;
 pub mod typed_enums;
 pub mod weld;
+mod tag_writer;
 
 // Both of these carry their own `//!` docs. An outer doc comment here would be
 // *merged* with those, and rustdoc then resolves the merged text against the
