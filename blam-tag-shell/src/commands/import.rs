@@ -75,6 +75,7 @@ pub fn run(
     output: Option<&str>,
     kind: Option<&str>,
     prt_samples: Option<usize>,
+    prt_threads: usize,
     instanced_geometry: bool,
     force: bool,
 ) -> Result<()> {
@@ -142,6 +143,7 @@ pub fn run(
             if let Some(n) = prt_samples {
                 opts.prt_samples = (n > 0).then_some(n);
             }
+            opts.prt_threads = prt_threads;
             let (tag, report) =
                 blam_tags::render_import::render_model_from_jms(&jms, &schema, &opts)
                     .map_err(|e| anyhow!("{}: {e}", src.display()))?;

@@ -63,6 +63,7 @@ pub fn run(
     overwrite: bool,
     prt_samples: Option<usize>,
     prt_order: u32,
+    prt_threads: usize,
 ) -> Result<()> {
     let game = ctx.require_game("jms-to-render")?;
     let schema = PathBuf::from("definitions").join(game).join("render_model.json");
@@ -80,6 +81,7 @@ pub fn run(
     let mut opts = RenderOptions::default();
     opts.prt_samples = prt_samples;
     opts.prt_order = prt_order.min(2);
+    opts.prt_threads = prt_threads;
     if let Some(s) = scale {
         if !(s.is_finite() && s > 0.0) {
             bail!("--scale must be a positive finite number, got {s}");

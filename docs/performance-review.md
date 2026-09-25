@@ -364,8 +364,14 @@ Re-measure after each fix and add a row to the log at the bottom.
     order with their edges precomputed (same subtraction, same bits), and
     `occluded` reuses one traversal stack per mesh instead of allocating per
     ray. 300 H3 render-model imports: 95.1 s → **84.3 s**, output identical.
-    Open, needs a decision: running the per-vertex loop on all cores
-    (deterministic — each vertex is independent) would be ~8× more.
+    **Opt-in threading done** (decided: opt-in, not default):
+    `PrtOptions::threads` / `RenderOptions::prt_threads` (default 1; 0 =
+    every core) spread vertices over `std::thread::scope` threads, each with
+    its own stack, results joined in order — no new dependency. Shell:
+    `--prt-threads` on `import` and `jms-to-render`. 300 H3 render-model
+    imports: 86.3 s at 1 thread → **22.2 s** on all cores (welding and the
+    rest stay serial), identical tags either way;
+    `the_solve_is_the_same_on_any_number_of_threads`.
 
 ---
 

@@ -126,6 +126,9 @@ pub struct RenderOptions {
     /// 2 quadratic. Shipped meshes are 48% ambient, 8% linear and 23%
     /// quadratic, so ambient is both the cheapest and the commonest.
     pub prt_order: u32,
+    /// Threads for the PRT solve — see [`crate::prt::PrtOptions::threads`].
+    /// 1 by default; the tag written is the same for any count.
+    pub prt_threads: usize,
 }
 
 impl Default for RenderOptions {
@@ -136,6 +139,7 @@ impl Default for RenderOptions {
             max_vertices_per_mesh: MAX_VERTICES_PER_MESH,
             prt_samples: Some(64),
             prt_order: 0,
+            prt_threads: 1,
         }
     }
 }
@@ -562,7 +566,7 @@ pub fn render_model_from_jms(
             &nrm,
             &global_tris,
             order,
-            &crate::prt::PrtOptions { samples, ..Default::default() },
+            &crate::prt::PrtOptions { samples, threads: opts.prt_threads, ..Default::default() },
         )
     });
     if let Some(v) = &visibility {

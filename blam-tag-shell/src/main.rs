@@ -95,6 +95,10 @@ enum Commands {
         /// Rays per vertex for PRT on a render_model. 0 turns PRT off.
         #[arg(long)]
         prt_samples: Option<usize>,
+        /// Threads for the PRT solve; 0 uses every core. Default 1. The
+        /// tag written is the same for any count.
+        #[arg(long)]
+        prt_threads: Option<usize>,
         /// Treat every authored mesh as its own cluster instead of
         /// writing instanced geometry. Still a correct scene, just a
         /// much larger one.
@@ -703,6 +707,10 @@ pub struct JmsToRenderArgs {
     /// Rays per vertex for the ambient PRT solve. Default 64.
     #[arg(long)]
     pub prt_samples: Option<usize>,
+    /// Threads for the PRT solve; 0 uses every core. Default 1. The tag
+    /// written is the same for any count.
+    #[arg(long)]
+    pub prt_threads: Option<usize>,
     /// Write every mesh as `No PRT` instead of solving it. 21% of
     /// shipped meshes are `No PRT`, so this is a real option and not
     /// only a way to save time.
@@ -821,6 +829,7 @@ pub(crate) fn dispatch(ctx: &mut CliContext, cmd: Commands, reload_tag: bool) ->
             output,
             kind,
             prt_samples,
+            prt_threads,
             no_instanced_geometry,
             force,
         } => commands::import::run(
@@ -829,6 +838,7 @@ pub(crate) fn dispatch(ctx: &mut CliContext, cmd: Commands, reload_tag: bool) ->
             output.as_deref(),
             kind.as_deref(),
             prt_samples,
+            prt_threads.unwrap_or(1),
             !no_instanced_geometry,
             force,
         ),
@@ -1030,6 +1040,7 @@ pub(crate) fn dispatch(ctx: &mut CliContext, cmd: Commands, reload_tag: bool) ->
             a.overwrite,
             if a.no_prt { None } else { Some(a.prt_samples.unwrap_or(64)) },
             a.prt_order.unwrap_or(0),
+            a.prt_threads.unwrap_or(1),
         ),
 
         Commands::JmsToCollision(a) => commands::jms_to_collision::run(

@@ -103,12 +103,49 @@ pub struct PrtOptions {
     /// model's size, so a vertex does not shadow itself on the triangles
     /// it belongs to.
     pub bias: f32,
+    /// Threads to spread the vertices over: 1 solves on the calling thread,
+    /// 0 uses every available core. Each vertex is solved on its own, so the
+    /// answer is the same for any count.
+    pub threads: usize,
 }
 
 impl Default for PrtOptions {
     fn default() -> Self {
-        Self { samples: 128, bias: 1e-4 }
+        Self { samples: 128, bias: 1e-4, threads: 1 }
     }
+}
+
+/// `solve(i, stack)` for each vertex `0..count`, in order, over `threads`
+/// threads (see [`PrtOptions::threads`]). Each thread takes a contiguous run
+/// of vertices and its own traversal stack.
+fn per_vertex<T: Send>(
+    count: usize,
+    threads: usize,
+    solve: impl Fn(usize, &mut Vec<usize>) -> T + Sync,
+) -> Vec<T> {
+    let threads = match threads {
+        0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+        n => n,
+    }
+    .min(count.max(1));
+    if threads <= 1 {
+        let mut stack = Vec::new();
+        return (0..count).map(|i| solve(i, &mut stack)).collect();
+    }
+    let chunk = count.div_ceil(threads);
+    let solve = &solve;
+    std::thread::scope(|scope| {
+        let runs: Vec<_> = (0..count)
+            .step_by(chunk)
+            .map(|start| {
+                scope.spawn(move || {
+                    let mut stack = Vec::new();
+                    (start..(start + chunk).min(count)).map(|i| solve(i, &mut stack)).collect::<Vec<T>>()
+                })
+            })
+            .collect();
+        runs.into_iter().flat_map(|run| run.join().expect("a PRT thread panicked")).collect()
+    })
 }
 
 // ------------------------------------------------------------------ bvh
@@ -317,34 +354,30 @@ pub fn ambient_transfer(
     // answer: a stochastic solve that moves between runs cannot be
     // compared against anything, including itself.
     let dirs = cosine_hemisphere(opts.samples);
-    let mut stack = Vec::new();
 
-    positions
-        .iter()
-        .zip(normals)
-        .map(|(p, n)| {
-            let nl = (n.i * n.i + n.j * n.j + n.k * n.k).sqrt();
-            if nl <= 0.0 {
-                return 1.0;
-            }
-            let up = [n.i / nl, n.j / nl, n.k / nl];
-            let (t, b) = basis_from(up);
-            let o = [p.x + up[0] * bias, p.y + up[1] * bias, p.z + up[2] * bias];
+    per_vertex(positions.len().min(normals.len()), opts.threads, |i, stack| {
+        let (p, n) = (&positions[i], &normals[i]);
+        let nl = (n.i * n.i + n.j * n.j + n.k * n.k).sqrt();
+        if nl <= 0.0 {
+            return 1.0;
+        }
+        let up = [n.i / nl, n.j / nl, n.k / nl];
+        let (t, b) = basis_from(up);
+        let o = [p.x + up[0] * bias, p.y + up[1] * bias, p.z + up[2] * bias];
 
-            let mut open = 0usize;
-            for d in &dirs {
-                let dir = [
-                    t[0] * d[0] + b[0] * d[1] + up[0] * d[2],
-                    t[1] * d[0] + b[1] * d[1] + up[1] * d[2],
-                    t[2] * d[0] + b[2] * d[1] + up[2] * d[2],
-                ];
-                if !bvh.occluded(o, dir, reach, &mut stack) {
-                    open += 1;
-                }
+        let mut open = 0usize;
+        for d in &dirs {
+            let dir = [
+                t[0] * d[0] + b[0] * d[1] + up[0] * d[2],
+                t[1] * d[0] + b[1] * d[1] + up[1] * d[2],
+                t[2] * d[0] + b[2] * d[1] + up[2] * d[2],
+            ];
+            if !bvh.occluded(o, dir, reach, stack) {
+                open += 1;
             }
-            open as f32 / dirs.len().max(1) as f32
-        })
-        .collect()
+        }
+        open as f32 / dirs.len().max(1) as f32
+    })
 }
 
 
@@ -420,46 +453,42 @@ pub fn sh_transfer(
     let bias = extent * opts.bias;
     let reach = extent * 2.0;
     let dirs = cosine_hemisphere(opts.samples);
-    let mut stack = Vec::new();
 
-    positions
-        .iter()
-        .zip(normals)
-        .map(|(p, nv)| {
-            let mut acc = vec![0.0f32; coeffs];
-            let nl = (nv.i * nv.i + nv.j * nv.j + nv.k * nv.k).sqrt();
-            if nl <= 0.0 {
-                acc[0] = Y00;
-                return acc;
-            }
-            let up = [nv.i / nl, nv.j / nl, nv.k / nl];
-            let (t, b) = basis_from(up);
-            let o = [p.x + up[0] * bias, p.y + up[1] * bias, p.z + up[2] * bias];
+    per_vertex(positions.len().min(normals.len()), opts.threads, |i, stack| {
+        let (p, nv) = (&positions[i], &normals[i]);
+        let mut acc = vec![0.0f32; coeffs];
+        let nl = (nv.i * nv.i + nv.j * nv.j + nv.k * nv.k).sqrt();
+        if nl <= 0.0 {
+            acc[0] = Y00;
+            return acc;
+        }
+        let up = [nv.i / nl, nv.j / nl, nv.k / nl];
+        let (t, b) = basis_from(up);
+        let o = [p.x + up[0] * bias, p.y + up[1] * bias, p.z + up[2] * bias];
 
-            let mut basis = vec![0.0f32; coeffs];
-            for d in &dirs {
-                // Into object space: the samples are built around +Z and
-                // the coefficients are not tangent-frame.
-                let dir = [
-                    t[0] * d[0] + b[0] * d[1] + up[0] * d[2],
-                    t[1] * d[0] + b[1] * d[1] + up[1] * d[2],
-                    t[2] * d[0] + b[2] * d[1] + up[2] * d[2],
-                ];
-                if bvh.occluded(o, dir, reach, &mut stack) {
-                    continue;
-                }
-                sh_basis(dir, &mut basis);
-                for (a, v) in acc.iter_mut().zip(&basis) {
-                    *a += *v;
-                }
+        let mut basis = vec![0.0f32; coeffs];
+        for d in &dirs {
+            // Into object space: the samples are built around +Z and
+            // the coefficients are not tangent-frame.
+            let dir = [
+                t[0] * d[0] + b[0] * d[1] + up[0] * d[2],
+                t[1] * d[0] + b[1] * d[1] + up[1] * d[2],
+                t[2] * d[0] + b[2] * d[1] + up[2] * d[2],
+            ];
+            if bvh.occluded(o, dir, reach, stack) {
+                continue;
             }
-            let inv = 1.0 / dirs.len().max(1) as f32;
-            for a in acc.iter_mut() {
-                *a *= inv;
+            sh_basis(dir, &mut basis);
+            for (a, v) in acc.iter_mut().zip(&basis) {
+                *a += *v;
             }
-            acc
-        })
-        .collect()
+        }
+        let inv = 1.0 / dirs.len().max(1) as f32;
+        for a in acc.iter_mut() {
+            *a *= inv;
+        }
+        acc
+    })
 }
 
 /// The bytes a mesh of this order stores.
@@ -544,6 +573,41 @@ mod tests {
     }
 
     /// A lone triangle has nothing to shadow it.
+    /// Spreading the vertices over threads changes nothing: the same
+    /// transfer, in the same order, for any thread count.
+    #[test]
+    fn the_solve_is_the_same_on_any_number_of_threads() {
+        // A bumpy grid, so vertices shadow each other unevenly.
+        let n = 24usize;
+        let mut positions = Vec::new();
+        let mut normals = Vec::new();
+        for y in 0..n {
+            for x in 0..n {
+                let h = ((x * 7 + y * 13) % 5) as f32 * 0.3;
+                positions.push(p(x as f32, y as f32, h));
+                normals.push(v(0.0, 0.0, 1.0));
+            }
+        }
+        let mut triangles = Vec::new();
+        for y in 0..n as u32 - 1 {
+            for x in 0..n as u32 - 1 {
+                let i = y * n as u32 + x;
+                triangles.push([i, i + 1, i + n as u32]);
+                triangles.push([i + 1, i + n as u32 + 1, i + n as u32]);
+            }
+        }
+        let solve = |threads| {
+            let opts = PrtOptions { samples: 32, threads, ..Default::default() };
+            (ambient_transfer(&positions, &normals, &triangles, &opts),
+             sh_transfer(&positions, &normals, &triangles, 1, &opts))
+        };
+        let one = solve(1);
+        assert!(one.0.iter().any(|&open| open < 1.0), "the grid shadows itself somewhere");
+        for threads in [2, 3, 7, 0] {
+            assert_eq!(solve(threads), one, "{threads} threads");
+        }
+    }
+
     #[test]
     fn an_unoccluded_surface_is_fully_open() {
         let pos = vec![p(0.0, 0.0, 0.0), p(1.0, 0.0, 0.0), p(0.0, 1.0, 0.0)];
