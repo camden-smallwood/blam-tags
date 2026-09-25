@@ -1695,9 +1695,21 @@
         "halo3_mcc",
         "halo3odst_mcc"
       ],
-      "source_definition": "processed_pixel_data_data",
+      "source_definition": "bitmap_pixel_data",
       "target_definition": "bitmap_group_pixel_data_def",
-      "reason": "Both are the bitmap's pixel payload in the tag body under the same field name, `processed pixel data`; only the data definition was renamed. Verified against the kits rather than the schema: a native H3EK bitmap keeps 699,052 bytes in `processed pixel data` and populates no pageable resource at all, despite the schema marking the field `*` and declaring interop resources. The formats line up too - Halo 2's `format_enum_2` and Halo 3's `bitmap_formats` share both index and name for dxt1 (14), dxt3 (15), dxt5 (16) and every uncompressed entry, and the enum is carried by name in any case. Halo 2's `p8` and `p8-bump` have no Halo 3 option and are reported. Scoped to Halo 3 and ODST on purpose: Reach's `bitmap_data_block_def` has no `pixels offset` field at all, so a blob carried there would have nothing indexing it - go through Halo 3, whose bitmaps already convert to Reach."
+      "reason": "Both are the bitmap's pixel payload in the tag body under the same field name, `processed pixel data`; only the data definition was renamed. (Halo 2's name is `bitmap_pixel_data`, tool.exe's own, since the definitions recovered from it in 586765c; the earlier dump called it `processed_pixel_data_data`.) Verified against the kits rather than the schema: a native H3EK bitmap keeps 699,052 bytes in `processed pixel data` and populates no pageable resource at all, despite the schema marking the field `*` and declaring interop resources. The formats line up too - Halo 2's `format_enum_2` and Halo 3's `bitmap_formats` share both index and name for dxt1 (14), dxt3 (15), dxt5 (16) and every uncompressed entry, and the enum is carried by name in any case. Halo 2's `p8` and `p8-bump` have no Halo 3 option and are reported. Scoped to Halo 3 and ODST on purpose: Reach's `bitmap_data_block_def` has no `pixels offset` field at all, so a blob carried there would have nothing indexing it - go through Halo 3, whose bitmaps already convert to Reach."
+    },
+    {
+      "group": "bitmap",
+      "source_games": [
+        "haloce_mcc"
+      ],
+      "target_games": [
+        "halo2_mcc"
+      ],
+      "source_definition": "processed_pixel_data_data",
+      "target_definition": "bitmap_pixel_data",
+      "reason": "Both are the bitmap's pixel payload under the same field name, `processed pixel data`. Until the Halo 2 definitions were recovered from tool.exe (586765c) both sides also shared the data definition name `processed_pixel_data_data`, and the derived same-name rule carried the pixels; tool.exe calls Halo 2's `bitmap_pixel_data`, so the pair is now declared. The bytes mean the same thing on both sides: Halo 1's per-bitmap `format_enum` and Halo 2's `format_2` agree option-for-option by name for A8 through DXT5, the enum is carried by name, and Halo 1's `P8` lands on Halo 2's `p8` rather than `p8-bump`. Halo 1's `BC7` has no Halo 2 option and is reported by the enum conversion."
     }
   ],
   "accepted_payload_drops": [

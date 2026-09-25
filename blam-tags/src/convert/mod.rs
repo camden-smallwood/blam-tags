@@ -685,10 +685,11 @@ struct FieldAliasRule {
 /// A reviewed pair of `data` definition names that hold the same kind of payload.
 ///
 /// The derived rule — carry a blob when both sides declare the *same* data
-/// definition name — covers Halo 1 to Halo 2, where both say
-/// `processed_pixel_data_data`. It cannot cover Halo 2 to Halo 3, which renamed the
-/// definition to `bitmap_group_pixel_data_def` while keeping the same field name and
-/// the same bytes. Renames are judgement, so they are declared here.
+/// definition name — covers pairs whose schemas agree on the name. It cannot cover
+/// a rename: Halo 3 calls the bitmap pixels `bitmap_group_pixel_data_def`, and
+/// Halo 2's definitions, recovered from tool.exe, call them `bitmap_pixel_data`
+/// where Halo 1 says `processed_pixel_data_data` — the same field name and the
+/// same bytes in all three. Renames are judgement, so they are declared here.
 #[derive(serde::Deserialize)]
 struct PayloadAliasRule {
     group: String,
@@ -5924,10 +5925,11 @@ fn convert_field(
             // struct, and neither holds for a Halo 1 bitmap against a Halo 2 one:
             // Halo 1 groups its root into `processing`/`color plate` sub-structs
             // where Halo 2 flattens them, so the roots differ in size and field
-            // count. But both declare the pixels with the *same data definition
-            // name* — `processed_pixel_data_data` — and the schema's own name for
-            // what a blob holds is exactly the claim needed here: these two fields
-            // hold the same kind of payload.
+            // count. But the schema's own name for what a blob holds is exactly
+            // the claim needed here: these two fields hold the same kind of
+            // payload. Where the two games name it the same that is enough; where
+            // they differ (Halo 1's `processed_pixel_data_data` is Halo 2's
+            // `bitmap_pixel_data`) a reviewed `payload_aliases` entry says so.
             //
             // Measured before relying on it: Halo 1's per-bitmap `format_enum` and
             // Halo 2's `format_enum_2` agree entry-for-entry for indices 0..=16
@@ -10952,10 +10954,12 @@ mod tests {
     /// A Halo 2 bitmap's pixels reach Halo 3, so the chain onward to Reach carries
     /// an image instead of empty metadata.
     ///
-    /// The pixels are a `data` blob in both, under the same field name, but Halo 3
-    /// renamed the data *definition* from `processed_pixel_data_data` to
-    /// `bitmap_group_pixel_data_def` — so the derived "same payload kind" rule could
-    /// not see it and a reviewed `payload_aliases` entry declares the rename.
+    /// The pixels are a `data` blob in both, under the same field name, but the
+    /// data *definitions* differ — Halo 2's `bitmap_pixel_data` against Halo 3's
+    /// `bitmap_group_pixel_data_def` — so the derived "same payload kind" rule
+    /// cannot see it and a reviewed `payload_aliases` entry declares the rename.
+    /// That entry named Halo 2's pre-tool.exe dump (`processed_pixel_data_data`)
+    /// until 586765c renamed it, and this test is what caught the drift.
     /// Asserts the bytes arrive whole and that the per-bitmap offsets indexing them
     /// come too, since a blob with no offsets is the version that crashed the tools.
     #[test]
