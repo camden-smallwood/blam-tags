@@ -580,129 +580,9 @@ impl AssFile {
             }
         }
 
-        // Weather polyhedra. Each polyhedron is a convex region
-        // defined by a set of bounding planes (`ax+by+cz+d=0`,
-        // normal points outward, "inside" is `n·p + d <= 0`). To
-        // emit as a MESH for re-compilation, we recover the region's
-        // vertices via triple-plane intersections, filter to those
-        // inside ALL other planes, then fan-triangulate per face.
-        // Each polyhedron becomes one `+weather`-named MESH so
-        // Tool.exe re-extracts it on recompile. Verified rare in H3
-        // MP corpus (only s3d_lockout has any).
-        let weather_mat_idx = ensure_special_material(&mut materials, "+weather") as i32;
-        if let Some(wp_block) = root.field_path("weather polyhedra").and_then(|f| f.as_block()) {
-            for wi in 0..wp_block.len() {
-                let wp = wp_block.element(wi).unwrap();
-                let planes_block = match wp.field("planes").and_then(|f| f.as_block()) { Some(b) => b, None => continue };
-                let mut planes: Vec<RealPlane3d> = Vec::with_capacity(planes_block.len());
-                for pi in 0..planes_block.len() {
-                    let pe = planes_block.element(pi).unwrap();
-                    planes.push(pe.read_plane3d("plane"));
-                }
-                if planes.len() < 4 { continue; }
-                let (verts, tris) = polyhedron_from_planes(&planes, weather_mat_idx);
-                if verts.is_empty() { continue; }
-                let object_index = objects.len() as i32;
-                objects.push(AssObject {
-                    xref_filepath: String::new(),
-                    xref_objectname: String::new(),
-                    payload: AssObjectPayload::Mesh { vertices: verts, triangles: tris },
-                });
-                instances.push(AssInstance {
-                    object_index,
-                    name: format!("+weather_{wi}"),
-                    unique_id: instances.len() as i32,
-                    parent_id: 0,
-                    ..Default::default()
-                });
-            }
-        }
-
-        // sbsp markers. Each marker becomes a SPHERE primitive OBJECT
-        // (matching the H3 source convention where construct emits
-        // `'frame construct'` as a SPHERE marker) plus one INSTANCE
-        // carrying the marker name + transform. Marker OBJECTs use
-        // parent=-1 (no material) and a default 10cm radius. Tool.exe
-        // re-extracts INSTANCEs of named SPHEREs into sbsp.markers on
-        // recompile.
-        if let Some(markers_block) = root.field_path("markers").and_then(|f| f.as_block()) {
-            for mi in 0..markers_block.len() {
-                let m = markers_block.element(mi).unwrap();
-                let name = m.read_string_id("name").unwrap_or_else(|| format!("marker_{mi}"));
-                let pos = m.read_point3d("position");
-                let rot = m.read_quat("rotation");
-                let object_index = objects.len() as i32;
-                objects.push(AssObject {
-                    xref_filepath: String::new(),
-                    xref_objectname: String::new(),
-                    payload: AssObjectPayload::Sphere { material: -1, radius: 10.0 },
-                });
-                instances.push(AssInstance {
-                    object_index,
-                    name,
-                    unique_id: instances.len() as i32,
-                    parent_id: 0,
-                    inheritance_flag: 0,
-                    local_rotation: rot,
-                    local_translation: pos * SCALE,
-                    local_scale: 1.0,
-                    pivot_rotation: RealQuaternion::IDENTITY,
-                    pivot_translation: RealPoint3d::ZERO,
-                    pivot_scale: 1.0,
-                    bone_groups: Vec::new(),
-                });
-            }
-        }
-
-        // Environment objects. These are sbsp-level scenery placements
-        // (one per `environment_objects[i]` pointing into
-        // `environment_object_palette[]`). Emit each as an XREF OBJECT
-        // — no inline geometry, just `xref_filepath` and
-        // `xref_objectname` pointing at the scenery tag — plus one
-        // INSTANCE per placement carrying the transform. Tool.exe
-        // re-resolves the xref on recompile via the scenery tag-ref.
-        let env_objects = root.field_path("environment objects").and_then(|f| f.as_block());
-        let env_palette = root.field_path("environment object palette").and_then(|f| f.as_block());
-        if let (Some(eo), Some(ep)) = (env_objects, env_palette) {
-            // Build OBJECT per palette entry (xref to scenery).
-            let mut palette_object_index: Vec<Option<i32>> = vec![None; ep.len()];
-            for pi in 0..ep.len() {
-                let pal = ep.element(pi).unwrap();
-                let xref = pal.read_tag_ref_path("object").unwrap_or_default();
-                if xref.is_empty() { continue; }
-                let xref_name = crate::geometry::tag_path_basename(&xref).unwrap_or("env_object").to_owned();
-                palette_object_index[pi] = Some(objects.len() as i32);
-                objects.push(AssObject {
-                    xref_filepath: xref,
-                    xref_objectname: xref_name,
-                    payload: AssObjectPayload::Mesh { vertices: Vec::new(), triangles: Vec::new() },
-                });
-            }
-            for ei in 0..eo.len() {
-                let placement = eo.element(ei).unwrap();
-                let pi = placement.read_int_any("palette index").unwrap_or(-1);
-                if pi < 0 || (pi as usize) >= palette_object_index.len() { continue; }
-                let Some(object_index) = palette_object_index[pi as usize] else { continue; };
-                let pos = placement.read_point3d("position");
-                let rot = placement.read_quat("rotation");
-                let scale = placement.read_real("scale").unwrap_or(1.0);
-                let name = placement.read_string_id("name").unwrap_or_else(|| format!("env_object_{ei}"));
-                instances.push(AssInstance {
-                    object_index,
-                    name,
-                    unique_id: instances.len() as i32,
-                    parent_id: 0,
-                    inheritance_flag: 0,
-                    local_rotation: rot,
-                    local_translation: pos * SCALE,
-                    local_scale: scale,
-                    pivot_rotation: RealQuaternion::IDENTITY,
-                    pivot_translation: RealPoint3d::ZERO,
-                    pivot_scale: 1.0,
-                    bone_groups: Vec::new(),
-                });
-            }
-        }
+        push_weather_polyhedra(&root, &mut materials, &mut objects, &mut instances);
+        push_markers(&root, &mut objects, &mut instances);
+        push_environment_objects(&root, &mut objects, &mut instances);
 
         // Structure collision BSP. Lives at
         // `resource interface/raw_resources[0]/raw_items/collision bsp`.
@@ -904,115 +784,9 @@ impl AssFile {
             }
         }
 
-        // Weather polyhedra → `+weather`-named hull MESHes.
-        let weather_mat_idx = ensure_special_material(&mut materials, "+weather") as i32;
-        if let Some(wp_block) = root.field_path("weather polyhedra").and_then(|f| f.as_block()) {
-            for wi in 0..wp_block.len() {
-                let wp = wp_block.element(wi).unwrap();
-                let planes_block = match wp.field("planes").and_then(|f| f.as_block()) { Some(b) => b, None => continue };
-                let mut planes: Vec<RealPlane3d> = Vec::with_capacity(planes_block.len());
-                for pi in 0..planes_block.len() {
-                    planes.push(planes_block.element(pi).unwrap().read_plane3d("plane"));
-                }
-                if planes.len() < 4 { continue; }
-                let (verts, tris) = polyhedron_from_planes(&planes, weather_mat_idx);
-                if verts.is_empty() { continue; }
-                let object_index = objects.len() as i32;
-                objects.push(AssObject {
-                    xref_filepath: String::new(),
-                    xref_objectname: String::new(),
-                    payload: AssObjectPayload::Mesh { vertices: verts, triangles: tris },
-                });
-                instances.push(AssInstance {
-                    object_index,
-                    name: format!("+weather_{wi}"),
-                    unique_id: instances.len() as i32,
-                    parent_id: 0,
-                    ..Default::default()
-                });
-            }
-        }
-
-        // Markers → SPHERE primitives. H2 marker `name` is an inline
-        // string (H3 used a string_id).
-        if let Some(markers_block) = root.field_path("markers").and_then(|f| f.as_block()) {
-            for mi in 0..markers_block.len() {
-                let m = markers_block.element(mi).unwrap();
-                let name = m.read_string_id("name").or_else(|| m.read_string("name"))
-                    .unwrap_or_else(|| format!("marker_{mi}"));
-                let pos = m.read_point3d("position");
-                let rot = m.read_quat("rotation");
-                let object_index = objects.len() as i32;
-                objects.push(AssObject {
-                    xref_filepath: String::new(),
-                    xref_objectname: String::new(),
-                    payload: AssObjectPayload::Sphere { material: -1, radius: 10.0 },
-                });
-                instances.push(AssInstance {
-                    object_index,
-                    name,
-                    unique_id: instances.len() as i32,
-                    parent_id: 0,
-                    inheritance_flag: 0,
-                    local_rotation: rot,
-                    local_translation: pos * SCALE,
-                    local_scale: 1.0,
-                    pivot_rotation: RealQuaternion::IDENTITY,
-                    pivot_translation: RealPoint3d::ZERO,
-                    pivot_scale: 1.0,
-                    bone_groups: Vec::new(),
-                });
-            }
-        }
-
-        // Environment objects → XREF OBJECTs. H2 fields differ from H3:
-        // placement uses `translation` (not `position`) + a `string`
-        // name, palette entry references the scenery via `definition`
-        // (not `object`), and there is no per-placement scale.
-        let env_objects = root.field_path("environment objects").and_then(|f| f.as_block());
-        let env_palette = root.field_path("environment object palette").and_then(|f| f.as_block());
-        if let (Some(eo), Some(ep)) = (env_objects, env_palette) {
-            let mut palette_object_index: Vec<Option<i32>> = vec![None; ep.len()];
-            for pi in 0..ep.len() {
-                let pal = ep.element(pi).unwrap();
-                let xref = pal.read_tag_ref_path("definition")
-                    .or_else(|| pal.read_tag_ref_path("object"))
-                    .unwrap_or_default();
-                if xref.is_empty() { continue; }
-                let xref_name = crate::geometry::tag_path_basename(&xref).unwrap_or("env_object").to_owned();
-                palette_object_index[pi] = Some(objects.len() as i32);
-                objects.push(AssObject {
-                    xref_filepath: xref,
-                    xref_objectname: xref_name,
-                    payload: AssObjectPayload::Mesh { vertices: Vec::new(), triangles: Vec::new() },
-                });
-            }
-            for ei in 0..eo.len() {
-                let placement = eo.element(ei).unwrap();
-                let pi = placement.read_int_any("palette_index")
-                    .or_else(|| placement.read_int_any("palette index")).unwrap_or(-1);
-                if pi < 0 || (pi as usize) >= palette_object_index.len() { continue; }
-                let Some(object_index) = palette_object_index[pi as usize] else { continue; };
-                let pos = placement.read_point3d("translation");
-                let rot = placement.read_quat("rotation");
-                let name = placement.read_string_id("name").or_else(|| placement.read_string("name"))
-                    .unwrap_or_else(|| format!("env_object_{ei}"));
-                instances.push(AssInstance {
-                    object_index,
-                    name,
-                    unique_id: instances.len() as i32,
-                    parent_id: 0,
-                    inheritance_flag: 0,
-                    local_rotation: rot,
-                    local_translation: pos * SCALE,
-                    local_scale: 1.0,
-                    pivot_rotation: RealQuaternion::IDENTITY,
-                    pivot_translation: RealPoint3d::ZERO,
-                    pivot_scale: 1.0,
-                    bone_groups: Vec::new(),
-                });
-            }
-        }
+        push_weather_polyhedra(&root, &mut materials, &mut objects, &mut instances);
+        push_markers(&root, &mut objects, &mut instances);
+        push_environment_objects(&root, &mut objects, &mut instances);
 
         // Structure collision BSP → single `@CollideOnly` MESH. H2 keeps
         // it in the top-level `collision bsp` block.
@@ -1956,6 +1730,143 @@ fn default_vertex() -> AssVertex {
     }
 }
 
+
+/// Weather polyhedra → `+weather`-named MESHes. Each polyhedron is a convex
+/// region bounded by planes (`ax+by+cz+d=0`, normal outward, "inside" is
+/// `n·p + d <= 0`); its vertices come back through triple-plane intersection,
+/// filtered to those inside every other plane, then fan-triangulated per
+/// face. One MESH per polyhedron so Tool.exe re-extracts it on recompile.
+/// Rare: in the H3 MP corpus only s3d_lockout has any. The `+weather`
+/// material is added whether or not there are any.
+fn push_weather_polyhedra(
+    root: &TagStruct<'_>,
+    materials: &mut Vec<AssMaterial>,
+    objects: &mut Vec<AssObject>,
+    instances: &mut Vec<AssInstance>,
+) {
+    let weather_mat_idx = ensure_special_material(materials, "+weather") as i32;
+    let Some(wp_block) = root.field_path("weather polyhedra").and_then(|f| f.as_block()) else {
+        return;
+    };
+    for wi in 0..wp_block.len() {
+        let wp = wp_block.element(wi).unwrap();
+        let planes_block = match wp.field("planes").and_then(|f| f.as_block()) { Some(b) => b, None => continue };
+        let planes: Vec<RealPlane3d> = (0..planes_block.len())
+            .map(|pi| planes_block.element(pi).unwrap().read_plane3d("plane"))
+            .collect();
+        if planes.len() < 4 { continue; }
+        let (verts, tris) = polyhedron_from_planes(&planes, weather_mat_idx);
+        if verts.is_empty() { continue; }
+        let object_index = objects.len() as i32;
+        objects.push(AssObject {
+            xref_filepath: String::new(),
+            xref_objectname: String::new(),
+            payload: AssObjectPayload::Mesh { vertices: verts, triangles: tris },
+        });
+        instances.push(AssInstance {
+            object_index,
+            name: format!("+weather_{wi}"),
+            unique_id: instances.len() as i32,
+            parent_id: 0,
+            ..Default::default()
+        });
+    }
+}
+
+/// The sbsp's markers, each a SPHERE primitive OBJECT (the H3 source
+/// convention: construct emits `'frame construct'` as a SPHERE marker) plus
+/// one INSTANCE carrying the name and transform. Marker OBJECTs have no
+/// material and a 10cm radius; Tool.exe re-extracts INSTANCEs of named
+/// SPHEREs into `markers` on recompile. The name is a string_id from Halo 3
+/// on, an inline string in Halo 2.
+fn push_markers(root: &TagStruct<'_>, objects: &mut Vec<AssObject>, instances: &mut Vec<AssInstance>) {
+    let Some(markers_block) = root.field_path("markers").and_then(|f| f.as_block()) else {
+        return;
+    };
+    for mi in 0..markers_block.len() {
+        let m = markers_block.element(mi).unwrap();
+        let name = m.read_string_id("name").or_else(|| m.read_string("name"))
+            .unwrap_or_else(|| format!("marker_{mi}"));
+        let object_index = objects.len() as i32;
+        objects.push(AssObject {
+            xref_filepath: String::new(),
+            xref_objectname: String::new(),
+            payload: AssObjectPayload::Sphere { material: -1, radius: 10.0 },
+        });
+        instances.push(placed_instance(object_index, name, instances.len(), m.read_quat("rotation"), m.read_point3d("position"), 1.0));
+    }
+}
+
+/// Environment objects — sbsp-level scenery placements, one per
+/// `environment objects[i]` pointing into `environment object palette[]` — as
+/// an XREF OBJECT per palette entry (no geometry, just the scenery tag to
+/// re-resolve on recompile) and an INSTANCE per placement.
+///
+/// The fields are named the same from Halo 2 through Reach: the palette's
+/// `definition`, the placement's `translation`, `palette_index` and `scale`
+/// (absent in Halo 2, so 1). The older spellings are read as a fallback.
+fn push_environment_objects(root: &TagStruct<'_>, objects: &mut Vec<AssObject>, instances: &mut Vec<AssInstance>) {
+    let env_objects = root.field_path("environment objects").and_then(|f| f.as_block());
+    let env_palette = root.field_path("environment object palette").and_then(|f| f.as_block());
+    let (Some(eo), Some(ep)) = (env_objects, env_palette) else { return };
+    let mut palette_object_index: Vec<Option<i32>> = vec![None; ep.len()];
+    for pi in 0..ep.len() {
+        let pal = ep.element(pi).unwrap();
+        let xref = pal.read_tag_ref_path("definition")
+            .or_else(|| pal.read_tag_ref_path("object"))
+            .unwrap_or_default();
+        if xref.is_empty() { continue; }
+        let xref_name = crate::geometry::tag_path_basename(&xref).unwrap_or("env_object").to_owned();
+        palette_object_index[pi] = Some(objects.len() as i32);
+        objects.push(AssObject {
+            xref_filepath: xref,
+            xref_objectname: xref_name,
+            payload: AssObjectPayload::Mesh { vertices: Vec::new(), triangles: Vec::new() },
+        });
+    }
+    for ei in 0..eo.len() {
+        let placement = eo.element(ei).unwrap();
+        let pi = placement.read_int_any("palette_index")
+            .or_else(|| placement.read_int_any("palette index")).unwrap_or(-1);
+        if pi < 0 || (pi as usize) >= palette_object_index.len() { continue; }
+        let Some(object_index) = palette_object_index[pi as usize] else { continue; };
+        let position = if placement.field("translation").is_some() {
+            placement.read_point3d("translation")
+        } else {
+            placement.read_point3d("position")
+        };
+        let scale = placement.read_real("scale").unwrap_or(1.0);
+        let name = placement.read_string_id("name").or_else(|| placement.read_string("name"))
+            .unwrap_or_else(|| format!("env_object_{ei}"));
+        instances.push(placed_instance(object_index, name, instances.len(), placement.read_quat("rotation"), position, scale));
+    }
+}
+
+/// An INSTANCE of `object_index` at a tag-space position (scaled to ASS
+/// centimetres), with no pivot and no bones.
+fn placed_instance(
+    object_index: i32,
+    name: String,
+    unique_id: usize,
+    rotation: RealQuaternion,
+    position: RealPoint3d,
+    scale: f32,
+) -> AssInstance {
+    AssInstance {
+        object_index,
+        name,
+        unique_id: unique_id as i32,
+        parent_id: 0,
+        inheritance_flag: 0,
+        local_rotation: rotation,
+        local_translation: position * SCALE,
+        local_scale: scale,
+        pivot_rotation: RealQuaternion::IDENTITY,
+        pivot_translation: RealPoint3d::ZERO,
+        pivot_scale: 1.0,
+        bone_groups: Vec::new(),
+    }
+}
 
 /// Reconstruct a convex polyhedron's mesh from its bounding planes
 /// (each plane: `[i, j, k, d]` with `n·p + d = 0` and inside region

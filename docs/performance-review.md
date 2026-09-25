@@ -403,6 +403,11 @@ Re-measure after each fix and add a row to the log at the bottom.
   - UE bake setup shared between `jms.rs:498` and `render_model.rs:918`;
     `jms.rs:392` `from_ue_skeletal_mesh` has no callers.
   - H3 vs H2 sbsp→ASS builders share 166 identical lines (`ass.rs:312-1095`).
+    **Done**: `push_weather_polyhedra`, `push_markers`,
+    `push_environment_objects` and `placed_instance` serve both builders.
+    `ass.rs` −89 lines. Unifying them surfaced B13 and B14; with those, the
+    only exports that changed are the 71 H3 BSPs they explain (4,714 other
+    exports, all H2 BSPs among them, identical).
   - **Done**: `geometry::write_floats` (the JMS/ASS/JMA float line) and
     `geometry::read_edge_rows` (a BSP `edges` block as `EdgeRow`s) replace
     three copies each. Net −30 lines; 4,785 exports identical.
@@ -673,6 +678,19 @@ Re-measure after each fix and add a row to the log at the bottom.
     render_models imported with a different index buffer per run (all
     valid, none reproducible). Edges are now walked in order.
     `stripify_is_deterministic` fails on the old code, passes on the new.
+- [x] **B13. H3 BSP → ASS export dropped every environment object** — Fixed
+  - The H3 builder read the palette's `object`, the placement's `position`
+    and `palette index`; the tags (and every schema from Halo 2 through
+    Reach) name them `definition`, `translation` and `palette_index`. So no
+    palette entry resolved and nothing was emitted: 45 H3 BSPs carry 2,021
+    placements, and their ASS exports had 0 XREF objects (176 now). The
+    Halo 2 builder had the right names, and the shared helper uses them,
+    with the old spellings as fallbacks.
+- [x] **B14. H3 BSP → ASS export renamed markers `marker_N`** — Fixed
+  - The H3 builder read marker `name` only as a string_id; in 26 H3 BSPs it
+    is an inline string, so 109 markers (e.g. `waste_door_small_03`) came
+    out as `marker_0`, `marker_1`, …. The shared helper reads either, as the
+    H2 builder did. Those 26 exports differ in marker names only.
 - [x] **B7. Lost `\` line continuations left space runs inside messages** — Fixed
   - 13 string literals (converter warnings and errors, collision/sbsp import
     errors, collision-verify diagnostics, a shell error) read like `was
