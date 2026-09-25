@@ -38,7 +38,10 @@ use std::path::Path;
 
 use crate::api::TagStruct;
 use crate::file::TagFile;
-use crate::geometry::{read_compression_bounds_at, strip_to_list_u32, CompressionBounds, SCALE};
+use crate::geometry::{
+    index_start, mesh_is_triangle_strip, read_compression_bounds_at, read_mesh_indices,
+    strip_to_list_u32, CompressionBounds, SCALE,
+};
 use crate::math::{RealPlane3d, RealPoint3d, RealQuaternion, RealRgbColor, RealVector3d};
 
 // SCALE constant lives in crate::geometry (re-exported above).
@@ -1679,8 +1682,6 @@ fn build_cluster_object(
     flip_winding: bool,
 ) -> Result<AssObject, AssError> {
     let raw_v = mesh_pmt.field("raw vertices").and_then(|f| f.as_block());
-    let raw_i = mesh_pmt.field("raw indices").and_then(|f| f.as_block());
-    let raw_i32 = mesh_pmt.field("raw indices32").and_then(|f| f.as_block());
     let parts = mesh.field("parts").and_then(|f| f.as_block());
     let subparts = mesh.field("subparts").and_then(|f| f.as_block());
     let (raw_v, parts) = match (raw_v, parts) {
@@ -1690,17 +1691,7 @@ fn build_cluster_object(
 
     // Try u16 `raw indices` first; fall back to u32 `raw indices32` for
     // meshes with >65k unique vertices (same pattern as JMS path).
-    let indices: Vec<u32> = match (raw_i, raw_i32) {
-        (Some(ri), _) if ri.len() > 0 => (0..ri.len())
-            .filter_map(|k| ri.element(k))
-            .map(|e| e.read_int_any("word").unwrap_or(0) as u32)
-            .collect(),
-        (_, Some(ri32)) if ri32.len() > 0 => (0..ri32.len())
-            .filter_map(|k| ri32.element(k))
-            .map(|e| e.read_int_any("dword").unwrap_or(0) as u32)
-            .collect(),
-        _ => return Ok(empty_mesh()),
-    };
+    let Some(indices) = read_mesh_indices(mesh_pmt) else { return Ok(empty_mesh()) };
 
     // H3 sbsp meshes are ALWAYS triangle lists — the schema's
     // `index buffer type` enum labels some meshes as "triangle strip"
@@ -1732,11 +1723,7 @@ fn build_cluster_object(
             if count_i <= 0 { return; }
             // H3: short_integer (i16, may wrap negative); H4:
             // long_integer (i32, no wrap < 2^31).
-            let start = if start_i < 0 {
-                (start_i as i16 as u16) as usize
-            } else {
-                start_i as usize
-            };
+            let start = index_start(start_i);
             let count = count_i as usize;
             if start >= indices.len() { return; }
             let end = (start + count).min(indices.len());
@@ -2339,8 +2326,6 @@ fn build_render_model_object(
     cell_label: &str,
 ) -> Result<AssObject, AssError> {
     let raw_v = mesh_pmt.field("raw vertices").and_then(|f| f.as_block());
-    let raw_i = mesh_pmt.field("raw indices").and_then(|f| f.as_block());
-    let raw_i32 = mesh_pmt.field("raw indices32").and_then(|f| f.as_block());
     let parts = mesh.field("parts").and_then(|f| f.as_block());
     let (raw_v, parts) = match (raw_v, parts) {
         (Some(v), Some(p)) => (v, p),
@@ -2349,25 +2334,12 @@ fn build_render_model_object(
 
     // u16 `raw indices` first; fall back to u32 `raw indices32` for
     // meshes with >65k unique vertices (mirror JMS path).
-    let indices: Vec<u32> = match (raw_i, raw_i32) {
-        (Some(ri), _) if ri.len() > 0 => (0..ri.len())
-            .filter_map(|k| ri.element(k))
-            .map(|e| e.read_int_any("word").unwrap_or(0) as u32)
-            .collect(),
-        (_, Some(ri32)) if ri32.len() > 0 => (0..ri32.len())
-            .filter_map(|k| ri32.element(k))
-            .map(|e| e.read_int_any("dword").unwrap_or(0) as u32)
-            .collect(),
-        _ => return Ok(empty_mesh()),
-    };
+    let Some(indices) = read_mesh_indices(mesh_pmt) else { return Ok(empty_mesh()) };
 
     // render_model meshes are TRIANGLE STRIPS (default for H3 MCC),
     // unlike sbsp which is always lists. The schema enum is
     // `index buffer type` — value 5 = strip.
-    let is_strip = mesh.field("index buffer type")
-        .and_then(|f| f.value())
-        .map(|v| matches!(v, crate::TagFieldData::CharEnum { name: Some(n), .. } if n == "triangle strip"))
-        .unwrap_or(true);
+    let is_strip = mesh_is_triangle_strip(mesh);
 
     let mut vertex_remap: HashMap<u32, u32> = HashMap::new();
     let mut vertices: Vec<AssVertex> = Vec::new();
@@ -2417,11 +2389,7 @@ fn build_render_model_object(
                            vertex_remap: &mut HashMap<u32, u32>| {
             if count_i <= 0 { return; }
             // H3: short_integer (i16, wraps negative); H4: long_integer.
-            let start = if start_i < 0 {
-                (start_i as i16 as u16) as usize
-            } else {
-                start_i as usize
-            };
+            let start = index_start(start_i);
             let count = count_i as usize;
             if start >= indices.len() { return; }
             let end = (start + count).min(indices.len());

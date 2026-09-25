@@ -397,6 +397,13 @@ Re-measure after each fix and add a row to the log at the bottom.
   - `write_floats` ×3, `EdgeRow` cache ×3, shader-basename extraction ×8
     with two different methods, material find-or-insert ×7.
   - Leave `collision_verify.rs`'s independent decode alone — it is the oracle.
+  - **Index walker done** (uncommitted): `geometry::read_mesh_indices`,
+    `index_start` and `mesh_is_triangle_strip` replace the copies in
+    `jms.rs` (×2), `ass.rs` (×2), `particle_model.rs` and `render_model.rs`
+    (strip check and start normalization; its u16-only readers keep their
+    shape). Net −61 lines. Verified identical: ASS for all 143 H3 BSPs, ASS
+    and JMS for all 1,614 render_models, meshes of all 45 particle_models.
+    Fixes B9 on the way.
 
 - [ ] **D3. Converter walkers, value matches and normalizers** — Reported
   - 14 hand-written recursive walkers (`convert/mod.rs` + `resources.rs`),
@@ -545,6 +552,13 @@ Re-measure after each fix and add a row to the log at the bottom.
     all-format digest; no local H3/H2/CE bitmap uses the format. Which is
     right (1 or 2 bytes per pixel, and what the second byte means) needs
     research against the engine/TagTool before changing either side.
+- [x] **B9. ASS export sign-extended 16-bit mesh indices past 32,767** — Fixed
+  - `raw indices`' `word` is `short_integer` in every schema. JMS, particle
+    and render_model readers masked or truncated it to 16 bits; `ass.rs`'s
+    two copies didn't, so an index of 32,768+ became `0xFFFF8000`+ and
+    looked up a vertex that isn't there. The shared reader masks. No H3 BSP
+    or render_model hits it today (all outputs unchanged);
+    `a_16_bit_index_past_32767_is_not_sign_extended` pins it.
 - [x] **B7. Lost `\` line continuations left space runs inside messages** — Fixed
   - 13 string literals (converter warnings and errors, collision/sbsp import
     errors, collision-verify diagnostics, a shell error) read like `was

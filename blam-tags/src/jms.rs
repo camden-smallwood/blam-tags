@@ -43,8 +43,8 @@ use crate::api::TagStruct;
 use crate::fields::TagFieldData;
 use crate::file::TagFile;
 use crate::geometry::{
-    read_compression_bounds, strip_to_list, strip_to_list_u32, walk_surface_ring,
-    CompressionBounds, EdgeRow, SCALE,
+    index_start, mesh_is_triangle_strip, read_compression_bounds, read_mesh_indices,
+    strip_to_list, strip_to_list_u32, walk_surface_ring, CompressionBounds, EdgeRow, SCALE,
 };
 use crate::math::{RealPoint3d, RealQuaternion, RealVector3d};
 // Only the UE-mesh fusion paths below use a 4x4, and they are all `iostore`.
@@ -3073,38 +3073,15 @@ fn build_geometry(
         let raw_v = pmt.field("raw vertices").and_then(|f| f.as_block())
             .ok_or(JmsError::MissingField("per mesh temporary[i]/raw vertices"))?;
         let mut decoded = DecodedVertices::new(raw_v, bounds);
-        // `raw indices` is u16; `raw indices32` is the parallel u32
-        // slot used by meshes too big to address with 16-bit indices
-        // (e.g. bigmuthafucka with 103k unique vertices). Read whichever
-        // is populated, widen both to u32 — the JMS output side uses
-        // u32 vertex indices already (`JmsTriangle.v: [u32; 3]`), so
-        // there's no downstream truncation concern.
-        let raw_i_u16 = pmt.field("raw indices").and_then(|f| f.as_block());
-        let raw_i_u32 = pmt.field("raw indices32").and_then(|f| f.as_block());
-        let raw_u16_len = raw_i_u16.as_ref().map(|b| b.len()).unwrap_or(0);
-        let raw_u32_len = raw_i_u32.as_ref().map(|b| b.len()).unwrap_or(0);
-        let indices: Vec<u32> = if raw_u16_len > 0 {
-            let raw_i = raw_i_u16.unwrap();
-            (0..raw_i.len())
-                .filter_map(|k| raw_i.element(k))
-                .map(|e| e.read_int_any("word").unwrap_or(0) as u32 & 0xFFFF)
-                .collect()
-        } else if raw_u32_len > 0 {
-            let raw_i = raw_i_u32.unwrap();
-            (0..raw_i.len())
-                .filter_map(|k| raw_i.element(k))
-                .map(|e| e.read_int_any("dword").unwrap_or(0) as u32)
-                .collect()
-        } else {
-            return Err(JmsError::MissingField("per mesh temporary[i]/raw indices"));
-        };
+        // 16-bit indices, or 32-bit for meshes too big to address with 16
+        // (e.g. bigmuthafucka with 103k unique vertices), widened to u32 —
+        // `JmsTriangle.v` is u32 already.
+        let indices = read_mesh_indices(&pmt)
+            .ok_or(JmsError::MissingField("per mesh temporary[i]/raw indices"))?;
 
         // Default to "triangle strip" — what every MCC render mesh
         // observed uses. The schema enum value 5 = triangle strip.
-        let is_strip = mesh.field("index buffer type")
-            .and_then(|f| f.value())
-            .map(|v| matches!(v, TagFieldData::CharEnum { name: Some(n), .. } if n == "triangle strip"))
-            .unwrap_or(true);
+        let is_strip = mesh_is_triangle_strip(&mesh);
 
         let parts = mesh.field("parts").and_then(|f| f.as_block())
             .ok_or(JmsError::MissingField("meshes[i]/parts"))?;
@@ -3121,11 +3098,7 @@ fn build_geometry(
             let start_i = part.read_int_any("index start").unwrap_or(0);
             let count_i = part.read_int_any("index count").unwrap_or(0);
             if count_i <= 0 { continue; }
-            let start = if start_i < 0 {
-                (start_i as i16 as u16) as usize
-            } else {
-                start_i as usize
-            };
+            let start = index_start(start_i);
             let count = count_i as usize;
             if start >= indices.len() { continue; }
             let end = (start + count).min(indices.len());
@@ -3212,29 +3185,9 @@ fn append_instance_geometry(
     let raw_v = pmt.field("raw vertices").and_then(|f| f.as_block())
         .ok_or(JmsError::MissingField("per mesh temporary[i]/raw vertices"))?;
     let mut decoded = DecodedVertices::new(raw_v, bounds);
-    let raw_i_u16 = pmt.field("raw indices").and_then(|f| f.as_block());
-    let raw_i_u32 = pmt.field("raw indices32").and_then(|f| f.as_block());
-    let raw_u16_len = raw_i_u16.as_ref().map(|b| b.len()).unwrap_or(0);
-    let raw_u32_len = raw_i_u32.as_ref().map(|b| b.len()).unwrap_or(0);
-    let indices: Vec<u32> = if raw_u16_len > 0 {
-        let raw_i = raw_i_u16.unwrap();
-        (0..raw_i.len())
-            .filter_map(|k| raw_i.element(k))
-            .map(|e| e.read_int_any("word").unwrap_or(0) as u32 & 0xFFFF)
-            .collect()
-    } else if raw_u32_len > 0 {
-        let raw_i = raw_i_u32.unwrap();
-        (0..raw_i.len())
-            .filter_map(|k| raw_i.element(k))
-            .map(|e| e.read_int_any("dword").unwrap_or(0) as u32)
-            .collect()
-    } else {
-        return Err(JmsError::MissingField("per mesh temporary[i]/raw indices"));
-    };
-    let is_strip = mesh.field("index buffer type")
-        .and_then(|f| f.value())
-        .map(|v| matches!(v, TagFieldData::CharEnum { name: Some(n), .. } if n == "triangle strip"))
-        .unwrap_or(true);
+    let indices = read_mesh_indices(&pmt)
+        .ok_or(JmsError::MissingField("per mesh temporary[i]/raw indices"))?;
+    let is_strip = mesh_is_triangle_strip(&mesh);
 
     let parts = mesh.field("parts").and_then(|f| f.as_block())
         .ok_or(JmsError::MissingField("meshes[i]/parts"))?;
@@ -3261,11 +3214,7 @@ fn append_instance_geometry(
         if count_i <= 0 { continue; }
         // H3: short_integer (i16, may wrap negative); H4: long_integer
         // (i32, no wrap < 2^31). See `build_geometry` for the same fix.
-        let start = if start_i < 0 {
-            (start_i as i16 as u16) as usize
-        } else {
-            start_i as usize
-        };
+        let start = index_start(start_i);
         let count = count_i as usize;
         if start >= indices.len() { continue; }
         let end = (start + count).min(indices.len());

@@ -181,6 +181,48 @@ pub fn strip_to_list_u32(strip: &[u32]) -> Vec<(u32, u32, u32)> {
 }
 
 //================================================================================
+// Mesh indices
+//================================================================================
+
+/// A mesh's index buffer from its `per mesh temporary` element, widened to
+/// `u32`: the 16-bit `raw indices` when it has any, else `raw indices32`
+/// (meshes with more vertices than 16 bits can address). `None` when neither
+/// has any.
+///
+/// `raw indices`' `word` is declared `short_integer` in every schema, so an
+/// index of 32,768 or more reads back negative; it is masked to its 16 bits.
+pub(crate) fn read_mesh_indices(pmt: &TagStruct<'_>) -> Option<Vec<u32>> {
+    let read = |block: &str, field: &str, mask: u32| {
+        let block = pmt.field(block).and_then(|f| f.as_block()).filter(|b| !b.is_empty())?;
+        Some(
+            (0..block.len())
+                .filter_map(|k| block.element(k))
+                .map(|e| e.read_int_any(field).unwrap_or(0) as u32 & mask)
+                .collect(),
+        )
+    };
+    read("raw indices", "word", 0xFFFF).or_else(|| read("raw indices32", "dword", u32::MAX))
+}
+
+/// A part's or subpart's `index start` as a position in the index buffer.
+/// Halo 3 declares it a signed `short_integer`, so a start past 32,767 reads
+/// back negative; Halo 4 widened it to `long_integer`. Negative can only be
+/// the Halo 3 wrap.
+pub(crate) fn index_start(start: i128) -> usize {
+    if start < 0 { (start as i16 as u16) as usize } else { start as usize }
+}
+
+/// Whether a render mesh's indices are a triangle strip, per its `index
+/// buffer type` — defaulting to a strip, which is what every MCC render mesh
+/// uses.
+pub(crate) fn mesh_is_triangle_strip(mesh: &TagStruct<'_>) -> bool {
+    mesh.field("index buffer type")
+        .and_then(|f| f.value())
+        .map(|v| matches!(v, TagFieldData::CharEnum { name: Some(n), .. } if n == "triangle strip"))
+        .unwrap_or(true)
+}
+
+//================================================================================
 // BSP edge-ring walker
 //================================================================================
 
@@ -234,4 +276,45 @@ pub(crate) fn walk_surface_ring(
         if steps > max_steps { return Vec::new(); }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{TagFieldData, TagFile};
+
+    /// `raw indices` stores `word` as a signed short, so the upper half of the
+    /// 16-bit range reads back negative and has to come out as the index it is.
+    #[test]
+    fn a_16_bit_index_past_32767_is_not_sign_extended() {
+        let schema = "../definitions/halo3_mcc/render_model.json";
+        if !std::path::Path::new(schema).exists() {
+            return;
+        }
+        let mut tag = TagFile::new(schema).unwrap();
+        let mut root = tag.root_mut();
+        let mut pmt = root.field_path_mut("render geometry/per mesh temporary").unwrap();
+        let mut pmt = pmt.as_block_mut().unwrap();
+        let element = pmt.add_element();
+        let mut element = pmt.element_mut(element).unwrap();
+        let mut field = element.field_path_mut("raw indices").unwrap();
+        let mut indices = field.as_block_mut().unwrap();
+        for value in [0i16, 32767, -32768, -1] {
+            let index = indices.add_element();
+            let mut word = indices.element_mut(index).unwrap();
+            word.field_path_mut("word").unwrap().set(TagFieldData::ShortInteger(value)).unwrap();
+        }
+
+        let pmt = tag.root().field_path("render geometry/per mesh temporary").unwrap();
+        let pmt = pmt.as_block().unwrap().element(0).unwrap();
+        assert_eq!(read_mesh_indices(&pmt), Some(vec![0, 32767, 32768, 65535]));
+    }
+
+    #[test]
+    fn a_negative_index_start_is_the_halo_3_short_wrap() {
+        assert_eq!(index_start(0), 0);
+        assert_eq!(index_start(40_000), 40_000);
+        assert_eq!(index_start(-32768), 32768);
+        assert_eq!(index_start(-1), 65535);
+    }
 }

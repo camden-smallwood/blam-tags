@@ -236,22 +236,10 @@ fn read_gen3(tag: &TagFile, stem: &str) -> Result<Vec<ParticleObjectMesh>, JmsEr
         .and_then(|f| f.as_block())
         .ok_or(JmsError::MissingField("per mesh temporary[0]/raw vertices"))?;
 
-    // `raw indices` is u16; `raw indices32` is the parallel wide slot.
-    // Widen both to u32 — JmsTriangle indexes with u32 already.
-    let indices: Vec<u32> = match (
-        pmt.field("raw indices").and_then(|f| f.as_block()).filter(|b| !b.is_empty()),
-        pmt.field("raw indices32").and_then(|f| f.as_block()).filter(|b| !b.is_empty()),
-    ) {
-        (Some(b), _) => (0..b.len())
-            .filter_map(|k| b.element(k))
-            .map(|e| e.read_int_any("word").unwrap_or(0) as u32 & 0xFFFF)
-            .collect(),
-        (_, Some(b)) => (0..b.len())
-            .filter_map(|k| b.element(k))
-            .map(|e| e.read_int_any("dword").unwrap_or(0) as u32)
-            .collect(),
-        _ => return Err(JmsError::MissingField("per mesh temporary[0]/raw indices")),
-    };
+    // 16-bit or 32-bit indices, widened to u32 — JmsTriangle indexes with
+    // u32 already.
+    let indices = crate::geometry::read_mesh_indices(&pmt)
+        .ok_or(JmsError::MissingField("per mesh temporary[0]/raw indices"))?;
 
     // No variants (or a malformed block) → treat the whole buffer as a
     // single object rather than dropping the geometry on the floor.

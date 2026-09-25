@@ -2805,11 +2805,7 @@ where
 
         let is_strip = match index_format {
             IndexFormatPolicy::ForceTriangleList => false,
-            IndexFormatPolicy::PerMeshSchema => mesh
-                .field("index buffer type")
-                .and_then(|f| f.value())
-                .map(|v| matches!(v, TagFieldData::CharEnum { name: Some(n), .. } if n == "triangle strip"))
-                .unwrap_or(true),
+            IndexFormatPolicy::PerMeshSchema => crate::geometry::mesh_is_triangle_strip(&mesh),
         };
 
         let parts_block = mesh
@@ -2824,10 +2820,6 @@ where
 
         let mut indices: Vec<u32> = Vec::new();
         let mut parts: Vec<RenderMeshPart> = Vec::with_capacity(parts_block.len());
-        // Normalize an `index start` that may be a wrapped i16 (H3 short).
-        let norm_start = |start_i: i128| -> usize {
-            if start_i < 0 { (start_i as i16 as u16) as usize } else { start_i as usize }
-        };
 
         if !is_strip {
             // Triangle-list (BSP cluster/instance) meshes: keep the RAW index
@@ -2855,7 +2847,7 @@ where
                         let mut total = 0usize;
                         for off in 0..sub_count as usize {
                             let Some(sp) = sps.element(sub_start as usize + off) else { break };
-                            let s = norm_start(sp.read_int_any("index start").unwrap_or(0));
+                            let s = crate::geometry::index_start(sp.read_int_any("index start").unwrap_or(0));
                             let c = sp.read_int_any("index count").unwrap_or(0).max(0) as usize;
                             start = start.min(s);
                             total += c;
@@ -2868,7 +2860,7 @@ where
                     }
                 }
                 if !from_subparts {
-                    index_start = norm_start(part.read_int_any("index start").unwrap_or(0)) as u32;
+                    index_start = crate::geometry::index_start(part.read_int_any("index start").unwrap_or(0)) as u32;
                     index_count = part.read_int_any("index count").unwrap_or(0).max(0) as u32;
                 }
                 if index_start > n { index_start = n; }
@@ -2888,7 +2880,7 @@ where
             // mapping, so the reassembled order is never indexed by the sampler.
             let emit_range = |start_i: i128, count_i: i128, indices: &mut Vec<u32>| {
                 if count_i <= 0 { return; }
-                let start = norm_start(start_i);
+                let start = crate::geometry::index_start(start_i);
                 let count = count_i as usize;
                 if start >= raw_index_list.len() { return; }
                 let end = (start + count).min(raw_index_list.len());
