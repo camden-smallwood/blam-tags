@@ -33,7 +33,7 @@ const PERIODIC_ROWS: usize = 11;
 const PERIODIC_BASE: usize = TRANSITION_ROWS * LUT_LEN; // 7168
 
 #[inline]
-fn lut(base: usize, k: usize) -> f32 {
+pub(crate) fn lut(base: usize, k: usize) -> f32 {
     // Engine scales bytes by 0.0039215689 (= 1/255).
     FUNCTION_TABLES[base + k] as f32 * (1.0 / 255.0)
 }

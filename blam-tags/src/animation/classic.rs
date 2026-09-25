@@ -247,12 +247,12 @@ impl<'a> CeAnimation<'a> {
             let (dz, rotation) = match kind {
                 MovementKind::DxDyDyaw => {
                     let yaw = read_f32(self.frame_info, &mut o, be);
-                    (0.0, yaw_quat(yaw))
+                    (0.0, RealQuaternion::from_yaw(yaw))
                 }
                 MovementKind::DxDyDzDyaw => {
                     let dz = read_f32(self.frame_info, &mut o, be);
                     let yaw = read_f32(self.frame_info, &mut o, be);
-                    (dz, yaw_quat(yaw))
+                    (dz, RealQuaternion::from_yaw(yaw))
                 }
                 _ => (0.0, RealQuaternion::IDENTITY),
             };
@@ -421,11 +421,6 @@ fn bit(mask: u64, node: usize) -> bool { node < 64 && (mask >> node) & 1 == 1 }
 /// Wrap a single static track value-set into the `[node][frame]` shape with
 /// one frame each (so `pick_*` indexes `[node][0]`).
 fn vec_of<T>(v: Vec<T>) -> Vec<Vec<T>> { v.into_iter().map(|x| vec![x]).collect() }
-
-fn yaw_quat(yaw: f32) -> RealQuaternion {
-    let h = yaw * 0.5;
-    RealQuaternion { i: 0.0, j: 0.0, k: h.sin(), w: h.cos() }
-}
 
 /// Decide whether an animation's raw blobs are big-endian. Uncompressed
 /// blobs follow the tag's structured endianness (`tag_be`; CE → BE). For a

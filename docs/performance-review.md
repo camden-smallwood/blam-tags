@@ -414,6 +414,12 @@ Re-measure after each fix and add a row to the log at the bottom.
   - `write_floats` ×3, `EdgeRow` cache ×3, shader-basename extraction ×8
     with two different methods, material find-or-insert ×7.
   - Leave `collision_verify.rs`'s independent decode alone — it is the oracle.
+  - **Decided against:** the "node readers ×4". `jms::read_nodes` builds a
+    `JmsNode` (and accepts CE's field types); `render_model::read_nodes` a
+    full `Node` with the shifted inverse-bind floats; they share three
+    field reads, not logic. Material find-or-insert: the three `jms.rs`
+    copies are one `material_slot` (B3); the others key differently (CE BSP
+    by name, ASS by exact variant, special materials) and stay.
   - **Index walker done** (uncommitted): `geometry::read_mesh_indices`,
     `index_start` and `mesh_is_triangle_strip` replace the copies in
     `jms.rs` (×2), `ass.rs` (×2), `particle_model.rs` and `render_model.rs`
@@ -564,8 +570,9 @@ Re-measure after each fix and add a row to the log at the bottom.
     - Verified: every image of 3,210 H3, 4,184 H2 and 1,818 CE bitmaps (DDS
       and TIFF export digested) plus all 47 formats on seeded random input at
       8 sizes, identical before and after.
-    - Open: `animation/classic.rs` endian readers vs `fields.rs`, `yaw_quat`
-      ×2, `lut` ×2.
+    - `yaw_quat` ×2 → `RealQuaternion::from_yaw`; `h2.rs` uses
+      `tables::lut` (both bit-identical copies). Open: `animation/classic.rs`
+      endian readers vs `fields.rs`.
 
 ---
 

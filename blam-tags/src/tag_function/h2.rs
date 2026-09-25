@@ -29,7 +29,7 @@
 //! in-place write.
 
 use super::editor::color_slots;
-use super::tables::FUNCTION_TABLES;
+use super::tables::lut;
 use super::{ColorGraphType, FunctionType};
 
 /// Size of the fixed header + union that precedes the graph data.
@@ -835,9 +835,6 @@ fn clamp_tail(v: f32) -> f32 {
 }
 
 #[inline]
-fn lut(base: usize, k: usize) -> f32 {
-    FUNCTION_TABLES[base + k] as f32 * (1.0 / 255.0)
-}
 
 /// MCC `transition_function_evaluate` (0x80CC70). The table rows match the
 /// H3+ ones byte for byte; the index arithmetic differs (it truncates).

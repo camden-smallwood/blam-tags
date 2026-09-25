@@ -591,6 +591,12 @@ impl RealQuaternion {
     /// Component quad `[i, j, k, w]`.
     pub fn to_array(self) -> [f32; 4] { [self.i, self.j, self.k, self.w] }
 
+    /// A rotation of `yaw` radians about +Z (Halo's up axis).
+    pub fn from_yaw(yaw: f32) -> Self {
+        let half = yaw * 0.5;
+        Self { i: 0.0, j: 0.0, k: half.sin(), w: half.cos() }
+    }
+
     /// The rotation matrix as its three columns, each `[x, y, z]` — the
     /// inverse of [`Self::from_basis_columns`].
     pub fn to_basis_columns(self) -> [[f32; 3]; 3] {

@@ -424,11 +424,11 @@ fn read_movement_at(
             },
             MovementKind::DxDyDyaw => MovementFrame {
                 dx: f32_at(blob, off), dy: f32_at(blob, off + 4),
-                rotation: yaw_quat(f32_at(blob, off + 8)), dz: 0.0,
+                rotation: RealQuaternion::from_yaw(f32_at(blob, off + 8)), dz: 0.0,
             },
             MovementKind::DxDyDzDyaw => MovementFrame {
                 dx: f32_at(blob, off), dy: f32_at(blob, off + 4),
-                dz: f32_at(blob, off + 8), rotation: yaw_quat(f32_at(blob, off + 12)),
+                dz: f32_at(blob, off + 8), rotation: RealQuaternion::from_yaw(f32_at(blob, off + 12)),
             },
             MovementKind::DxDyDzDangleAxis => MovementFrame {
                 dx: f32_at(blob, off), dy: f32_at(blob, off + 4), dz: f32_at(blob, off + 8),
@@ -446,12 +446,6 @@ fn read_movement_at(
         frames.push(f);
     }
     MovementData { kind, frames }
-}
-
-/// Quaternion for a rotation of `yaw` radians about +Z (Halo's up).
-fn yaw_quat(yaw: f32) -> RealQuaternion {
-    let half = yaw * 0.5;
-    RealQuaternion { i: 0.0, j: 0.0, k: half.sin(), w: half.cos() }
 }
 
 /// Decode an angle-axis 3-vector (magnitude = angle in radians, the
@@ -1497,7 +1491,7 @@ mod tests {
         // An angle-axis vector of magnitude θ about +Z equals a yaw quat.
         let theta = 0.7_f32;
         let aa = angle_axis_quat(0.0, 0.0, theta);
-        let yaw = yaw_quat(theta);
+        let yaw = RealQuaternion::from_yaw(theta);
         for (a, b) in aa.to_array().iter().zip(yaw.to_array().iter()) {
             assert!((a - b).abs() < 1e-6, "{a} vs {b}");
         }
