@@ -355,6 +355,14 @@ Re-measure after each fix and add a row to the log at the bottom.
     section key, then linear-searches.
   - `jms.rs:1376` / `ass.rs:1951` re-resolve the material per collision
     surface (allocation + O(materials) scan).
+  - **Weld grid done**: the cell grid hashes its `(i64, i64, i64)` keys
+    with a small multiplicative hasher instead of SipHash (27 probes per
+    point), and `skinning_compatible` checks each node straight off both
+    influence lists instead of collecting, sorting and deduping them per
+    candidate pair. The survivor's mean is still recomputed from all members
+    — a running sum would change the float order and so the bits. Render
+    import with PRT off, 1,614 H3 models: 13.9 s → **10.8 s**; all render,
+    collision (1,218), physics (1,211) and BSP (26) re-imports identical.
   - `weld.rs:326` clones every vertex to normalize normals; `:349`
     `Vec<Vec<u32>>`; `:453` allocates per candidate comparison.
   - `prt.rs:209` allocates a ray stack per ray; the per-vertex loop is

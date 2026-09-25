@@ -172,6 +172,36 @@
 //! against a shipped tag will see it.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+
+/// A fast hash for the weld grid's integer cell keys. Every point probes 27
+/// cells, and the default SipHash — built to resist adversarial keys, which
+/// these are not — was a large share of welding. Lookups only; the buckets
+/// and the order they are searched in are unchanged.
+type CellHash = BuildHasherDefault<CellHasher>;
+
+#[derive(Default)]
+struct CellHasher(u64);
+
+impl Hasher for CellHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(byte as u64);
+        }
+    }
+
+    fn write_i64(&mut self, value: i64) {
+        self.write_u64(value as u64);
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
 
 use crate::math::{RealPoint2d, RealPoint3d, RealVector3d};
 
@@ -449,15 +479,9 @@ fn skinning_compatible(a: &[(i16, f32)], b: &[(i16, f32)], tol: f32) -> bool {
     let weight = |list: &[(i16, f32)], node: i16| -> f32 {
         list.iter().filter(|(n, _)| *n == node).map(|(_, w)| *w).sum()
     };
-    let mut nodes: Vec<i16> = a.iter().map(|(n, _)| *n).chain(b.iter().map(|(n, _)| *n)).collect();
-    nodes.sort_unstable();
-    nodes.dedup();
-    for node in nodes {
-        if (weight(a, node) - weight(b, node)).abs() > tol {
-            return false;
-        }
-    }
-    true
+    // Every node either side names; one named on both is checked twice,
+    // which cannot change the answer. No list to build per candidate pair.
+    !a.iter().chain(b).any(|&(node, _)| (weight(a, node) - weight(b, node)).abs() > tol)
 }
 
 
@@ -503,7 +527,7 @@ fn merge_points(
             )
         };
         let eps2 = (eps as f64) * (eps as f64);
-        let mut grid: HashMap<(i64, i64, i64), Vec<u32>> = HashMap::new();
+        let mut grid: HashMap<(i64, i64, i64), Vec<u32>, CellHash> = HashMap::default();
 
         for p in 0..positions.len() {
             if !alive[p] || !admits(p, point_precise, point_section) {
