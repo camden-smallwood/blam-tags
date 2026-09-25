@@ -694,30 +694,7 @@ fn local_transform(jms: &JmsFile, i: usize) -> (RealPoint3d, crate::math::RealQu
     let pq = parent.rotation;
     let inv = crate::math::RealQuaternion { i: -pq.i, j: -pq.j, k: -pq.k, w: pq.w };
     let d = RealPoint3d { x: world_t.x - pt.x, y: world_t.y - pt.y, z: world_t.z - pt.z };
-    (rotate(inv, d), mul(inv, node.rotation))
-}
-
-fn mul(a: crate::math::RealQuaternion, b: crate::math::RealQuaternion) -> crate::math::RealQuaternion {
-    crate::math::RealQuaternion {
-        i: a.w * b.i + a.i * b.w + a.j * b.k - a.k * b.j,
-        j: a.w * b.j - a.i * b.k + a.j * b.w + a.k * b.i,
-        k: a.w * b.k + a.i * b.j - a.j * b.i + a.k * b.w,
-        w: a.w * b.w - a.i * b.i - a.j * b.j - a.k * b.k,
-    }
-}
-
-fn rotate(q: crate::math::RealQuaternion, p: RealPoint3d) -> RealPoint3d {
-    let (x, y, z, w) = (q.i, q.j, q.k, q.w);
-    let m = [
-        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
-        [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
-        [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
-    ];
-    RealPoint3d {
-        x: m[0][0] * p.x + m[0][1] * p.y + m[0][2] * p.z,
-        y: m[1][0] * p.x + m[1][1] * p.y + m[1][2] * p.z,
-        z: m[2][0] * p.x + m[2][1] * p.y + m[2][2] * p.z,
-    }
+    (inv.rotate_point(d), inv * node.rotation)
 }
 
 fn write_markers(tag: &mut TagFile, jms: &JmsFile) -> R<usize> {

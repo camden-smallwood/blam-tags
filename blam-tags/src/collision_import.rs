@@ -228,17 +228,7 @@ pub struct CollisionReport {
 
 // ------------------------------------------------------------- geometry
 
-type V3 = [f64; 3];
-
-fn sub3(a: V3, b: V3) -> V3 {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-fn cross3(a: V3, b: V3) -> V3 {
-    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
-}
-fn dot3(a: V3, b: V3) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
+use crate::math::v3::{cross as cross3, dot as dot3, sub as sub3, V3};
 fn len3(a: V3) -> f64 {
     dot3(a, a).sqrt()
 }

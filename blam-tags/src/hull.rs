@@ -146,24 +146,7 @@ impl std::fmt::Display for HullError {
 
 impl std::error::Error for HullError {}
 
-type V3 = [f64; 3];
-
-fn sub(a: V3, b: V3) -> V3 {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-fn cross(a: V3, b: V3) -> V3 {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-fn dot(a: V3, b: V3) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-fn norm(a: V3) -> f64 {
-    dot(a, a).sqrt()
-}
+use crate::math::v3::{cross, dot, norm, sub, V3};
 
 /// One triangular face of the working hull.
 #[derive(Clone, Copy)]

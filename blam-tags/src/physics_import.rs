@@ -546,32 +546,10 @@ pub fn physics_model_from_jms(
 
 // ---------------------------------------------------------------- readers
 
-/// The three columns of the rotation matrix a unit quaternion denotes.
-fn quat_columns(q: &RealQuaternion) -> [[f32; 3]; 3] {
-    let (x, y, z, w) = (q.i, q.j, q.k, q.w);
-    [
-        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + z * w), 2.0 * (x * z - y * w)],
-        [2.0 * (x * y - z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z + x * w)],
-        [2.0 * (x * z + y * w), 2.0 * (y * z - x * w), 1.0 - 2.0 * (x * x + y * y)],
-    ]
-}
-
 /// Rotate then translate.
 fn place(q: &RealQuaternion, t: &RealPoint3d, p: RealPoint3d) -> RealPoint3d {
-    let c = quat_columns(q);
-    RealPoint3d {
-        x: c[0][0] * p.x + c[1][0] * p.y + c[2][0] * p.z + t.x,
-        y: c[0][1] * p.x + c[1][1] * p.y + c[2][1] * p.z + t.y,
-        z: c[0][2] * p.x + c[1][2] * p.y + c[2][2] * p.z + t.z,
-    }
-}
-
-fn q(r: &RealQuaternion) -> RealQuaternion {
-    *r
-}
-
-fn scaled(p: &RealPoint3d, s: f32) -> RealPoint3d {
-    RealPoint3d { x: p.x * s, y: p.y * s, z: p.z * s }
+    let r = q.rotate_point(p);
+    RealPoint3d { x: r.x + t.x, y: r.y + t.y, z: r.z + t.z }
 }
 
 fn sphere_shape(sp: &JmsSphere, s: f32) -> Shape {
@@ -579,8 +557,8 @@ fn sphere_shape(sp: &JmsSphere, s: f32) -> Shape {
         name: sp.name.clone(),
         node: sp.parent,
         material: sp.material,
-        rotation: q(&sp.rotation),
-        translation: scaled(&sp.translation, s),
+        rotation: sp.rotation,
+        translation: sp.translation.scaled(s),
         kind: Kind::Sphere { radius: sp.radius * s },
     }
 }
@@ -590,8 +568,8 @@ fn capsule_shape(cp: &JmsCapsule, s: f32) -> Shape {
         name: cp.name.clone(),
         node: cp.parent,
         material: cp.material,
-        rotation: q(&cp.rotation),
-        translation: scaled(&cp.translation, s),
+        rotation: cp.rotation,
+        translation: cp.translation.scaled(s),
         kind: Kind::Pill { radius: cp.radius * s, height: cp.height * s },
     }
 }
@@ -601,8 +579,8 @@ fn box_shape(bx: &JmsBox, s: f32) -> Shape {
         name: bx.name.clone(),
         node: bx.parent,
         material: bx.material,
-        rotation: q(&bx.rotation),
-        translation: scaled(&bx.translation, s),
+        rotation: bx.rotation,
+        translation: bx.translation.scaled(s),
         // JMS stores full extents; Havok stores half.
         kind: Kind::Box {
             half: [bx.width * s * 0.5, bx.length * s * 0.5, bx.height * s * 0.5],
@@ -613,9 +591,9 @@ fn box_shape(bx: &JmsBox, s: f32) -> Shape {
 fn convex_shape(cv: &JmsConvex, s: f32, convex_radius: f32) -> R<Shape> {
     // A polyhedron has no placement wrapper: its vertices are already in
     // rigid-body space, so the shape's own transform is baked in here.
-    let t = scaled(&cv.translation, s);
+    let t = cv.translation.scaled(s);
     let scaled_pts: Vec<RealPoint3d> =
-        cv.vertices.iter().map(|v| place(&cv.rotation, &t, scaled(v, s))).collect();
+        cv.vertices.iter().map(|v| place(&cv.rotation, &t, v.scaled(s))).collect();
     let hull = match convex_hull(&scaled_pts) {
         Ok(h) => h,
         Err(HullError::Coplanar) => {
@@ -635,8 +613,8 @@ fn convex_shape(cv: &JmsConvex, s: f32, convex_radius: f32) -> R<Shape> {
         name: cv.name.clone(),
         node: cv.parent,
         material: cv.material,
-        rotation: q(&cv.rotation),
-        translation: scaled(&cv.translation, s),
+        rotation: cv.rotation,
+        translation: cv.translation.scaled(s),
         kind: Kind::Polyhedron { vertices: hull.vertices, planes: hull.planes },
     })
 }
@@ -924,7 +902,7 @@ fn write_shape(
                 })?;
                 // A box carries a full `hkConvexTransformShape` — three
                 // rotation columns and a translation.
-                let cols = quat_columns(&sh.rotation);
+                let cols = sh.rotation.to_basis_columns();
                 let t = sh.translation;
                 with_struct(&mut el, "convex transform shape", |ts| {
                     try_set(ts, "rotation i", vec3(cols[0]));

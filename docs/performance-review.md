@@ -389,6 +389,15 @@ Re-measure after each fix and add a row to the log at the bottom.
     (`gltf.rs:459-563`, `render_import.rs:706-735`,
     `physics_import.rs:543-567`, f32/f64 `v3` helpers in 5+ files,
     normalize-with-floor inlined 10+ times).
+  - **Importer math done**: `render_import`'s quaternion `mul` is
+    `RealQuaternion * RealQuaternion` (same formula, same order);
+    its `rotate` and `physics_import`'s `place`/`quat_columns` are
+    `RealQuaternion::rotate_point` / `to_basis_columns` — the rotation-matrix
+    form, kept apart from `rotate` (cross-product form, rounds differently);
+    `scaled` is `RealPoint3d::scaled` and the identity `q()` is gone.
+    `collision_import`'s and `hull.rs`'s f64 `sub`/`cross`/`dot`/`norm` are
+    one `math::v3`. Net −25 lines. Verified: all 4,069 re-imports identical.
+    Open: `gltf.rs`'s column-major matrix helpers (no glTF corpus locally).
   - Importer tag-writing helpers (`with_block`/`try_set`/`string_id`) ×4;
     first-child/sibling derivation ×4; `JMS_TO_WORLD` defined ×4.
   - UE bake setup shared between `jms.rs:498` and `render_model.rs:918`;

@@ -591,6 +591,31 @@ impl RealQuaternion {
     /// Component quad `[i, j, k, w]`.
     pub fn to_array(self) -> [f32; 4] { [self.i, self.j, self.k, self.w] }
 
+    /// The rotation matrix as its three columns, each `[x, y, z]` — the
+    /// inverse of [`Self::from_basis_columns`].
+    pub fn to_basis_columns(self) -> [[f32; 3]; 3] {
+        let (x, y, z, w) = (self.i, self.j, self.k, self.w);
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + z * w), 2.0 * (x * z - y * w)],
+            [2.0 * (x * y - z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z + x * w)],
+            [2.0 * (x * z + y * w), 2.0 * (y * z - x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ]
+    }
+
+    /// Rotate a point through the rotation matrix ([`Self::to_basis_columns`]).
+    ///
+    /// The same rotation as [`Self::rotate`], computed another way — and the
+    /// two round differently, so code whose output must stay byte-for-byte
+    /// keeps to the one it was written with. The importers use this one.
+    pub fn rotate_point(self, p: RealPoint3d) -> RealPoint3d {
+        let c = self.to_basis_columns();
+        RealPoint3d {
+            x: c[0][0] * p.x + c[1][0] * p.y + c[2][0] * p.z,
+            y: c[0][1] * p.x + c[1][1] * p.y + c[2][1] * p.z,
+            z: c[0][2] * p.x + c[1][2] * p.y + c[2][2] * p.z,
+        }
+    }
+
     /// Apply this rotation to a vector. Optimized two-cross-product form:
     /// `v' = v + 2 * cross(q.xyz, cross(q.xyz, v) + q.w * v)`.
     pub fn rotate(self, v: RealVector3d) -> RealVector3d {
@@ -1147,4 +1172,26 @@ pub(crate) fn half_to_f32(h: u16) -> f32 {
 pub(crate) fn clamp_unit_to_u8(value: f32) -> u8 {
     let clamped = if value.is_nan() { 0.0 } else { value.clamp(0.0, 1.0) };
     (clamped * 255.0 + 0.5) as u8
+}
+
+/// `[f64; 3]` vector arithmetic for the importers' exact-geometry passes
+/// (convex hulls, collision BSP planes), which work in double precision.
+pub(crate) mod v3 {
+    pub(crate) type V3 = [f64; 3];
+
+    pub(crate) fn sub(a: V3, b: V3) -> V3 {
+        [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+    }
+
+    pub(crate) fn cross(a: V3, b: V3) -> V3 {
+        [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+    }
+
+    pub(crate) fn dot(a: V3, b: V3) -> f64 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
+
+    pub(crate) fn norm(a: V3) -> f64 {
+        dot(a, a).sqrt()
+    }
 }
