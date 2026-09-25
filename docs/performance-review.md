@@ -276,7 +276,7 @@ Re-measure after each fix and add a row to the log at the bottom.
     and in ~20 tests (add a shared `OnceLock`); name map cloned and SipHashed
     per package (`name_map.rs:146`).
 
-- [ ] **P14. Bitmap / audio / classic copies** — Verified (code) / unmeasured
+- [x] **P14. Bitmap / audio / classic copies** — Verified (code) / unmeasured
   - `bitmap/mod.rs:553` `resolve_image_pixels`: `shared_pixels[offset..].to_vec()`
     copies from each image's offset to the **end** of the blob — quadratic in
     image count, done eagerly in `Bitmap::new`. Borrow instead (`Cow`).
@@ -295,6 +295,25 @@ Re-measure after each fix and add a row to the log at the bottom.
     string-matches (`render_method/cbuffer.rs:128`); object-space corrections
     redo FK with fresh allocations per frame (`animation/pose.rs:190`);
     `CodebookLibrary::load()` per `.wem` (`ww_vorbis.rs:453`).
+  - **Headline items done:**
+    - `Bitmap` keeps `Cow<'a, [u8]>` per image: borrowed from the shared blob
+      for PC tags (same bytes as before — each image still sees the blob's
+      tail from its offset), owned for X360. `Bitmap::new` over 3,210 H3
+      bitmaps: 113 ms → **6.8 ms**; DDS output identical for every tag.
+    - Classic: element slices are borrowed instead of `to_vec`'d, and
+      `classic_field_size`'s leaf path is inlined (its struct/array arms move
+      to an out-of-line `classic_container_size`). H2 corpus read
+      4.25 s → **3.06 s**, write 4.29 s → **4.05 s**; same 4 mismatches with
+      the same re-encoded bytes, CE 0. Tried and reverted: a forward cursor for
+      the per-field `sub_chunks.find` in `sync_fixed_counts` /
+      `encode_struct_trailing` — classic structs carry few entries and its
+      per-element ordering check made writes ~5% *slower*.
+    - Wwise Ogg writer: `write` fills whole bytes per step instead of a call
+      per bit, and `write_bytes` copies a byte-aligned packet payload as is.
+      No `.wem` on this machine to time; `chunked_writes_match_bit_at_a_time`
+      checks it against the old bit-at-a-time writer over every alignment.
+    - Still open: the "Reported, lower" items above, and `encode_block`'s
+      `raw_data.clone()`.
 
 - [ ] **P15. Geometry allocation churn** — Reported
   - Two heap `Vec`s per vertex in `JmsVertex` / `AssVertex` / `AuthorVertex`
@@ -454,5 +473,6 @@ Re-measure after each fix and add a row to the log at the bottom.
 | 2026-09-25 | P1 + P2 + P3 | 1.05 s (path) / 0.75 s (bytes) | 1.18 s | 9.9 s | 4.1 s | 3.4 s | 0.59 s |
 | 2026-09-25 | + P4 + P5 + P6 | 1.12 s (path) / 0.79 s (bytes)¹ | 1.27 s¹ | 3.8 s | 4.2 s | 0.77 s | 0.60 s |
 | 2026-09-25 | + P7 | — | 0.49–0.73 s | — | — | — | — |
+| 2026-09-25 | + P14 (classic) | — | — | 3.06 s | 4.05 s | 0.58 s | 0.65 s |
 
 ¹ Single runs of H3 vary ±5%; the P5 A/B over 3 reps is the reliable number (−3% read).

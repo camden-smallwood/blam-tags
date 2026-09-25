@@ -115,8 +115,8 @@ impl From<std::io::Error> for BitmapError {
 ///   whose contents are streamed from a `cache_N` partition and
 ///   pre-hydrated by [`crate::monolithic::MonolithicCache::read_tag`]).
 ///
-/// `Bitmap` normalizes both cases by owning a `Vec<u8>` per image
-/// — sliced from the shared blob for MCC, or copied from each
+/// `Bitmap` normalizes both cases with one byte run per image —
+/// borrowed from the shared blob for MCC, or converted from each
 /// resource's payload for X360. Per-image consumers
 /// ([`BitmapImage`]) get a borrowed `&[u8]` covering just their
 /// own data.
@@ -125,7 +125,10 @@ pub struct Bitmap<'a> {
     /// The `sequences[]` block (sprite-sheet atlas layout), if present.
     /// Populated for sprite/animated bitmaps; empty for plain textures.
     sequences: Option<TagBlock<'a>>,
-    per_image_pixels: Vec<Vec<u8>>,
+    /// Borrowed from the shared blob for PC tags — copying it cost one copy
+    /// of the blob's tail per image, quadratic in the image count — and owned
+    /// for X360, whose pixels are detiled and converted.
+    per_image_pixels: Vec<std::borrow::Cow<'a, [u8]>>,
     /// Per-image override of the mipmap level count. `None` means
     /// trust the tag's `mipmap count` field. `Some(n)` is used when
     /// we synthesize a different mip layout — currently only set
@@ -186,7 +189,7 @@ impl<'a> Bitmap<'a> {
             return Err(BitmapError::NotABitmapTag);
         };
 
-        let mut per_image_pixels: Vec<Vec<u8>> = Vec::with_capacity(bitmaps.len());
+        let mut per_image_pixels = Vec::with_capacity(bitmaps.len());
         let mut per_image_mip_override: Vec<Option<u32>> = Vec::with_capacity(bitmaps.len());
         for (i, elem) in bitmaps.iter().enumerate() {
             let hw_elem = if use_x360 {
@@ -276,7 +279,7 @@ impl<'a> Bitmap<'a> {
     /// Get the image at `index`, or `None` if out of range.
     pub fn image(&self, index: usize) -> Option<BitmapImage<'_>> {
         let elem = self.bitmaps.element(index)?;
-        let pixels = self.per_image_pixels.get(index)?.as_slice();
+        let pixels = self.per_image_pixels.get(index)?.as_ref();
         let mip_override = self.per_image_mip_override.get(index).copied().flatten();
         Some(BitmapImage {
             elem,
@@ -295,7 +298,7 @@ impl<'a> Bitmap<'a> {
         let x360 = self.x360;
         self.bitmaps.iter().enumerate().map(move |(i, elem)| BitmapImage {
             elem,
-            pixels: per_image[i].as_slice(),
+            pixels: per_image[i].as_ref(),
             mip_override: overrides[i],
             p8_palette,
             x360,
@@ -536,7 +539,8 @@ fn resolve_image_pixels<'a>(
     elem: TagStruct<'a>,
     hw_elem: Option<TagStruct<'a>>,
     shared_pixels: &'a [u8],
-) -> Result<(Vec<u8>, Option<u32>), BitmapError> {
+) -> Result<(std::borrow::Cow<'a, [u8]>, Option<u32>), BitmapError> {
+    use std::borrow::Cow;
     if let Some(hw) = hw_elem
         && let Some(resource) = hw
             .field("texture resource")
@@ -544,17 +548,18 @@ fn resolve_image_pixels<'a>(
         && resource.exploded_payload().is_some()
     {
         let (primary, secondary) = x360_buffers(&resource);
-        return convert_x360_image_full(elem, primary, secondary);
+        return convert_x360_image_full(elem, primary, secondary)
+            .map(|(pixels, mips)| (Cow::Owned(pixels), mips));
     }
 
     if !shared_pixels.is_empty() {
         let offset = elem.read_int_any("pixels offset").unwrap_or(0).max(0) as usize;
         if offset <= shared_pixels.len() {
-            return Ok((shared_pixels[offset..].to_vec(), None));
+            return Ok((Cow::Borrowed(&shared_pixels[offset..]), None));
         }
     }
 
-    Ok((Vec::new(), None))
+    Ok((Cow::Borrowed(&[]), None))
 }
 
 

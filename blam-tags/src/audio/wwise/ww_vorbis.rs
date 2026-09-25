@@ -94,20 +94,32 @@ impl OggWriter {
         }
     }
 
-    fn put_bit(&mut self, bit: u32) {
-        if bit != 0 {
-            self.bit_buffer |= 1 << self.bits_stored;
-        }
-        self.bits_stored += 1;
-        if self.bits_stored == 8 {
-            self.flush_bits();
+    /// Write `n` low bits of `v`, LSB-first — as many at a time as fit in the
+    /// byte being filled, rather than one bit per call.
+    fn write(&mut self, mut v: u32, mut n: u32) {
+        while n > 0 {
+            let take = (8 - self.bits_stored).min(n);
+            let bits = (v & ((1u32 << take) - 1)) as u8;
+            self.bit_buffer |= bits << self.bits_stored;
+            self.bits_stored += take;
+            v >>= take; // `take` is at most 8
+            n -= take;
+            if self.bits_stored == 8 {
+                self.flush_bits();
+            }
         }
     }
 
-    /// Write `n` low bits of `v`, LSB-first.
-    fn write(&mut self, v: u32, n: u32) {
-        for i in 0..n {
-            self.put_bit((v >> i) & 1);
+    /// Write whole bytes, LSB-first like [`Self::write`]. A packet's payload
+    /// is almost all of a stream's bytes; when the writer is on a byte
+    /// boundary they are copied as they are.
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        if self.bits_stored == 0 {
+            self.payload.extend_from_slice(bytes);
+            return;
+        }
+        for &byte in bytes {
+            self.write(byte as u32, 8);
         }
     }
 
@@ -712,13 +724,9 @@ impl WwiseVorbis<'_> {
                 // remaining bits of the first byte
                 os.write(remainder, 8 - mode_bits);
                 // rest of the packet bytes verbatim
-                for &b in &payload[1..size] {
-                    os.write(b as u32, 8);
-                }
+                os.write_bytes(&payload[1..size]);
             } else {
-                for &b in &payload[..size] {
-                    os.write(b as u32, 8);
-                }
+                os.write_bytes(&payload[..size]);
             }
 
             offset = next_offset;
@@ -746,6 +754,64 @@ impl WwiseVorbis<'_> {
     fn packet(&self, rel: u32) -> Result<(&[u8], usize), String> {
         let (payload, size, _) = self.packet_at(rel as usize)?;
         Ok((payload, size))
+    }
+}
+
+#[cfg(test)]
+mod ogg_writer_tests {
+    use super::OggWriter;
+
+    /// The bit-at-a-time writer `write`/`write_bytes` replaced.
+    fn reference(ops: &[(u32, u32)]) -> Vec<u8> {
+        let (mut out, mut buffer, mut stored) = (Vec::new(), 0u8, 0u32);
+        for &(v, n) in ops {
+            for i in 0..n {
+                if (v >> i) & 1 != 0 {
+                    buffer |= 1 << stored;
+                }
+                stored += 1;
+                if stored == 8 {
+                    out.push(buffer);
+                    (buffer, stored) = (0, 0);
+                }
+            }
+        }
+        if stored != 0 {
+            out.push(buffer);
+        }
+        out
+    }
+
+    #[test]
+    fn chunked_writes_match_bit_at_a_time() {
+        // Deterministic pseudo-random widths 0..=32 and values, across
+        // every alignment, plus whole-byte runs through `write_bytes`.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..200 {
+            let mut writer = OggWriter::new();
+            let mut ops = Vec::new();
+            for _ in 0..64 {
+                let r = next();
+                if r % 5 == 0 {
+                    let bytes: Vec<u8> = (0..(r >> 8) % 40).map(|_| next() as u8).collect();
+                    writer.write_bytes(&bytes);
+                    ops.extend(bytes.iter().map(|&b| (b as u32, 8)));
+                } else {
+                    let n = ((r >> 8) % 33) as u32;
+                    let v = (next() as u32) & if n == 32 { u32::MAX } else { (1u32 << n) - 1 };
+                    writer.write(v, n);
+                    ops.push((v, n));
+                }
+            }
+            writer.flush_bits();
+            assert_eq!(writer.payload, reference(&ops));
+        }
     }
 }
 

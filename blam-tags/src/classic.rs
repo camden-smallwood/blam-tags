@@ -409,19 +409,13 @@ fn inline_struct_static_index(layout: &TagLayout, base: u32) -> u32 {
 /// - `useless_pad`: its real `length` when legacy-padding, else 0.
 /// - `old_string_id`: a 32-byte inline string when legacy-strings, else
 ///   the modern 4-byte length slot.
+// Inlined: the field walks call this for every leaf field of every element.
+// The struct/array arms recurse, which kept the whole function out of line.
+#[inline]
 fn classic_field_size(layout: &TagLayout, field: &TagFieldLayout, engine: ClassicEngine) -> usize {
     match field.field_type {
         TagFieldType::Terminator => 0,
-        TagFieldType::Struct => {
-            classic_struct_size(layout, inline_struct_static_index(layout, field.definition), engine)
-        }
-        TagFieldType::Array => {
-            // Array element structs are versionless on disk (always v0,
-            // like an untagged inline struct).
-            let a = &layout.array_layouts[field.definition as usize];
-            let esi = resolve_version_variant(layout, a.struct_index, 0);
-            classic_struct_size(layout, esi, engine) * a.count as usize
-        }
+        TagFieldType::Struct | TagFieldType::Array => classic_container_size(layout, field, engine),
         TagFieldType::Pad | TagFieldType::Skip => field.definition as usize,
         TagFieldType::UselessPad => {
             if engine.legacy_padding() {
@@ -440,6 +434,19 @@ fn classic_field_size(layout: &TagLayout, field: &TagFieldLayout, engine: Classi
         TagFieldType::Custom => field.definition as usize,
         _ => layout.field_types[field.type_index as usize].size as usize,
     }
+}
+
+/// [`classic_field_size`] of an inline struct or array field.
+#[inline(never)]
+fn classic_container_size(layout: &TagLayout, field: &TagFieldLayout, engine: ClassicEngine) -> usize {
+    if field.field_type == TagFieldType::Struct {
+        return classic_struct_size(layout, inline_struct_static_index(layout, field.definition), engine);
+    }
+    // Array element structs are versionless on disk (always v0, like an
+    // untagged inline struct).
+    let a = &layout.array_layouts[field.definition as usize];
+    let esi = resolve_version_variant(layout, a.struct_index, 0);
+    classic_struct_size(layout, esi, engine) * a.count as usize
 }
 
 /// On-disk size of a struct's fixed region for `engine` (sum of its
@@ -702,8 +709,8 @@ pub(crate) fn read_classic_body(
     let raw_data = cur.take(total, "root struct").map(<[u8]>::to_vec)?;
     let mut elements = Vec::with_capacity(count);
     for i in 0..count {
-        let elem_raw = raw_data[i * elem_size..(i + 1) * elem_size].to_vec();
-        let sub = decode_struct_element(layout, struct_index, &elem_raw, &mut cur, engine, endian)?;
+        let elem_raw = &raw_data[i * elem_size..(i + 1) * elem_size];
+        let sub = decode_struct_element(layout, struct_index, elem_raw, &mut cur, engine, endian)?;
         elements.push(TagStructData { struct_index, sub_chunks: sub, classic_struct_header: None });
     }
 
@@ -992,8 +999,8 @@ fn decode_block(
 
     let mut elements = Vec::with_capacity(count);
     for i in 0..count {
-        let elem_raw = raw_data[i * elem_size..(i + 1) * elem_size].to_vec();
-        let sub = decode_struct_element(layout, struct_index, &elem_raw, cur, engine, endian)?;
+        let elem_raw = &raw_data[i * elem_size..(i + 1) * elem_size];
+        let sub = decode_struct_element(layout, struct_index, elem_raw, cur, engine, endian)?;
         elements.push(TagStructData { struct_index, sub_chunks: sub, classic_struct_header: None });
     }
 
