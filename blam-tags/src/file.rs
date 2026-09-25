@@ -496,13 +496,18 @@ impl TagFile {
     }
 
     fn write_atomic_bytes(&self) -> std::io::Result<Vec<u8>> {
-        let mut bytes = self.write_to_bytes()?;
-        if matches!(self.container, TagContainer::Mcc) {
-            let mut main_stream = Vec::new();
-            self.tag_stream
-                .write(u32::from_be_bytes(*b"tag!"), &mut main_stream)?;
-            patch_live_reload_checksum(&mut bytes, &main_stream);
+        if !matches!(self.container, TagContainer::Mcc) {
+            return self.write_to_bytes();
         }
+        // Same bytes as `write_to`, with the checksum taken over the `tag!`
+        // stream where it lands rather than over a second serialization of it.
+        let mut bytes = Vec::new();
+        self.header.write(&mut bytes)?;
+        let main_stream_start = bytes.len();
+        self.tag_stream.write(u32::from_be_bytes(*b"tag!"), &mut bytes)?;
+        let main_stream = main_stream_start..bytes.len();
+        self.write_optional_streams(&mut bytes)?;
+        patch_live_reload_checksum(&mut bytes, main_stream);
         Ok(bytes)
     }
 
@@ -535,7 +540,11 @@ impl TagFile {
 
         self.header.write(writer)?;
         self.tag_stream.write(u32::from_be_bytes(*b"tag!"), writer)?;
+        self.write_optional_streams(writer)
+    }
 
+    /// The `want`, `info` and `assd` streams that follow `tag!`, in that order.
+    fn write_optional_streams<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
         if let Some(dependency_list_stream) = &self.dependency_list_stream {
             dependency_list_stream.write(u32::from_be_bytes(*b"want"), writer)?;
         }
@@ -828,13 +837,14 @@ fn schema_profile_name(schema_path: &Path) -> Option<String> {
     Some(meta.get("game")?.as_str()?.to_owned())
 }
 
-fn patch_live_reload_checksum(bytes: &mut [u8], main_stream: &[u8]) {
+fn patch_live_reload_checksum(bytes: &mut [u8], main_stream: std::ops::Range<usize>) {
     const CHECKSUM_OFFSET: usize = 56;
     const CHECKSUM_END: usize = CHECKSUM_OFFSET + 4;
 
     if bytes.len() < CHECKSUM_END {
         return;
     }
+    let main_stream = &bytes[main_stream];
     // Same CRC as the classic header's: reflected, init all-ones, no final XOR.
     let checksum = crate::classic::classic_checksum(main_stream);
     bytes[CHECKSUM_OFFSET..CHECKSUM_END].copy_from_slice(&checksum.to_le_bytes());

@@ -84,7 +84,7 @@ Re-measure after each fix and add a row to the log at the bottom.
     empty) pass. H2 write 26.6 s → **4.1 s**, CE write 3.7 s → **0.59 s**,
     mismatch counts unchanged.
 
-- [ ] **P4. Classic reads rebuild the layout from JSON for every tag** — Verified
+- [x] **P4. Classic reads rebuild the layout from JSON for every tag** — Verified
   - Where: `blam-tag-shell/src/context.rs:146`, `convert/mod.rs:103`,
     `:1783`, the classic template scan (`convert/mod.rs:3786`), every test that
     reads a classic tag.
@@ -98,8 +98,18 @@ Re-measure after each fix and add a row to the log at the bottom.
     `persist_layout_version` (1328), plus `file.rs:822`.
   - Also: `schema.rs:406` uses `serde_json::from_reader(BufReader)`; use
     `fs::read` + `from_slice` (serde_json documents `from_reader` as slower).
+  - **Done** (uncommitted): `from_json_with_meta` keeps a process-wide cache
+    of built layouts keyed by canonical path, validated against the size and
+    mtime of the definition and its `_meta.json`; a hit is a clone re-stamped
+    with a fresh layout guid, since every build gets its own. `TagLayout` and
+    `TagLayoutHeader` derive `Clone`. JSON is read with `fs::read` +
+    `from_slice`. Every caller benefits unchanged (shell, converter, Python,
+    tests). Classic read: H2 9.9 s → **3.8 s** (layouts 6.5 → 0.43 s),
+    CE 3.4 s → **0.77 s**. Test: `an_edited_definition_is_not_served_from_the_layout_cache`.
+    Not done: an edit to an *ancestor* or template sibling JSON isn't seen by
+    a warm cache — only the definition itself and `_meta.json` are checked.
 
-- [ ] **P5. Simple-block elements rebuild their default scaffolding one at a time** — Verified
+- [x] **P5. Simple-block elements rebuild their default scaffolding one at a time** — Verified
   - Where: `data.rs:1255-1261` calls `TagStructData::new_default` for every
     element of a simple block, walking every field each time.
   - Cost: top CPU symbol of the H3 read profile (~35% of in-memory read time
@@ -109,13 +119,27 @@ Re-measure after each fix and add a row to the log at the bottom.
     when it is false. Related: `get_struct_expected_children`
     (`layout.rs:146`) re-walks the child struct for every nested struct read —
     cache it per struct on the layout.
+  - **Done, partly** (uncommitted): simple blocks build the scaffold once and
+    `resize` with clones. A/B, 3 reps of H3 read-only: 2.27 s → **2.21 s**
+    (~3%) — the review's "35%" was one BSP, not the corpus. Not done: complex
+    elements with an empty `tgst` (`data.rs:~499`) still walk per element
+    (~4% of read samples); a per-struct flag on `TagLayout` would fix it, but
+    the layout is mutable and the flag could go stale — not worth 3%.
+    `get_struct_expected_children` didn't show in the profile; left alone.
 
-- [ ] **P6. `write_atomic` serializes the tag stream twice** — Verified
+- [x] **P6. `write_atomic` serializes the tag stream twice** — Verified
   - Where: `file.rs:494` `write_atomic_bytes` — `write_to_bytes()` and then
     `tag_stream.write(..)` into `main_stream` just for the checksum.
   - Fix: compute the CRC over `bytes[64..64 + 12 + stream_size]` of the
     already-serialized output (after P3); verify with `read_from_bytes(&bytes)`
     instead of re-reading the temp file from disk.
+  - **Done** (uncommitted): `write_atomic_bytes` writes header, `tag!` and
+    the optional streams once (shared `write_optional_streams` with
+    `write_to`) and checksums the `tag!` range in place. Output byte-identical
+    to before on 2,223 H3 tags. Wall-clock gain is small — `write_atomic` is
+    dominated by `sync_all` and the file I/O. The verify step still re-reads
+    the temp file from disk on purpose (it checks what landed), and is fast now
+    after P1.
 
 ---
 
@@ -384,3 +408,6 @@ Re-measure after each fix and add a row to the log at the bottom.
 |---|---|---|---|---|---|---|---|
 | 2026-09-25 | baseline | 4.24 s (path) / 0.78 s (bytes) | 1.24 s | 11.7 s | 26.6 s | 6.9 s | 3.7 s |
 | 2026-09-25 | P1 + P2 + P3 | 1.05 s (path) / 0.75 s (bytes) | 1.18 s | 9.9 s | 4.1 s | 3.4 s | 0.59 s |
+| 2026-09-25 | + P4 + P5 + P6 | 1.12 s (path) / 0.79 s (bytes)¹ | 1.27 s¹ | 3.8 s | 4.2 s | 0.77 s | 0.60 s |
+
+¹ Single runs of H3 vary ±5%; the P5 A/B over 3 reps is the reliable number (−3% read).

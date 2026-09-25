@@ -398,12 +398,33 @@ impl TagLayout {
     /// carries but blay doesn't. Needed when creating a new tag file
     /// from scratch — the file header needs `group_tag` /
     /// `group_version`.
+    ///
+    /// Built layouts are cached for the life of the process, keyed by the
+    /// definition's path and checked against its and `_meta.json`'s size and
+    /// modification time, so reading many tags of one group builds its layout
+    /// once. A cache hit is a copy with a fresh layout guid, as every build
+    /// gets one (see `new_layout_guid`).
     pub fn from_json_with_meta(
         path: impl AsRef<Path>,
     ) -> Result<(Self, TagGroupMeta), TagSchemaError> {
         let path = path.as_ref();
-        let file = std::fs::File::open(path)?;
-        let mut schema: TagSchema = serde_json::from_reader(std::io::BufReader::new(file))?;
+        let key = std::fs::canonicalize(path)?;
+        let stamp = definition_stamp(&key);
+        if let Some((layout, meta)) = cached_layout(&key, stamp) {
+            let mut layout = layout;
+            layout.guid = new_layout_guid();
+            return Ok((layout, meta));
+        }
+        let (layout, meta) = Self::build_from_json_with_meta(path)?;
+        LAYOUT_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, (stamp, layout.clone(), meta.clone()));
+        Ok((layout, meta))
+    }
+
+    fn build_from_json_with_meta(path: &Path) -> Result<(Self, TagGroupMeta), TagSchemaError> {
+        let mut schema: TagSchema = serde_json::from_slice(&std::fs::read(path)?)?;
         let meta = TagGroupMeta {
             tag: parse_group_tag(&schema.tag)?,
             version: schema.version,
@@ -433,6 +454,30 @@ impl TagLayout {
         let layout = build_layout_from_schema(schema, defs_dir)?;
         Ok((layout, meta))
     }
+}
+
+/// Size and modification time of a definition and of the `_meta.json` beside
+/// it — what a cached layout was built from, as far as is cheap to check.
+type DefinitionStamp = [Option<(u64, std::time::SystemTime)>; 2];
+
+fn definition_stamp(path: &Path) -> DefinitionStamp {
+    let stamp = |p: &Path| {
+        let metadata = std::fs::metadata(p).ok()?;
+        Some((metadata.len(), metadata.modified().ok()?))
+    };
+    let meta_path = path.parent().map(|dir| dir.join("_meta.json"));
+    [stamp(path), meta_path.as_deref().and_then(stamp)]
+}
+
+type CachedLayout = (DefinitionStamp, TagLayout, TagGroupMeta);
+
+static LAYOUT_CACHE: std::sync::LazyLock<std::sync::Mutex<HashMap<std::path::PathBuf, CachedLayout>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn cached_layout(key: &Path, stamp: DefinitionStamp) -> Option<(TagLayout, TagGroupMeta)> {
+    let cache = LAYOUT_CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (cached_stamp, layout, meta) = cache.get(key)?;
+    (*cached_stamp == stamp).then(|| (layout.clone(), meta.clone()))
 }
 
 /// Walk `schema.parent_tag` recursively (via `_meta.json` for the
@@ -2246,6 +2291,25 @@ mod tests {
         let first = TagLayout::from_json("../definitions/halo4_mcc/particle.json").unwrap();
         let second = TagLayout::from_json("../definitions/halo4_mcc/particle.json").unwrap();
         assert_ne!(first.guid, second.guid);
+    }
+
+    /// A cached layout is rebuilt once its definition changes on disk.
+    #[test]
+    fn an_edited_definition_is_not_served_from_the_layout_cache() {
+        let dir = std::env::temp_dir().join(format!("blam_layout_cache_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = std::fs::read_to_string("../definitions/haloce_mcc/color_table.json").unwrap();
+        std::fs::copy("../definitions/haloce_mcc/_meta.json", dir.join("_meta.json")).unwrap();
+        let path = dir.join("color_table.json");
+
+        std::fs::write(&path, &source).unwrap();
+        let (_, before) = TagLayout::from_json_with_meta(&path).unwrap();
+        std::fs::write(&path, source.replacen("\"version\": 1,", "\"version\": 22,", 1)).unwrap();
+        let (_, after) = TagLayout::from_json_with_meta(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(before.version, 1);
+        assert_eq!(after.version, 22, "the edit (and its size change) is seen");
     }
 
     /// The layout a schema builds is the layout the kit's own tags carry.

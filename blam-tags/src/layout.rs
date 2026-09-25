@@ -151,7 +151,7 @@ pub struct TagStructLayout {
 /// structs + blocks + fields into `aggregate_layout_count` records;
 /// v2/v3 split them into the modern separate tables, and v3 adds
 /// interop definitions.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TagLayoutHeader {
     /// Index into [`TagLayout::block_layouts`] of the root (tag
     /// group) block. The tag's root `bdat` interprets its elements
@@ -186,7 +186,7 @@ pub struct TagLayoutHeader {
 ///
 /// All name-bearing records reference [`Self::string_data`] by byte
 /// offset; use [`Self::get_string`] to resolve.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TagLayout {
     /// Raw-data size of the root struct (one element of the root
     /// block). Schema-level sanity check; preserved for roundtrip.

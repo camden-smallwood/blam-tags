@@ -1251,13 +1251,13 @@ impl TagBlockData {
             // in-memory sub_chunk entries for the API to navigate them
             // — those entries don't consume any disk bytes since their
             // payload is fully fixed-size and lives inline in raw_data.
-            // Going through new_default builds that scaffolding.
-            for _ in 0..block_element_count {
-                elements.push(TagStructData::new_default(
-                    layout,
-                    struct_layout.index as usize,
-                    endian,
-                ));
+            // Going through new_default builds that scaffolding. Every element
+            // gets the same one, so walk the fields once and copy it — per
+            // element, the walk was the most expensive thing a read did.
+            if block_element_count > 0 {
+                let scaffold =
+                    TagStructData::new_default(layout, struct_layout.index as usize, endian);
+                elements.resize(block_element_count as usize, scaffold);
             }
         }
 
