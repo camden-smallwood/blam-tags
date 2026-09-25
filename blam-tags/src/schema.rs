@@ -34,7 +34,7 @@
 //! `biped_group` referencing `mapping_function` from object) resolve
 //! transparently.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use serde::Deserialize;
@@ -1709,6 +1709,12 @@ struct EngineOrderBuilder {
     field_type_memo: BTreeMap<usize, u32>,
     /// Old flat field index → new flat field index, for `tmpl_holes`.
     field_remap: BTreeMap<usize, usize>,
+    /// Every suffix of every string in `strings` (terminator included) → the
+    /// lowest offset it occurs at. A match for a terminated needle has to end
+    /// on a terminator and can't cross one, so it is always a suffix of some
+    /// stored string: this answers exactly what a scan of `strings` would,
+    /// without the scan that made building a layout quadratic.
+    string_suffixes: HashMap<Vec<u8>, u32>,
 }
 
 impl EngineOrderBuilder {
@@ -1716,17 +1722,42 @@ impl EngineOrderBuilder {
     /// a suffix of one already stored shares its offset.
     fn add_string(&mut self, text: &str) -> u32 {
         let mut needle = persisted_string(text).as_bytes().to_vec();
-        needle.push(0);
-        if let Some(at) = self
-            .strings
-            .windows(needle.len())
-            .position(|window| window == needle.as_slice())
-        {
-            return at as u32;
+        if needle.contains(&0) {
+            // An embedded terminator could match across stored strings, which
+            // the suffix index can't answer; scan like the engine does.
+            needle.push(0);
+            if let Some(at) = self
+                .strings
+                .windows(needle.len())
+                .position(|window| window == needle.as_slice())
+            {
+                return at as u32;
+            }
+            return self.append_string(&needle);
         }
-        let at = self.strings.len() as u32;
-        self.strings.extend_from_slice(&needle);
-        at
+        needle.push(0);
+        if let Some(&at) = self.string_suffixes.get(&needle) {
+            return at;
+        }
+        self.append_string(&needle)
+    }
+
+    /// Append a terminated string and index the suffixes of each terminated
+    /// piece of it. Existing entries win, so each suffix keeps the lowest offset
+    /// it was first seen at.
+    fn append_string(&mut self, terminated: &[u8]) -> u32 {
+        let at = self.strings.len();
+        self.strings.extend_from_slice(terminated);
+        let mut piece_start = 0;
+        for piece in terminated.split_inclusive(|&b| b == 0) {
+            for start in 0..piece.len() {
+                self.string_suffixes
+                    .entry(piece[start..].to_vec())
+                    .or_insert((at + piece_start + start) as u32);
+            }
+            piece_start += piece.len();
+        }
+        at as u32
     }
 
     fn string_at(layout: &TagLayout, offset: u32) -> String {

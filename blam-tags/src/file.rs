@@ -257,9 +257,13 @@ impl TagFile {
     /// Open `path` and parse a complete tag file. The read asserts that
     /// the file ends exactly at the last consumed stream, so trailing
     /// garbage surfaces as [`TagReadError::ChunkSizeMismatch`].
+    ///
+    /// The whole file is read into memory first. The parser asks for its
+    /// stream position several times per chunk, and on a file-backed reader
+    /// each ask is an `lseek` syscall — parsing through one measured 5× slower
+    /// than parsing the same bytes from memory.
     pub fn read<P: AsRef<Path>>(path: P) -> Result<Self, TagReadError> {
-        let reader = std::io::BufReader::with_capacity(64 * 1024, std::fs::File::open(path)?);
-        Self::read_from(reader)
+        Self::read_from_bytes(&std::fs::read(path)?)
     }
 
     /// Read only the optional dependency-list (`want`) stream from a tag file.
@@ -831,20 +835,9 @@ fn patch_live_reload_checksum(bytes: &mut [u8], main_stream: &[u8]) {
     if bytes.len() < CHECKSUM_END {
         return;
     }
-    let checksum = reflected_crc32_no_final_xor(main_stream);
+    // Same CRC as the classic header's: reflected, init all-ones, no final XOR.
+    let checksum = crate::classic::classic_checksum(main_stream);
     bytes[CHECKSUM_OFFSET..CHECKSUM_END].copy_from_slice(&checksum.to_le_bytes());
-}
-
-fn reflected_crc32_no_final_xor(bytes: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &byte in bytes {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            let mask = 0u32.wrapping_sub(crc & 1);
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    crc
 }
 
 fn commit_temp_file(from: &Path, to: &Path) -> std::io::Result<()> {

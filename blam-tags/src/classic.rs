@@ -567,33 +567,14 @@ pub fn read_classic_tag_file(bytes: &[u8], mut layout: TagLayout) -> Result<TagF
     ))
 }
 
-/// CRC32 table (poly `0xEDB88320`). Built at compile time.
-const CRC_TABLE: [u32; 256] = {
-    let mut t = [0u32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut r = i as u32;
-        let mut j = 0;
-        while j < 8 {
-            r = if r & 1 == 1 { (r >> 1) ^ 0xEDB8_8320 } else { r >> 1 };
-            j += 1;
-        }
-        t[i] = r;
-        i += 1;
-    }
-    t
-};
-
 /// Classic tag checksum: CRC32 (poly `0xEDB88320`, init `0xFFFFFFFF`)
 /// over the body, with **no final XOR inversion** (matches HABT
 /// `checksum_calculate`). Verified against real CE tags.
 pub fn classic_checksum(body: &[u8]) -> u32 {
-    let mut c: u32 = 0xFFFF_FFFF;
-    for &b in body {
-        let idx = ((c ^ b as u32) & 0xFF) as usize;
-        c = CRC_TABLE[idx] ^ (c >> 8);
-    }
-    c
+    // The standard CRC32 is this register with the final XOR applied; undo it.
+    // `crc32fast` runs on the CPU's CRC instructions, where a table walk goes a
+    // byte at a time — the walk was most of the time spent writing a classic tag.
+    !crc32fast::hash(body)
 }
 
 /// Serialize a complete classic tag: the original 64-byte header

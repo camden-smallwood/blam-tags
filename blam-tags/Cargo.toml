@@ -13,6 +13,9 @@ num-traits = "0.2"
 num-derive = "0.4"
 strum = { version = "0.27", features = ["derive"] }
 flate2 = "1"
+# Tag checksums (classic header, MCC live-reload). Already in the tree through
+# flate2; hardware CRC instructions where the CPU has them.
+crc32fast = "1"
 
 # `audio` feature: FSB5 sound-bank parsing + FMOD-Vorbis decode (Halo 3+), plus
 # classic inline codecs — Ogg Vorbis (CE), Opus + Xbox-ADPCM (H2).
