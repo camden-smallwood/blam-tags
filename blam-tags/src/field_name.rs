@@ -52,7 +52,7 @@ use std::borrow::Cow;
 /// without decoding the name a character at a time, as a `&[char]` pattern
 /// does. Name lookups clean a stored name per candidate field, so this is on
 /// the hottest path there is.
-fn is_name_marker(byte: u8) -> bool {
+pub(crate) fn is_name_marker(byte: u8) -> bool {
     matches!(byte, b'&' | b'#' | b':' | b'[' | b'{' | b'*' | b'!' | b'^' | b'|')
 }
 

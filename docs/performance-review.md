@@ -189,6 +189,16 @@ Re-measure after each fix and add a row to the log at the bottom.
     cases pinned in `matches_are_markup_insensitive_on_both_sides`.
     Open: (c) and (d) — both hang state off the mutable layout or add API;
     revisit when the geometry per-vertex loops (P11, P15) are worked on.
+  - **Byte-level match done** (instead of (c), with no cached state):
+    `stored_name_bytes_match` decides most candidates on the stored name's
+    raw bytes — the name starts with the query and continues with only
+    whitespace up to a marker or the end — skipping the UTF-8 check and the
+    clean, and hands anything with a `/` or non-ASCII after the prefix to
+    the slow path. Agrees with the slow path on 4,055,796 (name, query)
+    pairs from every schema plus edge cases (`\x0B`, invalid UTF-8 after a
+    marker). Lookup benchmark: 1.03 s → **0.64 s** net of the walk (~23 ns
+    per lookup, ~5× the review's starting point); render import (PRT off)
+    10.8 s → 10.0 s; paths, exports, imports and conversions identical.
 
 - [x] **P9. Sub-chunk lookups are linear scans** — Measured: not worth it
   - Where: `api.rs:979` `sub_chunk`, `data.rs:540`, `564`, `756`, `793`, the

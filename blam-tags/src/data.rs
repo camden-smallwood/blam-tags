@@ -297,8 +297,43 @@ pub(crate) fn clean_field_name_matches(stored: Option<&str>, clean_query: &str) 
 /// [`clean_field_name_matches`] for the layout name at `name_offset`, ruling
 /// the field out on its first byte before the name is even read as a string.
 pub(crate) fn layout_field_name_matches(layout: &TagLayout, name_offset: u32, clean_query: &str) -> bool {
-    first_byte_may_match(layout.string_data.get(name_offset as usize).copied(), clean_query)
-        && clean_field_name_matches(layout.get_string(name_offset), clean_query)
+    if !first_byte_may_match(layout.string_data.get(name_offset as usize).copied(), clean_query) {
+        return false;
+    }
+    match stored_name_bytes_match(&layout.string_data, name_offset as usize, clean_query.as_bytes()) {
+        Some(verdict) => verdict,
+        None => clean_field_name_matches(layout.get_string(name_offset), clean_query),
+    }
+}
+
+/// Decide [`clean_field_name_matches`] on the stored name's raw bytes when
+/// that is simple, skipping the UTF-8 check and the clean: the stored name
+/// cleans to `query` exactly when it starts with `query` and what follows is
+/// ASCII whitespace up to a markup marker or the end (`query` is clean, so it
+/// holds no marker itself). `None` — take the slow path — when the name has a
+/// `/` (cleaned to `\`) or anything but ASCII after the prefix.
+fn stored_name_bytes_match(strings: &[u8], offset: usize, query: &[u8]) -> Option<bool> {
+    let stored = strings.get(offset..)?;
+    let stored = &stored[..stored.iter().position(|&b| b == 0).unwrap_or(stored.len())];
+    if !stored.starts_with(query) {
+        return if stored.contains(&b'/') { None } else { Some(false) };
+    }
+    let rest = &stored[query.len()..];
+    for (i, &byte) in rest.iter().enumerate() {
+        if crate::field_name::is_name_marker(byte) {
+            // The slow path reads the whole name as UTF-8 before cleaning.
+            return std::str::from_utf8(&rest[i..]).is_ok().then_some(true);
+        }
+        if !byte.is_ascii() || byte == b'/' {
+            return None;
+        }
+        // `char::is_whitespace`, as `trim_end` uses — it counts `\x0B`,
+        // which `u8::is_ascii_whitespace` does not.
+        if !(byte as char).is_whitespace() {
+            return Some(false);
+        }
+    }
+    Some(true)
 }
 
 /// Whether a stored name starting with `stored_first` can clean to
@@ -326,6 +361,63 @@ fn looks_like_h2_classic_layout(layout: &TagLayout) -> bool {
 #[cfg(test)]
 mod field_name_match_tests {
     use super::field_name_matches;
+
+    /// The byte-level shortcut agrees with the full clean-and-compare for
+    /// every field name any schema declares, queried by every clean name in
+    /// the same layout, plus hand-made edge cases.
+    #[test]
+    fn the_byte_shortcut_agrees_with_cleaning() {
+        use super::{clean_field_name_matches, stored_name_bytes_match};
+        let check = |strings: &[u8], offset: usize, query: &str| {
+            if let Some(fast) = stored_name_bytes_match(strings, offset, query.as_bytes()) {
+                let stored = &strings[offset..];
+                let stored = &stored[..stored.iter().position(|&b| b == 0).unwrap_or(stored.len())];
+                let slow = clean_field_name_matches(std::str::from_utf8(stored).ok(), query);
+                assert_eq!(fast, slow, "{:?} vs {query:?}", String::from_utf8_lossy(stored));
+            }
+        };
+        let mut checked = 0usize;
+        if let Ok(games) = std::fs::read_dir("../definitions") {
+            for game in games.flatten().filter(|g| g.path().is_dir()) {
+                let Ok(files) = std::fs::read_dir(game.path()) else { continue };
+                for file in files.flatten().map(|f| f.path()).filter(|p| {
+                    p.extension().is_some_and(|e| e == "json")
+                        && !p.file_name().unwrap().to_string_lossy().starts_with('_')
+                }) {
+                    let Ok(layout) = crate::layout::TagLayout::from_json(&file) else { continue };
+                    for structure in &layout.struct_layouts {
+                        let mut names = Vec::new();
+                        let mut i = structure.first_field_index as usize;
+                        while layout.fields[i].field_type != crate::fields::TagFieldType::Terminator {
+                            names.push(layout.fields[i].name_offset as usize);
+                            i += 1;
+                        }
+                        let queries: Vec<String> = names
+                            .iter()
+                            .filter_map(|&o| layout.get_string(o as u32))
+                            .map(|n| crate::field_name::clean_field_name(n).into_owned())
+                            .collect();
+                        for &offset in &names {
+                            for query in &queries {
+                                check(&layout.string_data, offset, query);
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let edge: &[(&[u8], &str)] = &[
+            (b"flags\0", "flags"), (b"flags \0", "flags"), (b"flags\x0b\0", "flags"),
+            (b"flags #help\0", "flags"), (b"flags  x\0", "flags"), (b"flags*\0", "flags"),
+            (b"a/b\0", "a\\b"), (b"flags:\xff\0", "flags"), (b"flags\xc2\xa0\0", "flags"),
+            (b"#help\0", ""), (b"\0", ""), (b"abc\0", ""), (b"flagsx\0", "flags"),
+        ];
+        for (bytes, query) in edge {
+            check(bytes, 0, query);
+        }
+        eprintln!("{checked} (name, query) pairs checked");
+    }
 
     #[test]
     fn matches_are_markup_insensitive_on_both_sides() {
