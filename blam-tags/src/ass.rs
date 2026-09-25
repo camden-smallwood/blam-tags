@@ -34,7 +34,6 @@
 
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::path::Path;
 
 use crate::api::TagStruct;
 use crate::file::TagFile;
@@ -671,8 +670,7 @@ impl AssFile {
                 let pal = ep.element(pi).unwrap();
                 let xref = pal.read_tag_ref_path("object").unwrap_or_default();
                 if xref.is_empty() { continue; }
-                let xref_name = Path::new(&xref.replace('\\', "/"))
-                    .file_stem().and_then(|s| s.to_str()).unwrap_or("env_object").to_owned();
+                let xref_name = crate::geometry::tag_path_basename(&xref).unwrap_or("env_object").to_owned();
                 palette_object_index[pi] = Some(objects.len() as i32);
                 objects.push(AssObject {
                     xref_filepath: xref,
@@ -981,8 +979,7 @@ impl AssFile {
                     .or_else(|| pal.read_tag_ref_path("object"))
                     .unwrap_or_default();
                 if xref.is_empty() { continue; }
-                let xref_name = Path::new(&xref.replace('\\', "/"))
-                    .file_stem().and_then(|s| s.to_str()).unwrap_or("env_object").to_owned();
+                let xref_name = crate::geometry::tag_path_basename(&xref).unwrap_or("env_object").to_owned();
                 palette_object_index[pi] = Some(objects.len() as i32);
                 objects.push(AssObject {
                     xref_filepath: xref,
@@ -1633,8 +1630,7 @@ fn read_materials(root: &TagStruct<'_>) -> Result<Vec<AssMaterial>, AssError> {
     for i in 0..block.len() {
         let m = block.element(i).unwrap();
         let path = m.read_tag_ref_path("render method").unwrap_or_default();
-        let shader_name = Path::new(&path.replace('\\', "/"))
-            .file_stem().and_then(|s| s.to_str()).unwrap_or("default").to_owned();
+        let shader_name = crate::geometry::tag_path_basename(&path).unwrap_or("default").to_owned();
         // Walk per-material properties[] — type enum 0 carries the
         // lightmap resolution (the only one we map for now;
         // photon_fidelity etc don't have explicit tag fields and
@@ -1827,8 +1823,7 @@ fn read_materials_h2(root: &TagStruct<'_>) -> Result<Vec<AssMaterial>, AssError>
         let path = m.read_tag_ref_path("shader")
             .or_else(|| m.read_tag_ref_path("old shader"))
             .unwrap_or_default();
-        let name = Path::new(&path.replace('\\', "/"))
-            .file_stem().and_then(|s| s.to_str()).unwrap_or("default").to_owned();
+        let name = crate::geometry::tag_path_basename(&path).unwrap_or("default").to_owned();
         out.push(AssMaterial { name, lightmap_variant: String::new(), bm_strings: Vec::new() });
     }
     Ok(out)
@@ -2351,8 +2346,7 @@ fn build_render_model_object(
         let shader_name = if shader_idx >= 0 && (shader_idx as usize) < mats_block.len() {
             let m = mats_block.element(shader_idx as usize).unwrap();
             let path = m.read_tag_ref_path("render method").unwrap_or_default();
-            Path::new(&path.replace('\\', "/"))
-                .file_stem().and_then(|s| s.to_str()).unwrap_or("default").to_owned()
+            crate::geometry::tag_path_basename(&path).unwrap_or("default").to_owned()
         } else {
             "default".to_owned()
         };

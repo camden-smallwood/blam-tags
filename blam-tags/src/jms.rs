@@ -37,7 +37,6 @@
 
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::path::Path;
 
 use crate::api::TagStruct;
 use crate::fields::TagFieldData;
@@ -918,8 +917,7 @@ impl JmsFile {
                     let shader_name = if mat_idx >= 0 && (mat_idx as usize) < mats_block.len() {
                         let m = mats_block.element(mat_idx as usize).unwrap();
                         let path = m.read_tag_ref_path("shader").unwrap_or_default();
-                        Path::new(&path.replace('\\', "/"))
-                            .file_stem().and_then(|s| s.to_str()).unwrap_or("default").to_owned()
+                        crate::geometry::tag_path_basename(&path).unwrap_or("default").to_owned()
                     } else {
                         "default".to_owned()
                     };
@@ -1011,8 +1009,7 @@ impl JmsFile {
         for si in 0..shaders_block.len() {
             let s = shaders_block.element(si).unwrap();
             let path = s.read_tag_ref_path("shader").unwrap_or_default();
-            let name = Path::new(&path.replace('\\', "/"))
-                .file_stem().and_then(|x| x.to_str()).unwrap_or("default").to_owned();
+            let name = crate::geometry::tag_path_basename(&path).unwrap_or("default").to_owned();
             materials.push(JmsMaterial { name, material_name: "<none>".to_owned() });
         }
 
@@ -1391,7 +1388,7 @@ impl JmsFile {
                 // — accept either, using the shader tag's basename.
                 m.read_string_id("name").or_else(|| m.read_string("name"))
                     .or_else(|| m.read_tag_ref_path("shader").map(|p| {
-                        p.rsplit(['\\', '/']).next().unwrap_or(&p).to_owned()
+                        crate::geometry::tag_path_basename(&p).unwrap_or("").to_owned()
                     }))
                     .unwrap_or_default()
             } else {
@@ -1517,7 +1514,7 @@ impl JmsFile {
 
                 // Material slot, keyed by shader basename.
                 let shader_name = material.read_tag_ref_path("shader")
-                    .map(|p| p.rsplit(['\\', '/']).next().unwrap_or(&p).to_owned())
+                    .map(|p| crate::geometry::tag_path_basename(&p).unwrap_or("").to_owned())
                     .unwrap_or_else(|| "default".to_owned());
                 let jms_idx = match materials.iter().position(|m| m.name == shader_name) {
                     Some(i) => i as i32,
@@ -3014,8 +3011,7 @@ fn build_materials(root: &TagStruct<'_>)
                     let shader_name = if shader_idx >= 0 && (shader_idx as usize) < mats_block.len() {
                         let m = mats_block.element(shader_idx as usize).unwrap();
                         let path = m.read_tag_ref_path("render method").unwrap_or_default();
-                        Path::new(&path.replace('\\', "/"))
-                            .file_stem().and_then(|s| s.to_str()).unwrap_or("default").to_owned()
+                        crate::geometry::tag_path_basename(&path).unwrap_or("default").to_owned()
                     } else {
                         "default".to_owned()
                     };
@@ -3229,8 +3225,7 @@ fn append_instance_geometry(
             if shader_idx >= 0 && (shader_idx as usize) < mats_block.len() {
                 let m = mats_block.element(shader_idx as usize).unwrap();
                 let path = m.read_tag_ref_path("render method").unwrap_or_default();
-                Path::new(&path.replace('\\', "/"))
-                    .file_stem().and_then(|s| s.to_str()).unwrap_or("default").to_owned()
+                crate::geometry::tag_path_basename(&path).unwrap_or("default").to_owned()
             } else { "default".to_owned() }
         } else { "default".to_owned() };
 

@@ -415,6 +415,15 @@ Re-measure after each fix and add a row to the log at the bottom.
     exporting and re-importing every H3 render (1,614), collision (1,218) and
     physics (1,211) model and the 26 BSPs under 3 MB: 4,058 imports
     identical; the other 11 vary between runs of identical code (B11, B12).
+  - **Shader/object names done**: `geometry::tag_path_basename` (last path
+    segment, either separator; `None` when empty) replaces 13 copies — 10
+    `Path::file_stem` and 3 `rsplit`, which disagreed: `file_stem` treats
+    everything after a dot as an extension, but reference paths carry none,
+    so a tag named `probe. multipurpose` became `probe`. Five shipped
+    classic tags have such names (none a shader today). Each call site keeps
+    its own empty-path fallback. Verified: 4,785 JMS/ASS exports (H3
+    render/collision/BSP/particle, CE BSP + gbxmodel, H2 render + BSP)
+    identical; `a_tag_name_keeps_its_dots`.
 
 - [ ] **D3. Converter walkers, value matches and normalizers** — Reported
   - 14 hand-written recursive walkers (`convert/mod.rs` + `resources.rs`),

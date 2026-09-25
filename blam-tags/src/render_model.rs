@@ -468,11 +468,7 @@ impl Material {
     /// Shader basename (filename without extension/directory). Stable
     /// for dedupe / default-material keying.
     pub fn shader_name(&self) -> String {
-        std::path::Path::new(&self.render_method.replace('\\', "/"))
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("default")
-            .to_owned()
+        crate::geometry::tag_path_basename(&self.render_method).unwrap_or("default").to_owned()
     }
 }
 

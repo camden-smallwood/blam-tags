@@ -316,13 +316,7 @@ fn read_halo2(tag: &TagFile) -> Result<Vec<ParticleObjectMesh>, JmsError> {
     // carry a real name here — unlike gen3, where it is a placeholder.
     let shader = root
         .read_tag_ref_path("shader")
-        .and_then(|p| {
-            p.replace('\\', "/")
-                .rsplit('/')
-                .next()
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-        })
+        .and_then(|p| crate::geometry::tag_path_basename(&p).map(str::to_owned))
         .unwrap_or_else(|| "default".to_owned());
 
     let mut out = Vec::with_capacity(models.len());
