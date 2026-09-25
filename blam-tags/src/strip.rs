@@ -121,7 +121,12 @@ fn build_strips(triangles: &[[u32; 3]]) -> Vec<Vec<u32>> {
                 undirected.entry(k).or_default().push(i);
             }
         }
-        for list in undirected.values() {
+        // By edge, in order: each triangle's neighbour list is the order the
+        // strip builder tries them in, and taking it from the hash map made
+        // the strips — and the index buffer — differ from run to run.
+        let mut undirected: Vec<_> = undirected.into_iter().collect();
+        undirected.sort_unstable_by_key(|&(edge, _)| edge);
+        for (_, list) in &undirected {
             for &i in list {
                 for &j in list {
                     if i != j && !neighbours[i].contains(&j) {
@@ -307,6 +312,51 @@ pub fn destripify(indices: &[u32]) -> Vec<[u32; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every call builds the same strips. Each hash map gets its own random
+    /// seed, so neighbour order taken from one made repeated calls — and
+    /// repeated imports of one model — disagree.
+    #[test]
+    fn stripify_is_deterministic() {
+        // Irregular connectivity — seeded random diagonals, fins, shuffled
+        // order — so the builder faces choices a regular grid never gives it.
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let n = 16u32;
+        let mut triangles = Vec::new();
+        for y in 0..n {
+            for x in 0..n {
+                let v = y * (n + 1) + x;
+                let (a, b, c, d) = (v, v + 1, v + n + 2, v + n + 1);
+                if next() % 2 == 0 {
+                    triangles.extend([[a, b, d], [b, c, d]]);
+                } else {
+                    triangles.extend([[a, b, c], [a, c, d]]);
+                }
+            }
+        }
+        // Fins: extra triangles on existing edges, so some edges are shared
+        // by three or more triangles, as in real models.
+        let mut spare = (n + 1) * (n + 1);
+        for _ in 0..triangles.len() / 3 {
+            let t = triangles[(next() % triangles.len() as u64) as usize];
+            let e = (next() % 3) as usize;
+            triangles.push([t[(e + 1) % 3], t[e], spare]);
+            spare += 1;
+        }
+        for i in (1..triangles.len()).rev() {
+            triangles.swap(i, (next() % (i as u64 + 1)) as usize);
+        }
+        let first = stripify(&triangles);
+        for _ in 0..8 {
+            assert_eq!(stripify(&triangles), first);
+        }
+    }
     use std::collections::HashSet;
 
     /// A triangle as an orientation-independent-but-winding-preserving

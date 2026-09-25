@@ -1145,6 +1145,11 @@ fn write_partition(
             }
         }
     }
+    // In key order, so a tie goes to the lowest-numbered cluster. Walking
+    // the hash map instead handed a tied region to whichever cluster it
+    // happened to reach first, which changed from run to run.
+    let mut votes: Vec<_> = votes.into_iter().collect();
+    votes.sort_unstable_by_key(|&(key, _)| key);
     let mut owner: std::collections::HashMap<u32, (i16, usize)> = Default::default();
     for ((r, ci), count) in &votes {
         let e = owner.entry(*r).or_insert((*ci, 0));

@@ -608,6 +608,19 @@ Re-measure after each fix and add a row to the log at the bottom.
     struct — and an element's raw bytes can be shorter than its struct
     (truncated classic elements). Found by diffing the descent's three
     copies; no path over 3.1M probed hit it. Now one step planner serves both.
+- [x] **B11. BSP import assigned tied leaf regions to a random cluster** — Fixed
+  - `sbsp_import` gives each connected leaf region to the cluster that seeded
+    most of its cells, scanning a `HashMap` of votes; a tie went to whichever
+    cluster the scan met first, which changed per run. 6 of 26 H3 BSPs came
+    out different on every import. Votes are now scanned in key order (ties
+    to the lowest cluster).
+- [x] **B12. Render import built different triangle strips every run** — Fixed
+  - `strip::build_strips` took each triangle's neighbour order from a
+    `HashMap` of edges; on meshes with edges shared by three or more
+    triangles that order decides which strips get built. 8 of 1,614 H3
+    render_models imported with a different index buffer per run (all
+    valid, none reproducible). Edges are now walked in order.
+    `stripify_is_deterministic` fails on the old code, passes on the new.
 - [x] **B7. Lost `\` line continuations left space runs inside messages** — Fixed
   - 13 string literals (converter warnings and errors, collision/sbsp import
     errors, collision-verify diagnostics, a shell error) read like `was
