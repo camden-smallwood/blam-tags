@@ -73,6 +73,7 @@
 //! downstream exporters recompute face normals anyway).
 
 use super::MeshVertexType;
+use crate::math::half_to_f32;
 
 /// Decoded author-format vertex. Layout matches the fields the JMS
 /// exporter reads from `raw_vertex_block` (`crate::jms::read_vertex`).
@@ -440,37 +441,6 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
         a[2] * b[0] - a[0] * b[2],
         a[0] * b[1] - a[1] * b[0],
     ]
-}
-
-/// Branchless half→single conversion.
-fn half_to_f32(h: u16) -> f32 {
-    let sign = (h as u32 & 0x8000) << 16;
-    let exp = (h as u32 >> 10) & 0x1F;
-    let mant = h as u32 & 0x3FF;
-    let bits = match exp {
-        0 => {
-            if mant == 0 { sign }
-            else {
-                // Subnormal: shift the mantissa up until it is normalized, and
-                // let the exponent walk DOWN with it — one step per leading
-                // zero, so it goes negative for all but the largest subnormals.
-                //
-                // Signed because it is signed: as a `u32` this counted down
-                // through `wrapping_sub`, and `e + 127` then overflowed for any
-                // half needing two or more shifts. Release builds wrapped
-                // straight back to the intended value and never noticed;
-                // overflow-checked (dev/test) builds panicked. Reading a Halo 4
-                // monolithic build's render geometry is what found it.
-                let mut m = mant;
-                let mut e = 1i32;
-                while (m & 0x400) == 0 { m <<= 1; e -= 1; }
-                sign | (((e + 127 - 15) as u32) << 23) | ((m & 0x3FF) << 13)
-            }
-        }
-        0x1F => sign | 0x7F800000 | (mant << 13),
-        _    => sign | ((exp + 127 - 15) << 23) | (mant << 13),
-    };
-    f32::from_bits(bits)
 }
 
 #[cfg(test)]

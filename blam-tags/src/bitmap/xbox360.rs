@@ -10,7 +10,7 @@
 //! 2. **Big-endian byte order within compressed blocks.** Each
 //!    16-bit half of a DXT/BC block lands in memory with its bytes
 //!    reversed relative to PC. The fix-up is a pairwise byte swap
-//!    over the entire detiled buffer — see [`swap_byte_pairs`].
+//!    over the entire detiled buffer — see [`EndianSwap::In16`].
 //!
 //! Ported from TagTool's `XboxGraphics.XGAddress2DTiledOffset` and
 //! `XGEndianSwapSurface` (Xbox-360 SDK reference implementations).
@@ -85,20 +85,6 @@ pub fn detile_blocks(
         }
     }
     linear
-}
-
-/// Swap every pair of bytes in `buf`. Halo 4 X360 stores DXT5 / BC3
-/// blocks (and many other 16-bit-aligned formats) with each `u16`
-/// field's bytes reversed compared to PC LE. The PC decoders
-/// already in [`super::decode`] expect LE; pairwise swap fixes
-/// every affected field at once.
-///
-/// This matches TagTool's `XGEndianSwapSurface` for the
-/// `GPUENDIAN_8IN16` case, which is what DXT-family formats use.
-pub fn swap_byte_pairs(buf: &mut [u8]) {
-    for pair in buf.chunks_exact_mut(2) {
-        pair.swap(0, 1);
-    }
 }
 
 //================================================================================

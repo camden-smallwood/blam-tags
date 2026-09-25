@@ -6,6 +6,7 @@
 //! replaces the stored compressed bytes, so package round trips remain lossless.
 
 use anyhow::{Context, Result, bail};
+use crate::math::{clamp_unit_to_u8, half_to_f32};
 
 use crate::iostore::object::tail_models::{
     TextureChainTail, VirtualTextureBuiltData, VirtualTextureTileOffsetData,
@@ -878,29 +879,6 @@ pub fn ue_surface_len(format: &str, width: u32, height: u32) -> Option<usize> {
     blocks_x
         .checked_mul(blocks_y)?
         .checked_mul(block_bytes as usize)
-}
-
-/// Clamp a linear float channel to `[0, 1]` and scale to 8 bits.
-///
-/// HDR formats have no single correct 8-bit answer; this matches what the
-/// classic bitmap decoders do so the two viewers agree.
-fn clamp_unit_to_u8(value: f32) -> u8 {
-    let clamped = if value.is_nan() { 0.0 } else { value.clamp(0.0, 1.0) };
-    (clamped * 255.0 + 0.5) as u8
-}
-
-/// IEEE 754 half → f32, including subnormals, infinity and NaN.
-fn half_to_f32(half: u16) -> f32 {
-    let sign = if (half >> 15) & 1 == 1 { -1.0f32 } else { 1.0 };
-    let exponent = (half >> 10) & 0x1f;
-    let mantissa = half & 0x3ff;
-    match exponent {
-        0 if mantissa == 0 => sign * 0.0,
-        0 => sign * (mantissa as f32) * 2.0f32.powi(-24),
-        0x1f if mantissa == 0 => sign * f32::INFINITY,
-        0x1f => f32::NAN,
-        _ => sign * (1.0 + (mantissa as f32) / 1024.0) * 2.0f32.powi(exponent as i32 - 15),
-    }
 }
 
 fn checked_surface_len(width: u32, height: u32, channels: usize) -> Result<usize> {

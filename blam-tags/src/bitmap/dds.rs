@@ -11,10 +11,10 @@
 //!   slot) and for formats with no legacy expression (currently
 //!   just `signedr16g16b16a16`).
 //!
-//! [`decode_dxn_mono_alpha`] is the CPU decompressor for the
-//! Halo-specific BC5-shaped `(luminance, alpha)` layout. No DDS
-//! reader does the `(R, R, R, A)` swizzle automatically, so we
-//! decode to A8R8G8B8 before writing.
+//! Formats no DDS reader understands — the Halo-specific BC5-shaped
+//! `(luminance, alpha)` `dxn_mono_alpha` among them — are decoded to
+//! A8R8G8B8 through [`super::decode`] before writing
+//! (see [`needs_decode_for_dds`]).
 
 use std::io::Write;
 
@@ -445,114 +445,4 @@ pub fn ue_dxgi_format(format: &str) -> Option<u32> {
         "PF_A32B32G32R32F" => DXGI_FORMAT_R32G32B32A32_FLOAT,
         _ => return None,
     })
-}
-
-//================================================================================
-// dxn_mono_alpha decompression
-//================================================================================
-//
-// Mirrors TagTool's `BitmapCompression.DecompressDXNMonoAlpha`
-// (`TagTool/Bitmaps/Utils/BitmapCompression.cs:419`). Each 4×4 block
-// is two BC4-style sub-blocks back to back: the *red* sub-block
-// carries luminance, the *green* sub-block carries alpha. We expand
-// to A8R8G8B8 with `(R, R, R, A) = (luminance, luminance, luminance,
-// alpha)` semantics.
-
-/// Decode a stacked DxnMonoAlpha mip chain (optionally cubemap faces
-/// or array layers) into A8R8G8B8 bytes. Output is laid out
-/// layer-major to match the input.
-pub fn decode_dxn_mono_alpha(
-    input: &[u8],
-    width: u32,
-    height: u32,
-    mipmap_levels: u32,
-    layers: u32,
-) -> Vec<u8> {
-    let mut output = Vec::new();
-    let mut input_offset = 0usize;
-
-    for _layer in 0..layers {
-        for level in 0..mipmap_levels {
-            let w = (width >> level).max(1);
-            let h = (height >> level).max(1);
-            let blocks_w = ((w + 3) / 4).max(1);
-            let blocks_h = ((h + 3) / 4).max(1);
-
-            let mut mip_out = vec![0u8; (w as usize) * (h as usize) * 4];
-
-            for by in 0..blocks_h {
-                for bx in 0..blocks_w {
-                    let block_offset = input_offset
-                        + ((by * blocks_w + bx) as usize) * 16;
-                    let block = &input[block_offset..block_offset + 16];
-
-                    let mut red_values = [0u8; 8];
-                    let red_indices = unpack_bc4_alpha_block(&block[0..8], &mut red_values);
-                    let mut green_values = [0u8; 8];
-                    let green_indices = unpack_bc4_alpha_block(&block[8..16], &mut green_values);
-
-                    for j in 0..4u32 {
-                        for i in 0..4u32 {
-                            let px = bx * 4 + i;
-                            let py = by * 4 + j;
-                            if px >= w || py >= h { continue; }
-
-                            let pixel_idx = ((py * w + px) as usize) * 4;
-                            let bit_offset = 3 * (j * 4 + i);
-                            let red_idx = ((red_indices >> bit_offset) & 0x07) as usize;
-                            let green_idx = ((green_indices >> bit_offset) & 0x07) as usize;
-
-                            let r = red_values[red_idx];
-                            let g = green_values[green_idx];
-
-                            // A8R8G8B8 LE byte layout: [B, G, R, A].
-                            // Replicate red into RGB and put the green
-                            // sub-block result into alpha — matches
-                            // TagTool's DecompressDXNMonoAlpha.
-                            mip_out[pixel_idx] = r;
-                            mip_out[pixel_idx + 1] = r;
-                            mip_out[pixel_idx + 2] = r;
-                            mip_out[pixel_idx + 3] = g;
-                        }
-                    }
-                }
-            }
-
-            output.extend_from_slice(&mip_out);
-            input_offset += (blocks_w * blocks_h) as usize * 16;
-        }
-    }
-
-    output
-}
-
-/// Decode one BC4-style alpha sub-block: 2 endpoint bytes + 6 bytes
-/// of 3-bit indices. Fills `values[0..8]` with the 8-entry palette
-/// (2 endpoints + 6 interpolated values, with the BC4 mode switch
-/// based on whether `v0 > v1`). Returns the 48-bit index field
-/// packed into a `u64`.
-fn unpack_bc4_alpha_block(block: &[u8], values: &mut [u8; 8]) -> u64 {
-    let v0 = block[0] as u32;
-    let v1 = block[1] as u32;
-    values[0] = v0 as u8;
-    values[1] = v1 as u8;
-
-    if v0 > v1 {
-        for i in 0..6u32 {
-            values[(2 + i) as usize] = (((6 - i) * v0 + (1 + i) * v1) / 7) as u8;
-        }
-    } else {
-        for i in 0..4u32 {
-            values[(2 + i) as usize] = (((4 - i) * v0 + (1 + i) * v1) / 5) as u8;
-        }
-        values[6] = 0;
-        values[7] = 255;
-    }
-
-    (block[2] as u64)
-        | ((block[3] as u64) << 8)
-        | ((block[4] as u64) << 16)
-        | ((block[5] as u64) << 24)
-        | ((block[6] as u64) << 32)
-        | ((block[7] as u64) << 40)
 }

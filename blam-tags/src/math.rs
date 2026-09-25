@@ -1103,3 +1103,48 @@ mod tests {
         assert_eq!(Bounds { lower: 1.0_f32, upper: 5.0 }.range(), 4.0);
     }
 }
+
+/// IEEE 754 binary16 → binary32, exactly: zero, subnormals, infinity, and
+/// NaN with its payload kept. Built from the bits rather than through `powi`,
+/// which the bitmap and texture decoders each used to spell out their own way —
+/// `half::f16::to_f32` gives the same value for every one of the 65,536
+/// inputs, but quiets NaNs, and geometry read from a tag may be written back.
+pub(crate) fn half_to_f32(h: u16) -> f32 {
+    let sign = (h as u32 & 0x8000) << 16;
+    let exp = (h as u32 >> 10) & 0x1F;
+    let mant = h as u32 & 0x3FF;
+    let bits = match exp {
+        0 => {
+            if mant == 0 { sign }
+            else {
+                // Subnormal: shift the mantissa up until it is normalized, and
+                // let the exponent walk DOWN with it — one step per leading
+                // zero, so it goes negative for all but the largest subnormals.
+                //
+                // Signed because it is signed: as a `u32` this counted down
+                // through `wrapping_sub`, and `e + 127` then overflowed for any
+                // half needing two or more shifts. Release builds wrapped
+                // straight back to the intended value and never noticed;
+                // overflow-checked (dev/test) builds panicked. Reading a Halo 4
+                // monolithic build's render geometry is what found it.
+                let mut m = mant;
+                let mut e = 1i32;
+                while (m & 0x400) == 0 { m <<= 1; e -= 1; }
+                sign | (((e + 127 - 15) as u32) << 23) | ((m & 0x3FF) << 13)
+            }
+        }
+        0x1F => sign | 0x7F800000 | (mant << 13),
+        _    => sign | ((exp + 127 - 15) << 23) | (mant << 13),
+    };
+    f32::from_bits(bits)
+}
+
+/// Clamp a linear float channel to `[0, 1]` and scale to 8 bits, NaN to 0.
+///
+/// HDR formats have no single correct 8-bit answer; the classic bitmap
+/// decoders and the Campaign Evolved texture decoder share this one so the
+/// two viewers agree.
+pub(crate) fn clamp_unit_to_u8(value: f32) -> u8 {
+    let clamped = if value.is_nan() { 0.0 } else { value.clamp(0.0, 1.0) };
+    (clamped * 255.0 + 0.5) as u8
+}

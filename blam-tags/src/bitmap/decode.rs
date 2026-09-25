@@ -25,6 +25,7 @@
 //!   float-TIFF path can take a different lane.
 
 use super::{BitmapError, BitmapFormat};
+use crate::math::{clamp_unit_to_u8, half_to_f32};
 
 /// Decode one mip level of the given format into RGBA8 (memory order
 /// `[R, G, B, A]`). Output length is always `width * height * 4`.
@@ -417,10 +418,10 @@ fn decode_abgrfp16(input: &[u8], out: &mut [u8]) {
         let b = half_to_f32(u16::from_le_bytes([chunk[4], chunk[5]]));
         let a = half_to_f32(u16::from_le_bytes([chunk[6], chunk[7]]));
         let p = i * 4;
-        out[p] = clamp_to_u8(r);
-        out[p + 1] = clamp_to_u8(g);
-        out[p + 2] = clamp_to_u8(b);
-        out[p + 3] = clamp_to_u8(a);
+        out[p] = clamp_unit_to_u8(r);
+        out[p + 1] = clamp_unit_to_u8(g);
+        out[p + 2] = clamp_unit_to_u8(b);
+        out[p + 3] = clamp_unit_to_u8(a);
     }
 }
 
@@ -433,41 +434,10 @@ fn decode_abgrfp32(input: &[u8], out: &mut [u8]) {
         let b = f32::from_le_bytes([chunk[8], chunk[9], chunk[10], chunk[11]]);
         let a = f32::from_le_bytes([chunk[12], chunk[13], chunk[14], chunk[15]]);
         let p = i * 4;
-        out[p] = clamp_to_u8(r);
-        out[p + 1] = clamp_to_u8(g);
-        out[p + 2] = clamp_to_u8(b);
-        out[p + 3] = clamp_to_u8(a);
-    }
-}
-
-fn clamp_to_u8(v: f32) -> u8 {
-    let clamped = if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };
-    (clamped * 255.0 + 0.5) as u8
-}
-
-/// IEEE 754 half (1 sign + 5 exponent + 10 mantissa) → f32. Handles
-/// zero, subnormals, infinity, and NaN. Hand-rolled to avoid a
-/// dependency for one decoder path.
-fn half_to_f32(h: u16) -> f32 {
-    let sign = (h >> 15) & 1;
-    let exp = (h >> 10) & 0x1F;
-    let mant = h & 0x3FF;
-    let sign_f = if sign == 1 { -1.0_f32 } else { 1.0 };
-
-    if exp == 0 {
-        if mant == 0 {
-            sign_f * 0.0
-        } else {
-            // Subnormal: value = (-1)^s * mant/2^10 * 2^-14
-            sign_f * (mant as f32) * 2.0_f32.powi(-24)
-        }
-    } else if exp == 0x1F {
-        if mant == 0 { sign_f * f32::INFINITY } else { f32::NAN }
-    } else {
-        // Normal: value = (-1)^s * (1 + mant/2^10) * 2^(exp-15)
-        let exponent = exp as i32 - 15;
-        let mantissa = 1.0 + (mant as f32) / 1024.0;
-        sign_f * mantissa * 2.0_f32.powi(exponent)
+        out[p] = clamp_unit_to_u8(r);
+        out[p + 1] = clamp_unit_to_u8(g);
+        out[p + 2] = clamp_unit_to_u8(b);
+        out[p + 3] = clamp_unit_to_u8(a);
     }
 }
 
@@ -483,88 +453,93 @@ fn half_to_f32(h: u16) -> f32 {
 //      converting channel layout for BC4/BC5 (which produce R8 / RG8,
 //      not RGBA8).
 
-/// Block-decode into a 4×4 RGBA8 staging buffer, then copy the
-/// in-bounds pixels into the destination mip at `(bx, by)`.
-fn blit_rgba_block(
-    staging: &[u8; 64],
-    out: &mut [u8],
+/// Walk a block-compressed mip 4×4 block at a time. `prepare` turns each
+/// `block_bytes`-byte block into whatever its texels are read from, and
+/// `texel` gives the RGBA of texel `t` (`t = row * 4 + column` within the
+/// block) from it. Texels past the image's right or bottom edge are skipped.
+///
+/// Every block codec below is this walk; they differ only in the block size
+/// and those two steps. Generic, so each instantiation compiles to the loop
+/// its codec used to spell out by hand.
+fn decode_blocks<S>(
+    input: &[u8],
     width: u32,
     height: u32,
-    bx: u32,
-    by: u32,
+    out: &mut [u8],
+    block_bytes: usize,
+    mut prepare: impl FnMut(&[u8]) -> S,
+    mut texel: impl FnMut(&S, usize) -> [u8; 4],
 ) {
+    let blocks_w = ((width + 3) / 4).max(1);
+    let blocks_h = ((height + 3) / 4).max(1);
     let w = width as usize;
-    for j in 0..4u32 {
-        let py = by * 4 + j;
-        if py >= height { break; }
-        for i in 0..4u32 {
-            let px = bx * 4 + i;
-            if px >= width { break; }
-            let dst = (py as usize * w + px as usize) * 4;
-            let src = ((j * 4 + i) as usize) * 4;
-            out[dst..dst + 4].copy_from_slice(&staging[src..src + 4]);
+    for by in 0..blocks_h {
+        for bx in 0..blocks_w {
+            let block_idx = (by * blocks_w + bx) as usize;
+            let state = prepare(&input[block_idx * block_bytes..(block_idx + 1) * block_bytes]);
+            for j in 0..4u32 {
+                let py = by * 4 + j;
+                if py >= height { break; }
+                for i in 0..4u32 {
+                    let px = bx * 4 + i;
+                    if px >= width { break; }
+                    let dst = (py as usize * w + px as usize) * 4;
+                    out[dst..dst + 4].copy_from_slice(&texel(&state, (j * 4 + i) as usize));
+                }
+            }
         }
     }
+}
+
+/// A codec `bcdec_rs` decodes straight to RGBA8: each block into a 4×4
+/// staging buffer, whose texels are copied out.
+fn decode_bcdec_rgba(
+    input: &[u8],
+    width: u32,
+    height: u32,
+    out: &mut [u8],
+    block_bytes: usize,
+    decode: fn(&[u8], &mut [u8], usize),
+) {
+    decode_blocks(
+        input,
+        width,
+        height,
+        out,
+        block_bytes,
+        |block| {
+            let mut staging = [0u8; 64];
+            decode(block, &mut staging, 16);
+            staging
+        },
+        |staging, t| staging[t * 4..t * 4 + 4].try_into().unwrap(),
+    );
 }
 
 /// `dxt1` → BC1. 8-byte block. Direct RGBA8 output from bcdec_rs.
 fn decode_bc1(input: &[u8], width: u32, height: u32, out: &mut [u8]) {
-    let blocks_w = ((width + 3) / 4).max(1);
-    let blocks_h = ((height + 3) / 4).max(1);
-    for by in 0..blocks_h {
-        for bx in 0..blocks_w {
-            let block_idx = (by * blocks_w + bx) as usize;
-            let block = &input[block_idx * 8..(block_idx + 1) * 8];
-            let mut staging = [0u8; 64];
-            bcdec_rs::bc1(block, &mut staging, 16);
-            blit_rgba_block(&staging, out, width, height, bx, by);
-        }
-    }
+    decode_bcdec_rgba(input, width, height, out, 8, bcdec_rs::bc1);
 }
 
 /// `dxt3` → BC2. 16-byte block.
 fn decode_bc2(input: &[u8], width: u32, height: u32, out: &mut [u8]) {
-    let blocks_w = ((width + 3) / 4).max(1);
-    let blocks_h = ((height + 3) / 4).max(1);
-    for by in 0..blocks_h {
-        for bx in 0..blocks_w {
-            let block_idx = (by * blocks_w + bx) as usize;
-            let block = &input[block_idx * 16..(block_idx + 1) * 16];
-            let mut staging = [0u8; 64];
-            bcdec_rs::bc2(block, &mut staging, 16);
-            blit_rgba_block(&staging, out, width, height, bx, by);
-        }
-    }
+    decode_bcdec_rgba(input, width, height, out, 16, bcdec_rs::bc2);
 }
 
 /// `dxt5` → BC3. 16-byte block.
 fn decode_bc3(input: &[u8], width: u32, height: u32, out: &mut [u8]) {
-    let blocks_w = ((width + 3) / 4).max(1);
-    let blocks_h = ((height + 3) / 4).max(1);
-    for by in 0..blocks_h {
-        for bx in 0..blocks_w {
-            let block_idx = (by * blocks_w + bx) as usize;
-            let block = &input[block_idx * 16..(block_idx + 1) * 16];
-            let mut staging = [0u8; 64];
-            bcdec_rs::bc3(block, &mut staging, 16);
-            blit_rgba_block(&staging, out, width, height, bx, by);
-        }
-    }
+    decode_bcdec_rgba(input, width, height, out, 16, bcdec_rs::bc3);
 }
 
 /// `bc7` → BC7. 16-byte block, RGBA8 straight out of bcdec_rs.
 fn decode_bc7(input: &[u8], width: u32, height: u32, out: &mut [u8]) {
-    let blocks_w = ((width + 3) / 4).max(1);
-    let blocks_h = ((height + 3) / 4).max(1);
-    for by in 0..blocks_h {
-        for bx in 0..blocks_w {
-            let block_idx = (by * blocks_w + bx) as usize;
-            let block = &input[block_idx * 16..(block_idx + 1) * 16];
-            let mut staging = [0u8; 64];
-            bcdec_rs::bc7(block, &mut staging, 16);
-            blit_rgba_block(&staging, out, width, height, bx, by);
-        }
-    }
+    decode_bcdec_rgba(input, width, height, out, 16, bcdec_rs::bc7);
+}
+
+/// The value at texel `t` of an unpacked BC4-style block — 3-bit indices into
+/// its 8-entry palette.
+fn bc4_value(values: &[u8; 8], indices: u64, t: usize) -> u8 {
+    values[((indices >> (3 * t)) & 0x07) as usize]
 }
 
 /// `dxt5a`-family → BC4 (single 8-byte block, 8 values, 3-bit
@@ -579,33 +554,22 @@ fn decode_bc4_rgba(
     out: &mut [u8],
     mask: ChannelMask,
 ) {
-    let blocks_w = ((width + 3) / 4).max(1);
-    let blocks_h = ((height + 3) / 4).max(1);
-    let w = width as usize;
-    for by in 0..blocks_h {
-        for bx in 0..blocks_w {
-            let block_idx = (by * blocks_w + bx) as usize;
-            let block = &input[block_idx * 8..(block_idx + 1) * 8];
+    decode_blocks(
+        input,
+        width,
+        height,
+        out,
+        8,
+        |block| {
             let mut values = [0u8; 8];
             let indices = unpack_bc4_alpha_block(block, &mut values);
-            for j in 0..4u32 {
-                let py = by * 4 + j;
-                if py >= height { continue; }
-                for i in 0..4u32 {
-                    let px = bx * 4 + i;
-                    if px >= width { continue; }
-                    let bit_offset = 3 * (j * 4 + i);
-                    let idx = ((indices >> bit_offset) & 0x07) as usize;
-                    let v = values[idx];
-                    let dst = (py as usize * w + px as usize) * 4;
-                    out[dst] = v & mask.r;
-                    out[dst + 1] = v & mask.g;
-                    out[dst + 2] = v & mask.b;
-                    out[dst + 3] = v & mask.a;
-                }
-            }
-        }
-    }
+            (values, indices)
+        },
+        |(values, indices), t| {
+            let v = bc4_value(values, *indices, t);
+            [v & mask.r, v & mask.g, v & mask.b, v & mask.a]
+        },
+    );
 }
 
 /// `dxn` → BC5 (two-channel normal map). Output `(X, Y, Z, 255)` with
@@ -621,36 +585,26 @@ fn decode_bc4_rgba(
 /// two's-complement bytes, so they take the same `+128` bias that
 /// [`decode_v8u8`] applies.
 fn decode_bc5(input: &[u8], width: u32, height: u32, out: &mut [u8], signed: bool) {
-    let blocks_w = ((width + 3) / 4).max(1);
-    let blocks_h = ((height + 3) / 4).max(1);
-    for by in 0..blocks_h {
-        for bx in 0..blocks_w {
-            let block_idx = (by * blocks_w + bx) as usize;
-            let block = &input[block_idx * 16..(block_idx + 1) * 16];
+    decode_blocks(
+        input,
+        width,
+        height,
+        out,
+        16,
+        |block| {
             let mut staging = [0u8; 32]; // 4×4 RG8
             bcdec_rs::bc5(block, &mut staging, 8, signed);
-            let w = width as usize;
-            for j in 0..4u32 {
-                let py = by * 4 + j;
-                if py >= height { break; }
-                for i in 0..4u32 {
-                    let px = bx * 4 + i;
-                    if px >= width { break; }
-                    let src = ((j * 4 + i) * 2) as usize;
-                    let (r, g) = if signed {
-                        (bias_signed(staging[src]), bias_signed(staging[src + 1]))
-                    } else {
-                        (staging[src], staging[src + 1])
-                    };
-                    let dst = (py as usize * w + px as usize) * 4;
-                    out[dst] = r;
-                    out[dst + 1] = g;
-                    out[dst + 2] = calculate_normal_z(r, g);
-                    out[dst + 3] = 255;
-                }
-            }
-        }
-    }
+            staging
+        },
+        |staging, t| {
+            let (r, g) = if signed {
+                (bias_signed(staging[t * 2]), bias_signed(staging[t * 2 + 1]))
+            } else {
+                (staging[t * 2], staging[t * 2 + 1])
+            };
+            [r, g, calculate_normal_z(r, g), 255]
+        },
+    );
 }
 
 /// Re-bias one two's-complement signed byte (`-127..=127`) into the
@@ -661,46 +615,27 @@ fn bias_signed(v: u8) -> u8 {
 
 /// `dxn_mono_alpha` → custom Halo codec. Each 16-byte block is two
 /// BC4-style sub-blocks back to back: `red` carries luminance,
-/// `green` carries alpha. Output `(L, L, L, A)`.
-///
-/// Same numerical work as [`super::dds::decode_dxn_mono_alpha`] but
-/// inlined here for the per-mip RGBA8 output convention. The two
-/// produce byte-identical pixel data because R = G = B = luminance,
-/// so the BGRA / RGBA distinction collapses.
+/// `green` carries alpha. Output `(L, L, L, A)`. Mirrors TagTool's
+/// `BitmapCompression.DecompressDXNMonoAlpha`.
 fn decode_dxn_mono_alpha_rgba(input: &[u8], width: u32, height: u32, out: &mut [u8]) {
-    let blocks_w = ((width + 3) / 4).max(1);
-    let blocks_h = ((height + 3) / 4).max(1);
-    let w = width as usize;
-    for by in 0..blocks_h {
-        for bx in 0..blocks_w {
-            let block_idx = (by * blocks_w + bx) as usize;
-            let block = &input[block_idx * 16..(block_idx + 1) * 16];
-
+    decode_blocks(
+        input,
+        width,
+        height,
+        out,
+        16,
+        |block| {
             let mut red_values = [0u8; 8];
             let red_indices = unpack_bc4_alpha_block(&block[0..8], &mut red_values);
             let mut green_values = [0u8; 8];
             let green_indices = unpack_bc4_alpha_block(&block[8..16], &mut green_values);
-
-            for j in 0..4u32 {
-                let py = by * 4 + j;
-                if py >= height { continue; }
-                for i in 0..4u32 {
-                    let px = bx * 4 + i;
-                    if px >= width { continue; }
-                    let bit_offset = 3 * (j * 4 + i);
-                    let red_idx = ((red_indices >> bit_offset) & 0x07) as usize;
-                    let green_idx = ((green_indices >> bit_offset) & 0x07) as usize;
-                    let r = red_values[red_idx];
-                    let g = green_values[green_idx];
-                    let dst = (py as usize * w + px as usize) * 4;
-                    out[dst] = r;
-                    out[dst + 1] = r;
-                    out[dst + 2] = r;
-                    out[dst + 3] = g;
-                }
-            }
-        }
-    }
+            (red_values, red_indices, green_values, green_indices)
+        },
+        |(red_values, red_indices, green_values, green_indices), t| {
+            let r = bc4_value(red_values, *red_indices, t);
+            [r, r, r, bc4_value(green_values, *green_indices, t)]
+        },
+    );
 }
 
 /// `r5g6b5`: u16 LE with bits `RRRRR GGGGGG BBBBB`. Bit-replication
@@ -782,7 +717,7 @@ fn decode_l16(input: &[u8], out: &mut [u8]) {
 fn decode_f16_mono(input: &[u8], out: &mut [u8]) {
     for (i, chunk) in input.chunks_exact(2).enumerate() {
         let f = half_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
-        let v = clamp_to_u8(f);
+        let v = clamp_unit_to_u8(f);
         let p = i * 4;
         out[p] = v;
         out[p + 1] = v;
@@ -797,7 +732,7 @@ fn decode_f16_red(input: &[u8], out: &mut [u8]) {
     for (i, chunk) in input.chunks_exact(2).enumerate() {
         let f = half_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
         let p = i * 4;
-        out[p] = clamp_to_u8(f);
+        out[p] = clamp_unit_to_u8(f);
         out[p + 1] = 0;
         out[p + 2] = 0;
         out[p + 3] = 255;
@@ -861,69 +796,37 @@ fn decode_r16g16(input: &[u8], out: &mut [u8]) {
 /// the `Dxt3a` (all), `Dxt3aMono` (RGB), and `Dxt3aAlpha` (alpha-only)
 /// variants. Mirrors TagTool's `DecompressDXT3aX`.
 fn decode_dxt3a(input: &[u8], width: u32, height: u32, out: &mut [u8], mask: ChannelMask) {
-    let blocks_w = ((width + 3) / 4).max(1);
-    let blocks_h = ((height + 3) / 4).max(1);
-    let w = width as usize;
-    for by in 0..blocks_h {
-        for bx in 0..blocks_w {
-            let block_idx = (by * blocks_w + bx) as usize;
-            let block = &input[block_idx * 8..(block_idx + 1) * 8];
-            let alpha_data = u64::from_le_bytes([
-                block[0], block[1], block[2], block[3],
-                block[4], block[5], block[6], block[7],
-            ]);
-            for j in 0..4u32 {
-                let py = by * 4 + j;
-                if py >= height { continue; }
-                for i in 0..4u32 {
-                    let px = bx * 4 + i;
-                    if px >= width { continue; }
-                    let shift = 4 * (4 * j + i);
-                    let nibble = ((alpha_data >> shift) & 0xF) as u8;
-                    let value = nibble.wrapping_mul(17);
-                    let dst = (py as usize * w + px as usize) * 4;
-                    out[dst] = value & mask.r;
-                    out[dst + 1] = value & mask.g;
-                    out[dst + 2] = value & mask.b;
-                    out[dst + 3] = value & mask.a;
-                }
-            }
-        }
-    }
+    decode_blocks(
+        input,
+        width,
+        height,
+        out,
+        8,
+        |block| u64::from_le_bytes(block.try_into().unwrap()),
+        |alpha_data, t| {
+            let nibble = ((alpha_data >> (4 * t)) & 0xF) as u8;
+            let value = nibble.wrapping_mul(17);
+            [value & mask.r, value & mask.g, value & mask.b, value & mask.a]
+        },
+    );
 }
 
 /// `dxt3a_1111`: same 8-byte block as `Dxt3a` but the 4 bits per
 /// pixel are 4 binary channels (R, G, B, A). Each bit expands to
 /// `0` or `255`.
 fn decode_dxt3a_1111(input: &[u8], width: u32, height: u32, out: &mut [u8]) {
-    let blocks_w = ((width + 3) / 4).max(1);
-    let blocks_h = ((height + 3) / 4).max(1);
-    let w = width as usize;
-    for by in 0..blocks_h {
-        for bx in 0..blocks_w {
-            let block_idx = (by * blocks_w + bx) as usize;
-            let block = &input[block_idx * 8..(block_idx + 1) * 8];
-            let bits = u64::from_le_bytes([
-                block[0], block[1], block[2], block[3],
-                block[4], block[5], block[6], block[7],
-            ]);
-            for j in 0..4u32 {
-                let py = by * 4 + j;
-                if py >= height { continue; }
-                for i in 0..4u32 {
-                    let px = bx * 4 + i;
-                    if px >= width { continue; }
-                    let shift = 4 * (4 * j + i);
-                    let nibble = ((bits >> shift) & 0xF) as u8;
-                    let dst = (py as usize * w + px as usize) * 4;
-                    out[dst] = ((nibble >> 0) & 1) * 255;
-                    out[dst + 1] = ((nibble >> 1) & 1) * 255;
-                    out[dst + 2] = ((nibble >> 2) & 1) * 255;
-                    out[dst + 3] = ((nibble >> 3) & 1) * 255;
-                }
-            }
-        }
-    }
+    decode_blocks(
+        input,
+        width,
+        height,
+        out,
+        8,
+        |block| u64::from_le_bytes(block.try_into().unwrap()),
+        |bits, t| {
+            let nibble = ((bits >> (4 * t)) & 0xF) as u8;
+            [nibble & 1, (nibble >> 1) & 1, (nibble >> 2) & 1, (nibble >> 3) & 1].map(|bit| bit * 255)
+        },
+    );
 }
 
 /// `dxt5nm`: BC3-shaped 16-byte block as a normal map. BC4 alpha
@@ -931,37 +834,25 @@ fn decode_dxt3a_1111(input: &[u8], width: u32, height: u32, out: &mut [u8]) {
 /// Y, and Z (blue) is reconstructed from `sqrt(1 - x² - y²)`. Alpha
 /// is forced to `255`.
 fn decode_dxt5nm(input: &[u8], width: u32, height: u32, out: &mut [u8]) {
-    let blocks_w = ((width + 3) / 4).max(1);
-    let blocks_h = ((height + 3) / 4).max(1);
-    let w = width as usize;
-    for by in 0..blocks_h {
-        for bx in 0..blocks_w {
-            let block_idx = (by * blocks_w + bx) as usize;
-            let block = &input[block_idx * 16..(block_idx + 1) * 16];
+    decode_blocks(
+        input,
+        width,
+        height,
+        out,
+        16,
+        |block| {
             let mut alpha_values = [0u8; 8];
             let alpha_indices = unpack_bc4_alpha_block(&block[0..8], &mut alpha_values);
             let mut staging = [0u8; 64];
             bcdec_rs::bc1(&block[8..16], &mut staging, 16);
-            for j in 0..4u32 {
-                let py = by * 4 + j;
-                if py >= height { continue; }
-                for i in 0..4u32 {
-                    let px = bx * 4 + i;
-                    if px >= width { continue; }
-                    let bit_offset = 3 * (j * 4 + i);
-                    let a_idx = ((alpha_indices >> bit_offset) & 0x07) as usize;
-                    let r = alpha_values[a_idx];
-                    let g = staging[((j * 4 + i) as usize) * 4 + 1];
-                    let z = calculate_normal_z(r, g);
-                    let dst = (py as usize * w + px as usize) * 4;
-                    out[dst] = r;
-                    out[dst + 1] = g;
-                    out[dst + 2] = z;
-                    out[dst + 3] = 255;
-                }
-            }
-        }
-    }
+            (alpha_values, alpha_indices, staging)
+        },
+        |(alpha_values, alpha_indices, staging), t| {
+            let r = bc4_value(alpha_values, *alpha_indices, t);
+            let g = staging[t * 4 + 1];
+            [r, g, calculate_normal_z(r, g), 255]
+        },
+    );
 }
 
 /// `ctx1`: BC1-shaped 8-byte block carrying two 2-channel endpoints
@@ -969,14 +860,13 @@ fn decode_dxt5nm(input: &[u8], width: u32, height: u32, out: &mut [u8]) {
 /// indices into 4 lerped endpoints. Z is reconstructed from X/Y;
 /// alpha = 255. Mirrors TagTool's `DecompressCTX1`.
 fn decode_ctx1(input: &[u8], width: u32, height: u32, out: &mut [u8]) {
-    let blocks_w = ((width + 3) / 4).max(1);
-    let blocks_h = ((height + 3) / 4).max(1);
-    let w = width as usize;
-    for by in 0..blocks_h {
-        for bx in 0..blocks_w {
-            let block_idx = (by * blocks_w + bx) as usize;
-            let block = &input[block_idx * 8..(block_idx + 1) * 8];
-
+    decode_blocks(
+        input,
+        width,
+        height,
+        out,
+        8,
+        |block| {
             // Endpoints: 2 × (R, G) pairs at the start. TagTool reads
             // `(R = block[1], G = block[0])` then the second pair the
             // same way — the byte order matches Halo's `g8b8`-style
@@ -993,28 +883,14 @@ fn decode_ctx1(input: &[u8], width: u32, height: u32, out: &mut [u8]) {
                 ((endpoints[0][0] as u32 + 2 * endpoints[1][0] as u32) / 3) as u8,
                 ((endpoints[0][1] as u32 + 2 * endpoints[1][1] as u32) / 3) as u8,
             ];
-
             let indices = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
-
-            for j in 0..4u32 {
-                let py = by * 4 + j;
-                if py >= height { continue; }
-                for i in 0..4u32 {
-                    let px = bx * 4 + i;
-                    if px >= width { continue; }
-                    let shift = 2 * (4 * j + i);
-                    let idx = ((indices >> shift) & 0x3) as usize;
-                    let r = endpoints[idx][0];
-                    let g = endpoints[idx][1];
-                    let dst = (py as usize * w + px as usize) * 4;
-                    out[dst] = r;
-                    out[dst + 1] = g;
-                    out[dst + 2] = calculate_normal_z(r, g);
-                    out[dst + 3] = 255;
-                }
-            }
-        }
-    }
+            (endpoints, indices)
+        },
+        |(endpoints, indices), t| {
+            let [r, g] = endpoints[((indices >> (2 * t)) & 0x3) as usize];
+            [r, g, calculate_normal_z(r, g), 255]
+        },
+    );
 }
 
 /// `dxt5_red/green/blue` (Reach+): BC3-shaped 16-byte block where
@@ -1029,34 +905,23 @@ fn decode_bc3_single_channel(
     out: &mut [u8],
     target: usize,
 ) {
-    let blocks_w = ((width + 3) / 4).max(1);
-    let blocks_h = ((height + 3) / 4).max(1);
-    let w = width as usize;
-    for by in 0..blocks_h {
-        for bx in 0..blocks_w {
-            let block_idx = (by * blocks_w + bx) as usize;
-            let block = &input[block_idx * 16..(block_idx + 1) * 16];
+    decode_blocks(
+        input,
+        width,
+        height,
+        out,
+        16,
+        |block| {
             let mut values = [0u8; 8];
             let indices = unpack_bc4_alpha_block(&block[0..8], &mut values);
-            for j in 0..4u32 {
-                let py = by * 4 + j;
-                if py >= height { continue; }
-                for i in 0..4u32 {
-                    let px = bx * 4 + i;
-                    if px >= width { continue; }
-                    let bit_offset = 3 * (j * 4 + i);
-                    let idx = ((indices >> bit_offset) & 0x07) as usize;
-                    let v = values[idx];
-                    let dst = (py as usize * w + px as usize) * 4;
-                    out[dst] = 0;
-                    out[dst + 1] = 0;
-                    out[dst + 2] = 0;
-                    out[dst + target] = v;
-                    out[dst + 3] = 255;
-                }
-            }
-        }
-    }
+            (values, indices)
+        },
+        |(values, indices), t| {
+            let mut rgba = [0, 0, 0, 255];
+            rgba[target] = bc4_value(values, *indices, t);
+            rgba
+        },
+    );
 }
 
 /// Reconstruct the Z (blue) component of a unit normal from its X
@@ -1072,8 +937,7 @@ fn calculate_normal_z(r: u8, g: u8) -> u8 {
 
 /// 8-byte BC4-style alpha sub-block: 2 endpoint bytes + 6 bytes of
 /// 3-bit indices. Fills `values` with the 8-entry palette and
-/// returns the 48-bit index field as a `u64`. (Mirror of the helper
-/// in [`super::dds`].)
+/// returns the 48-bit index field as a `u64`.
 fn unpack_bc4_alpha_block(block: &[u8], values: &mut [u8; 8]) -> u64 {
     let v0 = block[0] as u32;
     let v1 = block[1] as u32;

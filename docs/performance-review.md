@@ -441,6 +441,24 @@ Re-measure after each fix and add a row to the log at the bottom.
   - Endian slice readers repeated in `animation/classic.rs:505` vs
     `fields.rs:541`; `yaw_quat` ×2; `lut()` ×2 in `tag_function`.
   - `xbox360.rs:98` `swap_byte_pairs` has no callers.
+  - **Mostly done** (uncommitted):
+    - `decode_blocks` walks a block-compressed mip; each of the 12 block codecs
+      (BC1/2/3/7 via `decode_bcdec_rgba`, BC4 family, BC5, DXN mono-alpha,
+      DXT3A, DXT3A-1111, DXT5NM, CTX1, DXT5 single-channel) is now its
+      per-block setup plus its per-texel formula. `decode.rs` −101 lines.
+    - Removed `dds::decode_dxn_mono_alpha`, its private BC4 unpacker, and
+      `xbox360::swap_byte_pairs` — public, no callers anywhere in the
+      workspace; DDS export decodes those formats through `decode`, and
+      `EndianSwap::In16` is the byte swap.
+    - `crate::math::half_to_f32` (the bit-built, NaN-payload-keeping one from
+      `render_geometry`) and `clamp_unit_to_u8` replace three and two copies.
+      All three old converters equal `half::f16::to_f32` on all 65,536
+      inputs apart from NaN identity, and both clamps send any NaN to 0.
+    - Verified: every image of 3,210 H3, 4,184 H2 and 1,818 CE bitmaps (DDS
+      and TIFF export digested) plus all 47 formats on seeded random input at
+      8 sizes, identical before and after.
+    - Open: `animation/classic.rs` endian readers vs `fields.rs`, `yaw_quat`
+      ×2, `lut` ×2.
 
 ---
 
@@ -519,6 +537,14 @@ Re-measure after each fix and add a row to the log at the bottom.
   - `validate_reference_fidelity` iterated a `HashSet`, so the same tag's
     warnings came out in a different order per process. Now source-walk order,
     deduplicated. Found because the converter A/B digests weren't stable.
+- [ ] **B8. `A4r4g4b4Font` decode panics on every image** — Verified, not fixed
+  - `decode_a4r4g4b4_font` (`bitmap/decode.rs`) writes one output pixel per
+    *input byte*, but the format table sizes it at 2 bytes per pixel
+    (`format.rs:382`), so it writes twice as many pixels as `out` holds and
+    indexes past the end — on any input, any size. Found by the synthetic
+    all-format digest; no local H3/H2/CE bitmap uses the format. Which is
+    right (1 or 2 bytes per pixel, and what the second byte means) needs
+    research against the engine/TagTool before changing either side.
 - [x] **B7. Lost `\` line continuations left space runs inside messages** — Fixed
   - 13 string literals (converter warnings and errors, collision/sbsp import
     errors, collision-verify diagnostics, a shell error) read like `was
