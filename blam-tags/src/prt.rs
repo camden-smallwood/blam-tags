@@ -121,14 +121,32 @@ impl Default for PrtOptions {
 /// ray-triangle tests.
 struct Bvh {
     nodes: Vec<BvhNode>,
-    /// Triangle indices, ordered so each leaf owns a contiguous run.
-    order: Vec<u32>,
+    /// The triangles, ordered so each leaf owns a contiguous run, and held
+    /// ready for the ray test so their edges are not recomputed per ray.
+    leaves: Vec<RayTri>,
+}
+
+/// A triangle as the ray test reads it: one vertex and the two edges from it.
+struct RayTri {
+    p0: [f32; 3],
+    e1: [f32; 3],
+    e2: [f32; 3],
+}
+
+impl RayTri {
+    fn new(p: &[[f32; 3]; 3]) -> Self {
+        Self {
+            p0: p[0],
+            e1: [p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]],
+            e2: [p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]],
+        }
+    }
 }
 
 struct BvhNode {
     lo: [f32; 3],
     hi: [f32; 3],
-    /// Leaf: `first` and `count` into `order`. Interior: `first` is the
+    /// Leaf: `first` and `count` into `leaves`. Interior: `first` is the
     /// right child and `count` is 0, the left child being `self + 1`.
     first: u32,
     count: u32,
@@ -151,7 +169,7 @@ impl Bvh {
         let mut order: Vec<u32> = (0..tris.len() as u32).collect();
         let mut nodes: Vec<BvhNode> = Vec::new();
         if tris.is_empty() {
-            return Self { nodes, order };
+            return Self { nodes, leaves: Vec::new() };
         }
         // An explicit stack: a mesh can be deep enough to overflow the
         // real one, and this runs on whatever the caller hands it.
@@ -193,19 +211,22 @@ impl Bvh {
             stack.push((mid, end, me, true));
             stack.push((begin, mid, me, false));
         }
-        Self { nodes, order }
+        let leaves = order.iter().map(|&t| RayTri::new(&tris[t as usize])).collect();
+        Self { nodes, leaves }
     }
 
     /// Is anything in the way between `o` and `o + dir * max_t`?
     ///
     /// Occlusion only — the nearest hit is never needed, so this stops at
-    /// the first blocker.
-    fn occluded(&self, tris: &[[[f32; 3]; 3]], o: [f32; 3], dir: [f32; 3], max_t: f32) -> bool {
+    /// the first blocker. `stack` is the caller's scratch, reused across rays
+    /// rather than allocated for each.
+    fn occluded(&self, o: [f32; 3], dir: [f32; 3], max_t: f32, stack: &mut Vec<usize>) -> bool {
         if self.nodes.is_empty() {
             return false;
         }
         let inv = [1.0 / dir[0], 1.0 / dir[1], 1.0 / dir[2]];
-        let mut stack = vec![0usize];
+        stack.clear();
+        stack.push(0);
         while let Some(at) = stack.pop() {
             let node = &self.nodes[at];
             // Slab test.
@@ -226,8 +247,8 @@ impl Bvh {
                 continue;
             }
             let begin = node.first as usize;
-            for &t in &self.order[begin..begin + node.count as usize] {
-                if moller_trumbore(&tris[t as usize], o, dir).is_some_and(|h| h > 0.0 && h < max_t) {
+            for tri in &self.leaves[begin..begin + node.count as usize] {
+                if moller_trumbore(tri, o, dir).is_some_and(|h| h > 0.0 && h < max_t) {
                     return true;
                 }
             }
@@ -239,16 +260,15 @@ impl Bvh {
 /// Ray-triangle, both faces. Occlusion does not care which way a
 /// triangle points, and a model's own back faces block light just the
 /// same.
-fn moller_trumbore(p: &[[f32; 3]; 3], o: [f32; 3], d: [f32; 3]) -> Option<f32> {
-    let e1 = [p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]];
-    let e2 = [p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]];
+fn moller_trumbore(tri: &RayTri, o: [f32; 3], d: [f32; 3]) -> Option<f32> {
+    let (p0, e1, e2) = (tri.p0, tri.e1, tri.e2);
     let h = [d[1] * e2[2] - d[2] * e2[1], d[2] * e2[0] - d[0] * e2[2], d[0] * e2[1] - d[1] * e2[0]];
     let a = e1[0] * h[0] + e1[1] * h[1] + e1[2] * h[2];
     if a.abs() < 1e-12 {
         return None;
     }
     let f = 1.0 / a;
-    let s = [o[0] - p[0][0], o[1] - p[0][1], o[2] - p[0][2]];
+    let s = [o[0] - p0[0], o[1] - p0[1], o[2] - p0[2]];
     let u = f * (s[0] * h[0] + s[1] * h[1] + s[2] * h[2]);
     if !(0.0..=1.0).contains(&u) {
         return None;
@@ -297,6 +317,7 @@ pub fn ambient_transfer(
     // answer: a stochastic solve that moves between runs cannot be
     // compared against anything, including itself.
     let dirs = cosine_hemisphere(opts.samples);
+    let mut stack = Vec::new();
 
     positions
         .iter()
@@ -317,7 +338,7 @@ pub fn ambient_transfer(
                     t[1] * d[0] + b[1] * d[1] + up[1] * d[2],
                     t[2] * d[0] + b[2] * d[1] + up[2] * d[2],
                 ];
-                if !bvh.occluded(&tris, o, dir, reach) {
+                if !bvh.occluded(o, dir, reach, &mut stack) {
                     open += 1;
                 }
             }
@@ -399,6 +420,7 @@ pub fn sh_transfer(
     let bias = extent * opts.bias;
     let reach = extent * 2.0;
     let dirs = cosine_hemisphere(opts.samples);
+    let mut stack = Vec::new();
 
     positions
         .iter()
@@ -423,7 +445,7 @@ pub fn sh_transfer(
                     t[1] * d[0] + b[1] * d[1] + up[1] * d[2],
                     t[2] * d[0] + b[2] * d[1] + up[2] * d[2],
                 ];
-                if bvh.occluded(&tris, o, dir, reach) {
+                if bvh.occluded(o, dir, reach, &mut stack) {
                     continue;
                 }
                 sh_basis(dir, &mut basis);

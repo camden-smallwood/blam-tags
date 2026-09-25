@@ -359,6 +359,13 @@ Re-measure after each fix and add a row to the log at the bottom.
     `Vec<Vec<u32>>`; `:453` allocates per candidate comparison.
   - `prt.rs:209` allocates a ray stack per ray; the per-vertex loop is
     embarrassingly parallel.
+    **Measured and partly done**: PRT is 84% of render-model import
+    (`Bvh::occluded`), welding 11%. The BVH now holds its triangles in leaf
+    order with their edges precomputed (same subtraction, same bits), and
+    `occluded` reuses one traversal stack per mesh instead of allocating per
+    ray. 300 H3 render-model imports: 95.1 s → **84.3 s**, output identical.
+    Open, needs a decision: running the per-vertex loop on all cores
+    (deterministic — each vertex is independent) would be ~8× more.
 
 ---
 
@@ -571,8 +578,10 @@ Re-measure after each fix and add a row to the log at the bottom.
       and TIFF export digested) plus all 47 formats on seeded random input at
       8 sizes, identical before and after.
     - `yaw_quat` ×2 → `RealQuaternion::from_yaw`; `h2.rs` uses
-      `tables::lut` (both bit-identical copies). Open: `animation/classic.rs`
-      endian readers vs `fields.rs`.
+      `tables::lut` (both bit-identical copies). **Decided against** merging
+      `animation/classic.rs`'s endian readers into `fields.rs`'s: they return
+      0 past the end of a (possibly truncated) blob, where the field readers
+      index a layout-guaranteed slice — different contracts.
 
 ---
 
