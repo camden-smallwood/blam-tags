@@ -57,7 +57,14 @@ fn main() {
         //    a valid template of its own group, so this needs no new code path.
         let utoc = out_dir.join(format!("mytag-{group}_P.utoc"));
         if let Err(error) = blam_tags::iostore::writer::write_new_tag_container(
-            &wrapper, &body, &package, None, &utoc,
+            &wrapper,
+            &body,
+            &package,
+            None,
+            // A new tag of the group: the derived wrapper supplies package
+            // structure only, with no bindings of its own to keep.
+            blam_tags::iostore::writer::WrapperOrigin::Template,
+            &utoc,
         ) {
             println!("{group:<26} FAIL  write: {error}");
             failures += 1;
