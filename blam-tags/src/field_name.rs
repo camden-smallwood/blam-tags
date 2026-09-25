@@ -48,6 +48,14 @@ use std::borrow::Cow;
 /// path built from the clean name resolves against the stored raw name.
 const NAME_MARKERS: &[char] = &['&', '#', ':', '[', '{', '*', '!', '^', '|'];
 
+/// Whether `byte` is one of [`NAME_MARKERS`]. They are all ASCII, so a byte
+/// scan finds the first one at a char boundary — without decoding the name a
+/// character at a time, as a `&[char]` pattern does. Name lookups clean a
+/// stored name per candidate field, so this is on the hottest path there is.
+fn is_name_marker(byte: u8) -> bool {
+    matches!(byte, b'&' | b'#' | b':' | b'[' | b'{' | b'*' | b'!' | b'^' | b'|')
+}
+
 /// Decomposition of a raw field name into its clean name plus presentation
 /// metadata. All borrowed slices point into the input `raw`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -175,7 +183,7 @@ pub fn clean_field_name(raw: &str) -> Cow<'_, str> {
 
 fn clean_name_cow(raw: &str) -> Cow<'_, str> {
     // Clean name = up to the first markup marker.
-    let end = raw.find(NAME_MARKERS).unwrap_or(raw.len());
+    let end = raw.bytes().position(is_name_marker).unwrap_or(raw.len());
     let base = raw[..end].trim_end();
     // Foundation normalizes `/`→`\` so a name can't split a path.
     if base.contains('/') {

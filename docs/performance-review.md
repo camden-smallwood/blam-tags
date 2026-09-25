@@ -177,8 +177,20 @@ Re-measure after each fix and add a row to the log at the bottom.
     range when the layout is built, making the compare a slice `==`;
     (d) a resolved-key API (`TagBlock::resolve(name) -> FieldKey`,
     `TagStruct::field_at(key)`) for hot loops.
+  - **(a) + (b) done** (uncommitted), plus a first-byte pre-filter:
+    `find_field_by_name` and the `path.rs` walk clean the query once; markers
+    are found with a byte scan; `layout_field_name_matches` rules a field out
+    on the first byte of its stored name in `string_data` — exact, because a
+    clean name starts with the stored name's first byte (`/` → `\`) — before
+    the name is UTF-8-validated or cleaned. Benchmark (`vbench` `walk`: every
+    field of 3,252 H3 character tags looked up by name, 28.1M lookups, same
+    hit count before and after): 3.93 s → **1.70 s**; with the 0.67 s
+    traversal taken out, lookups are **~3.2× faster** (~37 ns each). Edge
+    cases pinned in `matches_are_markup_insensitive_on_both_sides`.
+    Open: (c) and (d) — both hang state off the mutable layout or add API;
+    revisit when the geometry per-vertex loops (P11, P15) are worked on.
 
-- [ ] **P9. Sub-chunk lookups are linear scans** — Reported
+- [x] **P9. Sub-chunk lookups are linear scans** — Measured: not worth it
   - Where: `api.rs:979` `sub_chunk`, `data.rs:540`, `564`, `756`, `793`, the
     10 `descend_*` helpers in `path.rs:459-560` — each
     `sub_chunks.iter().find(|e| e.field_index == Some(i))`. Walking a struct
@@ -186,6 +198,14 @@ Re-measure after each fix and add a row to the log at the bottom.
   - Fix: route all through one `TagStructData::sub_chunk(i)`/`_mut`, then
     precompute each field's position among its struct's sub-chunk fields and
     search forward from there.
+  - **Won't fix** (measured): a full traversal of 3,252 H3 character tags —
+    `as_struct` + `as_block` + `as_array` on every one of 28.1M fields, each
+    scanning `sub_chunks` — takes **171 ms, ~6 ns per field**. The review's
+    "40% of the walk" was the walk's name cleaning, not the scans. A faster
+    search would also need `Some(..)` entries kept in field order, which the
+    retarget path (`data.rs:~182`) maps through another layout and can't
+    promise. The duplication half (one `sub_chunk(i)` accessor instead of ~20
+    inline `find`s) still belongs to D4.
 
 - [ ] **P10. `deserialize_field` allocates even when the caller only needs a type check** — Reported
   - Where: `fields.rs:628-636` (enum name `String`), `724-747` (flag names
@@ -195,6 +215,11 @@ Re-measure after each fix and add a row to the log at the bottom.
     on every leaf, cloning every data blob to check for a tag reference.
   - Fix: check `field_type()` before `value()`; add a raw-bits accessor for
     flag tests; resolve names lazily.
+  - **`collect_from_field` done** (uncommitted): it checks for
+    `TagReference` before decoding. `rebuild_dependency_list` over 3,252 H3
+    character tags: 288 ms → **~150 ms**, identical output (digest with the
+    new stream's fresh layout guid masked). Open: the flag-test and enum-name
+    allocations — they need a raw-bits accessor (new API).
 
 - [ ] **P11. `jms.rs` decodes the same raw vertex once per triangle corner** — Verified
   - Where: `jms.rs:3139-3150` (`build_geometry`), `jms.rs:~3298`

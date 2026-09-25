@@ -283,8 +283,35 @@ fn retarget_block_data(
 /// built from a raw name like `ambient color:[0,255]` or `animations|ABCDCC`
 /// still resolve.
 pub(crate) fn field_name_matches(stored: Option<&str>, query: &str) -> bool {
+    clean_field_name_matches(stored, &crate::field_name::clean_field_name(query))
+}
+
+/// [`field_name_matches`] for a query that is already clean, so a loop over a
+/// struct's fields cleans it once rather than once per field.
+pub(crate) fn clean_field_name_matches(stored: Option<&str>, clean_query: &str) -> bool {
     let Some(stored) = stored else { return false };
-    crate::field_name::clean_field_name(stored) == crate::field_name::clean_field_name(query)
+    first_byte_may_match(stored.as_bytes().first().copied(), clean_query)
+        && crate::field_name::clean_field_name(stored) == clean_query
+}
+
+/// [`clean_field_name_matches`] for the layout name at `name_offset`, ruling
+/// the field out on its first byte before the name is even read as a string.
+pub(crate) fn layout_field_name_matches(layout: &TagLayout, name_offset: u32, clean_query: &str) -> bool {
+    first_byte_may_match(layout.string_data.get(name_offset as usize).copied(), clean_query)
+        && clean_field_name_matches(layout.get_string(name_offset), clean_query)
+}
+
+/// Whether a stored name starting with `stored_first` can clean to
+/// `clean_query`. A stored name's clean form, when not empty, starts with the
+/// stored name's own first byte (`/` becoming `\`): cleaning only trims the end
+/// and maps `/`. So a first byte that can't match rules the field out without
+/// cleaning it — which is almost every field a lookup walks past. A stored
+/// name that is empty (first byte the terminator) matches only an empty query.
+fn first_byte_may_match(stored_first: Option<u8>, clean_query: &str) -> bool {
+    match (stored_first, clean_query.as_bytes().first()) {
+        (Some(have), Some(&want)) => have == want || (have == b'/' && want == b'\\'),
+        _ => true,
+    }
 }
 
 /// Heuristic: does this layout describe a Halo 2 classic tag? H2 classic
@@ -315,6 +342,15 @@ mod field_name_match_tests {
         // Genuinely different names still don't match.
         assert!(!field_name_matches(Some("ambient color"), "diffuse color"));
         assert!(!field_name_matches(None, "anything"));
+        // The first-byte shortcut must agree with cleaning: `/` cleans to `\`,
+        // a name that is all markup cleans to empty, and an empty query only
+        // matches such a name.
+        assert!(field_name_matches(Some("/per bone"), "\\per bone"));
+        assert!(field_name_matches(Some("/per bone"), "/per bone"));
+        assert!(field_name_matches(Some("#help only"), ""));
+        assert!(!field_name_matches(Some("#help only"), "help only"));
+        assert!(!field_name_matches(Some(""), "anything"));
+        assert!(!field_name_matches(Some("flags"), ""));
     }
 }
 
@@ -694,6 +730,7 @@ impl TagStructData {
     /// `first_field_index` up to the terminator and returns the
     /// first match. Returns `None` if no such field exists.
     pub(crate) fn find_field_by_name(&self, layout: &TagLayout, name: &str) -> Option<usize> {
+        let name = crate::field_name::clean_field_name(name);
         let struct_layout = &layout.struct_layouts[self.struct_index as usize];
         let mut field_index = struct_layout.first_field_index as usize;
         loop {
@@ -701,7 +738,7 @@ impl TagStructData {
             if field.field_type == TagFieldType::Terminator {
                 return None;
             }
-            if field_name_matches(layout.get_string(field.name_offset), name) {
+            if layout_field_name_matches(layout, field.name_offset, &name) {
                 return Some(field_index);
             }
             field_index += 1;

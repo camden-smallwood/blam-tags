@@ -783,7 +783,10 @@ fn collect_from_field(f: &crate::TagField<'_>, out: &mut Vec<(u32, String)>) {
         }
         return;
     }
-    if let Some(crate::TagFieldData::TagReference(r)) = f.value()
+    // Check the type before decoding: `value()` would copy every data blob and
+    // name every enum and flag in the tag just to find the references.
+    if f.field_type() == crate::TagFieldType::TagReference
+        && let Some(crate::TagFieldData::TagReference(r)) = f.value()
         && let Some((g, p)) = r.group_tag_and_name {
             out.push((g, p));
     }

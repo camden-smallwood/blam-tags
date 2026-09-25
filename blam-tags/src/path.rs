@@ -431,6 +431,7 @@ fn find_field_in_struct(
     // real struct of the same name (e.g. two "Mapping" fields), so an
     // intermediate segment must skip the leaf and resolve to the struct —
     // otherwise the descent hits a non-container and the whole path fails.
+    let clean_name = crate::field_name::clean_field_name(name);
     let mut field_index = first_field_index;
 
     loop {
@@ -438,7 +439,7 @@ fn find_field_in_struct(
         if field.field_type == TagFieldType::Terminator {
             return None;
         }
-        if crate::data::field_name_matches(layout.get_string(field.name_offset), name) {
+        if crate::data::layout_field_name_matches(layout, field.name_offset, &clean_name) {
             let type_ok = match type_filter {
                 Some(filter) => {
                     let type_name_offset = layout.field_types[field.type_index as usize].name_offset;
