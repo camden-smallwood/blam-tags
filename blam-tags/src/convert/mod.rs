@@ -656,6 +656,33 @@ struct ConversionMappingCatalog {
     group_aliases: Vec<GroupAliasRule>,
     #[serde(default)]
     payload_aliases: Vec<PayloadAliasRule>,
+    /// Source structs whose fields the target keeps one level up, reviewed and
+    /// declared. See [`lift_unmatched_source_structs`].
+    #[serde(default)]
+    flattened_structs: Vec<FlattenedStructRule>,
+}
+
+/// A source struct the target flattened into its parent: Halo 1 files a
+/// bitmap's `processing`, `color plate` and `more processing` values in
+/// sub-structs that Halo 2 keeps on the root, under the same names.
+///
+/// Declared rather than derived. Lifting *every* unmatched struct's children by
+/// name was tried and measured: across a Halo 1 -> Halo 2 sweep it placed 108
+/// fields in six groups, and some of those were guesses — three `hud_globals`
+/// colour structs competing for one root `default color`, a damage effect's
+/// `screen flash/duration` and `low frequency vibrate/duration` for one root
+/// `duration`. A wrong value in the right-typed field is invisible in any
+/// report, so each flattening is reviewed and listed here.
+#[derive(serde::Deserialize)]
+struct FlattenedStructRule {
+    group: String,
+    #[serde(default)]
+    source_games: Vec<String>,
+    #[serde(default)]
+    target_games: Vec<String>,
+    /// The source struct's path from the root, as the converter reports it.
+    source_path: String,
+    reason: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -921,6 +948,20 @@ impl ConversionMappingCatalog {
                 ));
             }
         }
+        for (index, rule) in catalog.flattened_structs.iter().enumerate() {
+            validate_game_scopes(
+                "flattened_structs",
+                index,
+                &rule.group,
+                &rule.source_games,
+                &rule.target_games,
+            )?;
+            if clean_field_key(&rule.source_path).is_empty() || rule.reason.trim().is_empty() {
+                return Err(format!(
+                    "conversion_mappings.json flattened_structs[{index}] has an empty path or reason"
+                ));
+            }
+        }
         for (index, rule) in catalog.accepted_payload_drops.iter().enumerate() {
             validate_game_scopes(
                 "accepted_payload_drops",
@@ -1037,6 +1078,23 @@ impl ConversionMappingCatalog {
                 && rule.source_definition == target_definition
                 && rule.target_definition == source_definition;
             forward || reverse
+        })
+    }
+
+    /// Whether the struct at `source_path` is declared flattened for this pair.
+    fn flattens_struct(
+        &self,
+        group: &str,
+        source_game: &str,
+        target_game: &str,
+        source_path: &str,
+    ) -> bool {
+        let path = clean_field_key_round_trip(source_path);
+        self.flattened_structs.iter().any(|rule| {
+            rule.group.eq_ignore_ascii_case(group)
+                && game_scope_matches(&rule.source_games, source_game)
+                && game_scope_matches(&rule.target_games, target_game)
+                && clean_field_key_round_trip(&rule.source_path) == path
         })
     }
 
@@ -4547,6 +4605,8 @@ fn convert_struct(
         }
     }
     let plan = match_plan(source, target.as_ref(), source_guid, target_guid, same_guid, context);
+    let lifted = lift_unmatched_source_structs(source, &mut target, &plan, path, context);
+    reparented_fields.extend(lifted.consumed);
 
     for (source_field, planned) in source.fields().zip(plan.fields.iter()) {
         let key = &planned.key;
@@ -4582,7 +4642,106 @@ fn convert_struct(
         );
     }
 
-    context.report.defaulted_target += plan.defaulted;
+    context.report.defaulted_target += plan.defaulted.saturating_sub(lifted.filled);
+}
+
+/// What [`lift_unmatched_source_structs`] did.
+struct LiftedFields {
+    /// Source struct keys whose children were placed or reported one by one, so
+    /// the main loop must not also report the struct whole.
+    consumed: HashSet<String>,
+    /// Target fields filled, which the plan had counted as defaulted.
+    filled: usize,
+}
+
+/// Place the children of a source struct the target has no struct for into the
+/// same-named fields at the target's own level: the mirror of
+/// [`fill_nested_target_from_flat_source`]. Only for a struct a
+/// `flattened_structs` rule declares.
+///
+/// Halo 1 groups a bitmap's root into `processing`, `sprite budget`, `color
+/// plate`, `more processing` and `sprite processing` sub-structs, where Halo 2
+/// keeps every one of those fields on the root. The ordinary matcher pairs
+/// fields within one struct level, so each sub-struct went unmatched as a whole
+/// and every value in it was dropped. The colour plate among them, whose
+/// target field then kept whatever the native layout template held: a
+/// converted bitmap arrived with *another tag's* source image.
+///
+/// Conservative on purpose. Only a declared source struct the plan left
+/// unmatched is opened, only a target field the plan left unmatched is filled,
+/// each at most once, and only by cleaned name and compatible shape; nothing is
+/// placed positionally, and a child with no home is reported on its own. One
+/// level deep, which is what the Halo 1 layouts need.
+fn lift_unmatched_source_structs(
+    source: TagStruct<'_>,
+    target: &mut TagStructMut<'_>,
+    plan: &MatchPlan,
+    path: &str,
+    context: &mut ConversionContext<'_>,
+) -> LiftedFields {
+    let mut lifted = LiftedFields {
+        consumed: HashSet::new(),
+        filled: 0,
+    };
+    let mut taken: HashSet<usize> = plan
+        .fields
+        .iter()
+        .filter_map(|planned| planned.target.map(|target| target.ordinal))
+        .collect();
+    // Target fields by cleaned name, gathered only if some struct is unmatched.
+    let mut target_fields: Option<Vec<(usize, String, TagFieldType)>> = None;
+    for (source_field, planned) in source.fields().zip(plan.fields.iter()) {
+        if planned.target.is_some()
+            || planned.key.is_empty()
+            || source_field.field_type() != TagFieldType::Struct
+        {
+            continue;
+        }
+        let struct_path = join_path(path, &planned.key);
+        if !context.mapping_catalog.flattens_struct(
+            context.group_name,
+            context.source_game,
+            context.target_game,
+            &struct_path,
+        ) {
+            continue;
+        }
+        let Some(nested) = source_field.as_struct() else {
+            continue;
+        };
+        let target_fields = target_fields.get_or_insert_with(|| {
+            target
+                .as_ref()
+                .fields()
+                .enumerate()
+                .map(|(ordinal, field)| (ordinal, clean_field_key(field.name()), field.field_type()))
+                .collect()
+        });
+        for child in nested.fields() {
+            let key = clean_field_key(child.name());
+            if key.is_empty() {
+                continue;
+            }
+            let home = target_fields
+                .iter()
+                .find(|(ordinal, target_key, target_type)| {
+                    !taken.contains(ordinal)
+                        && *target_key == key
+                        && compatible_field_shapes(child.field_type(), *target_type)
+                })
+                .map(|(ordinal, _, _)| *ordinal);
+            match home.and_then(|ordinal| target.field_at_mut(ordinal).map(|field| (ordinal, field))) {
+                Some((ordinal, target_field)) => {
+                    convert_field(child, target_field, &join_path(path, &key), false, context);
+                    taken.insert(ordinal);
+                    lifted.filled += 1;
+                }
+                None => record_unmatched_field_values(child, &join_path(&struct_path, &key), context),
+            }
+        }
+        lifted.consumed.insert(planned.key.clone());
+    }
+    lifted
 }
 
 /// How one struct's fields map onto another's, for [`convert_struct`].
@@ -11237,6 +11396,160 @@ mod tests {
 
     /// A Halo 1 bitmap's pixels reach Halo 2 intact.
     ///
+    /// A Halo 1 bitmap's colour plate — the source image it was processed
+    /// from — reaches Halo 2 and decodes to the same image, and one without a
+    /// colour plate arrives without one.
+    ///
+    /// Halo 1 nests the plate (and `processing`, `sprite budget`, …) in
+    /// sub-structs where Halo 2 keeps the fields on the root, so the matcher
+    /// dropped all of it, and the target kept the native layout template's
+    /// plate: a converted bitmap carried another tag's source image. Checked by
+    /// decoding with [`crate::bitmap::color_plate`] rather than by bytes alone,
+    /// so width, height and blob have to agree with each other on arrival.
+    #[test]
+    fn a_halo1_bitmaps_color_plate_arrives_in_halo2() {
+        let (Some(h1), Some(h2)) = (
+            kit_tags("BLAM_TEST_HCEEK", "HCEEK"),
+            kit_tags("BLAM_TEST_H2EK", "H2EK"),
+        ) else {
+            eprintln!("skipping: needs HCEEK and H2EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = u32::from_be_bytes(*b"bitm");
+        let (mut with_plate, mut without_plate) = (0usize, 0usize);
+        for path in tags_with_extension(&h1, "bitmap").iter().take(300) {
+            let Ok(source) = read_tag_for_conversion(
+                path,
+                Some("haloce_mcc"),
+                Some(definitions.as_path()),
+                group_tag,
+            ) else {
+                continue;
+            };
+            let plate = crate::bitmap::color_plate(&source)
+                .unwrap_or_else(|error| panic!("{}: source plate: {error}", path.display()));
+            if plate.is_some() && with_plate >= 5 || plate.is_none() && without_plate >= 5 {
+                continue;
+            }
+            let draft = match analyze_conversion(
+                &source,
+                "haloce_mcc",
+                "halo2_mcc",
+                &definitions,
+                Some(h2.as_path()),
+            ) {
+                Ok(draft) => draft,
+                Err(error) => panic!("{} refused: {error}", path.display()),
+            };
+            let landed = crate::bitmap::color_plate(&draft.tag)
+                .unwrap_or_else(|error| panic!("{}: converted plate: {error}", path.display()));
+            match plate {
+                Some(plate) => {
+                    let landed = landed.unwrap_or_else(|| {
+                        panic!("{}: its colour plate did not arrive", path.display())
+                    });
+                    assert_eq!(
+                        (landed.width, landed.height),
+                        (plate.width, plate.height),
+                        "{}: plate size",
+                        path.display()
+                    );
+                    assert!(landed.rgba == plate.rgba, "{}: plate pixels differ", path.display());
+                    // The rest of `processing` comes up to the root with it.
+                    // Halo 1 stores it as a `real`, Halo 2 as a `real_fraction`.
+                    let fade = |tag: &TagFile, at: &str| match tag
+                        .root()
+                        .field_path(at)
+                        .and_then(|field| field.value())
+                    {
+                        Some(TagFieldData::Real(value) | TagFieldData::RealFraction(value)) => {
+                            Some(value)
+                        }
+                        _ => None,
+                    };
+                    assert_eq!(
+                        fade(&draft.tag, "detail fade factor"),
+                        fade(&source, "processing/detail fade factor"),
+                        "{}: detail fade factor",
+                        path.display()
+                    );
+                    assert!(
+                        fade(&source, "processing/detail fade factor").is_some(),
+                        "{}: the source has no fade factor to compare",
+                        path.display()
+                    );
+                    with_plate += 1;
+                }
+                None => {
+                    assert!(
+                        landed.is_none(),
+                        "{} has no colour plate but arrived with a {}x{} one — the \
+                         layout template's",
+                        path.display(),
+                        landed.as_ref().map_or(0, |plate| plate.width),
+                        landed.as_ref().map_or(0, |plate| plate.height),
+                    );
+                    without_plate += 1;
+                }
+            }
+            if with_plate >= 5 && without_plate >= 5 {
+                break;
+            }
+        }
+        assert!(with_plate > 0, "no Halo 1 bitmap with a colour plate in the first 300");
+        assert!(without_plate > 0, "no Halo 1 bitmap without a colour plate in the first 300");
+    }
+
+    /// A struct no rule declares flattened stays unlifted, even where the
+    /// target has a same-named field one level up.
+    ///
+    /// Halo 1's `hud_globals` has three colour structs — `help text color`,
+    /// `not much time left color`, `time out color` — each with a `default
+    /// color`, and Halo 2's root has one `default color`. Lifting by name alone
+    /// put the help text's colour there, a guess that no report would show.
+    /// Undeclared, the struct's values are reported as not carried instead.
+    #[test]
+    fn an_undeclared_struct_is_reported_not_lifted() {
+        let (Some(h1), Some(h2)) = (
+            kit_tags("BLAM_TEST_HCEEK", "HCEEK"),
+            kit_tags("BLAM_TEST_H2EK", "H2EK"),
+        ) else {
+            eprintln!("skipping: needs HCEEK and H2EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = u32::from_be_bytes(*b"hudg");
+        let path = tags_with_extension(&h1, "hud_globals")
+            .into_iter()
+            .next()
+            .expect("the Halo 1 kit ships a hud_globals");
+        let source = read_tag_for_conversion(
+            &path,
+            Some("haloce_mcc"),
+            Some(definitions.as_path()),
+            group_tag,
+        )
+        .unwrap();
+        let draft = analyze_conversion(
+            &source,
+            "haloce_mcc",
+            "halo2_mcc",
+            &definitions,
+            Some(h2.as_path()),
+        )
+        .unwrap_or_else(|error| panic!("{} refused: {error}", path.display()));
+        assert!(
+            draft
+                .report
+                .issues
+                .iter()
+                .any(|issue| issue.path.starts_with("help text color/")),
+            "{}: `help text color` was lifted onto the root instead of reported",
+            path.display()
+        );
+    }
+
     /// The user asked for this specifically: everything else in the geometry
     /// family is better reimported, but pixel data carried forward avoids a
     /// recompression pass. It was refused because the opaque-copy path required a
@@ -12517,6 +12830,65 @@ mod tests {
                         rule.group,
                         rule.source_path,
                     );
+                }
+            }
+        }
+    }
+
+    /// A declared flattening must name a struct the source has and the target
+    /// does not, and every named field in it must have a home one level up on
+    /// the target. A rule for a struct the target also declares would be
+    /// hiding a plain match; a child with no home would be lifted nowhere.
+    #[test]
+    fn every_flattened_struct_lands_whole_on_the_target() {
+        let catalog = ConversionMappingCatalog::load().unwrap();
+        let definitions = locate_definitions_root();
+        assert!(!catalog.flattened_structs.is_empty(), "the bitmap rules should be here");
+        for rule in &catalog.flattened_structs {
+            for source_game in &rule.source_games {
+                let path = definitions.join(source_game).join(format!("{}.json", rule.group));
+                let source = TagFile::new(&path)
+                    .unwrap_or_else(|error| panic!("build {source_game}/{}: {error}", rule.group));
+                let source_root = source.definitions().root_struct();
+                assert!(
+                    schema_path_resolves(source_root, &rule.source_path),
+                    "{source_game}/{}: `{}` does not resolve",
+                    rule.group,
+                    rule.source_path,
+                );
+                let children: Vec<String> = source
+                    .root()
+                    .field_path(&rule.source_path)
+                    .and_then(|field| field.as_struct())
+                    .expect("a flattened path names a struct")
+                    .fields()
+                    .map(|field| clean_field_key(field.name()))
+                    .filter(|key| !key.is_empty())
+                    .collect();
+                let parent = rule.source_path.rsplit_once('/').map_or("", |(parent, _)| parent);
+                for target_game in &rule.target_games {
+                    let path = definitions.join(target_game).join(format!("{}.json", rule.group));
+                    let target = TagFile::new(&path).unwrap();
+                    let target_root = target.definitions().root_struct();
+                    assert!(
+                        !schema_path_resolves(target_root, &rule.source_path),
+                        "{target_game}/{} declares `{}` itself, so it is not flattened",
+                        rule.group,
+                        rule.source_path,
+                    );
+                    for child in &children {
+                        let home = if parent.is_empty() {
+                            child.clone()
+                        } else {
+                            format!("{parent}/{child}")
+                        };
+                        assert!(
+                            schema_path_resolves(target_root, &home),
+                            "{target_game}/{} has no `{home}` for `{}/{child}`",
+                            rule.group,
+                            rule.source_path,
+                        );
+                    }
                 }
             }
         }

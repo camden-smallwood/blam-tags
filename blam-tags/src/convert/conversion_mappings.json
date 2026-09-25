@@ -1710,6 +1710,18 @@
       "source_definition": "processed_pixel_data_data",
       "target_definition": "bitmap_pixel_data",
       "reason": "Both are the bitmap's pixel payload under the same field name, `processed pixel data`. Until the Halo 2 definitions were recovered from tool.exe (586765c) both sides also shared the data definition name `processed_pixel_data_data`, and the derived same-name rule carried the pixels; tool.exe calls Halo 2's `bitmap_pixel_data`, so the pair is now declared. The bytes mean the same thing on both sides: Halo 1's per-bitmap `format_enum` and Halo 2's `format_2` agree option-for-option by name for A8 through DXT5, the enum is carried by name, and Halo 1's `P8` lands on Halo 2's `p8` rather than `p8-bump`. Halo 1's `BC7` has no Halo 2 option and is reported by the enum conversion."
+    },
+    {
+      "group": "bitmap",
+      "source_games": [
+        "haloce_mcc"
+      ],
+      "target_games": [
+        "halo2_mcc"
+      ],
+      "source_definition": "compressed_color_plate_data_data",
+      "target_definition": "color_plate_data",
+      "reason": "The compressed colour plate, the source image the bitmap was processed from, under the same field name, `compressed color plate data`, on both sides. One encoding in both games: a big-endian u32 uncompressed size, then a zlib stream of width x height little-endian A8R8G8B8 texels. `bitmap::color_plate` decodes both with the same code, verified on CE and H2 against SnowyMouse's halo2-color-plate-extractor, which reads exactly that shape from H2 tags. Carried by the derived same-name rule while Halo 2's dump called it `compressed_color_plate_data_data`; tool.exe calls it `color_plate_data` (586765c), so the pair is now declared. The width and height travel with it, lifted out of Halo 1's `color plate` struct."
     }
   ],
   "accepted_payload_drops": [
@@ -1735,6 +1747,41 @@
       ],
       "source_path": "editor scenario data",
       "reason": "Sapien's own editor bookkeeping for the scenario, not gameplay data. Every profile declares it under the same field name and a different data definition (`editor_scenario_data_data` in Halo CE, `_data_3` in Halo 2's version-3 struct, `editor_scenario_data_definition` in Halo 3), so the opaque copy path has no identity to pair them on and refused the whole scenario over it. Measured: Halo CE ships it populated and Halo 2 ships it empty in every scenario its kit carries, which is what a per-editor scratch blob looks like. Reviewed as safe to drop -- one game's editor state means nothing to another's editor, and the scenario's actual contents live in the blocks around it."
+    }
+  ],
+  "flattened_structs": [
+    {
+      "group": "bitmap",
+      "source_games": [
+        "haloce_mcc"
+      ],
+      "target_games": [
+        "halo2_mcc"
+      ],
+      "source_path": "processing",
+      "reason": "Halo 1 files these under a `processing` sub-struct; Halo 2 keeps every one of them on the bitmap root under the same name. Halo 2's bitmap is Halo 1's with the sub-structs removed: the field order runs the same way through processing, colour plate and more processing, and `bitmap::color_plate` already reads the colour plate from either shape."
+    },
+    {
+      "group": "bitmap",
+      "source_games": [
+        "haloce_mcc"
+      ],
+      "target_games": [
+        "halo2_mcc"
+      ],
+      "source_path": "color plate",
+      "reason": "Halo 1 files these under a `color plate` sub-struct; Halo 2 keeps every one of them on the bitmap root under the same name. Halo 2's bitmap is Halo 1's with the sub-structs removed: the field order runs the same way through processing, colour plate and more processing, and `bitmap::color_plate` already reads the colour plate from either shape."
+    },
+    {
+      "group": "bitmap",
+      "source_games": [
+        "haloce_mcc"
+      ],
+      "target_games": [
+        "halo2_mcc"
+      ],
+      "source_path": "more processing",
+      "reason": "Halo 1 files these under a `more processing` sub-struct; Halo 2 keeps every one of them on the bitmap root under the same name. Halo 2's bitmap is Halo 1's with the sub-structs removed: the field order runs the same way through processing, colour plate and more processing, and `bitmap::color_plate` already reads the colour plate from either shape."
     }
   ]
 }
