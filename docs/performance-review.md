@@ -477,10 +477,17 @@ Re-measure after each fix and add a row to the log at the bottom.
     `panic = "abort"` — `convert` uses `catch_unwind` and PyO3 needs unwinding.
   - A `[profile.profiling]` (release + `debug = true`) for samply / Instruments.
 
-- [ ] **C3. flate2 zlib-rs backend** — Reported, unmeasured
+- [x] **C3. flate2 zlib-rs backend** — Measured
   - `flate2 = { version = "1.1", features = ["zlib-rs"] }` in
     `blam-tags/Cargo.toml` wins over tiff's default backend. Measure on
     info-stream unpacking before keeping.
+  - **Done**: zlib is used for classic bitmap color plates (and by the
+    shell's `extract-import-info`, and legacy paks); TIFF output is
+    uncompressed. Decoding every color plate, digests identical:
+    H2 4,067 plates / 1.87 GB **4.1 → 2.8 s**, CE 1,817 plates / 1.47 GB
+    **5.4 → 1.9–2.1 s**. `cargo tree -i flate2 -e features` confirms the
+    zlib-rs backend is the one compiled even though tiff still asks for the
+    default.
 
 - [ ] **C4. mimalloc for the CLI** — Reported, unmeasured
   - Only if a benchmark shows it; not in the PyO3 cdylib.

@@ -12,7 +12,10 @@ half = "2"
 num-traits = "0.2"
 num-derive = "0.4"
 strum = { version = "0.27", features = ["derive"] }
-flate2 = "1"
+# zlib-rs: the pure-Rust zlib port, faster than the default miniz_oxide at
+# inflating color plates and packed import sources. Enabled here, it is the
+# backend for every crate in the build (tiff pulls flate2 with defaults).
+flate2 = { version = "1.1", features = ["zlib-rs"] }
 # Tag checksums (classic header, MCC live-reload). Already in the tree through
 # flate2; hardware CRC instructions where the CPU has them.
 crc32fast = "1"
