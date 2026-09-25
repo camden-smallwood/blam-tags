@@ -5,3 +5,21 @@ members = ["blam-tags", "blam-tag-shell", "blam-tags-py", "blam-tags-bindgen"]
 # build it and fail.
 exclude = ["fuzz"]
 resolver = "3"
+
+# Dev and test builds. File-and-line debug info keeps backtraces readable while
+# writing far less of it; set `CARGO_PROFILE_DEV_DEBUG=true` for a session that
+# needs local variables in lldb.
+[profile.dev]
+debug = "line-tables-only"
+
+# Dependencies build optimized even in dev: the corpus tests run the decoders
+# (Oodle, zlib, BC, Vorbis, blake3, TIFF) over real tags, and unoptimized they
+# are many times slower. Dependencies compile once and stay cached, so edits to
+# the workspace's own crates rebuild no slower.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Build scripts and proc macros (serde, strum, num-derive) run once per build;
+# optimizing them costs more compile time than it saves.
+[profile.dev.build-override]
+opt-level = 0

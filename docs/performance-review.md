@@ -446,12 +446,27 @@ Re-measure after each fix and add a row to the log at the bottom.
 
 ## Build configuration
 
-- [ ] **C1. Dev profile** — Verified (`target/debug` is 66 GB)
+- [x] **C1. Dev profile** — Verified (`target/debug` is 66 GB)
   - `[profile.dev] debug = "line-tables-only"`;
     `[profile.dev.package."*"] opt-level = 3` so corpus tests run the
     decoders (oozextract, miniz/zlib-rs, bcdec_rs, lewton, blake3, tiff)
     optimized; `[profile.dev.build-override] opt-level = 0`.
   - One-time `cargo clean` (27 GB of `target/debug/examples` is stale probes).
+  - **Done**: the three profile sections in the workspace
+    `Cargo.toml`. Measured before → after (dev):
+    | | before | after |
+    |---|---|---|
+    | incremental rebuild of `blam-tags` after a real edit | 2.0–2.8 s | **1.0–1.35 s** |
+    | from-scratch build of the `blam-tags` crate | 5.0 s (tests 6.7 s) | 5.0 s (tests 6.4 s) |
+    | `cargo test --lib` run | 14.6 s | **8.8–10.0 s** |
+    | one-time rebuild of all dependencies at opt-level 3 | — | ~30 s |
+    `target/debug/examples` held **2,259,022 files** of builds for examples
+    that no longer exist (`dedupe_definitions`, `*_sweep`, …) — `cargo clean
+    -p blam-tags` can't reach them, since they belong to no current package.
+    Cleaned with `cargo clean --profile dev` (release untouched): removed
+    2,580,356 files, 82.3 GiB. After a full workspace rebuild (35.6 s) plus the
+    lib tests, `target/debug` is **980 MB**. Trade-off:
+    no local variables in lldb unless `CARGO_PROFILE_DEV_DEBUG=true`.
 
 - [ ] **C2. Release / dist profiles** — Verified: **no runtime gain**
   - Fat LTO + `codegen-units = 1` measured on vbench: read 0.78 → 0.83 s,
