@@ -221,11 +221,17 @@ Re-measure after each fix and add a row to the log at the bottom.
     new stream's fresh layout guid masked). Open: the flag-test and enum-name
     allocations — they need a raw-bits accessor (new API).
 
-- [ ] **P11. `jms.rs` decodes the same raw vertex once per triangle corner** — Verified
+- [x] **P11. `jms.rs` decodes the same raw vertex once per triangle corner** — Verified
   - Where: `jms.rs:3139-3150` (`build_geometry`), `jms.rs:~3298`
     (`append_instance_geometry`).
   - Fix: decode `raw_v` into a `Vec<JmsVertex>` once per mesh, clone per corner.
   - See also **B1** — the `continue` on this path is an index-corruption bug.
+  - **Done** (uncommitted): `DecodedVertices` decodes each raw vertex on
+    first use and hands out clones, in both `build_geometry` and
+    `append_instance_geometry`. JMS export of all 1,614 H3 render_models:
+    ~9.4–10.7 s → **6.4–7.7 s**, output byte-identical for every one. What's
+    left is float formatting in the JMS text writer (`{:.N}` through
+    `grisu::format_exact`) — inherent to the format.
 
 - [ ] **P12. Converter hot spots** — Reported (measured by the review: 11 ms/effect … 278 ms/scenario)
   - `build_target_from_definitions` (`convert/mod.rs:2733`) runs
@@ -418,10 +424,13 @@ Re-measure after each fix and add a row to the log at the bottom.
 
 ## Bugs found during the review
 
-- [ ] **B1. JMS render export corrupts triangle indices on a missing vertex** — Verified
+- [x] **B1. JMS render export corrupts triangle indices on a missing vertex** — Verified
   - `jms.rs:3142`: `let Some(v) = raw_v.element(vi as usize) else { continue; };`
     pushes fewer than 3 vertices, but the triangle still uses
     `[base, base + 1, base + 2]`. Same shape at `~3298`.
+  - **Fixed** (uncommitted): a triangle with any out-of-range corner is
+    skipped whole, at both sites. No shipped H3 render_model hits it (output
+    unchanged on all 1,614), so there is no corpus fixture for it.
 - [ ] **B2. `"PRT vertex type"` set twice** — Reported
   - `render_import.rs:~996` and `~1002`; the first write is dead.
 - [ ] **B3. Collision material match can false-match** — Reported

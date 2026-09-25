@@ -3072,6 +3072,7 @@ fn build_geometry(
 
         let raw_v = pmt.field("raw vertices").and_then(|f| f.as_block())
             .ok_or(JmsError::MissingField("per mesh temporary[i]/raw vertices"))?;
+        let mut decoded = DecodedVertices::new(raw_v, bounds);
         // `raw indices` is u16; `raw indices32` is the parallel u32
         // slot used by meshes too big to address with 16-bit indices
         // (e.g. bigmuthafucka with 103k unique vertices). Read whichever
@@ -3137,10 +3138,13 @@ fn build_geometry(
             };
 
             for (a, b, c) in tris {
+                let corners = [a, b, c];
+                // All three corners or none: a triangle's indices assume three
+                // vertices were pushed for it.
+                if !corners.iter().all(|&vi| decoded.contains(vi)) { continue; }
                 let base = vertices.len() as u32;
-                for vi in [a, b, c] {
-                    let Some(v) = raw_v.element(vi as usize) else { continue; };
-                    let mut jv = read_vertex(&v, bounds);
+                for vi in corners {
+                    let mut jv = decoded.get(vi).clone();
                     if jv.node_sets.is_empty() {
                         if let Some(node) = rigid_fallback_node {
                             jv.node_sets.push((node, 1.0));
@@ -3207,6 +3211,7 @@ fn append_instance_geometry(
 
     let raw_v = pmt.field("raw vertices").and_then(|f| f.as_block())
         .ok_or(JmsError::MissingField("per mesh temporary[i]/raw vertices"))?;
+    let mut decoded = DecodedVertices::new(raw_v, bounds);
     let raw_i_u16 = pmt.field("raw indices").and_then(|f| f.as_block());
     let raw_i_u32 = pmt.field("raw indices32").and_then(|f| f.as_block());
     let raw_u16_len = raw_i_u16.as_ref().map(|b| b.len()).unwrap_or(0);
@@ -3294,10 +3299,13 @@ fn append_instance_geometry(
         };
 
         for (a, b, c) in tris {
+            let corners = [a, b, c];
+            // All three corners or none: a triangle's indices assume three
+            // vertices were pushed for it.
+            if !corners.iter().all(|&vi| decoded.contains(vi)) { continue; }
             let base = vertices.len() as u32;
-            for vi in [a, b, c] {
-                let Some(v) = raw_v.element(vi as usize) else { continue; };
-                let mut jv = read_vertex(&v, bounds);
+            for vi in corners {
+                let mut jv = decoded.get(vi).clone();
                 // Transform vertex by placement basis. Foundry packs
                 // `(forward, left, up)` as columns of the 3×3 rotation,
                 // i.e. `new = forward*x + left*y + up*z + position`,
@@ -3337,6 +3345,35 @@ fn append_instance_geometry(
 //================================================================================
 // raw_vertex_block reader
 //================================================================================
+
+/// A mesh's raw vertices, each decoded on first use and kept. The JMS output
+/// is unwelded — every triangle corner gets its own copy — and a strip mesh
+/// shares a vertex between ~6 triangles, so decoding per corner decoded (and
+/// looked up every field of) each vertex that many times.
+struct DecodedVertices<'a, 'b> {
+    block: crate::api::TagBlock<'a>,
+    bounds: &'b CompressionBounds,
+    decoded: Vec<Option<JmsVertex>>,
+}
+
+impl<'a, 'b> DecodedVertices<'a, 'b> {
+    fn new(block: crate::api::TagBlock<'a>, bounds: &'b CompressionBounds) -> Self {
+        Self { block, bounds, decoded: vec![None; block.len()] }
+    }
+
+    /// Whether `index` names a vertex of the mesh.
+    fn contains(&self, index: u32) -> bool {
+        (index as usize) < self.decoded.len()
+    }
+
+    /// The vertex at `index`, which [`Self::contains`] must have accepted.
+    fn get(&mut self, index: u32) -> &JmsVertex {
+        let (block, bounds) = (self.block, self.bounds);
+        self.decoded[index as usize].get_or_insert_with(|| {
+            read_vertex(&block.element(index as usize).expect("index checked by contains"), bounds)
+        })
+    }
+}
 
 fn read_vertex(v: &TagStruct<'_>, bounds: &CompressionBounds) -> JmsVertex {
     let raw_pos = v.read_point3d("position");
