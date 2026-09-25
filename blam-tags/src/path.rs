@@ -67,79 +67,10 @@ pub(crate) fn lookup_from_struct<'a>(
 ) -> Option<TagFieldCursor<'a>> {
     let segments: Vec<&str> = path.split('/').collect();
     let (final_segment, preceding) = segments.split_last()?;
-
-    let mut current_raw: &[u8] = start_raw;
-    let mut current_struct: &TagStructData = start_struct;
-
-    for segment in preceding {
-        let (type_filter, name, ordinal, index) = parse_segment(segment);
-        let field_index =
-            find_field_in_struct(layout, current_struct, name, type_filter, ordinal, true)?;
-        let field = &layout.fields[field_index];
-
-        match field.field_type {
-            TagFieldType::Struct => {
-                let nested_def = &layout.struct_layouts[field.definition as usize];
-                let offset = field.offset as usize;
-                if offset >= current_raw.len() {
-                    return None;
-                }
-                let end = (offset + nested_def.size).min(current_raw.len());
-                current_raw = &current_raw[offset..end];
-                current_struct = descend_struct(current_struct, field_index)?;
-            }
-            TagFieldType::Block => {
-                let block = descend_block_data(current_struct, field_index)?;
-                // Use the VERSION-AWARE element size (`raw_data / count`), not the
-                // base struct size: H2 has versioned classic blocks whose on-disk
-                // element is a different size than their base/latest struct (e.g.
-                // `bitmap_data` v1 = 116 vs base 140). Using the base size here
-                // made the bounds check reject the descent. Matches
-                // `TagBlock::element_size`.
-                let element_size = block.element_size(layout);
-                let element_index = index.unwrap_or(0) as usize;
-                // Bounds check: a block can legitimately be empty
-                // (X360 monolithic tags with pageable resources push
-                // their element data into the cache partition and
-                // leave the on-disk block at 0 elements).
-                let start = element_index * element_size;
-                let end = start + element_size;
-                if end > block.raw_data.len() {
-                    return None;
-                }
-                current_raw = &block.raw_data[start..end];
-                current_struct = block.elements.get(element_index)?;
-            }
-            TagFieldType::Array => {
-                let array_def = &layout.array_layouts[field.definition as usize];
-                let element_def = &layout.struct_layouts[array_def.struct_index as usize];
-                let element_index = index.unwrap_or(0) as usize;
-                let start = field.offset as usize + element_index * element_def.size;
-                let end = start + element_def.size;
-                if end > current_raw.len() {
-                    return None;
-                }
-                current_raw = &current_raw[start..end];
-                let elements = descend_array(current_struct, field_index)?;
-                current_struct = elements.get(element_index)?;
-            }
-            TagFieldType::PageableResource => {
-                let (nested, nested_raw) = descend_resource(layout, current_struct, field_index)?;
-                current_raw = nested_raw;
-                current_struct = nested;
-            }
-            _ => return None,
-        }
-    }
-
-    let (type_filter, name, ordinal, _index) = parse_segment(final_segment);
-    let field_index =
-        find_field_in_struct(layout, current_struct, name, type_filter, ordinal, false)?;
-    Some(TagFieldCursor {
-        struct_raw: current_raw,
-        struct_data: current_struct,
-        field_index,
-    })
+    let (struct_data, struct_raw) =
+        descend_segments(layout, start_struct, start_raw, preceding.iter().copied())?;
+    let field_index = final_field(layout, struct_data, final_segment)?;
+    Some(TagFieldCursor { struct_raw, struct_data, field_index })
 }
 
 /// Walk `path` treating every `/`-separated segment as an intermediate
@@ -155,66 +86,7 @@ pub(crate) fn descend_from_struct<'a>(
     start_raw: &'a [u8],
     path: &str,
 ) -> Option<(&'a TagStructData, &'a [u8])> {
-    let mut current_raw: &[u8] = start_raw;
-    let mut current_struct: &TagStructData = start_struct;
-
-    for segment in path.split('/').filter(|s| !s.is_empty()) {
-        let (type_filter, name, ordinal, index) = parse_segment(segment);
-        let field_index =
-            find_field_in_struct(layout, current_struct, name, type_filter, ordinal, true)?;
-        let field = &layout.fields[field_index];
-
-        match field.field_type {
-            TagFieldType::Struct => {
-                let nested_def = &layout.struct_layouts[field.definition as usize];
-                let offset = field.offset as usize;
-                if offset >= current_raw.len() {
-                    return None;
-                }
-                let end = (offset + nested_def.size).min(current_raw.len());
-                current_raw = &current_raw[offset..end];
-                current_struct = descend_struct(current_struct, field_index)?;
-            }
-            TagFieldType::Block => {
-                let block = descend_block_data(current_struct, field_index)?;
-                // Version-aware element size (see `lookup_from_struct`).
-                let element_size = block.element_size(layout);
-                let element_index = index.unwrap_or(0) as usize;
-                // Bounds check: a block can legitimately be empty
-                // (X360 monolithic tags with pageable resources push
-                // their element data into the cache partition and
-                // leave the on-disk block at 0 elements).
-                let start = element_index * element_size;
-                let end = start + element_size;
-                if end > block.raw_data.len() {
-                    return None;
-                }
-                current_raw = &block.raw_data[start..end];
-                current_struct = block.elements.get(element_index)?;
-            }
-            TagFieldType::Array => {
-                let array_def = &layout.array_layouts[field.definition as usize];
-                let element_def = &layout.struct_layouts[array_def.struct_index as usize];
-                let element_index = index.unwrap_or(0) as usize;
-                let start = field.offset as usize + element_index * element_def.size;
-                let end = start + element_def.size;
-                if end > current_raw.len() {
-                    return None;
-                }
-                current_raw = &current_raw[start..end];
-                let elements = descend_array(current_struct, field_index)?;
-                current_struct = elements.get(element_index)?;
-            }
-            TagFieldType::PageableResource => {
-                let (nested, nested_raw) = descend_resource(layout, current_struct, field_index)?;
-                current_raw = nested_raw;
-                current_struct = nested;
-            }
-            _ => return None,
-        }
-    }
-
-    Some((current_struct, current_raw))
+    descend_segments(layout, start_struct, start_raw, path.split('/').filter(|s| !s.is_empty()))
 }
 
 /// Mutable counterpart to [`lookup_from_struct`]. Descends through
@@ -232,70 +104,146 @@ pub(crate) fn lookup_mut_from_struct<'a>(
 
     let mut current_raw: &mut [u8] = start_raw;
     let mut current_struct: &mut TagStructData = start_struct;
-
     for segment in preceding {
-        let (type_filter, name, ordinal, index) = parse_segment(segment);
-        let field_index =
-            find_field_in_struct(layout, current_struct, name, type_filter, ordinal, true)?;
-        let field = &layout.fields[field_index];
-
-        match field.field_type {
-            TagFieldType::Struct => {
-                let nested_def = &layout.struct_layouts[field.definition as usize];
-                let offset = field.offset as usize;
-                let size = nested_def.size;
-                let new_raw = &mut current_raw[offset..offset + size];
+        match plan_step(layout, current_struct, current_raw.len(), segment)? {
+            Step::Struct { field_index, range } => {
                 let new_struct = descend_struct_mut(current_struct, field_index)?;
-                current_raw = new_raw;
+                current_raw = &mut current_raw[range];
                 current_struct = new_struct;
             }
-            TagFieldType::Block => {
+            Step::Block { field_index, element, range } => {
                 let block = descend_block_data_mut(current_struct, field_index)?;
-                // Version-aware element size (see `lookup_from_struct`).
-                let element_size = block.element_size(layout);
-                let element_index = index.unwrap_or(0) as usize;
-                let start = element_index * element_size;
-                let end = start + element_size;
-                if end > block.raw_data.len() {
-                    return None;
-                }
-                let new_raw = &mut block.raw_data[start..end];
-                let new_struct = block.elements.get_mut(element_index)?;
-                current_raw = new_raw;
-                current_struct = new_struct;
+                current_raw = &mut block.raw_data[range];
+                current_struct = block.elements.get_mut(element)?;
             }
-            TagFieldType::Array => {
-                let array_def = &layout.array_layouts[field.definition as usize];
-                let element_def = &layout.struct_layouts[array_def.struct_index as usize];
-                let element_index = index.unwrap_or(0) as usize;
-                let offset = field.offset as usize + element_index * element_def.size;
-                let size = element_def.size;
-                if offset + size > current_raw.len() {
-                    return None;
-                }
-                let new_raw = &mut current_raw[offset..offset + size];
+            Step::Array { field_index, element, range } => {
                 let elements = descend_array_mut(current_struct, field_index)?;
-                let new_struct = elements.get_mut(element_index)?;
-                current_raw = new_raw;
-                current_struct = new_struct;
+                current_raw = &mut current_raw[range];
+                current_struct = elements.get_mut(element)?;
             }
-            TagFieldType::PageableResource => {
+            Step::Resource { field_index } => {
                 let (new_struct, new_raw) = descend_resource_mut(layout, current_struct, field_index)?;
                 current_raw = new_raw;
                 current_struct = new_struct;
             }
-            _ => return None,
         }
     }
 
-    let (type_filter, name, ordinal, _index) = parse_segment(final_segment);
-    let field_index =
-        find_field_in_struct(layout, current_struct, name, type_filter, ordinal, false)?;
-    Some(TagFieldCursorMut {
-        struct_raw: current_raw,
-        struct_data: current_struct,
-        field_index,
+    let field_index = final_field(layout, current_struct, final_segment)?;
+    Some(TagFieldCursorMut { struct_raw: current_raw, struct_data: current_struct, field_index })
+}
+
+/// Take each of `segments` as a descent step (see [`plan_step`]) from
+/// `start_struct`, returning the struct and raw bytes reached.
+fn descend_segments<'a, 's>(
+    layout: &'a TagLayout,
+    start_struct: &'a TagStructData,
+    start_raw: &'a [u8],
+    segments: impl IntoIterator<Item = &'s str>,
+) -> Option<(&'a TagStructData, &'a [u8])> {
+    let mut current_raw = start_raw;
+    let mut current_struct = start_struct;
+    for segment in segments {
+        match plan_step(layout, current_struct, current_raw.len(), segment)? {
+            Step::Struct { field_index, range } => {
+                current_raw = &current_raw[range];
+                current_struct = descend_struct(current_struct, field_index)?;
+            }
+            Step::Block { field_index, element, range } => {
+                let block = descend_block_data(current_struct, field_index)?;
+                current_raw = &block.raw_data[range];
+                current_struct = block.elements.get(element)?;
+            }
+            Step::Array { field_index, element, range } => {
+                current_raw = &current_raw[range];
+                current_struct = descend_array(current_struct, field_index)?.get(element)?;
+            }
+            Step::Resource { field_index } => {
+                (current_struct, current_raw) = descend_resource(layout, current_struct, field_index)?;
+            }
+        }
+    }
+    Some((current_struct, current_raw))
+}
+
+/// One step of a path descent, worked out from shared references so the
+/// shared and the mutable walk take exactly the same one. Ranges are into the
+/// current struct's raw bytes, except a block's, which is into the block's own.
+enum Step {
+    /// Into an inline struct.
+    Struct { field_index: usize, range: std::ops::Range<usize> },
+    /// Into element `element` of a block.
+    Block { field_index: usize, element: usize, range: std::ops::Range<usize> },
+    /// Into element `element` of an inline array.
+    Array { field_index: usize, element: usize, range: std::ops::Range<usize> },
+    /// Into a pageable resource's header struct.
+    Resource { field_index: usize },
+}
+
+/// Resolve one intermediate `segment` against `current_struct`, whose raw
+/// bytes are `raw_len` long, into the [`Step`] that descends through it.
+/// `None` when the segment names nothing to descend into, or its bytes run
+/// past what is there.
+fn plan_step(
+    layout: &TagLayout,
+    current_struct: &TagStructData,
+    raw_len: usize,
+    segment: &str,
+) -> Option<Step> {
+    let (type_filter, name, ordinal, index) = parse_segment(segment);
+    let field_index = find_field_in_struct(layout, current_struct, name, type_filter, ordinal, true)?;
+    let field = &layout.fields[field_index];
+    let element = index.unwrap_or(0) as usize;
+    Some(match field.field_type {
+        TagFieldType::Struct => {
+            // A truncated (clamped) element can end partway through an inline
+            // struct, or before it: take what is there.
+            let offset = field.offset as usize;
+            if offset >= raw_len {
+                return None;
+            }
+            let size = layout.struct_layouts[field.definition as usize].size;
+            Step::Struct { field_index, range: offset..(offset + size).min(raw_len) }
+        }
+        TagFieldType::Block => {
+            let block = descend_block_data(current_struct, field_index)?;
+            // Use the VERSION-AWARE element size (`raw_data / count`), not the
+            // base struct size: H2 has versioned classic blocks whose on-disk
+            // element is a different size than their base/latest struct (e.g.
+            // `bitmap_data` v1 = 116 vs base 140). Using the base size here
+            // made the bounds check reject the descent. Matches
+            // `TagBlock::element_size`.
+            let element_size = block.element_size(layout);
+            // Bounds check: a block can legitimately be empty
+            // (X360 monolithic tags with pageable resources push
+            // their element data into the cache partition and
+            // leave the on-disk block at 0 elements).
+            let start = element * element_size;
+            let end = start + element_size;
+            if end > block.raw_data.len() {
+                return None;
+            }
+            Step::Block { field_index, element, range: start..end }
+        }
+        TagFieldType::Array => {
+            let array_def = &layout.array_layouts[field.definition as usize];
+            let element_size = layout.struct_layouts[array_def.struct_index as usize].size;
+            let start = field.offset as usize + element * element_size;
+            let end = start + element_size;
+            if end > raw_len {
+                return None;
+            }
+            Step::Array { field_index, element, range: start..end }
+        }
+        TagFieldType::PageableResource => Step::Resource { field_index },
+        _ => return None,
     })
+}
+
+/// Resolve a path's final segment to a field of `struct_data`.
+fn final_field(layout: &TagLayout, struct_data: &TagStructData, segment: &str) -> Option<usize> {
+    let (type_filter, name, ordinal, _index) = parse_segment(segment);
+    find_field_in_struct(layout, struct_data, name, type_filter, ordinal, false)
 }
 
 //================================================================================
@@ -458,73 +406,55 @@ fn find_field_in_struct(
     }
 }
 
+/// The sub-chunk entry content for layout field `field_index`, if the struct
+/// holds one.
+fn sub_chunk(struct_data: &TagStructData, field_index: usize) -> Option<&TagSubChunkContent> {
+    let field_index = Some(field_index as u32);
+    struct_data.sub_chunks.iter().find(|entry| entry.field_index == field_index).map(|entry| &entry.content)
+}
+
+fn sub_chunk_mut(struct_data: &mut TagStructData, field_index: usize) -> Option<&mut TagSubChunkContent> {
+    let field_index = Some(field_index as u32);
+    struct_data.sub_chunks.iter_mut().find(|entry| entry.field_index == field_index).map(|entry| &mut entry.content)
+}
+
 fn descend_struct(struct_data: &TagStructData, field_index: usize) -> Option<&TagStructData> {
-    let entry = struct_data
-        .sub_chunks
-        .iter()
-        .find(|entry| entry.field_index == Some(field_index as u32))?;
-    match &entry.content {
+    match sub_chunk(struct_data, field_index)? {
         TagSubChunkContent::Struct(nested) => Some(nested),
         _ => None,
     }
 }
 
 fn descend_struct_mut(struct_data: &mut TagStructData, field_index: usize) -> Option<&mut TagStructData> {
-    let entry = struct_data
-        .sub_chunks
-        .iter_mut()
-        .find(|entry| entry.field_index == Some(field_index as u32))?;
-    match &mut entry.content {
+    match sub_chunk_mut(struct_data, field_index)? {
         TagSubChunkContent::Struct(nested) => Some(nested),
         _ => None,
     }
 }
 
 fn descend_block_data(struct_data: &TagStructData, field_index: usize) -> Option<&TagBlockData> {
-    let entry = struct_data
-        .sub_chunks
-        .iter()
-        .find(|entry| entry.field_index == Some(field_index as u32))?;
-    match &entry.content {
+    match sub_chunk(struct_data, field_index)? {
         TagSubChunkContent::Block(block) => Some(block),
         _ => None,
     }
 }
 
-fn descend_block_data_mut(
-    struct_data: &mut TagStructData,
-    field_index: usize,
-) -> Option<&mut TagBlockData> {
-    let entry = struct_data
-        .sub_chunks
-        .iter_mut()
-        .find(|entry| entry.field_index == Some(field_index as u32))?;
-    match &mut entry.content {
+fn descend_block_data_mut(struct_data: &mut TagStructData, field_index: usize) -> Option<&mut TagBlockData> {
+    match sub_chunk_mut(struct_data, field_index)? {
         TagSubChunkContent::Block(block) => Some(block),
         _ => None,
     }
 }
 
 fn descend_array(struct_data: &TagStructData, field_index: usize) -> Option<&[TagStructData]> {
-    let entry = struct_data
-        .sub_chunks
-        .iter()
-        .find(|entry| entry.field_index == Some(field_index as u32))?;
-    match &entry.content {
+    match sub_chunk(struct_data, field_index)? {
         TagSubChunkContent::Array(elements) => Some(elements),
         _ => None,
     }
 }
 
-fn descend_array_mut(
-    struct_data: &mut TagStructData,
-    field_index: usize,
-) -> Option<&mut [TagStructData]> {
-    let entry = struct_data
-        .sub_chunks
-        .iter_mut()
-        .find(|entry| entry.field_index == Some(field_index as u32))?;
-    match &mut entry.content {
+fn descend_array_mut(struct_data: &mut TagStructData, field_index: usize) -> Option<&mut [TagStructData]> {
+    match sub_chunk_mut(struct_data, field_index)? {
         TagSubChunkContent::Array(elements) => Some(elements),
         _ => None,
     }
@@ -539,12 +469,8 @@ fn descend_resource<'a>(
     struct_data: &'a TagStructData,
     field_index: usize,
 ) -> Option<(&'a TagStructData, &'a [u8])> {
-    let entry = struct_data
-        .sub_chunks
-        .iter()
-        .find(|entry| entry.field_index == Some(field_index as u32))?;
     let TagSubChunkContent::Resource(TagResourceChunk::Exploded { struct_data, exploded, .. }) =
-        &entry.content
+        sub_chunk(struct_data, field_index)?
     else {
         return None;
     };
@@ -558,12 +484,8 @@ fn descend_resource_mut<'a>(
     struct_data: &'a mut TagStructData,
     field_index: usize,
 ) -> Option<(&'a mut TagStructData, &'a mut [u8])> {
-    let entry = struct_data
-        .sub_chunks
-        .iter_mut()
-        .find(|entry| entry.field_index == Some(field_index as u32))?;
     let TagSubChunkContent::Resource(TagResourceChunk::Exploded { struct_data, exploded, .. }) =
-        &mut entry.content
+        sub_chunk_mut(struct_data, field_index)?
     else {
         return None;
     };

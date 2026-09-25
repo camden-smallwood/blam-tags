@@ -455,8 +455,20 @@ Re-measure after each fix and add a row to the log at the bottom.
       schema comparison).
     - Left as is: the two top-level stream loops in `file.rs` (one parses
       every stream, the other skips to `want` by inner chunk sizes — they share
-      only a peek-and-dispatch skeleton). Open: path descent ×3, the typed
-      readers in `api.rs`.
+      only a peek-and-dispatch skeleton).
+    - **Path descent done** (uncommitted): `plan_step` works out each
+      descent step (field, element, byte range) from shared references;
+      `descend_segments` and `lookup_mut_from_struct` apply it with `&` and
+      `&mut`, and `lookup_from_struct` is "descend the preceding segments,
+      then find the final field". The six `descend_*` twins sit on one
+      `sub_chunk`/`sub_chunk_mut` pair. `path.rs` −78 lines. Verified: what
+      `field_path`, `field_path_mut` and `descend` resolve, for 1,375,940
+      paths over 3,252 H3 character tags and 1,741,544 over H2 objects
+      (including malformed paths), identical; lookup time unchanged
+      (18.8 s both). Fixes B10.
+    - **Decided against:** a macro for the 14 typed math readers
+      (`read_quat` … `read_euler2d`). It would save ~60 lines but cost each
+      its readable definition, go-to-definition, and doc comment in place.
 
 - [ ] **D5. Bitmap and shared numeric helpers** — Reported
   - `decode_bc1/2/3/7` identical but for the block function
@@ -579,6 +591,12 @@ Re-measure after each fix and add a row to the log at the bottom.
     looked up a vertex that isn't there. The shared reader masks. No H3 BSP
     or render_model hits it today (all outputs unchanged);
     `a_16_bit_index_past_32767_is_not_sign_extended` pins it.
+- [x] **B10. `field_path_mut` could panic stepping into an inline struct of a truncated element** — Fixed (latent)
+  - The mutable descent sliced `&mut raw[offset..offset + size]` unchecked,
+    where the shared one returns `None` past the end and clamps a partial
+    struct — and an element's raw bytes can be shorter than its struct
+    (truncated classic elements). Found by diffing the descent's three
+    copies; no path over 3.1M probed hit it. Now one step planner serves both.
 - [x] **B7. Lost `\` line continuations left space runs inside messages** — Fixed
   - 13 string literals (converter warnings and errors, collision/sbsp import
     errors, collision-verify diagnostics, a shell error) read like `was
