@@ -96,7 +96,7 @@ pub(crate) fn lookup_from_struct<'a>(
                 // `bitmap_data` v1 = 116 vs base 140). Using the base size here
                 // made the bounds check reject the descent. Matches
                 // `TagBlock::element_size`.
-                let element_size = crate::api::block_element_size(layout, block);
+                let element_size = block.element_size(layout);
                 let element_index = index.unwrap_or(0) as usize;
                 // Bounds check: a block can legitimately be empty
                 // (X360 monolithic tags with pageable resources push
@@ -178,7 +178,7 @@ pub(crate) fn descend_from_struct<'a>(
             TagFieldType::Block => {
                 let block = descend_block_data(current_struct, field_index)?;
                 // Version-aware element size (see `lookup_from_struct`).
-                let element_size = crate::api::block_element_size(layout, block);
+                let element_size = block.element_size(layout);
                 let element_index = index.unwrap_or(0) as usize;
                 // Bounds check: a block can legitimately be empty
                 // (X360 monolithic tags with pageable resources push
@@ -252,7 +252,7 @@ pub(crate) fn lookup_mut_from_struct<'a>(
             TagFieldType::Block => {
                 let block = descend_block_data_mut(current_struct, field_index)?;
                 // Version-aware element size (see `lookup_from_struct`).
-                let element_size = crate::api::block_element_size(layout, block);
+                let element_size = block.element_size(layout);
                 let element_index = index.unwrap_or(0) as usize;
                 let start = element_index * element_size;
                 let end = start + element_size;

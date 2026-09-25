@@ -190,41 +190,53 @@ fn diff_fields(expected: TagStructDefinition<'_>, actual: TagStructDefinition<'_
 /// (equal keys) and unmatched items appear on a single side. Preserves
 /// relative order on each side.
 fn align_lcs(a: &[FieldKey], b: &[FieldKey]) -> Vec<(Option<FieldKey>, Option<FieldKey>)> {
-    let n = a.len();
-    let m = b.len();
+    lcs_align(a.len(), b.len(), |i, j| a[i] == b[j])
+        .into_iter()
+        .map(|(i, j)| (i.map(|i| a[i].clone()), j.map(|j| b[j].clone())))
+        .collect()
+}
+
+/// Align two sequences of `n` and `m` items by longest common subsequence,
+/// with `same(i, j)` saying whether `a[i]` and `b[j]` match. Returns the
+/// alignment in order as index pairs: both sides for a match, one side for an
+/// item only that side has. Ties prefer keeping `a`'s item first.
+pub(crate) fn lcs_align(
+    n: usize,
+    m: usize,
+    same: impl Fn(usize, usize) -> bool,
+) -> Vec<(Option<usize>, Option<usize>)> {
     // dp[i][j] = LCS length of a[..i] vs b[..j]
     let mut dp = vec![vec![0u32; m + 1]; n + 1];
     for i in 0..n {
         for j in 0..m {
-            dp[i + 1][j + 1] = if a[i] == b[j] {
+            dp[i + 1][j + 1] = if same(i, j) {
                 dp[i][j] + 1
             } else {
                 dp[i + 1][j].max(dp[i][j + 1])
             };
         }
     }
+    let (mut i, mut j) = (n, m);
     let mut out = Vec::with_capacity(n + m);
-    let mut i = n;
-    let mut j = m;
     while i > 0 && j > 0 {
-        if a[i - 1] == b[j - 1] {
-            out.push((Some(a[i - 1].clone()), Some(b[j - 1].clone())));
+        if same(i - 1, j - 1) {
+            out.push((Some(i - 1), Some(j - 1)));
             i -= 1;
             j -= 1;
         } else if dp[i - 1][j] >= dp[i][j - 1] {
-            out.push((Some(a[i - 1].clone()), None));
+            out.push((Some(i - 1), None));
             i -= 1;
         } else {
-            out.push((None, Some(b[j - 1].clone())));
+            out.push((None, Some(j - 1)));
             j -= 1;
         }
     }
     while i > 0 {
-        out.push((Some(a[i - 1].clone()), None));
+        out.push((Some(i - 1), None));
         i -= 1;
     }
     while j > 0 {
-        out.push((None, Some(b[j - 1].clone())));
+        out.push((None, Some(j - 1)));
         j -= 1;
     }
     out.reverse();

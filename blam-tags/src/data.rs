@@ -939,53 +939,16 @@ fn read_sub_chunks<R: Seek + Read>(
                 });
             }
 
-            TagFieldType::TagReference => {
-                let (version, content) = read_tag_chunk_content(reader, u32::from_be_bytes(*b"tgrf"), endian)?;
-                if version != 0 {
-                    return Err(TagReadError::BadChunkVersion { chunk: "tgrf", version });
-                }
+            TagFieldType::TagReference
+            | TagFieldType::StringId
+            | TagFieldType::OldStringId
+            | TagFieldType::Data
+            | TagFieldType::ApiInterop => {
+                let (signature, chunk, content) =
+                    leaf_chunk(field.field_type).expect("a leaf field type");
                 sub_chunks.push(TagSubChunkEntry {
                     field_index: Some(field_index as u32),
-                    content: TagSubChunkContent::TagReference(content),
-                });
-            }
-
-            TagFieldType::StringId => {
-                let (version, content) = read_tag_chunk_content(reader, u32::from_be_bytes(*b"tgsi"), endian)?;
-                if version != 0 {
-                    return Err(TagReadError::BadChunkVersion {
-                        chunk: "tgsi (string_id)",
-                        version,
-                    });
-                }
-                sub_chunks.push(TagSubChunkEntry {
-                    field_index: Some(field_index as u32),
-                    content: TagSubChunkContent::StringId(content),
-                });
-            }
-
-            TagFieldType::OldStringId => {
-                let (version, content) = read_tag_chunk_content(reader, u32::from_be_bytes(*b"tgsi"), endian)?;
-                if version != 0 {
-                    return Err(TagReadError::BadChunkVersion {
-                        chunk: "tgsi (old_string_id)",
-                        version,
-                    });
-                }
-                sub_chunks.push(TagSubChunkEntry {
-                    field_index: Some(field_index as u32),
-                    content: TagSubChunkContent::OldStringId(content),
-                });
-            }
-
-            TagFieldType::Data => {
-                let (version, content) = read_tag_chunk_content(reader, u32::from_be_bytes(*b"tgda"), endian)?;
-                if version != 0 {
-                    return Err(TagReadError::BadChunkVersion { chunk: "tgda", version });
-                }
-                sub_chunks.push(TagSubChunkEntry {
-                    field_index: Some(field_index as u32),
-                    content: TagSubChunkContent::Data(content),
+                    content: content(read_leaf_chunk(reader, signature, chunk, endian)?),
                 });
             }
 
@@ -1090,19 +1053,6 @@ fn read_sub_chunks<R: Seek + Read>(
                 });
             }
 
-            TagFieldType::ApiInterop => {
-                let (version, content) = read_tag_chunk_content(reader, u32::from_be_bytes(*b"ti]["), endian)?;
-                if version != 0 {
-                    return Err(TagReadError::BadChunkVersion {
-                        chunk: "ti][ (api_interop)",
-                        version,
-                    });
-                }
-                sub_chunks.push(TagSubChunkEntry {
-                    field_index: Some(field_index as u32),
-                    content: TagSubChunkContent::ApiInterop(content),
-                });
-            }
 
             // Primitives / pad / skip / custom / explanation / useless_pad.
             _ => {
@@ -1126,6 +1076,34 @@ fn read_sub_chunks<R: Seek + Read>(
 
 /// Serialize a vec of sub-chunk entries in stored order. Mirrors
 /// `read_sub_chunks`.
+/// The leaf sub-chunks — a payload carried verbatim — by field type: their
+/// signature, the name read errors give them, and the variant that holds them.
+/// [`TagSubChunkContent::leaf_signature`] is the write side's view of the same
+/// table.
+fn leaf_chunk(field_type: TagFieldType) -> Option<([u8; 4], &'static str, fn(Vec<u8>) -> TagSubChunkContent)> {
+    Some(match field_type {
+        TagFieldType::TagReference => (*b"tgrf", "tgrf", TagSubChunkContent::TagReference),
+        TagFieldType::StringId => (*b"tgsi", "tgsi (string_id)", TagSubChunkContent::StringId),
+        TagFieldType::OldStringId => (*b"tgsi", "tgsi (old_string_id)", TagSubChunkContent::OldStringId),
+        TagFieldType::Data => (*b"tgda", "tgda", TagSubChunkContent::Data),
+        TagFieldType::ApiInterop => (*b"ti][", "ti][ (api_interop)", TagSubChunkContent::ApiInterop),
+        _ => return None,
+    })
+}
+
+impl TagSubChunkContent {
+    /// The chunk signature of a leaf payload (see [`leaf_chunk`]).
+    fn leaf_signature(&self) -> Option<[u8; 4]> {
+        Some(match self {
+            Self::TagReference(_) => *b"tgrf",
+            Self::StringId(_) | Self::OldStringId(_) => *b"tgsi",
+            Self::Data(_) => *b"tgda",
+            Self::ApiInterop(_) => *b"ti][",
+            _ => return None,
+        })
+    }
+}
+
 fn write_sub_chunks(
     entries: &[TagSubChunkEntry],
     layout: &TagLayout,
@@ -1153,24 +1131,13 @@ fn write_sub_chunks(
                 }
             }
 
-            TagSubChunkContent::TagReference(content) => {
-                write_tag_chunk_content(writer, u32::from_be_bytes(*b"tgrf"), 0, content)?;
-            }
-
-            TagSubChunkContent::StringId(content) => {
-                write_tag_chunk_content(writer, u32::from_be_bytes(*b"tgsi"), 0, content)?;
-            }
-
-            TagSubChunkContent::OldStringId(content) => {
-                write_tag_chunk_content(writer, u32::from_be_bytes(*b"tgsi"), 0, content)?;
-            }
-
-            TagSubChunkContent::Data(content) => {
-                write_tag_chunk_content(writer, u32::from_be_bytes(*b"tgda"), 0, content)?;
-            }
-
-            TagSubChunkContent::ApiInterop(content) => {
-                write_tag_chunk_content(writer, u32::from_be_bytes(*b"ti]["), 0, content)?;
+            TagSubChunkContent::TagReference(content)
+            | TagSubChunkContent::StringId(content)
+            | TagSubChunkContent::OldStringId(content)
+            | TagSubChunkContent::Data(content)
+            | TagSubChunkContent::ApiInterop(content) => {
+                let signature = entry.content.leaf_signature().expect("a leaf chunk");
+                write_tag_chunk_content(writer, u32::from_be_bytes(signature), 0, content)?;
             }
 
             TagSubChunkContent::Resource(TagResourceChunk::Null) => {
@@ -1327,7 +1294,7 @@ impl TagBlockData {
     }
 
     /// Size of one element's byte region.
-    fn element_size(&self, layout: &TagLayout) -> usize {
+    pub(crate) fn element_size(&self, layout: &TagLayout) -> usize {
         // For a populated block the on-disk element size is authoritative
         // as `raw_data / count` — this is what the (classic) encoder uses
         // and is essential for VERSIONED classic blocks, whose elements

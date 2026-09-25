@@ -128,7 +128,7 @@ fn stream_root_mut(stream: &mut crate::stream::TagStream) -> Option<TagStructMut
     // latest struct size — versioned classic root structs (e.g. H2
     // masterchief.shader = 120 bytes vs latest 128) are smaller/larger than
     // the schema, and slicing by the schema size overruns `raw_data`.
-    let size = block_element_size(layout, block);
+    let size = block.element_size(layout);
 
     let struct_data = block.elements.first_mut()?;
     let struct_raw = &mut block.raw_data[0..size];
@@ -1015,12 +1015,12 @@ impl<'a> TagBlock<'a> {
     pub fn is_empty(&self) -> bool { self.block_data.elements.is_empty() }
 
     /// On-disk byte size of one element in this block.
-    pub fn element_size(&self) -> usize { block_element_size(self.layout, self.block_data) }
+    pub fn element_size(&self) -> usize { self.block_data.element_size(self.layout) }
 
     /// Get the element at `index`. `None` if out of range.
     pub fn element(&self, index: usize) -> Option<TagStruct<'a>> {
         let struct_data = self.block_data.elements.get(index)?;
-        let size = block_element_size(self.layout, self.block_data);
+        let size = self.block_data.element_size(self.layout);
         let start = index * size;
         let struct_raw = &self.block_data.raw_data[start..start + size];
         Some(TagStruct { layout: self.layout, struct_data, struct_raw, endian: self.block_data.endian })
@@ -1039,7 +1039,7 @@ impl<'a> TagBlock<'a> {
     /// block with the same element struct.
     pub fn element_snapshot(&self, index: usize) -> Option<TagBlockElement> {
         let struct_data = self.block_data.elements.get(index)?;
-        let size = block_element_size(self.layout, self.block_data);
+        let size = self.block_data.element_size(self.layout);
         let start = index * size;
         let raw = self.block_data.raw_data.get(start..start + size)?;
         Some(TagBlockElement {
@@ -1067,19 +1067,6 @@ pub enum TagPasteError {
     OutOfRange { index: usize, len: usize },
     Incompatible,
     EndianMismatch,
-}
-
-pub(crate) fn block_element_size(layout: &TagLayout, block_data: &TagBlockData) -> usize {
-    // For a populated block the on-disk element size is `raw_data /
-    // count` — authoritative for VERSIONED classic blocks whose elements
-    // are a FieldSet variant smaller/larger than the block's base/latest
-    // struct (e.g. H2 bitmap_data v1 = 116 vs latest 140). Empty blocks
-    // fall back to the base struct; non-versioned blocks agree either way.
-    if !block_data.elements.is_empty() && !block_data.raw_data.is_empty() {
-        return block_data.raw_data.len() / block_data.elements.len();
-    }
-    let struct_index = layout.block_layouts[block_data.block_index as usize].struct_index as usize;
-    layout.struct_layouts[struct_index].size
 }
 
 /// A fixed-count inline array. Count is schema-declared; elements'
@@ -1934,7 +1921,7 @@ impl<'a> TagBlockMut<'a> {
         if index >= self.block_data.elements.len() {
             return None;
         }
-        let size = block_element_size(self.layout, &*self.block_data);
+        let size = self.block_data.element_size(self.layout);
         let start = index * size;
         let endian = self.block_data.endian;
         let struct_data = &mut self.block_data.elements[index];
@@ -1950,7 +1937,7 @@ impl<'a> TagBlockMut<'a> {
         F: FnMut(TagStructMut<'_>),
     {
         let layout = self.layout;
-        let size = block_element_size(layout, &*self.block_data);
+        let size = self.block_data.element_size(layout);
         let endian = self.block_data.endian;
         let count = self.block_data.elements.len();
         for i in 0..count {
@@ -2060,7 +2047,7 @@ impl<'a> TagBlockMut<'a> {
         if element.endian != self.block_data.endian {
             return Err(TagPasteError::EndianMismatch);
         }
-        let size = block_element_size(self.layout, &*self.block_data);
+        let size = self.block_data.element_size(self.layout);
         if element.struct_index != self.element_struct_index() || element.raw.len() != size {
             return Err(TagPasteError::Incompatible);
         }

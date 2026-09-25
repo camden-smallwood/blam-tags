@@ -1211,43 +1211,9 @@ fn align_by_name(
     a: &[WireField<'_>],
     b: &[WireField<'_>],
 ) -> Vec<(Option<usize>, Option<usize>)> {
-    let same = |i: usize, j: usize| a[i].clean_name == b[j].clean_name && a[i].class == b[j].class;
-    let (n, m) = (a.len(), b.len());
-    let mut dp = vec![vec![0u32; m + 1]; n + 1];
-    for i in 0..n {
-        for j in 0..m {
-            dp[i + 1][j + 1] = if same(i, j) {
-                dp[i][j] + 1
-            } else {
-                dp[i + 1][j].max(dp[i][j + 1])
-            };
-        }
-    }
-    let (mut i, mut j) = (n, m);
-    let mut out = Vec::with_capacity(n + m);
-    while i > 0 && j > 0 {
-        if same(i - 1, j - 1) {
-            out.push((Some(i - 1), Some(j - 1)));
-            i -= 1;
-            j -= 1;
-        } else if dp[i - 1][j] >= dp[i][j - 1] {
-            out.push((Some(i - 1), None));
-            i -= 1;
-        } else {
-            out.push((None, Some(j - 1)));
-            j -= 1;
-        }
-    }
-    while i > 0 {
-        out.push((Some(i - 1), None));
-        i -= 1;
-    }
-    while j > 0 {
-        out.push((None, Some(j - 1)));
-        j -= 1;
-    }
-    out.reverse();
-    out
+    crate::schema_compare::lcs_align(a.len(), b.len(), |i, j| {
+        a[i].clean_name == b[j].clean_name && a[i].class == b[j].class
+    })
 }
 
 #[cfg(test)]

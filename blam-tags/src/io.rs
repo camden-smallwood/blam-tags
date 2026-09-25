@@ -224,30 +224,18 @@ pub(crate) fn end_tag_chunk(out: &mut [u8], start: usize) -> u32 {
     size
 }
 
-/// Read a chunk header and verify its signature, then read the payload into a
-/// `Vec<u8>`. Returns the chunk's `version` (preserved for byte-exact roundtrip)
-/// and its `content`. The signature is implicit in the caller's
-/// TagSubChunkContent variant, and the size is `content.len()`.
-pub(crate) fn read_tag_chunk_content<R: Read + Seek>(
+/// Read a version-0 chunk whose payload is carried verbatim, checking its
+/// signature (`expected_sig`) and version, and return the payload.
+pub(crate) fn read_leaf_chunk<R: Read + Seek>(
     reader: &mut std::io::BufReader<R>,
-    expected_signature: u32,
+    expected_sig: [u8; 4],
+    chunk: &'static str,
     endian: Endian,
-) -> Result<(u32, Vec<u8>), TagReadError> {
-    let offset = reader.stream_position()?;
-    let header = read_tag_chunk_header(reader, endian)?;
-
-    if header.signature != expected_signature {
-        return Err(TagReadError::BadChunkSignature {
-            offset,
-            expected: expected_signature.to_be_bytes(),
-            got: header.signature.to_be_bytes(),
-        });
-    }
-
+) -> Result<Vec<u8>, TagReadError> {
+    let header = read_validated_chunk_header(reader, expected_sig, chunk, endian)?;
     let mut content = vec![0u8; header.size as usize];
     reader.read_exact(&mut content)?;
-
-    Ok((header.version, content))
+    Ok(content)
 }
 
 //================================================================================
@@ -284,26 +272,38 @@ pub(crate) fn read_chunk_header<R: Read>(
 /// `expected_sig` and that its version is `0`. Returns the parsed
 /// header on success.
 ///
-/// Most chunks in the format use version 0; the few that don't
-/// (`tgly`, `bdat`) have their own version-checking code in the
-/// caller and should use [`read_chunk_header`] + their own version
-/// check instead.
+/// Most chunks in the format use version 0; for the few that don't
+/// (`blay`, `tgly`, `bdat`) or whose signature is only known at run time
+/// (the outer stream chunk), use [`read_expected_chunk_header`].
 pub(crate) fn read_validated_chunk_header<R: Read + Seek>(
     reader: &mut BufReader<R>,
     expected_sig: [u8; 4],
     chunk: &'static str,
     endian: Endian,
 ) -> Result<TagChunkHeader, TagReadError> {
+    read_expected_chunk_header(reader, u32::from_be_bytes(expected_sig), 0, chunk, endian)
+}
+
+/// Read a 12-byte chunk header and validate its signature (packed as the
+/// chunk constants are, `u32::from_be_bytes(*b"....")`) and its version.
+/// Errors name the chunk as `chunk`.
+pub(crate) fn read_expected_chunk_header<R: Read + Seek>(
+    reader: &mut BufReader<R>,
+    signature: u32,
+    version: u32,
+    chunk: &'static str,
+    endian: Endian,
+) -> Result<TagChunkHeader, TagReadError> {
     let offset = reader.stream_position()?;
     let header = read_chunk_header(reader, endian)?;
-    if header.signature != u32::from_be_bytes(expected_sig) {
+    if header.signature != signature {
         return Err(TagReadError::BadChunkSignature {
             offset,
-            expected: expected_sig,
+            expected: signature.to_be_bytes(),
             got: header.signature.to_be_bytes(),
         });
     }
-    if header.version != 0 {
+    if header.version != version {
         return Err(TagReadError::BadChunkVersion { chunk, version: header.version });
     }
     Ok(header)

@@ -36,26 +36,9 @@ impl TagStream {
         reader: &mut std::io::BufReader<R>,
         endian: Endian,
     ) -> Result<Self, TagReadError> {
-        // Outer chunk: signature is dynamic (one of tag!/want/info/
-        // assd), so we can't use the validating helper — inline the
-        // signature/version checks. Stream-level error context uses
-        // the static name "tag stream" since we can't materialise the
-        // dynamic name as a `&'static str`.
-        let chunk_header_offset = reader.stream_position()?;
-        let chunk_header = read_chunk_header(reader, endian)?;
-        if chunk_header.signature != chunk_signature {
-            return Err(TagReadError::BadChunkSignature {
-                offset: chunk_header_offset,
-                expected: chunk_signature.to_be_bytes(),
-                got: chunk_header.signature.to_be_bytes(),
-            });
-        }
-        if chunk_header.version != 0 {
-            return Err(TagReadError::BadChunkVersion {
-                chunk: "tag stream",
-                version: chunk_header.version,
-            });
-        }
+        // Outer chunk: one of tag!/want/info/assd. Errors name it "tag
+        // stream" since the dynamic name can't be a `&'static str`.
+        let chunk_header = read_expected_chunk_header(reader, chunk_signature, 0, "tag stream", endian)?;
         let chunk_offset = reader.stream_position()?;
 
         //
@@ -65,27 +48,9 @@ impl TagStream {
         let layout = TagLayout::read(reader, endian)?;
         let root_block_layout = &layout.block_layouts[layout.header.tag_group_block_index as usize];
 
-        //
-        // Read the 'bdat' chunk — version is 1 (not 0), so we use
-        // the unvalidated header reader and check the version
-        // ourselves.
-        //
-
-        let bdat_offset = reader.stream_position()?;
-        let block_data_header = read_chunk_header(reader, endian)?;
-        if block_data_header.signature != u32::from_be_bytes(*b"bdat") {
-            return Err(TagReadError::BadChunkSignature {
-                offset: bdat_offset,
-                expected: *b"bdat",
-                got: block_data_header.signature.to_be_bytes(),
-            });
-        }
-        if block_data_header.version != 1 {
-            return Err(TagReadError::BadChunkVersion {
-                chunk: "bdat",
-                version: block_data_header.version,
-            });
-        }
+        // The 'bdat' chunk — version 1, not 0.
+        let block_data_header =
+            read_expected_chunk_header(reader, u32::from_be_bytes(*b"bdat"), 1, "bdat", endian)?;
         let block_data_offset = reader.stream_position()?;
 
         let tag_block_data = TagBlockData::read(&layout, root_block_layout, reader, endian)?;

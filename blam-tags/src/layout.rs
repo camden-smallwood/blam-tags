@@ -408,21 +408,8 @@ impl TagLayout {
         // doesn't apply here.
         //================================================================================
 
-        let blay_header_offset = reader.stream_position()?;
-        let blay_header = read_chunk_header(reader, endian)?;
-        if blay_header.signature != u32::from_be_bytes(*b"blay") {
-            return Err(TagReadError::BadChunkSignature {
-                offset: blay_header_offset,
-                expected: *b"blay",
-                got: blay_header.signature.to_be_bytes(),
-            });
-        }
-        if blay_header.version != 2 {
-            return Err(TagReadError::BadChunkVersion {
-                chunk: "blay",
-                version: blay_header.version,
-            });
-        }
+        let blay_header =
+            read_expected_chunk_header(reader, u32::from_be_bytes(*b"blay"), 2, "blay", endian)?;
 
         let blay_offset = reader.stream_position()?;
 
@@ -477,21 +464,13 @@ impl TagLayout {
         //================================================================================
 
         let tag_layout_header_and_offset = if block_layout_version > 1 {
-            let tgly_offset = reader.stream_position()?;
-            let tag_layout_header = read_chunk_header(reader, endian)?;
-            if tag_layout_header.signature != u32::from_be_bytes(*b"tgly") {
-                return Err(TagReadError::BadChunkSignature {
-                    offset: tgly_offset,
-                    expected: *b"tgly",
-                    got: tag_layout_header.signature.to_be_bytes(),
-                });
-            }
-            if tag_layout_header.version != block_layout_version {
-                return Err(TagReadError::BadChunkVersion {
-                    chunk: "tgly",
-                    version: tag_layout_header.version,
-                });
-            }
+            let tag_layout_header = read_expected_chunk_header(
+                reader,
+                u32::from_be_bytes(*b"tgly"),
+                block_layout_version,
+                "tgly",
+                endian,
+            )?;
             Some((tag_layout_header, reader.stream_position()?))
         } else {
             None

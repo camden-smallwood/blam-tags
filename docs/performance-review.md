@@ -437,6 +437,26 @@ Re-measure after each fix and add a row to the log at the bottom.
   - LCS alignment twice (`schema_compat.rs:1210`, `schema_compare.rs:192`).
   - `_meta.json` + parent-chain walk ×5 (see P4).
   - ~20 typed readers in `api.rs:323-686` share one shape.
+  - **Partly done** (uncommitted), net −124 lines:
+    - `io::read_expected_chunk_header` (signature as `u32`, any version)
+      replaces the four inline check-signature/check-version blocks (outer
+      stream chunk, `bdat`, `blay`, `tgly`); `read_validated_chunk_header`
+      is it at version 0.
+    - Leaf sub-chunks (`tgrf`, `tgsi` ×2, `tgda`, `ti][`) read through one
+      `leaf_chunk` table and `io::read_leaf_chunk`, and write through one
+      arm (`TagSubChunkContent::leaf_signature`), in place of five arms each.
+    - Element size: `TagBlockData::element_size` only; `api::block_element_size`
+      removed, its 11 callers call the method.
+    - LCS: `schema_compare::lcs_align` serves `align_lcs` and
+      `schema_compat::align_by_name`.
+    - Verified: 0 mismatches over 15,885 H3 tags (objects + all BSPs), the
+      same 4 H2 mismatch digests, CE 0, corruption tests (exact error
+      variants), and the 164-tag conversion digests (which exercise the
+      schema comparison).
+    - Left as is: the two top-level stream loops in `file.rs` (one parses
+      every stream, the other skips to `want` by inner chunk sizes — they share
+      only a peek-and-dispatch skeleton). Open: path descent ×3, the typed
+      readers in `api.rs`.
 
 - [ ] **D5. Bitmap and shared numeric helpers** — Reported
   - `decode_bc1/2/3/7` identical but for the block function
