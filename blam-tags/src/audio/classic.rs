@@ -15,8 +15,8 @@ const OPUS_MAX_FRAME: usize = 5760;
 
 /// Decode a length-prefixed raw Opus stream (H2) to interleaved PCM.
 ///
-/// Layout: `[u16 le len][opus packet]…`. Decoding stops cleanly at the first
-/// truncated/garbage length (some tags carry a short trailing chunk).
+/// Layout: `[i16 le len][opus packet]…`, the last packet's length negated.
+/// Decoding stops cleanly at the first truncated/garbage length.
 pub fn decode_opus(bytes: &[u8], channels: u16) -> Result<DecodedPcm, String> {
     use opus::{Channels, Decoder};
     let (opus_channels, nch) = if channels >= 2 {
@@ -31,7 +31,10 @@ pub fn decode_opus(bytes: &[u8], channels: u16) -> Result<DecodedPcm, String> {
     let mut frame = vec![0i16; OPUS_MAX_FRAME * nch];
     let mut pos = 0usize;
     while pos + 2 <= bytes.len() {
-        let len = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+        // The final packet's length is stored negated (`0xffd4` is the last 44
+        // bytes), so the prefix is signed. An Opus packet never nears 32 KiB.
+        let prefix = i16::from_le_bytes([bytes[pos], bytes[pos + 1]]);
+        let len = usize::from(prefix.unsigned_abs());
         pos += 2;
         if len == 0 || pos + len > bytes.len() {
             break;
@@ -629,6 +632,32 @@ mod tests {
         let rms = |s: &[i16]| (s.iter().map(|&x| (x as f64).powi(2)).sum::<f64>() / s.len() as f64).sqrt();
         let (a, b) = (rms(&input), rms(&pcm.samples));
         assert!((a - b).abs() / a < 0.2, "rms {a} vs {b}");
+    }
+
+    /// Halo 2 stores a stream's last packet length negated (`0xffd4` for the
+    /// final 44 bytes). Read unsigned it overran the buffer and the decoder
+    /// stopped a packet early; read signed, the last packet decodes too.
+    #[test]
+    fn opus_last_packet_length_is_negated() {
+        let input: Vec<i16> = (0..9_600)
+            .map(|i| ((i as f64 * 0.05).sin() * 8000.0) as i16)
+            .collect();
+        let mut encoded = encode_opus(&input, 1).expect("encode");
+        let whole = decode_opus(&encoded, 1).expect("decode").frame_count();
+
+        // Walk to the last packet and negate its length, as the tool writes it.
+        let mut pos = 0usize;
+        let mut last = 0usize;
+        while pos + 2 <= encoded.len() {
+            last = pos;
+            pos += 2 + usize::from(u16::from_le_bytes([encoded[pos], encoded[pos + 1]]));
+        }
+        assert_eq!(pos, encoded.len());
+        let len = i16::from_le_bytes([encoded[last], encoded[last + 1]]);
+        encoded[last..last + 2].copy_from_slice(&(-len).to_le_bytes());
+
+        let negated = decode_opus(&encoded, 1).expect("decode").frame_count();
+        assert_eq!(negated, whole, "the negated last packet must still decode");
     }
 
     /// `encode_xbox_adpcm` → `decode_xbox_adpcm` reproduces a sine within IMA
