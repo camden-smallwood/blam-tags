@@ -1702,20 +1702,49 @@ fn read_h2_section(section: &TagStruct<'_>) -> RenderMesh {
         .read_int_any("rigid node")
         .map(|v| v as i16)
         .filter(|&v| v >= 0);
+    // Worldspace (0) and rigid (1) sections draw every vertex on the section's
+    // `rigid node`, which is already a global index (1,969 of the 1,975 mapped
+    // rigid sections in halo2_mcc carry `node map == [rigid node]`).
+    let rigid = section
+        .read_int_any("global_geometry_classification_enum_definition")
+        .is_some_and(|class| class <= 1);
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
     let mut parts = Vec::new();
 
-    if let Some(sd) = section
+    let section_data = section
         .field("section data")
         .and_then(|f| f.as_block())
-        .and_then(|b| b.element(0))
+        .and_then(|b| b.element(0));
+    // Skinned vertex indices are LOCAL to the section; `node map` takes them
+    // to skeleton nodes. Empty means the indices are already global.
+    let node_map: Vec<i16> = section_data
+        .as_ref()
+        .and_then(|e| e.field("node map"))
+        .and_then(|f| f.as_block())
+        .map(|b| {
+            (0..b.len())
+                .filter_map(|k| b.element(k))
+                .map(|e| e.read_int_any("node index").unwrap_or(-1) as i16)
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(sd) = section_data
+        .as_ref()
         .and_then(|e| e.field("section").and_then(|f| f.as_struct()))
     {
         if let Some(raw) = sd.field("raw vertices").and_then(|f| f.as_block()) {
             vertices.reserve(raw.len());
             for k in 0..raw.len() {
-                vertices.push(read_h2_render_vertex(&raw.element(k).unwrap()));
+                let raw_vertex = raw.element(k).unwrap();
+                let mut vertex = read_h2_render_vertex(&raw_vertex);
+                let rigid_node = rigid_node.unwrap_or(0) as i32;
+                (vertex.node_indices, vertex.node_weights) = if rigid {
+                    pack_node_influences([(rigid_node, 1.0)], 0)
+                } else {
+                    pack_node_influences(h2_vertex_influences(&raw_vertex, &node_map), rigid_node)
+                };
+                vertices.push(vertex);
             }
         }
         // H2 strip indices are u16 with a 0xFFFF restart sentinel between subparts.
@@ -1773,9 +1802,75 @@ fn read_h2_section(section: &TagStruct<'_>) -> RenderMesh {
     }
 }
 
+/// A raw vertex's influences as global node indices, by the rule tool.exe
+/// bakes into the vertex buffer (`geometry_postprocess_get_point_skinning`,
+/// 2003 H2 tool): `adjusted compound node index` other than -1 wins at full
+/// weight; otherwise `node indices (NEW)`, or `(OLD)` when `use new node
+/// indices` is 0, paired with `node weights`. Every halo2_mcc vertex sets
+/// `use new`, and 59 of 1,264,614 carry a compound index. Local indices go
+/// through the section `node map`.
+fn h2_vertex_influences(v: &TagStruct<'_>, node_map: &[i16]) -> Vec<(i32, f32)> {
+    let remap = |index: i128| -> i32 {
+        match usize::try_from(index) {
+            Ok(i) if !node_map.is_empty() => node_map.get(i).map_or(-1, |&n| n as i32),
+            _ => index as i32,
+        }
+    };
+    let compound = v.read_int_any("adjusted compound node index").unwrap_or(-1);
+    if compound != -1 {
+        return vec![(remap(compound), 1.0)];
+    }
+    let (field, element) = if v.read_int_any("use new node indices").unwrap_or(1) != 0 {
+        ("node indices (NEW)", "node index (NEW)")
+    } else {
+        ("node indices (OLD)", "node index (OLD)")
+    };
+    let (Some(nodes), Some(weights)) = (
+        v.field(field).and_then(|f| f.as_array()),
+        v.field("node weights").and_then(|f| f.as_array()),
+    ) else {
+        return Vec::new();
+    };
+    (0..nodes.len().min(weights.len()))
+        .filter_map(|k| {
+            let index = nodes.element(k)?.read_int_any(element)?;
+            let weight = weights.element(k)?.read_real("node_weight")?;
+            (index >= 0).then(|| (remap(index), weight))
+        })
+        .collect()
+}
+
+/// Up to four `(global node, weight)` influences into a [`RenderVertex`]'s
+/// fixed slots: unusable entries dropped (negative node, non-positive
+/// weight), heaviest kept, weights renormalized to 1. No usable influence at
+/// all binds the vertex to `fallback` at full weight.
+fn pack_node_influences(
+    influences: impl IntoIterator<Item = (i32, f32)>,
+    fallback: i32,
+) -> ([u8; 4], [f32; 4]) {
+    let mut kept: Vec<(u8, f32)> = influences
+        .into_iter()
+        .filter(|&(node, weight)| (0..=u8::MAX as i32).contains(&node) && weight > 0.0)
+        .map(|(node, weight)| (node as u8, weight))
+        .collect();
+    kept.sort_by(|a, b| b.1.total_cmp(&a.1));
+    kept.truncate(4);
+    let total: f32 = kept.iter().map(|&(_, weight)| weight).sum();
+    if kept.is_empty() || !total.is_finite() {
+        return ([fallback.clamp(0, u8::MAX as i32) as u8, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]);
+    }
+    let mut node_indices = [0u8; 4];
+    let mut node_weights = [0.0f32; 4];
+    for (slot, (node, weight)) in kept.into_iter().enumerate() {
+        node_indices[slot] = node;
+        node_weights[slot] = weight / total;
+    }
+    (node_indices, node_weights)
+}
+
 /// One H2 `raw vertices[i]` element → [`RenderVertex`]. Full-float object-space
-/// position; authored tangent/binormal basis; UV unflipped. Skinning indices are
-/// left at defaults — the preview renders the bind pose without per-vertex skin.
+/// position; authored tangent/binormal basis; UV unflipped. Skinning is filled
+/// by the caller, which knows the section's classification and node map.
 fn read_h2_render_vertex(v: &TagStruct<'_>) -> RenderVertex {
     RenderVertex {
         position: v.read_point3d("position"),
@@ -1952,14 +2047,52 @@ fn derive_render_meshes_gbxmodel(tag: &TagFile) -> Result<Vec<RenderMesh>, Rende
         .field("geometries")
         .and_then(|f| f.as_block())
         .ok_or(RenderModelError::MissingField("geometries"))?;
+    let local_nodes = root.read_int_any("flags").is_some_and(|flags| flags & GBXMODEL_PARTS_HAVE_LOCAL_NODES != 0);
     Ok((0..geometries.len())
-        .map(|gi| read_gbxmodel_geometry(&geometries.element(gi).unwrap(), uv_scale))
+        .map(|gi| read_gbxmodel_geometry(&geometries.element(gi).unwrap(), uv_scale, local_nodes))
         .collect())
+}
+
+/// gbxmodel `flags` bit 1, `parts have local nodes`.
+const GBXMODEL_PARTS_HAVE_LOCAL_NODES: i128 = 1 << 1;
+
+/// A CE part's local node table: the first `local node count` of its
+/// `local node indices`, each a global node. Vertex node indices in a part of
+/// a `parts have local nodes` model index this table — the engine uploads
+/// matrix `table[i]` to skinning slot `i` (`rasterizer_model_setupnodeparts`,
+/// CE Anniversary X360). All 265 such parts in haloce_mcc stay within it.
+pub(crate) fn gbxmodel_part_local_nodes(part: &TagStruct<'_>) -> Vec<i32> {
+    let count = part.read_int_any("local node count").unwrap_or(0).max(0) as usize;
+    part.fields()
+        .filter(|field| field.name() == "local node indices")
+        .filter_map(|field| match field.value() {
+            Some(TagFieldData::CharInteger(node)) => Some(node as i32),
+            _ => None,
+        })
+        .take(count)
+        .collect()
+}
+
+/// A CE vertex's `node0`/`node1` influences as global nodes, through the
+/// part's local node table when the model has one.
+pub(crate) fn gbxmodel_vertex_influences(v: &TagStruct<'_>, local_nodes: Option<&[i32]>) -> Vec<(i32, f32)> {
+    [("node0 index", "node0 weight"), ("node1 index", "node1 weight")]
+        .into_iter()
+        .filter_map(|(index, weight)| {
+            let node = v.read_int_any(index)? as i32;
+            let weight = v.read_real(weight)?;
+            let node = match local_nodes {
+                Some(table) => *usize::try_from(node).ok().and_then(|i| table.get(i))?,
+                None => node,
+            };
+            Some((node, weight))
+        })
+        .collect()
 }
 
 /// Decode one CE `geometries[i]` into a [`RenderMesh`]. Each part appends its own
 /// vertex pool (offsetting indices) and contributes one [`RenderMeshPart`].
-fn read_gbxmodel_geometry(geo: &TagStruct<'_>, uv_scale: [f32; 2]) -> RenderMesh {
+fn read_gbxmodel_geometry(geo: &TagStruct<'_>, uv_scale: [f32; 2], local_nodes: bool) -> RenderMesh {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
     let mut parts = Vec::new();
@@ -1969,9 +2102,16 @@ fn read_gbxmodel_geometry(geo: &TagStruct<'_>, uv_scale: [f32; 2]) -> RenderMesh
             let part = pblock.element(pi).unwrap();
             let material_index = part.read_int_any("shader index").unwrap_or(0).max(0) as u16;
             let vbase = vertices.len() as u32;
+            let local_table = local_nodes.then(|| gbxmodel_part_local_nodes(&part));
             if let Some(uv) = part.field("uncompressed vertices").and_then(|f| f.as_block()) {
                 for k in 0..uv.len() {
-                    vertices.push(read_gbxmodel_render_vertex(&uv.element(k).unwrap(), uv_scale));
+                    let raw_vertex = uv.element(k).unwrap();
+                    let mut vertex = read_gbxmodel_render_vertex(&raw_vertex, uv_scale);
+                    (vertex.node_indices, vertex.node_weights) = pack_node_influences(
+                        gbxmodel_vertex_influences(&raw_vertex, local_table.as_deref()),
+                        0,
+                    );
+                    vertices.push(vertex);
                 }
             }
             // Flatten the triangle-data chunks (each holds 3 `indices`) into one
@@ -2024,7 +2164,8 @@ fn read_gbxmodel_geometry(geo: &TagStruct<'_>, uv_scale: [f32; 2]) -> RenderMesh
 
 /// One CE `uncompressed vertices[i]` → [`RenderVertex`]. Full-float object-space
 /// position; the model-level base-map UV scale folded into the texcoord; no
-/// authored tangent basis (the preview derives one). UV is unflipped.
+/// authored tangent basis (the preview derives one). UV is unflipped. Skinning
+/// is filled by the caller, which knows the part's local node table.
 fn read_gbxmodel_render_vertex(v: &TagStruct<'_>, uv_scale: [f32; 2]) -> RenderVertex {
     let p = v.read_vec3("position");
     let uv = v.read_point2d("texture coords");
@@ -3351,5 +3492,194 @@ mod tests {
         let named: std::collections::BTreeSet<i16> =
             perms.iter().map(|p| p.mesh_index).collect();
         assert_eq!(named.len(), 2);
+    }
+
+    /// A kit's `tags` directory from its env var (the kit root or its `tags`).
+    fn kit_tags(env_var: &str) -> Option<std::path::PathBuf> {
+        let path = std::path::PathBuf::from(std::env::var(env_var).ok()?);
+        let tags = path.join("tags");
+        Some(if tags.is_dir() { tags } else { path })
+    }
+
+    fn read_kit_tag(tags: &std::path::Path, game: &str, relative: &str, group: &str) -> TagFile {
+        let path = tags.join(relative);
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let defs = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../definitions")
+            .join(game)
+            .join(format!("{group}.json"));
+        let layout = crate::TagLayout::from_json(defs).expect("layout");
+        crate::classic::read_classic_tag_file(&bytes, layout)
+            .unwrap_or_else(|e| panic!("decode {relative}: {e}"))
+    }
+
+    /// Bind-pose world position of every node, chained from the parent-local
+    /// defaults `RenderModel` reads.
+    fn bind_positions(nodes: &[Node]) -> Vec<RealPoint3d> {
+        let mut world: Vec<(RealQuaternion, RealPoint3d)> = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let local = (node.default_rotation, node.default_translation);
+            let placed = match usize::try_from(node.parent_node).ok().and_then(|p| world.get(p)) {
+                Some(&(rotation, translation)) => {
+                    let offset = rotation.rotate_point(local.1);
+                    (
+                        rotation * local.0,
+                        RealPoint3d { x: translation.x + offset.x, y: translation.y + offset.y, z: translation.z + offset.z },
+                    )
+                }
+                None => local,
+            };
+            world.push(placed);
+        }
+        world.into_iter().map(|(_, position)| position).collect()
+    }
+
+    fn median(mut values: Vec<f32>) -> f32 {
+        values.sort_by(f32::total_cmp);
+        values[values.len() / 2]
+    }
+
+    /// Median distance from each vertex to the bind position of the node its
+    /// heaviest influence names. Skinned to the right bones, a vertex sits on
+    /// its bone; skinned to the wrong ones, it is across the body.
+    fn median_bone_distance(
+        positions: &[RealPoint3d],
+        vertices: impl Iterator<Item = (RealPoint3d, usize)>,
+    ) -> f32 {
+        median(
+            vertices
+                .map(|(p, node)| {
+                    let b = positions[node];
+                    ((p.x - b.x).powi(2) + (p.y - b.y).powi(2) + (p.z - b.z).powi(2)).sqrt()
+                })
+                .collect(),
+        )
+    }
+
+    /// Every gbxmodel vertex used to arrive bound to node 0. The elite is one
+    /// of the 18 haloce_mcc models whose parts carry local node tables, so its
+    /// raw indices are part-local: read as global they land on the wrong
+    /// bones, which the bone-distance comparison sees.
+    #[test]
+    fn gbxmodel_skinning_resolves_part_local_nodes() {
+        let Some(tags) = kit_tags("BLAM_TEST_HCEEK") else {
+            eprintln!("skipping gbxmodel_skinning_resolves_part_local_nodes: set BLAM_TEST_HCEEK");
+            return;
+        };
+        let tag = read_kit_tag(&tags, "haloce_mcc", "characters/elite/elite.gbxmodel", "gbxmodel");
+        let model = RenderModel::from_tag(&tag).expect("read model");
+        let meshes = RenderModel::derive_render_meshes(&tag).expect("derive meshes");
+        let positions = bind_positions(&model.nodes);
+
+        // The counterfactual: the same vertices, their raw indices read as global.
+        let root = tag.root();
+        let geometries = root.field("geometries").and_then(|f| f.as_block()).unwrap();
+        let mut resolved = Vec::new();
+        let mut raw = Vec::new();
+        for (gi, mesh) in meshes.iter().enumerate() {
+            let geometry = geometries.element(gi).unwrap();
+            let parts = geometry.field("parts").and_then(|f| f.as_block()).unwrap();
+            let mut raw_nodes = Vec::new();
+            for pi in 0..parts.len() {
+                let vertices = parts.element(pi).unwrap().field("uncompressed vertices").and_then(|f| f.as_block()).unwrap();
+                for k in 0..vertices.len() {
+                    let influences = gbxmodel_vertex_influences(&vertices.element(k).unwrap(), None);
+                    let heaviest = influences.iter().copied().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
+                    raw_nodes.push(heaviest.0 as usize);
+                }
+            }
+            assert_eq!(raw_nodes.len(), mesh.vertices.len(), "geometry {gi} vertex order");
+            for (vertex, raw_node) in mesh.vertices.iter().zip(raw_nodes) {
+                assert!((vertex.node_indices[0] as usize) < model.nodes.len());
+                resolved.push((vertex.position, vertex.node_indices[0] as usize));
+                raw.push((vertex.position, raw_node));
+            }
+        }
+
+        let distinct: std::collections::BTreeSet<usize> = resolved.iter().map(|&(_, n)| n).collect();
+        assert!(distinct.len() > 10, "skinned across the skeleton, not bound to one node: {distinct:?}");
+        let right = median_bone_distance(&positions, resolved.into_iter());
+        let wrong = median_bone_distance(&positions, raw.into_iter());
+        assert!(
+            right < wrong * 0.5,
+            "local-node skinning should sit vertices on their bones: {right} vs raw indices {wrong}"
+        );
+    }
+
+    /// The other 451 gbxmodels index global nodes directly; the cyborg must
+    /// skin to many nodes, each its vertex's own `node0`/`node1`.
+    #[test]
+    fn gbxmodel_skinning_reads_global_nodes_unchanged() {
+        let Some(tags) = kit_tags("BLAM_TEST_HCEEK") else {
+            eprintln!("skipping gbxmodel_skinning_reads_global_nodes_unchanged: set BLAM_TEST_HCEEK");
+            return;
+        };
+        let tag = read_kit_tag(&tags, "haloce_mcc", "characters/cyborg/cyborg.gbxmodel", "gbxmodel");
+        let model = RenderModel::from_tag(&tag).expect("read model");
+        let meshes = RenderModel::derive_render_meshes(&tag).expect("derive meshes");
+        let positions = bind_positions(&model.nodes);
+        let skinned: Vec<(RealPoint3d, usize)> = meshes
+            .iter()
+            .flat_map(|mesh| mesh.vertices.iter())
+            .map(|v| (v.position, v.node_indices[0] as usize))
+            .collect();
+        let distinct: std::collections::BTreeSet<usize> = skinned.iter().map(|&(_, n)| n).collect();
+        assert!(distinct.len() > 10, "skinned across the skeleton: {distinct:?}");
+        // Against everything bound to node 0, as before: a real binding is far tighter.
+        let right = median_bone_distance(&positions, skinned.iter().copied());
+        let unbound = median_bone_distance(&positions, skinned.iter().map(|&(p, _)| (p, 0)));
+        assert!(right < unbound * 0.5, "{right} vs all-node-0 {unbound}");
+        for mesh in &meshes {
+            for v in &mesh.vertices {
+                let total: f32 = v.node_weights.iter().sum();
+                assert!((total - 1.0).abs() < 1e-4, "weights sum to 1, got {total}");
+            }
+        }
+    }
+
+    /// H2 skinned sections index a per-section `node map`; read raw, the
+    /// masterchief's vertices land on the wrong bones.
+    #[test]
+    fn halo2_skinning_resolves_the_section_node_map() {
+        let Some(tags) = kit_tags("BLAM_TEST_H2EK") else {
+            eprintln!("skipping halo2_skinning_resolves_the_section_node_map: set BLAM_TEST_H2EK");
+            return;
+        };
+        let tag = read_kit_tag(
+            &tags,
+            "halo2_mcc",
+            "objects/characters/masterchief/masterchief.render_model",
+            "render_model",
+        );
+        let model = RenderModel::from_tag(&tag).expect("read model");
+        let meshes = RenderModel::derive_render_meshes(&tag).expect("derive meshes");
+        let positions = bind_positions(&model.nodes);
+
+        let sections = tag.root().field("sections").and_then(|f| f.as_block()).unwrap();
+        let (mut resolved, mut raw) = (Vec::new(), Vec::new());
+        let mut skinned_sections = 0;
+        for (si, mesh) in meshes.iter().enumerate() {
+            let section = sections.element(si).unwrap();
+            if section.read_int_any("global_geometry_classification_enum_definition").unwrap_or(0) < 2 {
+                continue;
+            }
+            skinned_sections += 1;
+            let raw_vertices = section
+                .field("section data").and_then(|f| f.as_block()).and_then(|b| b.element(0)).unwrap()
+                .field("section").and_then(|f| f.as_struct()).unwrap()
+                .field("raw vertices").and_then(|f| f.as_block()).unwrap();
+            assert_eq!(raw_vertices.len(), mesh.vertices.len());
+            for (k, vertex) in mesh.vertices.iter().enumerate() {
+                let local = h2_vertex_influences(&raw_vertices.element(k).unwrap(), &[]);
+                let heaviest = local.iter().copied().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
+                assert!((vertex.node_indices[0] as usize) < model.nodes.len());
+                resolved.push((vertex.position, vertex.node_indices[0] as usize));
+                raw.push((vertex.position, (heaviest.0.max(0) as usize).min(model.nodes.len() - 1)));
+            }
+        }
+        assert!(skinned_sections > 0, "the masterchief has skinned sections");
+        let right = median_bone_distance(&positions, resolved.into_iter());
+        let wrong = median_bone_distance(&positions, raw.into_iter());
+        assert!(right < wrong * 0.5, "node-map skinning: {right} vs raw local indices {wrong}");
     }
 }

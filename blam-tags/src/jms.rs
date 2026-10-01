@@ -967,8 +967,9 @@ impl JmsFile {
     /// (the parallel `compressed vertices` block is the 32-bit-packed
     /// alternate). `triangle data` is a triangle strip stored as 3-index
     /// chunks with `-1` (`0xFFFF`) restart/padding. Node indices are
-    /// global unless the `parts have local nodes` flag is set (local node
-    /// maps are not yet applied). Materials come from `shaders[]`.
+    /// global unless the `parts have local nodes` flag is set, in which case
+    /// they index each part's local node table. Materials come from
+    /// `shaders[]`.
     pub fn from_gbxmodel(tag: &TagFile) -> Result<Self, JmsError> {
         let root = tag.root();
         let world_nodes = chain_local_to_world(&read_nodes(&root)?);
@@ -988,6 +989,10 @@ impl JmsFile {
             .ok_or(JmsError::MissingField("regions"))?;
         let geometries_block = root.field_path("geometries").and_then(|f| f.as_block())
             .ok_or(JmsError::MissingField("geometries"))?;
+        // `flags` bit 1, `parts have local nodes`: set on 18 of haloce_mcc's
+        // 469 gbxmodels, the elite, hunter, jackal and first-person arms among
+        // them. Ignoring it skins those to the wrong bones.
+        let local_nodes = root.read_int_any("flags").is_some_and(|flags| flags & (1 << 1) != 0);
 
         // Halo CE: one JMS material per shader (region is a SEPARATE
         // section + a per-triangle index, not folded into the material as
@@ -1029,6 +1034,7 @@ impl JmsFile {
                 for part_i in 0..parts.len() {
                     let part = parts.element(part_i).unwrap();
                     let mat = part.read_int_any("shader index").unwrap_or(0).max(0) as i32;
+                    let local_table = local_nodes.then(|| crate::render_model::gbxmodel_part_local_nodes(&part));
 
                     let uv = match part.field("uncompressed vertices").and_then(|f| f.as_block()) {
                         Some(b) => b, None => continue,
@@ -1056,7 +1062,7 @@ impl JmsFile {
                         // triangles "to fix facing normals".
                         for vi in [a, c, b] {
                             let Some(v) = uv.element(vi as usize) else { continue };
-                            let mut vert = read_ce_vertex(&v);
+                            let mut vert = read_ce_vertex(&v, local_table.as_deref());
                             for uv in &mut vert.uvs {
                                 uv.x *= uv_scale[0];
                                 uv.y *= uv_scale[1];
@@ -3380,20 +3386,18 @@ pub(crate) fn read_h2_vertex(v: &TagStruct<'_>) -> JmsVertex {
 
 /// Read one Halo CE `uncompressed vertices[]` element into a JMS vertex.
 /// Position is a `real_vector_3d` (Halo 1's convention); node binding is
-/// the fixed two-influence `node0/node1` index+weight pair.
-fn read_ce_vertex(v: &TagStruct<'_>) -> JmsVertex {
+/// the fixed two-influence `node0/node1` index+weight pair, through the part's
+/// local node table when the model has one.
+fn read_ce_vertex(v: &TagStruct<'_>, local_nodes: Option<&[i32]>) -> JmsVertex {
     let p = v.read_vec3("position");
     let position = RealPoint3d { x: p.i, y: p.j, z: p.k } * SCALE;
     let normal = v.read_vec3("normal");
     let uv = v.read_point2d("texture coords");
-    let mut node_sets = Vec::with_capacity(2);
-    for (idx_f, wt_f) in [("node0 index", "node0 weight"), ("node1 index", "node1 weight")] {
-        let idx = v.read_int_any(idx_f).unwrap_or(-1) as i16;
-        let wt = v.read_real(wt_f).unwrap_or(0.0);
-        if idx >= 0 && wt > 0.0 {
-            node_sets.push((idx, wt));
-        }
-    }
+    let node_sets = crate::render_model::gbxmodel_vertex_influences(v, local_nodes)
+        .into_iter()
+        .filter(|&(node, weight)| node >= 0 && weight > 0.0)
+        .map(|(node, weight)| (node as i16, weight))
+        .collect();
     JmsVertex {
         position,
         normal,
