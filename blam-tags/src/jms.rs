@@ -3010,6 +3010,10 @@ fn build_geometry(
         .and_then(|f| f.as_block())
         .ok_or(JmsError::MissingField("render geometry/meshes"))?;
 
+    let node_maps = root.field_path("render geometry").and_then(|f| f.as_struct())
+        .map(|geo| crate::render_model::read_per_mesh_node_map(&geo))
+        .unwrap_or_default();
+
     let mut vertices: Vec<JmsVertex> = Vec::new();
     let mut triangles: Vec<JmsTriangle> = Vec::new();
 
@@ -3018,16 +3022,24 @@ fn build_geometry(
         let pmt = pmt_block.element(mi).unwrap();
         let mesh = meshes_block.element(mi).unwrap();
 
-        // Defensive rigid fallback (see crate-level doc note).
+        // A rigid mesh rides its `rigid node index`; the influence its raw
+        // vertices carry is palette-local, never the node to bind to.
         let vt = mesh.field("vertex type").and_then(|f| f.value()).map(|v| match v {
-            TagFieldData::CharEnum { value, .. } => value as i32, _ => -1,
+            TagFieldData::CharEnum { value, .. } => value as i32,
+            TagFieldData::CharInteger(value) => value as i32,
+            _ => -1,
         }).unwrap_or(-1);
-        let rigid_fallback_node = if matches!(vt, 1 | 5) {
+        let rigid_node = if matches!(vt, 1 | 5) {
             mesh.read_int_any("rigid node index").map(|v| v as i16).filter(|&v| v >= 0)
         } else { None };
+        // Otherwise a mesh with a node palette indexes it, not the skeleton.
+        let node_map = node_maps.get(mi).map(Vec::as_slice).unwrap_or(&[]);
 
         let raw_v = pmt.field("raw vertices").and_then(|f| f.as_block())
             .ok_or(JmsError::MissingField("per mesh temporary[i]/raw vertices"))?;
+        // An empty mesh has no index block either (most of Halo 4
+        // storm_masterchief_solo's 416); it adds nothing, it isn't an error.
+        if raw_v.is_empty() { continue; }
         let mut decoded = DecodedVertices::new(raw_v, bounds);
         // 16-bit indices, or 32-bit for meshes too big to address with 16
         // (e.g. bigmuthafucka with 103k unique vertices), widened to u32 —
@@ -3074,9 +3086,13 @@ fn build_geometry(
                 let base = vertices.len() as u32;
                 for vi in corners {
                     let mut jv = decoded.get(vi).clone();
-                    if jv.node_sets.is_empty() {
-                        if let Some(node) = rigid_fallback_node {
-                            jv.node_sets.push((node, 1.0));
+                    if let Some(node) = rigid_node {
+                        jv.node_sets = vec![(node, 1.0)];
+                    } else if !node_map.is_empty() {
+                        for (node, _) in &mut jv.node_sets {
+                            if let Some(&global) = usize::try_from(*node).ok().and_then(|l| node_map.get(l)) {
+                                *node = global as i16;
+                            }
                         }
                     }
                     vertices.push(jv);
@@ -3425,7 +3441,7 @@ const EMPTY_SECTIONS_TRAILING: &[(&str, &[&str])] = &[
 mod tests {
     use super::marker_display_name;
     use super::material_slot;
-    use super::{overlay_skeleton, JmsNode};
+    use super::{overlay_skeleton, JmsFile, JmsNode};
     use crate::math::{RealPoint3d, RealQuaternion};
 
     /// A cell reuses only its own slot, not one whose label ends the same way
@@ -3608,6 +3624,71 @@ mod tests {
         assert_eq!(marker_display_name("m", 9, 0, &regions()), "m");
         // Region ok, permutation out of range => region-only.
         assert_eq!(marker_display_name("m", 0, 9, &regions()), "(l_pod)m");
+    }
+
+    /// Reach meshes index a per-mesh node palette (`per mesh node map`); the
+    /// spartans' body palette has 29 entries, so its raw indices read as
+    /// global land on the pedestal, pelvis and legs. Rigid meshes bind to
+    /// their `rigid node index`, whatever local index their vertices carry.
+    #[test]
+    fn reach_meshes_export_through_their_node_palettes() {
+        let Some(tags) = std::env::var_os("BLAM_TEST_HREK").map(std::path::PathBuf::from) else {
+            eprintln!("skipping reach_meshes_export_through_their_node_palettes: set BLAM_TEST_HREK");
+            return;
+        };
+        let tags = if tags.join("tags").is_dir() { tags.join("tags") } else { tags };
+        let path = tags.join("objects/characters/spartans/spartans.render_model");
+        let tag = crate::TagFile::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let jms = JmsFile::from_render_model(&tag).expect("jms");
+
+        let cell = |label: &str| -> Vec<&super::JmsVertex> {
+            jms.triangles
+                .iter()
+                .filter(|t| jms.materials[t.material as usize].material_name.split_once(") ").map(|(_, l)| l) == Some(label))
+                .flat_map(|t| t.v.iter().map(|&v| &jms.vertices[v as usize]))
+                .collect()
+        };
+        let heaviest = |v: &super::JmsVertex| {
+            v.node_sets.iter().copied().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0 as usize
+        };
+        let node = |name: &str| jms.nodes.iter().position(|n| n.name == name).unwrap();
+
+        let helmet = cell("default head");
+        assert!(!helmet.is_empty());
+        assert!(helmet.iter().all(|v| v.node_sets == vec![(node("b_helmet") as i16, 1.0)]));
+
+        let body = cell("default body");
+        assert!(!body.is_empty());
+        let distance = |v: &super::JmsVertex, n: usize| {
+            let b = jms.nodes[n].translation;
+            let p = v.position;
+            ((p.x - b.x).powi(2) + (p.y - b.y).powi(2) + (p.z - b.z).powi(2)).sqrt()
+        };
+        let median = |mut d: Vec<f32>| { d.sort_by(f32::total_cmp); d[d.len() / 2] };
+        let bound = median(body.iter().map(|v| distance(v, heaviest(v))).collect());
+        let nearest = median(body.iter().map(|v| (0..jms.nodes.len()).map(|n| distance(v, n)).fold(f32::MAX, f32::min)).collect());
+        eprintln!("body: median distance to bound bone {bound}, to nearest bone {nearest}");
+        assert!(bound < nearest * 2.0, "body skinned to its bones: {bound} vs nearest {nearest}");
+    }
+
+    /// Most of Halo 4 storm_masterchief_solo's meshes are empty, with no index
+    /// block; each used to fail the whole export. The rest index byte-typed
+    /// node palettes.
+    #[test]
+    fn halo4_export_skips_empty_meshes_and_follows_palettes() {
+        let Some(tags) = std::env::var_os("BLAM_TEST_H4EK").map(std::path::PathBuf::from) else {
+            eprintln!("skipping halo4_export_skips_empty_meshes_and_follows_palettes: set BLAM_TEST_H4EK");
+            return;
+        };
+        let tags = if tags.join("tags").is_dir() { tags.join("tags") } else { tags };
+        let path = tags.join("objects/characters/storm_masterchief/storm_masterchief_solo.render_model");
+        let tag = crate::TagFile::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let jms = JmsFile::from_render_model(&tag).expect("jms");
+        assert!(!jms.vertices.is_empty());
+        let bones: std::collections::BTreeSet<i16> =
+            jms.vertices.iter().flat_map(|v| v.node_sets.iter().map(|&(n, _)| n)).collect();
+        assert!(bones.len() > 50, "skinned across the skeleton: {} bones", bones.len());
+        assert!(bones.iter().all(|&n| n >= 0 && (n as usize) < jms.nodes.len()));
     }
 }
 

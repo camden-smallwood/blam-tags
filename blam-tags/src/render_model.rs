@@ -2550,7 +2550,7 @@ fn read_per_mesh_temporary(geo: &TagStruct<'_>) -> Vec<PerMeshTemporary> {
     out
 }
 
-fn read_per_mesh_node_map(geo: &TagStruct<'_>) -> Vec<Vec<u8>> {
+pub(crate) fn read_per_mesh_node_map(geo: &TagStruct<'_>) -> Vec<Vec<u8>> {
     let Some(block) = geo.field("per mesh node map").and_then(|f| f.as_block()) else {
         return Vec::new();
     };
@@ -3329,9 +3329,14 @@ fn decode_render_vertex(
         v.field("node weights").and_then(|f| f.as_array()),
     ) {
         for k in 0..idx_arr.len().min(wt_arr.len()).min(4) {
+            // H3/Reach type the index `char_integer`, H4/H2A `byte_integer`.
             let idx = idx_arr.element(k).unwrap().fields().next()
                 .and_then(|f| f.value())
-                .and_then(|v| if let TagFieldData::CharInteger(c) = v { Some(c) } else { None })
+                .and_then(|v| match v {
+                    TagFieldData::CharInteger(c) => Some(c as i16),
+                    TagFieldData::ByteInteger(b) => Some(b as i16),
+                    _ => None,
+                })
                 .unwrap_or(0);
             let wt = wt_arr.element(k).unwrap().fields().next()
                 .and_then(|f| f.value())
@@ -3344,13 +3349,14 @@ fn decode_render_vertex(
             }
         }
     }
-    if filled == 0 {
-        if let Some(node) = rigid_node_index {
-            if node >= 0 {
-                node_indices[0] = node as u8;
-                node_weights[0] = 1.0;
-            }
-        }
+    // A rigid mesh rides one node: the mesh-level `rigid node index`, which
+    // is global. Its raw vertices still carry an influence, but that index
+    // is palette-LOCAL (Reach spartans' helmets say node 0 at full weight,
+    // and their one-entry node map says local 0 is `b_helmet`), so it is
+    // never the node to bind to.
+    if let Some(node) = rigid_node_index.filter(|&node| node >= 0) {
+        node_indices = [node as u8, 0, 0, 0];
+        node_weights = [1.0, 0.0, 0.0, 0.0];
     }
 
     RenderVertex {
@@ -3681,5 +3687,101 @@ mod tests {
         let right = median_bone_distance(&positions, resolved.into_iter());
         let wrong = median_bone_distance(&positions, raw.into_iter());
         assert!(right < wrong * 0.5, "node-map skinning: {right} vs raw local indices {wrong}");
+    }
+
+    /// Reach rigid meshes carry a palette-local influence on every raw vertex
+    /// (the spartans' helmet says node 0), which used to win over the mesh's
+    /// `rigid node index` and pin helmets and decals to the root while the
+    /// body animated.
+    #[test]
+    fn reach_rigid_meshes_bind_to_their_rigid_node() {
+        let Some(tags) = kit_tags("BLAM_TEST_HREK") else {
+            eprintln!("skipping reach_rigid_meshes_bind_to_their_rigid_node: set BLAM_TEST_HREK");
+            return;
+        };
+        let path = tags.join("objects/characters/spartans/spartans.render_model");
+        let tag = TagFile::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let model = RenderModel::from_tag(&tag).expect("read model");
+        let meshes = RenderModel::derive_render_meshes(&tag).expect("derive meshes");
+
+        let root = tag.root();
+        let regions = root.field("regions").and_then(|f| f.as_block()).unwrap();
+        let mesh_of = |region: &str, permutation: &str| -> usize {
+            let region = (0..regions.len())
+                .filter_map(|i| regions.element(i))
+                .find(|r| r.read_string_id("name").as_deref() == Some(region))
+                .unwrap();
+            let permutations = region.field("permutations").and_then(|f| f.as_block()).unwrap();
+            (0..permutations.len())
+                .filter_map(|i| permutations.element(i))
+                .find(|p| p.read_string_id("name").as_deref() == Some(permutation))
+                .and_then(|p| p.read_int_any("mesh index"))
+                .unwrap() as usize
+        };
+        let raw_vertices = root.field_path("render geometry/per mesh temporary").and_then(|f| f.as_block()).unwrap();
+
+        for (region, node) in [("head", "b_helmet"), ("decals", "b_torso")] {
+            let mi = mesh_of(region, "default");
+            let mesh = &meshes[mi];
+            let expected = model.nodes.iter().position(|n| n.name == node).unwrap();
+            assert_eq!(mesh.rigid_node_index, Some(expected as i16), "{region} is rigid on {node}");
+            // The counterfactual: the raw vertex names some other node.
+            let raw = raw_vertices.element(mi).unwrap()
+                .field("raw vertices").and_then(|f| f.as_block()).unwrap()
+                .element(0).unwrap()
+                .field("node indices").and_then(|f| f.as_array()).unwrap()
+                .element(0).unwrap()
+                .fields().next().and_then(|f| f.value());
+            assert!(
+                !matches!(raw, Some(TagFieldData::CharInteger(i)) if i as usize == expected),
+                "{region}: raw influence already global ({raw:?}), the check proves nothing"
+            );
+            assert!(!mesh.vertices.is_empty());
+            for v in &mesh.vertices {
+                assert_eq!(v.node_indices[0] as usize, expected, "{region} vertex bound to {node}");
+                assert_eq!(v.node_weights, [1.0, 0.0, 0.0, 0.0]);
+            }
+        }
+    }
+
+    /// Halo 4 types a raw vertex's `node index` as `byte_integer` (Halo 3 and
+    /// Reach say `char_integer`). Read as only the latter, every influence
+    /// fell back to local 0, so each mesh rode its palette's first node: the
+    /// masterchief skinned to 7 bones out of 120.
+    #[test]
+    fn halo4_skinning_reads_byte_node_indices() {
+        let Some(tags) = kit_tags("BLAM_TEST_H4EK") else {
+            eprintln!("skipping halo4_skinning_reads_byte_node_indices: set BLAM_TEST_H4EK");
+            return;
+        };
+        let path = tags.join("objects/characters/storm_masterchief/storm_masterchief_solo.render_model");
+        let tag = TagFile::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let model = RenderModel::from_tag(&tag).expect("read model");
+        let meshes = RenderModel::derive_render_meshes(&tag).expect("derive meshes");
+        let positions = bind_positions(&model.nodes);
+        let skinned: Vec<(RealPoint3d, usize)> = meshes
+            .iter()
+            .flat_map(|mesh| mesh.vertices.iter())
+            .map(|v| {
+                let heaviest = (0..4).max_by(|&a, &b| v.node_weights[a].total_cmp(&v.node_weights[b])).unwrap();
+                (v.position, v.node_indices[heaviest] as usize)
+            })
+            .collect();
+        assert!(!skinned.is_empty());
+        let distinct: std::collections::BTreeSet<usize> = skinned.iter().map(|&(_, n)| n).collect();
+        assert!(distinct.len() > 50, "skinned across the skeleton: {} bones", distinct.len());
+        let bound = median_bone_distance(&positions, skinned.iter().copied());
+        let nearest = median(
+            skinned
+                .iter()
+                .map(|&(p, _)| {
+                    positions
+                        .iter()
+                        .map(|b| ((p.x - b.x).powi(2) + (p.y - b.y).powi(2) + (p.z - b.z).powi(2)).sqrt())
+                        .fold(f32::MAX, f32::min)
+                })
+                .collect(),
+        );
+        assert!(bound < nearest * 2.0, "vertices sit on their bones: {bound} vs nearest {nearest}");
     }
 }
