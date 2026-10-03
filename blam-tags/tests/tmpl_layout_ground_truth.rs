@@ -32,9 +32,11 @@ use std::path::PathBuf;
 
 use blam_tags::{TagFieldType, TagFile};
 
+/// An editing kit's `tags` directory, from `env_var` (the kit root, as every
+/// other kit-gated suite takes it) or a Steam library.
 fn kit_tags(env_var: &str, kit: &str) -> Option<PathBuf> {
     if let Ok(path) = std::env::var(env_var) {
-        let path = PathBuf::from(path);
+        let path = PathBuf::from(path).join("tags");
         return path.is_dir().then_some(path);
     }
     [
@@ -81,7 +83,7 @@ fn find_one(tags: &PathBuf, extension: &str) -> Option<PathBuf> {
 #[test]
 fn a_shipped_reach_particle_keeps_its_render_method_in_an_unnamed_slot() {
     let Some(tags) = kit_tags("BLAM_TEST_HREK", "HREK") else {
-        eprintln!("skipping: no HREK editing kit (set BLAM_TEST_HREK to its `tags` directory)");
+        eprintln!("skipping: no HREK editing kit (set BLAM_TEST_HREK to the kit root)");
         return;
     };
     let Some(path) = find_one(&tags, "particle") else {
@@ -145,7 +147,7 @@ fn find_all(tags: &PathBuf, extension: &str) -> Vec<PathBuf> {
 #[test]
 fn h3ek_ships_particles_at_several_root_sizes_and_the_dump_matches_one() {
     let Some(tags) = kit_tags("BLAM_TEST_H3EK", "H3EK") else {
-        eprintln!("skipping: no H3EK editing kit (set BLAM_TEST_H3EK to its `tags` directory)");
+        eprintln!("skipping: no H3EK editing kit (set BLAM_TEST_H3EK to the kit root)");
         return;
     };
     let paths = find_all(&tags, "particle");

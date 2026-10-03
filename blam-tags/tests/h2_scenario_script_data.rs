@@ -8,13 +8,14 @@ use std::path::{Path, PathBuf};
 
 use blam_tags::{TagFieldData, TagFieldType, TagFile, TagStruct};
 
-/// An editing kit's `tags` directory, via `BLAM_TEST_<KIT>` or a Steam library.
+/// An editing kit's `tags` directory, from `BLAM_TEST_<KIT>` (the kit root,
+/// as every other kit-gated suite takes it) or a Steam library.
 ///
 /// Same convention as the other kit-gated suites: a machine with no kits skips
 /// rather than fails, and a machine with kits somewhere unusual can say where.
 fn kit(name: &str) -> Option<PathBuf> {
     if let Ok(path) = std::env::var(format!("BLAM_TEST_{name}")) {
-        let path = PathBuf::from(path);
+        let path = PathBuf::from(path).join("tags");
         return path.is_dir().then_some(path);
     }
     [
