@@ -506,11 +506,13 @@ impl AssFile {
                         .and_then(|f| f.as_block())
                         .map(|b| b.len())
                         .unwrap_or(0);
+                    let mesh = meshes.element(mesh_idx as usize).unwrap();
                     let bounds = if (mesh_idx as usize) >= comp_count {
                         CompressionBounds::identity()
                     } else {
                         read_compression_bounds_at(&root, comp_idx)
-                    };
+                    }
+                    .for_mesh(&mesh);
                     // Compression-bounds chirality: when an ODD number of
                     // axes have negative span (mx < mn), the unpacker's
                     // Jacobian flips sign and triangle winding inverts vs
@@ -519,7 +521,6 @@ impl AssFile {
                     // shipped Guardian content but a documented
                     // safety-net per the H3 Blender Toolset's decoder.
                     let flip_winding = compute_axis_flip(&bounds);
-                    let mesh = meshes.element(mesh_idx as usize).unwrap();
                     let mesh_pmt = pmt.element(mesh_idx as usize).unwrap();
                     build_cluster_object(&mesh, &mesh_pmt, &bounds, flip_winding)?
                 };
@@ -954,7 +955,7 @@ impl AssFile {
                     let mesh_pmt = pmt.element(mi).unwrap();
                     let cell_label = format!("{} {}", perm_name, region_name);
                     let object = build_render_model_object(
-                        &mesh, &mesh_pmt, &mats_block, &bounds, &mut materials, &cell_label,
+                        &mesh, &mesh_pmt, &mats_block, &bounds.for_mesh(&mesh), &mut materials, &cell_label,
                     )?;
                     if object.vertices_len() == 0 { continue; }
                     let object_index = objects.len() as i32;
@@ -1001,7 +1002,7 @@ impl AssFile {
                         let mesh = meshes.element(imi).unwrap();
                         let mesh_pmt = pmt.element(imi).unwrap();
                         let object = build_render_model_object(
-                            &mesh, &mesh_pmt, &mats_block, &bounds, &mut materials,
+                            &mesh, &mesh_pmt, &mats_block, &bounds.for_mesh(&mesh), &mut materials,
                             "instance_mesh",
                         )?;
                         let imi_object_index = if object.vertices_len() > 0 {

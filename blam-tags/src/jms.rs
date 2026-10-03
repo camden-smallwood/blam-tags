@@ -3095,11 +3095,9 @@ fn build_geometry(
 
         // A rigid mesh rides its `rigid node index`; the influence its raw
         // vertices carry is palette-local, never the node to bind to.
-        let vt = mesh.field("vertex type").and_then(|f| f.value()).map(|v| match v {
-            TagFieldData::CharEnum { value, .. } => value as i32,
-            TagFieldData::CharInteger(value) => value as i32,
-            _ => -1,
-        }).unwrap_or(-1);
+        let vt = crate::geometry::mesh_vertex_type(&mesh);
+        // And its vertices decompress by that type, not the flags word.
+        let bounds = bounds.for_vertex_type(vt);
         let rigid_node = if matches!(vt, 1 | 5) {
             mesh.read_int_any("rigid node index").map(|v| v as i16).filter(|&v| v >= 0)
         } else { None };
@@ -3111,7 +3109,7 @@ fn build_geometry(
         // An empty mesh has no index block either (most of Halo 4
         // storm_masterchief_solo's 416); it adds nothing, it isn't an error.
         if raw_v.is_empty() { continue; }
-        let mut decoded = DecodedVertices::new(raw_v, bounds);
+        let mut decoded = DecodedVertices::new(raw_v, &bounds);
         // 16-bit indices, or 32-bit for meshes too big to address with 16
         // (e.g. bigmuthafucka with 103k unique vertices), widened to u32 —
         // `JmsTriangle.v` is u32 already.
@@ -3224,10 +3222,11 @@ fn append_instance_geometry(
     }
     let mesh = meshes_block.element(instance_mesh_index).unwrap();
     let pmt = pmt_block.element(instance_mesh_index).unwrap();
+    let bounds = bounds.for_mesh(&mesh);
 
     let raw_v = pmt.field("raw vertices").and_then(|f| f.as_block())
         .ok_or(JmsError::MissingField("per mesh temporary[i]/raw vertices"))?;
-    let mut decoded = DecodedVertices::new(raw_v, bounds);
+    let mut decoded = DecodedVertices::new(raw_v, &bounds);
     let indices = read_mesh_indices(&pmt)
         .ok_or(JmsError::MissingField("per mesh temporary[i]/raw indices"))?;
     let is_strip = mesh_is_triangle_strip(&mesh);

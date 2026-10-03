@@ -2817,34 +2817,13 @@ where
 
         // Rigid meshes store the single bone via the mesh-level `rigid
         // node index`; per-vertex node arrays are typically all zero.
-        // `vertex type` is a char_enum in most tags, but some (e.g. zanzibar
-        // dome_light) carry an embedded schema that types it as a plain
-        // char_integer — same value (1 = rigid), different TagFieldData
-        // variant. Accept BOTH, else the mesh decodes to -1 and misses the
-        // format-based decompression below (→ rendered at raw 0..1 scale).
-        let vt = mesh.field("vertex type").and_then(|f| f.value()).map(|v| match v {
-            TagFieldData::CharEnum { value, .. } => value as i32,
-            TagFieldData::CharInteger(value) => value as i32,
-            _ => -1,
-        }).unwrap_or(-1);
+        let vt = crate::geometry::mesh_vertex_type(&mesh);
 
-        // ⭐Decompression is gated by the VERTEX FORMAT, not the
-        // `compression flags` word. Verified against BOTH the dllcache and
-        // Ares: `s_compression_info::compression_flags` is referenced ONLY in
-        // the struct definition — never read. The CPU extract path
-        // (`extract_rigid_vertex_data @0x180490610`) and the GPU submit path
-        // (`render_mesh_submit_compression @0x18069DF90`) apply
-        // `position_bounds`/`texcoord_bounds` whenever the vertex format is
-        // rigid/skinned (positions stored normalized 0..1), and the `world`
-        // format path (`extract_world_vertex_data @0x180490a10`) copies
-        // full-precision floats with NO bounds. `read_compression_bounds_at`
-        // derives `pos/uv_compressed` from the flag word, which is WRONG: e.g.
-        // zanzibar `dome_light` is rigid with normalized verts but has
-        // `compression flags = 0`, so the flag path left it un-decompressed →
-        // the model rendered at raw 0..1 scale (≈5× too big) and offset to
-        // +0.5 (wrong location). Override per-mesh by format: rigid(1)/
-        // flat-rigid(5)/skinned(2)/flat-skinned(6) → always decompress;
-        // world(0)/flat-world(4) → never (already full-precision).
+        // Decompression is gated by the vertex format, not the `compression
+        // flags` word (`CompressionBounds::for_vertex_type` says why, at the
+        // dllcache addresses `extract_rigid_vertex_data @0x180490610`,
+        // `render_mesh_submit_compression @0x18069DF90` and
+        // `extract_world_vertex_data @0x180490a10`).
         if std::env::var_os("BLAM_DIAG_DECOMPRESS").is_some() {
             eprintln!(
                 "[decompress] mesh{mi} vt={vt} flag_pos_compressed={} -> override, pbounds x[{:.4},{:.4}] y[{:.4},{:.4}] z[{:.4},{:.4}]",
@@ -2852,11 +2831,7 @@ where
                 bounds.px_min, bounds.px_max, bounds.py_min, bounds.py_max, bounds.pz_min, bounds.pz_max,
             );
         }
-        match vt {
-            1 | 2 | 5 | 6 => { bounds.pos_compressed = true; bounds.uv_compressed = true; }
-            0 | 4 => { bounds.pos_compressed = false; bounds.uv_compressed = false; }
-            _ => {}
-        }
+        bounds = bounds.for_vertex_type(vt);
 
         let rigid_node_index = if matches!(vt, 1 | 5) {
             mesh.read_int_any("rigid node index").map(|v| v as i16).filter(|&v| v >= 0)
@@ -3117,6 +3092,7 @@ pub fn extract_decorator_subparts(tag: &TagFile) -> Option<DecoratorSubpartGeome
     }
 
     let mesh = meshes.element(0)?;
+    let bounds = bounds.for_mesh(&mesh);
     let pmt0 = pmt.element(0)?;
     let raw_v = pmt0.field("raw vertices").and_then(|f| f.as_block())?;
     let raw_i = pmt0.field("raw indices").and_then(|f| f.as_block())?;

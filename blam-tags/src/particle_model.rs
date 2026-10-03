@@ -223,7 +223,16 @@ fn read_variant_ranges(root: &TagStruct<'_>) -> Option<Vec<(usize, usize)>> {
 
 fn read_gen3(tag: &TagFile, stem: &str) -> Result<Vec<ParticleObjectMesh>, JmsError> {
     let root = tag.root();
-    let bounds = read_compression_bounds(&root);
+    // Decompressed by `meshes[0]`'s vertex type where it has one, as every
+    // other reader of these vertices does.
+    let mut bounds = read_compression_bounds(&root);
+    if let Some(mesh) = root
+        .field_path("render geometry/meshes")
+        .and_then(|f| f.as_block())
+        .and_then(|b| b.element(0))
+    {
+        bounds = bounds.for_mesh(&mesh);
+    }
 
     let pmt = root
         .field_path("render geometry/per mesh temporary")

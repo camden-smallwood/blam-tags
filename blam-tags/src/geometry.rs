@@ -78,6 +78,44 @@ impl CompressionBounds {
         }
     }
 
+    /// These bounds as the engine applies them to a mesh whose `vertex
+    /// type` is `vertex_type` (see [`mesh_vertex_type`]).
+    ///
+    /// Decompression is gated by the vertex format, not the `compression
+    /// flags` word, which [`read_compression_bounds_at`] reads.
+    /// `s_compression_info::compression_flags` is referenced only in the
+    /// struct definition and never read (checked against both the dllcache
+    /// and Ares): the CPU extract path (`extract_rigid_vertex_data`) and the
+    /// GPU submit path (`render_mesh_submit_compression`) apply the position
+    /// and texcoord bounds whenever the format is rigid or skinned
+    /// (positions stored normalized 0..1), and the world path
+    /// (`extract_world_vertex_data`) copies full-precision floats with no
+    /// bounds. Zanzibar `dome_light` is rigid with normalized vertices and
+    /// `compression flags = 0`; trusting the flags rendered it at raw 0..1
+    /// scale, about 5x too big and offset by +0.5. So rigid (1), skinned (2),
+    /// flat rigid (5) and flat skinned (6) always decompress; world (0) and
+    /// flat world (4) never do; any other type keeps the flags' answer.
+    pub fn for_vertex_type(mut self, vertex_type: i32) -> Self {
+        match vertex_type {
+            1 | 2 | 5 | 6 => {
+                self.pos_compressed = true;
+                self.uv_compressed = true;
+            }
+            0 | 4 => {
+                self.pos_compressed = false;
+                self.uv_compressed = false;
+            }
+            _ => {}
+        }
+        self
+    }
+
+    /// [`Self::for_vertex_type`] with `mesh`'s own vertex type: what every
+    /// reader of a mesh's vertices should decompress them with.
+    pub fn for_mesh(self, mesh: &TagStruct<'_>) -> Self {
+        self.for_vertex_type(mesh_vertex_type(mesh))
+    }
+
     /// Map a 0..1 quantized position back into world units.
     /// Passthrough when [`Self::pos_compressed`] is `false`.
     pub fn decompress_position(&self, p: RealPoint3d) -> RealPoint3d {
@@ -97,6 +135,18 @@ impl CompressionBounds {
             x: self.u_min + uv.x * (self.u_max - self.u_min),
             y: self.v_min + uv.y * (self.v_max - self.v_min),
         }
+    }
+}
+
+/// A `render geometry/meshes[i]` element's `vertex type`, or -1 when it has
+/// none. The field is a `char enum` in most tags, but some (e.g. zanzibar
+/// `dome_light`) carry an embedded schema that types it `char integer` — the
+/// same value (1 = rigid) in a different variant — so both are taken.
+pub fn mesh_vertex_type(mesh: &TagStruct<'_>) -> i32 {
+    match mesh.field("vertex type").and_then(|f| f.value()) {
+        Some(TagFieldData::CharEnum { value, .. }) => value as i32,
+        Some(TagFieldData::CharInteger(value)) => value as i32,
+        _ => -1,
     }
 }
 
