@@ -184,6 +184,85 @@ impl TagFieldType {
             _ => Self::Unknown,
         }
     }
+
+    /// The field-type name as the layout's `string_data` stores it — the
+    /// inverse of [`Self::from_name`]. [`TagFieldType::Unknown`] reads as
+    /// `"unknown"`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::LongString => "long string",
+            Self::StringId => "string id",
+            Self::OldStringId => "old string id",
+            Self::CharInteger => "char integer",
+            Self::ShortInteger => "short integer",
+            Self::LongInteger => "long integer",
+            Self::Int64Integer => "int64 integer",
+            Self::ByteInteger => "byte integer",
+            Self::WordInteger => "word integer",
+            Self::DwordInteger => "dword integer",
+            Self::QwordInteger => "qword integer",
+            Self::Angle => "angle",
+            Self::Tag => "tag",
+            Self::CharEnum => "char enum",
+            Self::ShortEnum => "short enum",
+            Self::LongEnum => "long enum",
+            Self::LongFlags => "long flags",
+            Self::WordFlags => "word flags",
+            Self::ByteFlags => "byte flags",
+            Self::Point2d => "point 2d",
+            Self::Rectangle2d => "rectangle 2d",
+            Self::RgbColor => "rgb color",
+            Self::ArgbColor => "argb color",
+            Self::Real => "real",
+            Self::RealSlider => "real slider",
+            Self::RealFraction => "real fraction",
+            Self::RealPoint2d => "real point 2d",
+            Self::RealPoint3d => "real point 3d",
+            Self::RealVector2d => "real vector 2d",
+            Self::RealVector3d => "real vector 3d",
+            Self::RealQuaternion => "real quaternion",
+            Self::RealEulerAngles2d => "real euler angles 2d",
+            Self::RealEulerAngles3d => "real euler angles 3d",
+            Self::RealPlane2d => "real plane 2d",
+            Self::RealPlane3d => "real plane 3d",
+            Self::RealRgbColor => "real rgb color",
+            Self::RealArgbColor => "real argb color",
+            Self::RealHsvColor => "real hsv color",
+            Self::RealAhsvColor => "real ahsv color",
+            Self::ShortIntegerBounds => "short integer bounds",
+            Self::AngleBounds => "angle bounds",
+            Self::RealBounds => "real bounds",
+            Self::FractionBounds => "fraction bounds",
+            Self::TagReference => "tag reference",
+            Self::Block => "block",
+            Self::LongBlockFlags => "long block flags",
+            Self::WordBlockFlags => "word block flags",
+            Self::ByteBlockFlags => "byte block flags",
+            Self::CharBlockIndex => "char block index",
+            Self::CustomCharBlockIndex => "custom char block index",
+            Self::ShortBlockIndex => "short block index",
+            Self::CustomShortBlockIndex => "custom short block index",
+            Self::LongBlockIndex => "long block index",
+            Self::CustomLongBlockIndex => "custom long block index",
+            Self::Data => "data",
+            Self::VertexBuffer => "vertex buffer",
+            Self::Pointer => "pointer",
+            Self::RealMatrix3x3 => "real matrix 3x3",
+            Self::Pad => "pad",
+            Self::UselessPad => "useless pad",
+            Self::Skip => "skip",
+            Self::Explanation => "explanation",
+            Self::Custom => "custom",
+            Self::Struct => "struct",
+            Self::Array => "array",
+            Self::PageableResource => "pageable resource",
+            Self::ApiInterop => "api interop",
+            Self::Terminator => "terminator X",
+            Self::NonCacheRuntimeValue => "non-cache runtime value",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 //================================================================================
@@ -464,6 +543,71 @@ pub enum TagFieldData {
 }
 
 impl TagFieldData {
+    /// The field type this value belongs to — the only type
+    /// [`crate::TagFieldMut::set`] accepts it for.
+    pub fn field_type(&self) -> TagFieldType {
+        use TagFieldData as D;
+        match self {
+            D::String(..) => TagFieldType::String,
+            D::LongString(..) => TagFieldType::LongString,
+            D::StringId(..) => TagFieldType::StringId,
+            D::OldStringId(..) => TagFieldType::OldStringId,
+            D::TagReference(..) => TagFieldType::TagReference,
+            D::Data(..) => TagFieldType::Data,
+            D::ApiInterop(..) => TagFieldType::ApiInterop,
+            D::CharInteger(..) => TagFieldType::CharInteger,
+            D::ShortInteger(..) => TagFieldType::ShortInteger,
+            D::LongInteger(..) => TagFieldType::LongInteger,
+            D::Int64Integer(..) => TagFieldType::Int64Integer,
+            D::ByteInteger(..) => TagFieldType::ByteInteger,
+            D::WordInteger(..) => TagFieldType::WordInteger,
+            D::DwordInteger(..) => TagFieldType::DwordInteger,
+            D::QwordInteger(..) => TagFieldType::QwordInteger,
+            D::Tag(..) => TagFieldType::Tag,
+            D::CharEnum { .. } => TagFieldType::CharEnum,
+            D::ShortEnum { .. } => TagFieldType::ShortEnum,
+            D::LongEnum { .. } => TagFieldType::LongEnum,
+            D::ByteFlags { .. } => TagFieldType::ByteFlags,
+            D::WordFlags { .. } => TagFieldType::WordFlags,
+            D::LongFlags { .. } => TagFieldType::LongFlags,
+            D::ByteBlockFlags(..) => TagFieldType::ByteBlockFlags,
+            D::WordBlockFlags(..) => TagFieldType::WordBlockFlags,
+            D::LongBlockFlags(..) => TagFieldType::LongBlockFlags,
+            D::CharBlockIndex(..) => TagFieldType::CharBlockIndex,
+            D::CustomCharBlockIndex(..) => TagFieldType::CustomCharBlockIndex,
+            D::ShortBlockIndex(..) => TagFieldType::ShortBlockIndex,
+            D::CustomShortBlockIndex(..) => TagFieldType::CustomShortBlockIndex,
+            D::LongBlockIndex(..) => TagFieldType::LongBlockIndex,
+            D::CustomLongBlockIndex(..) => TagFieldType::CustomLongBlockIndex,
+            D::Angle(..) => TagFieldType::Angle,
+            D::Real(..) => TagFieldType::Real,
+            D::RealSlider(..) => TagFieldType::RealSlider,
+            D::RealFraction(..) => TagFieldType::RealFraction,
+            D::Point2d(..) => TagFieldType::Point2d,
+            D::Rectangle2d(..) => TagFieldType::Rectangle2d,
+            D::RealPoint2d(..) => TagFieldType::RealPoint2d,
+            D::RealPoint3d(..) => TagFieldType::RealPoint3d,
+            D::RealVector2d(..) => TagFieldType::RealVector2d,
+            D::RealVector3d(..) => TagFieldType::RealVector3d,
+            D::RealQuaternion(..) => TagFieldType::RealQuaternion,
+            D::RealEulerAngles2d(..) => TagFieldType::RealEulerAngles2d,
+            D::RealEulerAngles3d(..) => TagFieldType::RealEulerAngles3d,
+            D::RealPlane2d(..) => TagFieldType::RealPlane2d,
+            D::RealPlane3d(..) => TagFieldType::RealPlane3d,
+            D::RgbColor(..) => TagFieldType::RgbColor,
+            D::ArgbColor(..) => TagFieldType::ArgbColor,
+            D::RealRgbColor(..) => TagFieldType::RealRgbColor,
+            D::RealArgbColor(..) => TagFieldType::RealArgbColor,
+            D::RealHsvColor(..) => TagFieldType::RealHsvColor,
+            D::RealAhsvColor(..) => TagFieldType::RealAhsvColor,
+            D::ShortIntegerBounds(..) => TagFieldType::ShortIntegerBounds,
+            D::AngleBounds(..) => TagFieldType::AngleBounds,
+            D::RealBounds(..) => TagFieldType::RealBounds,
+            D::FractionBounds(..) => TagFieldType::FractionBounds,
+            D::Custom(..) => TagFieldType::Custom,
+        }
+    }
+
     /// Read a single bit from a flags-shaped variant (including
     /// block-flags). Returns `None` for variants that aren't flags.
     pub fn flag_bit(&self, bit: u32) -> Option<bool> {
@@ -677,7 +821,7 @@ fn decode_null_padded_string(bytes: &[u8]) -> String {
 
 /// Write `s` into a fixed-size buffer, truncating to fit and zero-padding
 /// the tail.
-fn encode_null_padded_string(s: &str, dest: &mut [u8]) {
+pub(crate) fn encode_null_padded_string(s: &str, dest: &mut [u8]) {
     let bytes = s.as_bytes();
     let n = bytes.len().min(dest.len());
     dest[..n].copy_from_slice(&bytes[..n]);

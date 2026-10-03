@@ -56,6 +56,7 @@ impl fmt::Display for ParseError {
             Self::Set(TagSetError::TypeMismatch { expected, got }) => {
                 write!(f, "type mismatch: expected {expected}, got {got}")
             }
+            Self::Set(other) => write!(f, "{other}"),
         }
     }
 }

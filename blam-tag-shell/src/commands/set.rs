@@ -81,5 +81,6 @@ fn set_error_to_anyhow(e: TagSetError) -> anyhow::Error {
         TagSetError::TypeMismatch { expected, got } => {
             anyhow::anyhow!("type mismatch: expected {expected}, got {got}")
         }
+        other => anyhow::anyhow!("{other}"),
     }
 }

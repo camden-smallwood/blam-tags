@@ -13,8 +13,9 @@
 
 use std::io::{Read, Seek, SeekFrom};
 
+use crate::api::TagSetError;
 use crate::error::TagReadError;
-use crate::fields::{deserialize_field, serialize_field, TagFieldData, TagFieldType};
+use crate::fields::{deserialize_field, encode_null_padded_string, serialize_field, TagFieldData, TagFieldType};
 use crate::io::*;
 use crate::layout::{TagBlockLayout, TagFieldLayout, TagLayout, TagStructLayout};
 use crate::monolithic::XSyncState;
@@ -678,7 +679,9 @@ impl TagStructData {
     /// Primitive, enum/flag, and math values mutate `struct_raw` at
     /// the field's offset. Sub-chunk leaf values swap the matching
     /// `TagSubChunkEntry.content`; that entry is expected to exist
-    /// already (set on read or via `new_default`).
+    /// already (set on read or via `new_default`). The caller has
+    /// already checked that `value` is of the field's type; this
+    /// refuses a field whose bytes or sub-chunk are not there.
     pub(crate) fn set_field(
         &mut self,
         layout: &TagLayout,
@@ -686,16 +689,45 @@ impl TagStructData {
         field_index: usize,
         value: TagFieldData,
         endian: Endian,
-    ) {
+    ) -> Result<(), TagSetError> {
         let field = &layout.fields[field_index];
-        if let Some(new_content) = serialize_field(field, &value, struct_raw, endian) {
+        let size = layout.field_types.get(field.type_index as usize).map_or(0, |t| t.size as usize);
+        // A classic legacy `old string id` is 32 inline bytes with no
+        // sub-chunk (see `deserialize_field`).
+        let inline_old_string_id = field.field_type == TagFieldType::OldStringId && size == 32;
+        let in_sub_chunk = !inline_old_string_id
+            && matches!(
+                field.field_type,
+                TagFieldType::StringId
+                    | TagFieldType::OldStringId
+                    | TagFieldType::TagReference
+                    | TagFieldType::Data
+                    | TagFieldType::ApiInterop
+            );
+        if !in_sub_chunk && field.offset as usize + size > struct_raw.len() {
+            return Err(TagSetError::Absent);
+        }
+        if inline_old_string_id {
+            let TagFieldData::OldStringId(value) = &value else {
+                return Err(TagSetError::TypeMismatch { expected: "old string id", got: value.field_type().name() });
+            };
+            let offset = field.offset as usize;
+            encode_null_padded_string(&value.string, &mut struct_raw[offset..offset + 32]);
+            return Ok(());
+        }
+        if in_sub_chunk {
             let entry = self
                 .sub_chunks
                 .iter_mut()
                 .find(|entry| entry.field_index == Some(field_index as u32))
-                .expect("set_field: sub-chunk entry missing for sub-chunk-bearing field");
-            entry.content = new_content;
+                .ok_or(TagSetError::Absent)?;
+            if let Some(new_content) = serialize_field(field, &value, struct_raw, endian) {
+                entry.content = new_content;
+            }
+        } else {
+            serialize_field(field, &value, struct_raw, endian);
         }
+        Ok(())
     }
 
     /// Build a struct tree with default sub_chunks for every

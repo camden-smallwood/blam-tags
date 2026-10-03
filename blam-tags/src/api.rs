@@ -1579,9 +1579,14 @@ impl<'a> TagFieldMut<'a> {
     /// Write `value`. Returns [`TagSetError::NotAssignable`] for
     /// container fields (struct/block/array/pageable_resource) —
     /// those must be mutated via [`TagFieldMut::as_struct_mut`] /
-    /// `as_block_mut` / `as_array_mut`.
+    /// `as_block_mut` / `as_array_mut` — and
+    /// [`TagSetError::TypeMismatch`] when `value`'s variant is not the
+    /// field's own type ([`TagFieldData::field_type`]): the bytes are
+    /// written at the value's width, so a mismatch would overrun or
+    /// under-fill the field. Nothing is written on error.
     pub fn set(&mut self, value: TagFieldData) -> Result<(), TagSetError> {
-        let ft = self.layout.fields[self.field_index].field_type;
+        let field = &self.layout.fields[self.field_index];
+        let ft = field.field_type;
         if matches!(
             ft,
             TagFieldType::Struct
@@ -1591,8 +1596,21 @@ impl<'a> TagFieldMut<'a> {
         ) {
             return Err(TagSetError::NotAssignable);
         }
-        self.struct_data.set_field(self.layout, &mut *self.struct_raw, self.field_index, value, self.endian);
-        Ok(())
+        let got = value.field_type();
+        if got != ft {
+            return Err(TagSetError::TypeMismatch { expected: ft.name(), got: got.name() });
+        }
+        let size = self
+            .layout
+            .field_types
+            .get(field.type_index as usize)
+            .map_or(0, |field_type| field_type.size as usize);
+        if let TagFieldData::Custom(bytes) = &value
+            && bytes.len() != size
+        {
+            return Err(TagSetError::SizeMismatch { expected: size, got: bytes.len() });
+        }
+        self.struct_data.set_field(self.layout, &mut *self.struct_raw, self.field_index, value, self.endian)
     }
 
     /// Look up a single flag by name and return a mutable handle.
@@ -2222,11 +2240,32 @@ impl<'a> TagField<'a> {
 #[derive(Debug)]
 pub enum TagSetError {
     /// The supplied [`TagFieldData`] variant doesn't match the
-    /// field's schema type.
+    /// field's schema type. Both are field-type names as
+    /// [`TagFieldType::name`] spells them.
     TypeMismatch { expected: &'static str, got: &'static str },
     /// The field is a container — use `as_block_mut()` / etc.
     NotAssignable,
+    /// A [`TagFieldData::Custom`] value whose byte count is not the
+    /// field's declared size.
+    SizeMismatch { expected: usize, got: usize },
+    /// The field's bytes are not all present in this element — a
+    /// classic element stored shorter than its definition — or the
+    /// sub-chunk that holds its value is missing.
+    Absent,
 }
+
+impl std::fmt::Display for TagSetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TypeMismatch { expected, got } => write!(f, "expected a {expected} value, got a {got}"),
+            Self::NotAssignable => f.write_str("a struct, block, array or resource field cannot be assigned a value"),
+            Self::SizeMismatch { expected, got } => write!(f, "expected {expected} bytes, got {got}"),
+            Self::Absent => f.write_str("the field's storage is not present in this element"),
+        }
+    }
+}
+
+impl std::error::Error for TagSetError {}
 
 /// Failure modes for block / array structural edits.
 #[derive(Debug)]
@@ -2234,6 +2273,16 @@ pub enum TagIndexError {
     /// An index argument was outside the block / array's `0..len` range.
     OutOfRange { index: usize, len: usize },
 }
+
+impl std::fmt::Display for TagIndexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutOfRange { index, len } => write!(f, "index {index} is out of range for {len} elements"),
+        }
+    }
+}
+
+impl std::error::Error for TagIndexError {}
 
 #[cfg(test)]
 mod resource_copy_tests {
@@ -2386,5 +2435,90 @@ mod resource_copy_tests {
                 "{game}",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod set_type_tests {
+    use super::TagSetError;
+    use crate::fields::TagFieldData;
+    use crate::file::TagFile;
+    use crate::math::Rectangle2d;
+    use std::path::Path;
+
+    /// A Halo 3 GUI model widget: its root holds `render depth bias`, a
+    /// `short integer`, directly ahead of the `bounds 720p` rectangle.
+    fn widget() -> TagFile {
+        let definition = Path::new("../definitions/halo3_mcc/gui_model_widget_definition.json");
+        TagFile::new(definition).unwrap_or_else(|error| panic!("build widget: {error}"))
+    }
+
+    fn bounds(tag: &TagFile) -> Option<TagFieldData> {
+        tag.root().field("bounds 720p").and_then(|field| field.value())
+    }
+
+    #[test]
+    fn a_value_of_another_type_is_refused_and_writes_nothing() {
+        let mut tag = widget();
+        let before = format!("{:?}", bounds(&tag));
+
+        // Four bytes aimed at a two-byte field.
+        let result = tag
+            .root_mut()
+            .field_mut("render depth bias")
+            .expect("render depth bias")
+            .set(TagFieldData::LongInteger(0x7fff_7fff));
+        assert!(
+            matches!(result, Err(TagSetError::TypeMismatch { expected: "short integer", got: "long integer" })),
+            "{result:?}"
+        );
+        assert_eq!(format!("{:?}", bounds(&tag)), before, "the neighbouring field changed");
+        assert!(matches!(
+            tag.root().field("render depth bias").and_then(|field| field.value()),
+            Some(TagFieldData::ShortInteger(0))
+        ));
+    }
+
+    #[test]
+    fn a_value_of_the_field_type_is_written() {
+        let mut tag = widget();
+        tag.root_mut()
+            .field_mut("render depth bias")
+            .expect("render depth bias")
+            .set(TagFieldData::ShortInteger(-7))
+            .expect("same type");
+        let rectangle = Rectangle2d { top: 1, left: 2, bottom: 3, right: 4 };
+        tag.root_mut()
+            .field_mut("bounds 720p")
+            .expect("bounds 720p")
+            .set(TagFieldData::Rectangle2d(rectangle))
+            .expect("same type");
+        assert!(matches!(
+            tag.root().field("render depth bias").and_then(|field| field.value()),
+            Some(TagFieldData::ShortInteger(-7))
+        ));
+        assert!(matches!(
+            bounds(&tag),
+            Some(TagFieldData::Rectangle2d(Rectangle2d { top: 1, left: 2, bottom: 3, right: 4 }))
+        ));
+    }
+
+    #[test]
+    fn a_sub_chunk_value_for_an_inline_field_is_refused() {
+        let mut tag = widget();
+        let result = tag
+            .root_mut()
+            .field_mut("render depth bias")
+            .expect("render depth bias")
+            .set(TagFieldData::Data(vec![1, 2, 3]));
+        assert!(matches!(result, Err(TagSetError::TypeMismatch { .. })), "{result:?}");
+    }
+
+    #[test]
+    fn the_errors_read_as_sentences() {
+        let error = TagSetError::TypeMismatch { expected: "short integer", got: "long integer" };
+        assert_eq!(error.to_string(), "expected a short integer value, got a long integer");
+        let error: &dyn std::error::Error = &super::TagIndexError::OutOfRange { index: 3, len: 2 };
+        assert_eq!(error.to_string(), "index 3 is out of range for 2 elements");
     }
 }
