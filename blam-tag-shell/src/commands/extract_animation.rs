@@ -1,7 +1,8 @@
 //! `extract-animation` — decode animations from a
 //! `.model_animation_graph`, the bundle `.model` (hlmt) that owns
 //! one, or any object-inheriting tag (.biped, .vehicle, .scenery,
-//! .weapon, .equipment, …) that points at a .model. Two output
+//! .weapon, .equipment, …) that points at a .model. Halo CE takes a
+//! `.model_animations`, or an object tag that points at one. Two output
 //! formats:
 //!
 //! - `--format json` — full per-frame transform table for both
@@ -64,7 +65,8 @@ use serde_json::json;
 use blam_tags::animation::classic::{CeAnimation, CeAnimations};
 use blam_tags::extract::animation::{
     additional_node_data_is_object_space, build_defaults, halo_bone_reorientation, jma_kind_for,
-    resolve_animation_inputs, sanitize, write_ce_group_jma, write_group_jma,
+    ce_skeleton, resolve_animation_inputs, resolve_ce_animation_graph, sanitize,
+    write_ce_group_jma, write_group_jma, CE_NO_SKELETON,
 };
 use blam_tags::{Animation, AnimationGraph, AnimationGroup, JmaKind, Skeleton, TagFile};
 
@@ -94,14 +96,20 @@ pub fn run(
     // Halo CE `model_animations` (group `antr`) predates the gen3
     // codec-pack model entirely — route it through the classic decoder.
     if &loaded.tag.header.group_tag.to_be_bytes() == b"antr" {
-        return run_ce(&loaded.tag, &loaded.path, anim, output, flat, format);
+        return run_ce(&loaded.tag, None, &loaded.path, anim, output, flat, format);
+    }
+
+    // A Halo CE object (.biped, .weapon, …) names its antr directly through
+    // `animation graph`; extract that, filed under the input's own name.
+    let resolver = CtxResolver { ctx: &*ctx };
+    if let Some(ce) = resolve_ce_animation_graph(&loaded.tag, &resolver)? {
+        return run_ce(&ce.antr, ce.model.as_ref(), &loaded.path, anim, output, flat, format);
     }
 
     // Resolve the input to an owned (jmad, optional render_model) pair via
     // the shared orchestration, using the CLI's filesystem/cache loader.
     // For a direct jmad input no fresh copy is loaded — `resolved.jmad` is
     // `None` and we reuse `loaded.tag`.
-    let resolver = CtxResolver { ctx: &*ctx };
     let resolved = resolve_animation_inputs(&loaded.tag, &resolver)?;
     let jmad_tag: &TagFile = resolved.jmad.as_ref().unwrap_or(&loaded.tag);
     let render_model: Option<&TagFile> = resolved.render_model.as_ref();
@@ -229,7 +237,8 @@ pub fn run(
 
 /// Halo CE `model_animations` (antr) extraction. CE stores each
 /// animation's frames inline (no gen3 codec pack / tgrc resource), with
-/// the skeleton in the tag's own `nodes` block and the rest pose carried
+/// the skeleton in the tag's own `nodes` block (or, where that is empty,
+/// `model`'s — see `ce_skeleton`) and the rest pose carried
 /// implicitly by the static (`default data`) stream — so CE poses are
 /// self-contained and need no render_model. Overlays/replacements compose
 /// onto the skeleton rest pose (CE has no per-graph base resolution like
@@ -237,6 +246,7 @@ pub fn run(
 /// rest). See `blam_tags::animation::classic`.
 fn run_ce(
     tag: &TagFile,
+    model: Option<&TagFile>,
     path: &Path,
     anim: Option<&str>,
     output: Option<&str>,
@@ -247,9 +257,9 @@ fn run_ce(
     if animations.is_empty() {
         anyhow::bail!("model_animations has no animations to extract");
     }
-    let skeleton = Skeleton::from_tag(tag);
+    let skeleton = ce_skeleton(&animations, tag, model);
     if matches!(format, Format::Jma) && skeleton.is_empty() {
-        anyhow::bail!("model_animations has no nodes — JMA export needs a skeleton");
+        anyhow::bail!(CE_NO_SKELETON);
     }
     // Halo 1 `antr` — a classic Bungie X-down rig, never Campaign Evolved — so
     // no bone-convention reorientation applies.

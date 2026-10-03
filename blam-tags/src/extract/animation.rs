@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use crate::animation::classic::{CeAnimation, CeAnimations};
 use crate::animation::SizeLayout;
+use crate::game::Game;
 use crate::math::{RealPoint3d, RealQuaternion, RealVector3d};
 use crate::paths::tag_ref_path;
 use crate::{
@@ -66,8 +67,9 @@ pub struct ResolvedAnimation {
 /// Extract every animation in `input` to `<out_dir>/<actor_name>/animations/`.
 ///
 /// `input` may be a `.model_animation_graph` (jmad), a `.model` (hlmt),
-/// any object-inheriting tag that points at a `.model`, or a Halo CE
-/// `.model_animations` (antr). `actor_name` is used both as the folder
+/// any object-inheriting tag that points at a `.model`, a Halo CE
+/// `.model_animations` (antr), or a Halo CE object-inheriting tag that points
+/// at one. `actor_name` is used both as the folder
 /// stem and as the JMA header actor name.
 pub fn animations_to_dir(
     input: &TagFile,
@@ -78,7 +80,10 @@ pub fn animations_to_dir(
     // Halo CE `model_animations` (antr) predates the gen3 codec-pack model
     // entirely — route it through the classic decoder.
     if &input.header.group_tag.to_be_bytes() == b"antr" {
-        return ce_animations_to_dir(input, out_dir, actor_name);
+        return ce_animations_to_dir(input, None, out_dir, actor_name);
+    }
+    if let Some(ce) = resolve_ce_animation_graph(input, resolver)? {
+        return ce_animations_to_dir(&ce.antr, ce.model.as_ref(), out_dir, actor_name);
     }
 
     let resolved = resolve_animation_inputs(input, resolver)?;
@@ -153,10 +158,11 @@ pub fn animations_to_dir(
 
 /// Halo CE `model_animations` (antr) directory export. CE stores each
 /// animation's frames inline (no gen3 codec pack), with the skeleton in
-/// the tag's own `nodes` block; poses are self-contained and need no
-/// render_model.
+/// the tag's own `nodes` block — or, where that is empty, the `model`'s (see
+/// [`ce_skeleton`]); poses are self-contained and need no render_model.
 fn ce_animations_to_dir(
     tag: &TagFile,
+    model: Option<&TagFile>,
     out_dir: &Path,
     actor_name: &str,
 ) -> Result<AnimSummary, ExtractError> {
@@ -166,11 +172,9 @@ fn ce_animations_to_dir(
             "model_animations has no animations to extract",
         ));
     }
-    let skeleton = Skeleton::from_tag(tag);
+    let skeleton = ce_skeleton(&animations, tag, model);
     if skeleton.is_empty() {
-        return Err(ExtractError::msg(
-            "model_animations has no nodes — JMA export needs a skeleton",
-        ));
+        return Err(ExtractError::msg(CE_NO_SKELETON));
     }
     // Halo CE `additional node data` is parent-local (no conversion).
     // (This is Halo 1 `antr` — a classic Bungie X-down rig, never Campaign
@@ -284,23 +288,93 @@ fn resolve_from_model(
     })
 }
 
+/// What a Halo CE object animates with: its `model_animations` (antr), and
+/// the `gbxmodel` it is drawn with.
+pub struct CeAnimationInputs {
+    pub antr: TagFile,
+    /// The object's gbxmodel, when it has one that loads. Only consulted for
+    /// the skeleton of an antr whose own `nodes` block is empty.
+    pub model: Option<TagFile>,
+}
+
+/// Resolve an object-inheriting Halo CE tag (`.biped`, `.weapon`, `.scenery`,
+/// …) to the antr it animates with, from its inherited `animation graph`
+/// reference, and its gbxmodel from `model`. CE objects reference their
+/// animations directly, with no `.model` in between, and CE animations carry
+/// their own rest pose.
+///
+/// `None` for anything but a CE tag other than an antr; an error for a CE tag
+/// with no animation graph to follow.
+pub fn resolve_ce_animation_graph(
+    input: &TagFile,
+    resolver: &dyn TagResolver,
+) -> Result<Option<CeAnimationInputs>, ExtractError> {
+    let group = input.header.group_tag.to_be_bytes();
+    if Game::of(input) != Game::Halo1 || &group == b"antr" {
+        return Ok(None);
+    }
+    let antr_rel = find_object_ref(input, "animation graph").ok_or_else(|| {
+        ExtractError::msg(format!(
+            "input group `{}` has no `animation graph` ref — pass a .model_animations, or \
+             an object tag (.biped, .weapon, .scenery, …) that has one",
+            std::str::from_utf8(&group).unwrap_or("?"),
+        ))
+    })?;
+    let antr = resolver.resolve(&antr_rel, "model_animations", u32::from_be_bytes(*b"antr"))?;
+    // Tolerant: the model only matters for an antr with no nodes, and that
+    // case reports its own error.
+    let model = find_object_ref(input, "model")
+        .and_then(|r| resolver.resolve(&r, "gbxmodel", u32::from_be_bytes(*b"mod2")).ok());
+    Ok(Some(CeAnimationInputs { antr, model }))
+}
+
+/// Why a CE extraction has no skeleton to write against.
+pub const CE_NO_SKELETON: &str = "model_animations has no nodes and no gbxmodel with a matching \
+    node list to take them from — extract it through an object tag (.biped, .vehicle, …) that \
+    uses it";
+
+/// The skeleton a Halo CE antr's animations target.
+///
+/// Normally the antr's own `nodes` block. Some antrs (33 in haloce_mcc, among
+/// them the warthog, ghost and engineer) leave that block empty and animate
+/// their gbxmodel's nodes directly: every animation's `node list checksum`
+/// equals the model's, as does its `node count`. Wherever the two checksums
+/// agree, the gbxmodel's node list is the antr's — checked against all 132
+/// object pairs in haloce_mcc whose antr does carry nodes, which differ only
+/// in the antr's root naming itself as its parent. Empty if neither applies.
+pub fn ce_skeleton(animations: &CeAnimations<'_>, antr: &TagFile, model: Option<&TagFile>) -> Skeleton {
+    let own = Skeleton::from_tag(antr);
+    if !own.is_empty() {
+        return own;
+    }
+    let Some(model) = model else { return own };
+    let checksum = model.root().read_int_any("node list checksum").map(|v| v as i32);
+    if animations.iter().all(|a| Some(a.node_list_checksum) == checksum) {
+        Skeleton::from_tag(model)
+    } else {
+        own
+    }
+}
+
 /// Find the inherited `model` tag_reference on an object-inheriting tag.
-/// Every object-inheriting group uses one of these inheritance paths; we
-/// probe in order and use the first match.
 fn find_object_model_ref(tag: &TagFile) -> Option<String> {
-    const PATHS: &[&str] = &[
-        "unit/object/model",
-        "item/object/model",
-        "device/object/model",
-        "object/model",
-    ];
+    find_object_ref(tag, "model")
+}
+
+/// Find an inherited `object` tag_reference by name. Every object-inheriting
+/// group uses one of these inheritance paths; we probe in order and use the
+/// first match.
+fn find_object_ref(tag: &TagFile, field: &str) -> Option<String> {
+    const PARENTS: &[&str] = &["unit/object", "item/object", "device/object", "object"];
     let root = tag.root();
-    PATHS.iter().find_map(|p| match root.field_path(p)?.value()? {
-        TagFieldData::TagReference(r) => r
-            .group_tag_and_name
-            .map(|(_, name)| name)
-            .filter(|s| !s.is_empty()),
-        _ => None,
+    PARENTS.iter().find_map(|parent| {
+        match root.field_path(&format!("{parent}/{field}"))?.value()? {
+            TagFieldData::TagReference(r) => r
+                .group_tag_and_name
+                .map(|(_, name)| name)
+                .filter(|s| !s.is_empty()),
+            _ => None,
+        }
     })
 }
 

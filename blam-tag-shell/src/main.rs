@@ -456,14 +456,16 @@ enum Commands {
 
     /// Decode animations from a `.model_animation_graph`, or from a
     /// `.model` (hlmt) / object-inheriting tag (.biped, .scenery,
-    /// .weapon, .equipment, …) that points at one. Default output is
+    /// .weapon, .equipment, …) that points at one, or a Halo CE
+    /// `.model_animations` / object tag. Default output is
     /// a JMA-family text file (`.JMM/.JMA/.JMT/...`) re-importable by
     /// Halo content tooling. `--format json` emits the full per-frame
     /// transform table for diagnostics. With no `<anim>` arg, every
     /// animation in the tag is extracted.
     ExtractAnimation {
-        /// Path to a `.model_animation_graph`, `.model`, or any
-        /// object-inheriting tag (.biped/.weapon/.scenery/…)
+        /// Path to a `.model_animation_graph`, `.model`, Halo CE
+        /// `.model_animations`, or any object-inheriting tag
+        /// (.biped/.weapon/.scenery/…)
         file: String,
         /// Animation index (`definitions/animations[N]`) or name.
         /// Omit to extract every animation in the tag.
