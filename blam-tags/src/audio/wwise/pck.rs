@@ -91,6 +91,13 @@ impl Pck {
                 "AKPK section sizes ({sections_len}) exceed header ({header_len})"
             ));
         }
+        // Checked against the file before allocating: the sizes are its word.
+        let file_len = file.metadata().map_err(|e| format!("stat pck: {e}"))?.len();
+        if 28 + sections_len as u64 > file_len {
+            return Err(format!(
+                "AKPK section sizes ({sections_len}) run past the {file_len}-byte package"
+            ));
+        }
         let mut sections = vec![0u8; sections_len];
         file.read_exact(&mut sections)
             .map_err(|e| format!("read AKPK sections: {e}"))?;
@@ -118,6 +125,12 @@ impl Pck {
     /// `.wem` slices whose location was computed from a bank's DIDX/DATA).
     pub fn read_range(&self, offset: u64, size: u64) -> Result<Vec<u8>, String> {
         let mut file = File::open(&self.path).map_err(|e| format!("reopen pck: {e}"))?;
+        let file_len = file.metadata().map_err(|e| format!("stat pck: {e}"))?.len();
+        if offset.checked_add(size).is_none_or(|end| end > file_len) {
+            return Err(format!(
+                "{size} bytes at {offset} run past the {file_len}-byte package"
+            ));
+        }
         file.seek(SeekFrom::Start(offset))
             .map_err(|e| format!("seek: {e}"))?;
         let mut buf = vec![0u8; size as usize];
@@ -158,6 +171,9 @@ fn parse_files(section: &[u8], languages: &HashMap<u32, String>) -> Result<Vec<P
         return Ok(Vec::new());
     }
     let count = rd_u32(section, 0) as usize;
+    if count > (section.len() - 4) / FILE_ENTRY_BYTES {
+        return Err("AKPK file table truncated".into());
+    }
     let mut entries = Vec::with_capacity(count);
     let mut p = 4;
     for _ in 0..count {

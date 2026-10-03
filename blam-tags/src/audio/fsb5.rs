@@ -150,6 +150,22 @@ impl Fsb5 {
 
         let data_start = FSB5_HEADER_SIZE + header_chunk + names_chunk;
 
+        // Every size above is the file's word: check the regions fit the bank,
+        // and the subsound count its sample headers (each at least 8 bytes),
+        // before allocating for any of them.
+        let file_len = file.metadata().map_err(|e| format!("stat: {e}"))?.len();
+        if data_start > file_len {
+            return Err(format!(
+                "sample header ({header_chunk} bytes) and name ({names_chunk} bytes) regions \
+                 run past the {file_len}-byte bank"
+            ));
+        }
+        if num_subsounds as u64 > header_chunk / 8 {
+            return Err(format!(
+                "{num_subsounds} subsounds cannot fit {header_chunk} bytes of sample headers"
+            ));
+        }
+
         // Read the packed sample-header region and the name region together.
         let mut sample_headers = vec![0u8; header_chunk as usize];
         file.read_exact(&mut sample_headers)

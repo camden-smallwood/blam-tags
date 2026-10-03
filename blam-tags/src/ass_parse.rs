@@ -150,6 +150,14 @@ impl Lexer {
         usize::try_from(v).map_err(|_| AssParseError::Bad { what, got: v.to_string() })
     }
 
+    /// How much to pre-allocate for `n` elements of at least
+    /// `min_tokens_each` tokens: no more than the tokens left can fill, so
+    /// a corrupt count cannot become a huge allocation. The read loop then
+    /// stops at the first missing token. Mirrors the JMS reader's `hint`.
+    fn hint(&self, n: usize, min_tokens_each: usize) -> usize {
+        n.min((self.toks.len() - self.at) / min_tokens_each.max(1))
+    }
+
     fn f32(&mut self, what: &'static str) -> R<f32> {
         let t = self.next(what)?;
         t.parse::<f32>().map_err(|_| AssParseError::Bad { what, got: t.to_owned() })
@@ -196,7 +204,7 @@ pub fn parse(src: &str) -> R<(AssFile, u32)> {
 
     // ---- materials --------------------------------------------------
     let count = lx.usize("the material count")?;
-    let mut materials = Vec::with_capacity(count);
+    let mut materials = Vec::with_capacity(lx.hint(count, 2));
     for _ in 0..count {
         let name = lx.string("a material name")?;
         let lightmap_variant = lx.string("a lightmap variant")?;
@@ -212,7 +220,7 @@ pub fn parse(src: &str) -> R<(AssFile, u32)> {
 
     // ---- objects ----------------------------------------------------
     let count = lx.usize("the object count")?;
-    let mut objects = Vec::with_capacity(count);
+    let mut objects = Vec::with_capacity(lx.hint(count, 3));
     for _ in 0..count {
         let class = lx.string("an object class")?;
         let xref_filepath = lx.string("an xref filepath")?;
@@ -236,7 +244,7 @@ pub fn parse(src: &str) -> R<(AssFile, u32)> {
 
     // ---- instances --------------------------------------------------
     let count = lx.usize("the instance count")?;
-    let mut instances = Vec::with_capacity(count);
+    let mut instances = Vec::with_capacity(lx.hint(count, 21));
     for _ in 0..count {
         let object_index = lx.i32("an instance object index")?;
         let name = lx.string("an instance name")?;
@@ -285,7 +293,7 @@ pub fn parse(src: &str) -> R<(AssFile, u32)> {
 
 fn parse_mesh(lx: &mut Lexer, version: u32) -> R<AssObjectPayload> {
     let n = lx.usize("a vertex count")?;
-    let mut vertices = Vec::with_capacity(n);
+    let mut vertices = Vec::with_capacity(lx.hint(n, 8));
     for _ in 0..n {
         let position = lx.point3("a vertex position")?;
         let normal = lx.vector3("a vertex normal")?;
@@ -295,7 +303,7 @@ fn parse_mesh(lx: &mut Lexer, version: u32) -> R<AssObjectPayload> {
             RealRgbColor { red: 0.0, green: 0.0, blue: 0.0 }
         };
         let sets = lx.usize("a node set count")?;
-        let mut node_set = Vec::with_capacity(sets);
+        let mut node_set = Vec::with_capacity(lx.hint(sets, 2));
         for _ in 0..sets {
             // Whether the pair is on one line or two makes no difference
             // once tokenised — the version only changes the whitespace.
@@ -304,7 +312,7 @@ fn parse_mesh(lx: &mut Lexer, version: u32) -> R<AssObjectPayload> {
             node_set.push((idx, weight));
         }
         let uv_count = lx.usize("a uv count")?;
-        let mut uvs = Vec::with_capacity(uv_count);
+        let mut uvs = Vec::with_capacity(lx.hint(uv_count, 2));
         for _ in 0..uv_count {
             let x = lx.f32("a uv u")?;
             let y = lx.f32("a uv v")?;
@@ -315,7 +323,7 @@ fn parse_mesh(lx: &mut Lexer, version: u32) -> R<AssObjectPayload> {
     }
 
     let n = lx.usize("a triangle count")?;
-    let mut triangles = Vec::with_capacity(n);
+    let mut triangles = Vec::with_capacity(lx.hint(n, 4));
     for _ in 0..n {
         let material = lx.i32("a triangle material")?;
         let a = lx.i32("a triangle vertex")? as u32;
