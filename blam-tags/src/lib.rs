@@ -94,6 +94,7 @@ pub mod gltf;
 pub mod hull;
 pub mod jms_parse;
 pub mod jms_split;
+pub mod jms_generation;
 pub mod jmi;
 pub mod ass;
 pub mod ass_parse;

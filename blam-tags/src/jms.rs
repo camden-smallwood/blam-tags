@@ -971,8 +971,46 @@ impl JmsFile {
     /// they index each part's local node table. Materials come from
     /// `shaders[]`.
     pub fn from_gbxmodel(tag: &TagFile) -> Result<Self, JmsError> {
+        Self::from_gbxmodel_permutation(tag, None)
+    }
+
+    /// The names of a gbxmodel's permutations, in first-seen order across its
+    /// regions. Halo CE tool.exe takes a permutation's name from its JMS file
+    /// name, and gathers every region's permutation of that name from the one
+    /// file — so these are the files a re-importable export writes.
+    pub fn gbxmodel_permutation_names(tag: &TagFile) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
         let root = tag.root();
-        let world_nodes = chain_local_to_world(&read_nodes(&root)?);
+        let Some(regions) = root.field_path("regions").and_then(|f| f.as_block()) else {
+            return names;
+        };
+        for ri in 0..regions.len() {
+            let Some(perms) = regions.element(ri).and_then(|r| r.field("permutations")).and_then(|f| f.as_block()) else {
+                continue;
+            };
+            for pi in 0..perms.len() {
+                let name = perms.element(pi).and_then(|p| p.read_string("name")).unwrap_or_default();
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        names
+    }
+
+    /// [`Self::from_gbxmodel`] limited to the permutations named `permutation`
+    /// (one per region at most), or every permutation when `None`.
+    pub fn from_gbxmodel_permutation(tag: &TagFile, permutation: Option<&str>) -> Result<Self, JmsError> {
+        let root = tag.root();
+        // A gbxmodel's `default rotation` is the inverse of the bind rotation
+        // (the preview's `read_gbxmodel_nodes` conjugates it too), so turn it
+        // round before chaining: every `JmsFile` holds world nodes in the
+        // H2/H3 convention, and the 8200 writer turns them back.
+        let mut local_nodes = read_nodes(&root)?;
+        for node in &mut local_nodes {
+            node.rotation = node.rotation.conjugate();
+        }
+        let world_nodes = chain_local_to_world(&local_nodes);
 
         // The gbxmodel header carries a model-level `base map u/v scale` that the
         // engine multiplies into every vertex texcoord (a value of 0 means "no
@@ -1020,6 +1058,9 @@ impl JmsFile {
             };
             for pi in 0..perms.len() {
                 let perm = perms.element(pi).unwrap();
+                if permutation.is_some_and(|want| perm.read_string("name").unwrap_or_default() != want) {
+                    continue;
+                }
                 let ngeo = geometries_block.len();
                 let geo_idx = ["super high", "high", "medium", "low", "super low"]
                     .iter()
@@ -1709,6 +1750,12 @@ impl JmsFile {
     /// dedicated REGIONS section (8197), two-influence vertices (8199:
     /// node0 / pos / normal / node1 / node1-weight / uv / unused), and
     /// per-triangle region indices (8198).
+    ///
+    /// Nodes are held in world space, in the H2/H3 quaternion convention; Halo
+    /// CE tool.exe reads them parent-relative and builds each node's matrix
+    /// from the *conjugate* of the stored quaternion (`sub_4391E0`,
+    /// `sub_4CAB60`), so each is written as `inverse(parent) * node`,
+    /// conjugated — the values a gbxmodel's own `nodes` block holds.
     fn write_jms_old<W: Write>(&self, w: &mut W, version: u16) -> Result<(), JmsError> {
         writeln!(w, "{version}")?;
         writeln!(w, "0")?; // node list checksum (unused by importers)
@@ -1716,11 +1763,12 @@ impl JmsFile {
         let (children, siblings) = derive_child_sibling(&self.nodes);
         writeln!(w, "{}", self.nodes.len())?;
         for (i, n) in self.nodes.iter().enumerate() {
+            let (rotation, translation) = parent_relative_node(&self.nodes, i);
             writeln!(w, "{}", n.name)?;
             writeln!(w, "{}", children[i])?;
             writeln!(w, "{}", siblings[i])?;
-            write_floats(w, &n.rotation.to_array())?;
-            write_floats(w, &n.translation.to_array())?;
+            write_floats(w, &rotation.conjugate().to_array())?;
+            write_floats(w, &translation.to_array())?;
         }
 
         writeln!(w, "{}", self.materials.len())?;
@@ -1732,9 +1780,13 @@ impl JmsFile {
         writeln!(w, "{}", self.markers.len())?;
         for m in &self.markers {
             writeln!(w, "{}", m.name)?;
-            writeln!(w, "-1")?; // region (markers aren't region-scoped here)
+            // Region -1: Halo CE tool.exe gives the marker the region of the
+            // nearest vertex skinned to its node (`sub_42C350`).
+            writeln!(w, "-1")?;
             writeln!(w, "{}", m.node_index)?;
-            write_floats(w, &m.rotation.to_array())?;
+            // Node-local in every version; only the quaternion convention
+            // differs, as for nodes.
+            write_floats(w, &m.rotation.conjugate().to_array())?;
             write_floats(w, &m.translation.to_array())?;
             write_floats(w, &[m.radius])?;
         }
@@ -2241,6 +2293,20 @@ pub(crate) fn xform_dir(m: &Matrix4, d: [f32; 3]) -> [f32; 3] {
         m.m[1][0] * d[0] + m.m[1][1] * d[1] + m.m[1][2] * d[2],
         m.m[2][0] * d[0] + m.m[2][1] * d[1] + m.m[2][2] * d[2],
     ]
+}
+
+/// Node `index` of a world-space node list, in its parent's space:
+/// `inverse(parent) * node`. A root (or a parent that is not earlier in the
+/// list, which [`chain_local_to_world`] also treats as world) is unchanged.
+fn parent_relative_node(nodes: &[JmsNode], index: usize) -> (RealQuaternion, RealPoint3d) {
+    let node = &nodes[index];
+    if node.parent < 0 || node.parent as usize >= index {
+        return (node.rotation, node.translation);
+    }
+    let parent = &nodes[node.parent as usize];
+    let inverse = parent.rotation.conjugate();
+    let offset = inverse.rotate(node.translation - parent.translation);
+    (inverse * node.rotation, RealPoint3d { x: offset.i, y: offset.j, z: offset.k })
 }
 
 fn chain_local_to_world(local: &[JmsNode]) -> Vec<JmsNode> {
