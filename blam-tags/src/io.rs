@@ -226,16 +226,79 @@ pub(crate) fn end_tag_chunk(out: &mut [u8], start: usize) -> u32 {
 
 /// Read a version-0 chunk whose payload is carried verbatim, checking its
 /// signature (`expected_sig`) and version, and return the payload.
+///
+/// `end` is the offset the payload must finish by — the end of the enclosing
+/// chunk, or of the input — so a size field larger than what is left is an
+/// error rather than an allocation.
 pub(crate) fn read_leaf_chunk<R: Read + Seek>(
     reader: &mut std::io::BufReader<R>,
     expected_sig: [u8; 4],
     chunk: &'static str,
     endian: Endian,
+    end: u64,
 ) -> Result<Vec<u8>, TagReadError> {
     let header = read_validated_chunk_header(reader, expected_sig, chunk, endian)?;
-    let mut content = vec![0u8; header.size as usize];
+    read_bounded_bytes(reader, header.size as u64, end, chunk)
+}
+
+/// Fail with [`TagReadError::SizeExceedsInput`] unless `size` bytes fit
+/// between the reader's position and `end`. Every count or size read from a
+/// file passes through here (or [`bounded_capacity`]) before anything is
+/// allocated for it: a tiny file can claim gigabytes, and an allocation that
+/// large aborts the process instead of returning an error.
+pub(crate) fn ensure_available<R: Seek>(
+    reader: &mut R,
+    size: u64,
+    end: u64,
+    chunk: &'static str,
+) -> Result<(), TagReadError> {
+    let available = end.saturating_sub(reader.stream_position()?);
+    if size > available {
+        return Err(TagReadError::SizeExceedsInput { chunk, size, available });
+    }
+    Ok(())
+}
+
+/// Read `size` bytes, after checking with [`ensure_available`] that they are
+/// there.
+pub(crate) fn read_bounded_bytes<R: Read + Seek>(
+    reader: &mut R,
+    size: u64,
+    end: u64,
+    chunk: &'static str,
+) -> Result<Vec<u8>, TagReadError> {
+    ensure_available(reader, size, end, chunk)?;
+    let mut content = vec![0u8; size as usize];
     reader.read_exact(&mut content)?;
     Ok(content)
+}
+
+/// The end offset of a chunk whose payload starts at `start` and runs
+/// `size` bytes, checked to lie within `end` (the enclosing chunk's end or
+/// the input's).
+pub(crate) fn bounded_chunk_end(
+    start: u64,
+    size: u32,
+    end: u64,
+    chunk: &'static str,
+) -> Result<u64, TagReadError> {
+    let chunk_end = start + size as u64;
+    if chunk_end > end {
+        return Err(TagReadError::SizeExceedsInput {
+            chunk,
+            size: size as u64,
+            available: end.saturating_sub(start),
+        });
+    }
+    Ok(chunk_end)
+}
+
+/// The length of everything `reader` holds, leaving it at offset 0.
+pub(crate) fn stream_len<R: Seek>(reader: &mut R) -> io::Result<u64> {
+    let position = reader.stream_position()?;
+    let len = reader.seek(io::SeekFrom::End(0))?;
+    reader.seek(io::SeekFrom::Start(position))?;
+    Ok(len)
 }
 
 //================================================================================

@@ -49,9 +49,14 @@ fn truncated_tag_surfaces_io_error() {
     // payload.
     let truncated = &bytes[..bytes.len() / 2];
     let err = TagFile::read_from_bytes(truncated).expect_err("truncated tag must error");
+    // A chunk whose declared size runs past the cut is caught before its
+    // bytes are read, as SizeExceedsInput.
     assert!(
-        matches!(err, TagReadError::Io(_) | TagReadError::ChunkSizeMismatch { .. }),
-        "expected Io or ChunkSizeMismatch, got {err:?}",
+        matches!(
+            err,
+            TagReadError::Io(_) | TagReadError::ChunkSizeMismatch { .. } | TagReadError::SizeExceedsInput { .. }
+        ),
+        "expected Io, ChunkSizeMismatch or SizeExceedsInput, got {err:?}",
     );
 }
 

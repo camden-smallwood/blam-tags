@@ -157,6 +157,38 @@ pub enum TagReadError {
     UnexpectedEof {
         chunk: &'static str,
     },
+
+    /// A size or count in the file asks for more bytes than are left in the
+    /// enclosing chunk or the input. Checked before allocating, so a small
+    /// malformed file cannot request gigabytes.
+    SizeExceedsInput {
+        chunk: &'static str,
+        /// Bytes the file asked for.
+        size: u64,
+        /// Bytes actually left.
+        available: u64,
+    },
+
+    /// The tag's `blay` layout is internally inconsistent: an index past the
+    /// end of its table, a struct with no terminator, a struct that contains
+    /// itself, nesting deeper than any real layout, or a size that overflows.
+    /// Reading the data through it would index out of bounds or recurse
+    /// without end, so it is refused as a whole.
+    InvalidLayout {
+        /// What is wrong, naming the struct, field or table.
+        reason: String,
+    },
+
+    /// Blocks nest deeper than the reader follows. No shipped layout nests
+    /// structs, arrays and blocks more than nine deep; this limit is far
+    /// above that and keeps a crafted file from exhausting the stack.
+    NestingTooDeep {
+        limit: u32,
+    },
+
+    /// The main `tag!` stream's root block has no element, so the tag has no
+    /// root struct to read.
+    EmptyRootBlock,
 }
 
 impl fmt::Display for TagReadError {
@@ -224,6 +256,15 @@ impl fmt::Display for TagReadError {
             Self::UnexpectedEof { chunk } => {
                 write!(f, "unexpected EOF while reading {chunk:?} chunk")
             }
+            Self::SizeExceedsInput { chunk, size, available } => write!(
+                f,
+                "{chunk:?} asks for {size} bytes but only {available} are left",
+            ),
+            Self::InvalidLayout { reason } => write!(f, "invalid tag layout: {reason}"),
+            Self::NestingTooDeep { limit } => {
+                write!(f, "blocks nest more than {limit} deep")
+            }
+            Self::EmptyRootBlock => f.write_str("the tag's root block has no element"),
         }
     }
 }

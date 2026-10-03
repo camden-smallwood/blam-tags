@@ -276,6 +276,26 @@ pub struct TagTemplateHole {
     pub size: u32,
 }
 
+/// How deep [`TagLayout::read`] lets struct and array fields nest. No shipped
+/// layout of any game nests structs, arrays and blocks together more than
+/// nine deep (measured over every `definitions/` game); a deeper one is a
+/// crafted or corrupt file, and following it would recurse until the stack
+/// overflows, which aborts the process.
+pub const MAX_STRUCT_NESTING: u32 = 64;
+
+/// How many struct instances one struct may expand to — itself, its nested
+/// structs and every array element — in a layout [`TagLayout::read`] accepts.
+/// The largest in any shipped game is 699 (Halo 4 `globals`). Each instance is
+/// built for every element read, so this bounds what one element can cost.
+pub const MAX_STRUCT_INSTANCES: u64 = 1 << 14;
+
+#[derive(Clone, Copy)]
+enum Measure {
+    Unvisited,
+    InProgress,
+    Done(u64, u64),
+}
+
 impl TagLayout {
     /// The template hole at `field_index`, if that field is one.
     pub fn template_hole(&self, field_index: usize) -> Option<&TagTemplateHole> {
@@ -394,9 +414,23 @@ impl TagLayout {
     /// After parsing all records, resolves each field's
     /// [`TagFieldType`] and computes the size/offset of every struct
     /// so the data-layer parsing can dispatch cheaply.
+    ///
+    /// The layout is validated before it is used (see
+    /// [`TagReadError::InvalidLayout`]), and no table is allocated for more
+    /// entries than the input has bytes left to hold.
     pub fn read<R: Seek + Read>(
         reader: &mut std::io::BufReader<R>,
         endian: Endian,
+    ) -> Result<Self, TagReadError> {
+        let end = stream_len(reader)?;
+        Self::read_within(reader, endian, end)
+    }
+
+    /// [`Self::read`], with the input known to end at offset `end`.
+    pub(crate) fn read_within<R: Seek + Read>(
+        reader: &mut std::io::BufReader<R>,
+        endian: Endian,
+        end: u64,
     ) -> Result<Self, TagReadError> {
         //================================================================================
         // Outer blay chunk header + 24-byte payload header.
@@ -412,6 +446,9 @@ impl TagLayout {
             read_expected_chunk_header(reader, u32::from_be_bytes(*b"blay"), 2, "blay", endian)?;
 
         let blay_offset = reader.stream_position()?;
+        // Every table below lies inside the blay chunk, so nothing may claim
+        // more bytes than it has left.
+        let blay_end = bounded_chunk_end(blay_offset, blay_header.size, end, "blay")?;
 
         let root_data_size = read_u32(reader, endian)?;
         let guid = read_guid(reader, endian)?;
@@ -422,7 +459,7 @@ impl TagLayout {
             return Err(TagReadError::UnsupportedLayoutVersion(block_layout_version));
         }
 
-        let mut string_data;
+        let string_data;
         let mut string_offsets;
         let mut string_lists;
         let mut custom_block_index_search_names_offsets;
@@ -491,8 +528,7 @@ impl TagLayout {
             }
         }
 
-        string_data = vec![0u8; header.string_data_size as _];
-        reader.read_exact(string_data.as_mut_slice())?;
+        string_data = read_bounded_bytes(reader, header.string_data_size as u64, blay_end, "str*")?;
 
         //================================================================================
         // Read the string offsets
@@ -508,6 +544,7 @@ impl TagLayout {
             )?;
         }
 
+        ensure_available(reader, header.string_offset_count as u64 * 4, blay_end, "sz+x")?;
         string_offsets = vec![0; header.string_offset_count as usize];
 
         for slot in &mut string_offsets {
@@ -523,6 +560,7 @@ impl TagLayout {
             check_count_matches_size("sz[]", header.string_list_count, string_lists_header.size, 12)?;
         }
 
+        ensure_available(reader, header.string_list_count as u64 * 12, blay_end, "sz[]")?;
         string_lists = Vec::with_capacity(header.string_list_count as usize);
 
         for _ in 0..header.string_list_count {
@@ -547,6 +585,7 @@ impl TagLayout {
             )?;
         }
 
+        ensure_available(reader, header.custom_block_index_search_names_count as u64 * 4, blay_end, "csbn")?;
         custom_block_index_search_names_offsets = Vec::with_capacity(header.custom_block_index_search_names_count as usize);
 
         for _ in 0..header.custom_block_index_search_names_count {
@@ -567,6 +606,7 @@ impl TagLayout {
             )?;
         }
 
+        ensure_available(reader, header.data_definition_name_count as u64 * 4, blay_end, "dtnm")?;
         data_definition_name_offsets = vec![0; header.data_definition_name_count as usize];
 
         for slot in &mut data_definition_name_offsets {
@@ -582,6 +622,7 @@ impl TagLayout {
             check_count_matches_size("arr!", header.array_layout_count, arr_header.size, 12)?;
         }
 
+        ensure_available(reader, header.array_layout_count as u64 * 12, blay_end, "arr!")?;
         array_layouts = Vec::with_capacity(header.array_layout_count as usize);
 
         for _ in 0..header.array_layout_count {
@@ -601,6 +642,7 @@ impl TagLayout {
             check_count_matches_size("tgft", header.field_type_count, tgft_header.size, 12)?;
         }
 
+        ensure_available(reader, header.field_type_count as u64 * 12, blay_end, "tgft")?;
         field_types = Vec::with_capacity(header.field_type_count as usize);
 
         for _ in 0..header.field_type_count {
@@ -620,6 +662,7 @@ impl TagLayout {
             check_count_matches_size("gras", header.field_count, gras_header.size, 12)?;
         }
 
+        ensure_available(reader, header.field_count as u64 * 12, blay_end, "gras")?;
         field_layouts = Vec::with_capacity(header.field_count as usize);
 
         for _ in 0..header.field_count {
@@ -637,6 +680,7 @@ impl TagLayout {
             // Read the aggregate definitions
             //================================================================================
 
+            ensure_available(reader, header.aggregate_layout_count as u64 * 28, blay_end, "agro")?;
             block_layouts = Vec::with_capacity(header.aggregate_layout_count as usize);
             struct_layouts = Vec::with_capacity(header.aggregate_layout_count as usize);
 
@@ -677,6 +721,7 @@ impl TagLayout {
             let block_layout_header = read_validated_chunk_header(reader, *b"blv2", "blv2", endian)?;
             check_count_matches_size("blv2", header.block_layout_count, block_layout_header.size, 12)?;
 
+            ensure_available(reader, header.block_layout_count as u64 * 12, blay_end, "blv2")?;
             block_layouts = Vec::with_capacity(header.block_layout_count as usize);
 
             for i in 0..header.block_layout_count {
@@ -695,6 +740,7 @@ impl TagLayout {
             let rcv2_header = read_validated_chunk_header(reader, *b"rcv2", "rcv2", endian)?;
             check_count_matches_size("rcv2", header.resource_layout_count, rcv2_header.size, 12)?;
 
+            ensure_available(reader, header.resource_layout_count as u64 * 12, blay_end, "rcv2")?;
             resource_layouts = Vec::with_capacity(header.resource_layout_count as usize);
 
             for _ in 0..header.resource_layout_count {
@@ -715,6 +761,7 @@ impl TagLayout {
                 let interop_header = read_validated_chunk_header(reader, *b"]==[", "]==[", endian)?;
                 check_count_matches_size("]==[", header.interop_layout_count, interop_header.size, 24)?;
 
+                ensure_available(reader, header.interop_layout_count as u64 * 24, blay_end, "]==[")?;
                 interop_layouts.reserve(header.interop_layout_count as usize);
 
                 for _ in 0..header.interop_layout_count {
@@ -747,6 +794,7 @@ impl TagLayout {
                 struct_record_size,
             )?;
 
+            ensure_available(reader, header.struct_layout_count as u64 * struct_record_size as u64, blay_end, struct_chunk_name)?;
             struct_layouts = Vec::with_capacity(header.struct_layout_count as usize);
 
             for i in 0..header.struct_layout_count {
@@ -774,6 +822,7 @@ impl TagLayout {
         }
 
         check_chunk_end(reader, "blay", blay_offset, blay_header.size)?;
+        let _ = blay_end;
 
         let mut result = Self {
             root_data_size,
@@ -807,6 +856,17 @@ impl TagLayout {
         // string_data and comparing strings for every field read.
         //================================================================================
 
+        for (i, field) in result.fields.iter().enumerate() {
+            if field.type_index as usize >= result.field_types.len() {
+                return Err(TagReadError::InvalidLayout {
+                    reason: format!(
+                        "field {i} has type {} of {}",
+                        field.type_index,
+                        result.field_types.len()
+                    ),
+                });
+            }
+        }
         for i in 0..result.fields.len() {
             let type_name_offset = result.field_types[result.fields[i].type_index as usize].name_offset;
             let name = result.get_string(type_name_offset).ok_or(TagReadError::InvalidUtf8 {
@@ -815,11 +875,142 @@ impl TagLayout {
             result.fields[i].field_type = TagFieldType::from_name(name);
         }
 
+        // `compute_struct_layout` and the data reader index these tables
+        // unchecked and recurse through nested structs; check the layout can
+        // take that first.
+        result.validate()?;
+
         for i in 0..result.struct_layouts.len() {
             result.compute_struct_layout(i);
         }
 
         Ok(result)
+    }
+
+    /// Check that a layout read from a file can be walked: every index in
+    /// bounds, every struct terminated, no struct containing itself (through
+    /// struct or array fields), nesting no deeper than [`MAX_STRUCT_NESTING`],
+    /// sizes that fit a `u32`, at most [`MAX_STRUCT_INSTANCES`] structs per
+    /// struct, and no array of zero-size elements. Field types must already
+    /// be resolved and every `type_index` in bounds.
+    fn validate(&self) -> Result<(), TagReadError> {
+        let invalid = |reason: String| TagReadError::InvalidLayout { reason };
+        let structs = self.struct_layouts.len();
+
+        let root = self.header.tag_group_block_index as usize;
+        if root >= self.block_layouts.len() {
+            return Err(invalid(format!(
+                "root block {root} of {}",
+                self.block_layouts.len()
+            )));
+        }
+        for (i, block) in self.block_layouts.iter().enumerate() {
+            if block.struct_index as usize >= structs {
+                return Err(invalid(format!("block {i} has struct {} of {structs}", block.struct_index)));
+            }
+        }
+        for (i, array) in self.array_layouts.iter().enumerate() {
+            if array.struct_index as usize >= structs {
+                return Err(invalid(format!("array {i} has struct {} of {structs}", array.struct_index)));
+            }
+        }
+
+        // Where each field's run ends: the index of the first terminator at
+        // or after it. One backward pass, so a crafted layout of many structs
+        // sharing one long unterminated run costs linear time, not quadratic.
+        let mut next_terminator = vec![usize::MAX; self.fields.len() + 1];
+        for i in (0..self.fields.len()).rev() {
+            next_terminator[i] = if self.fields[i].field_type == TagFieldType::Terminator {
+                i
+            } else {
+                next_terminator[i + 1]
+            };
+        }
+        let mut checked = vec![false; self.fields.len()];
+        for (s, layout) in self.struct_layouts.iter().enumerate() {
+            let first = layout.first_field_index as usize;
+            if first >= self.fields.len() || next_terminator[first] == usize::MAX {
+                return Err(invalid(format!("struct {s} has no terminator")));
+            }
+            for i in first..next_terminator[first] {
+                if std::mem::replace(&mut checked[i], true) {
+                    continue;
+                }
+                let field = &self.fields[i];
+                let (table, len) = match field.field_type {
+                    TagFieldType::Struct => ("struct_layouts", structs),
+                    TagFieldType::Array => ("array_layouts", self.array_layouts.len()),
+                    TagFieldType::Block => ("block_layouts", self.block_layouts.len()),
+                    _ => continue,
+                };
+                if field.definition as usize >= len {
+                    return Err(invalid(format!(
+                        "field {i} names {table} entry {} of {len}",
+                        field.definition
+                    )));
+                }
+            }
+        }
+
+        let mut state = vec![Measure::Unvisited; structs];
+        for s in 0..structs {
+            self.measure_struct(s, 0, &mut state, &next_terminator)?;
+        }
+        Ok(())
+    }
+
+    /// The byte size and the number of struct instances (itself, its nested
+    /// structs, and every array element) of struct `s`, for [`Self::validate`].
+    fn measure_struct(
+        &self,
+        s: usize,
+        depth: u32,
+        state: &mut [Measure],
+        next_terminator: &[usize],
+    ) -> Result<(u64, u64), TagReadError> {
+        let invalid = |reason: String| TagReadError::InvalidLayout { reason };
+        match state[s] {
+            Measure::Done(size, instances) => return Ok((size, instances)),
+            Measure::InProgress => return Err(invalid(format!("struct {s} contains itself"))),
+            Measure::Unvisited => {}
+        }
+        if depth > MAX_STRUCT_NESTING {
+            return Err(invalid(format!("structs nest more than {MAX_STRUCT_NESTING} deep at struct {s}")));
+        }
+        state[s] = Measure::InProgress;
+        let overflow = || invalid(format!("struct {s} is too large"));
+        let mut size = 0u64;
+        let mut instances = 1u64;
+        let first = self.struct_layouts[s].first_field_index as usize;
+        for field in &self.fields[first..next_terminator[first]] {
+            let (field_size, field_instances) = match field.field_type {
+                TagFieldType::Struct => {
+                    self.measure_struct(field.definition as usize, depth + 1, state, next_terminator)?
+                }
+                TagFieldType::Array => {
+                    let array = self.array_layouts[field.definition as usize];
+                    let (element_size, element_instances) =
+                        self.measure_struct(array.struct_index as usize, depth + 1, state, next_terminator)?;
+                    if element_size == 0 && array.count != 0 {
+                        return Err(invalid(format!("struct {s} has an array of zero-size elements")));
+                    }
+                    let count = array.count as u64;
+                    (
+                        element_size.checked_mul(count).ok_or_else(overflow)?,
+                        element_instances.checked_mul(count).ok_or_else(overflow)?,
+                    )
+                }
+                TagFieldType::Pad | TagFieldType::Skip | TagFieldType::Custom => (field.definition as u64, 0),
+                _ => (self.field_types[field.type_index as usize].size as u64, 0),
+            };
+            size = size.checked_add(field_size).ok_or_else(overflow)?;
+            instances = instances.checked_add(field_instances).ok_or_else(overflow)?;
+        }
+        if size > u32::MAX as u64 || instances > MAX_STRUCT_INSTANCES {
+            return Err(overflow());
+        }
+        state[s] = Measure::Done(size, instances);
+        Ok((size, instances))
     }
 
     /// Write this layout as a `blay` chunk. Mirrors [`TagLayout::read`]:

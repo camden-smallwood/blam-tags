@@ -147,6 +147,9 @@ pub enum ClassicError {
     /// header — caught here so a single tag fails cleanly instead of
     /// driving `Vec::with_capacity(count)` into a multi-gigabyte alloc.
     CorruptBlockHeader { count: usize, elem_size: usize },
+    /// A Halo 2 tag whose root block header declares no element, so there is
+    /// no root struct to read.
+    EmptyRootBlock,
 }
 
 impl std::fmt::Display for ClassicError {
@@ -154,6 +157,7 @@ impl std::fmt::Display for ClassicError {
         match self {
             ClassicError::ShortHeader => write!(f, "file shorter than 64-byte classic header"),
             ClassicError::NotClassic => write!(f, "not a classic (CE/H2) tag header"),
+            ClassicError::EmptyRootBlock => write!(f, "the tag's root block has no element"),
             ClassicError::UnexpectedEof { context, need, have } => {
                 write!(f, "unexpected EOF reading {context}: need {need} bytes, have {have}")
             }
@@ -552,6 +556,10 @@ pub fn read_classic_tag_file(bytes: &[u8], mut layout: TagLayout) -> Result<TagF
     adjust_layout_for_engine(&mut layout, engine);
     let body = &bytes[64..];
     let root = read_classic_body(body, &layout, engine)?;
+    // `TagFile::root()` hands out the first root element.
+    if root.elements.is_empty() {
+        return Err(ClassicError::EmptyRootBlock);
+    }
 
     let file_header = TagFileHeader {
         pad: [0u8; 36],
@@ -1277,6 +1285,34 @@ fn encode_struct_trailing(
 #[cfg(test)]
 mod tests {
     use super::classic_checksum;
+
+    /// A Halo 2 tag whose root block header declares no element reads to
+    /// a tag with no root struct, which `TagFile::root()` would panic on.
+    #[test]
+    fn an_empty_halo_2_root_block_is_refused() {
+        let layout = crate::TagLayout::from_json("../definitions/halo2_mcc/sound_mix.json")
+            .expect("H2 sound_mix layout");
+        let mut bytes = vec![0u8; 64];
+        bytes[36..40].copy_from_slice(b"xim!"); // `!mix`, stored reversed
+        bytes[60..64].copy_from_slice(b"!MLB"); // `BLM!`, stored reversed
+        // Root block header: 4cc, version, count 0, element size.
+        bytes.extend_from_slice(b"dfbt");
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+
+        let result = super::read_classic_tag_file(&bytes, layout.clone());
+        assert!(matches!(result, Err(super::ClassicError::EmptyRootBlock)), "{:?}", result.err());
+
+        // The same header with one (zeroed) element reads.
+        let root = layout.block_layouts[layout.header.tag_group_block_index as usize].struct_index as usize;
+        let size = layout.struct_layouts[root].size;
+        bytes[64 + 8..64 + 12].copy_from_slice(&1u32.to_le_bytes());
+        bytes[64 + 12..64 + 16].copy_from_slice(&(size as u32).to_le_bytes());
+        bytes.resize(bytes.len() + size, 0);
+        let tag = super::read_classic_tag_file(&bytes, layout).expect("one element");
+        let _ = tag.root();
+    }
 
     /// A `LAMB` tag stores every `old_string_id` as 32 inline bytes, not the
     /// modern 4-byte slot, so each one shifts everything after it by 28. The

@@ -326,7 +326,7 @@ impl TagFile {
             reader.seek(SeekFrom::Start(chunk_header_offset))?;
             match &chunk_signature.to_be_bytes() {
                 b"want" => {
-                    let stream = TagStream::read(chunk_signature, &mut reader, endian)?;
+                    let stream = TagStream::read(chunk_signature, &mut reader, endian, tag_file_size)?;
                     let Some(root) = crate::api::stream_root(&stream) else {
                         return Ok(Some(Vec::new()));
                     };
@@ -375,7 +375,12 @@ impl TagFile {
         let header = TagFileHeader::read(&mut reader, endian)?;
 
         // The 'tag!' chunk contains the tag stream
-        let tag_stream = TagStream::read(u32::from_be_bytes(*b"tag!"), &mut reader, endian)?;
+        let tag_stream = TagStream::read(u32::from_be_bytes(*b"tag!"), &mut reader, endian, tag_file_size)?;
+        // `root()` hands out the root block's first element; a tag without
+        // one is refused here rather than panicking there.
+        if tag_stream.data.elements.is_empty() {
+            return Err(TagReadError::EmptyRootBlock);
+        }
 
         let mut dependency_list_stream = None;
         let mut import_info_stream = None;
@@ -392,21 +397,21 @@ impl TagFile {
                     if dependency_list_stream.is_some() {
                         return Err(TagReadError::DuplicateOptionalStream { signature: *b"want" });
                     }
-                    dependency_list_stream = Some(TagStream::read(chunk_signature, &mut reader, endian)?);
+                    dependency_list_stream = Some(TagStream::read(chunk_signature, &mut reader, endian, tag_file_size)?);
                 }
 
                 b"info" => {
                     if import_info_stream.is_some() {
                         return Err(TagReadError::DuplicateOptionalStream { signature: *b"info" });
                     }
-                    import_info_stream = Some(TagStream::read(chunk_signature, &mut reader, endian)?);
+                    import_info_stream = Some(TagStream::read(chunk_signature, &mut reader, endian, tag_file_size)?);
                 }
 
                 b"assd" => {
                     if asset_depot_storage_stream.is_some() {
                         return Err(TagReadError::DuplicateOptionalStream { signature: *b"assd" });
                     }
-                    asset_depot_storage_stream = Some(TagStream::read(chunk_signature, &mut reader, endian)?);
+                    asset_depot_storage_stream = Some(TagStream::read(chunk_signature, &mut reader, endian, tag_file_size)?);
                 }
 
                 signature => {

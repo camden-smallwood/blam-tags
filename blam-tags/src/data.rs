@@ -538,17 +538,40 @@ mod dirty_tests {
     }
 }
 
+/// How many blocks deep [`TagBlockData::read`] follows a tag. No shipped
+/// layout nests structs, arrays and blocks more than nine deep in all.
+pub(crate) const MAX_BLOCK_NESTING: u32 = 64;
+
 impl TagStructData {
+    /// This struct plus every struct and array element nested in it (not
+    /// counting block elements, which are read rather than built).
+    fn instance_count(&self) -> u64 {
+        1 + self
+            .sub_chunks
+            .iter()
+            .map(|entry| match &entry.content {
+                TagSubChunkContent::Struct(nested) => nested.instance_count(),
+                TagSubChunkContent::Array(elements) => elements.iter().map(Self::instance_count).sum(),
+                _ => 0,
+            })
+            .sum::<u64>()
+    }
+
     /// Parse a `tgst` chunk.
     ///
     /// This method parses only the `tgst` header and its sub-chunks
     /// from `reader`; the raw bytes themselves stay in the enclosing
     /// block's `raw_data`.
+    ///
+    /// `end` is where the enclosing chunk ends and `depth` how many blocks
+    /// enclose this struct (see [`TagBlockData::read`]).
     pub(crate) fn read<R: Seek + Read>(
         layout: &TagLayout,
         definition: &TagStructLayout,
         reader: &mut std::io::BufReader<R>,
         endian: Endian,
+        end: u64,
+        depth: u32,
     ) -> Result<Self, TagReadError> {
         let tag_struct_header_offset = reader.stream_position()?;
         let tag_struct_header = read_chunk_header(reader, endian)?;
@@ -572,9 +595,11 @@ impl TagStructData {
             });
         }
 
+        let tag_struct_end = bounded_chunk_end(tag_struct_offset, tag_struct_header.size, end, "tgst")?;
+
         // tgst with size=0 is a null struct: no sub-chunks follow.
         let sub_chunks = if tag_struct_header.size != 0 {
-            let mut sub_chunks = read_sub_chunks(layout, definition, reader, endian)?;
+            let mut sub_chunks = read_sub_chunks(layout, definition, reader, endian, tag_struct_end, depth)?;
 
             // Trailing empty-tgst absorb: the chunk of a zero-byte
             // struct the layout dropped (see `absorb_empty_tgsts`)
@@ -1018,6 +1043,8 @@ fn read_sub_chunks<R: Seek + Read>(
     definition: &TagStructLayout,
     reader: &mut std::io::BufReader<R>,
     endian: Endian,
+    end: u64,
+    depth: u32,
 ) -> Result<Vec<TagSubChunkEntry>, TagReadError> {
     let mut sub_chunks = Vec::new();
     let mut field_index = definition.first_field_index as usize;
@@ -1041,7 +1068,7 @@ fn read_sub_chunks<R: Seek + Read>(
                     absorb_empty_tgsts(reader, endian, &mut sub_chunks)?;
                 }
 
-                let nested = TagStructData::read(layout, nested_definition, reader, endian)?;
+                let nested = TagStructData::read(layout, nested_definition, reader, endian, end, depth)?;
 
                 sub_chunks.push(TagSubChunkEntry {
                     field_index: Some(field_index as u32),
@@ -1056,7 +1083,8 @@ fn read_sub_chunks<R: Seek + Read>(
                 let mut elements = Vec::with_capacity(array_layout.count as usize);
 
                 for _ in 0..array_layout.count as usize {
-                    let element_sub_chunks = read_sub_chunks(layout, element_definition, reader, endian)?;
+                    let element_sub_chunks =
+                        read_sub_chunks(layout, element_definition, reader, endian, end, depth)?;
 
                     elements.push(TagStructData {
                         struct_index: element_definition.index,
@@ -1074,7 +1102,7 @@ fn read_sub_chunks<R: Seek + Read>(
             TagFieldType::Block => {
                 absorb_empty_tgsts(reader, endian, &mut sub_chunks)?;
                 let block_layout = &layout.block_layouts[field.definition as usize];
-                let block_data = TagBlockData::read(layout, block_layout, reader, endian)?;
+                let block_data = TagBlockData::read(layout, block_layout, reader, endian, end, depth + 1)?;
 
                 sub_chunks.push(TagSubChunkEntry {
                     field_index: Some(field_index as u32),
@@ -1092,7 +1120,7 @@ fn read_sub_chunks<R: Seek + Read>(
                     leaf_chunk(field.field_type).expect("a leaf field type");
                 sub_chunks.push(TagSubChunkEntry {
                     field_index: Some(field_index as u32),
-                    content: content(read_leaf_chunk(reader, signature, chunk, endian)?),
+                    content: content(read_leaf_chunk(reader, signature, chunk, endian, end)?),
                 });
             }
 
@@ -1121,6 +1149,8 @@ fn read_sub_chunks<R: Seek + Read>(
                 absorb_empty_tgsts(reader, endian, &mut sub_chunks)?;
                 let outer_header = read_chunk_header(reader, endian)?;
                 let outer_content_offset = reader.stream_position()?;
+                let outer_end =
+                    bounded_chunk_end(outer_content_offset, outer_header.size, end, "pageable resource")?;
 
                 let resource = match &outer_header.signature.to_be_bytes() {
                     b"tg\0c" => {
@@ -1143,14 +1173,15 @@ fn read_sub_chunks<R: Seek + Read>(
 
                         let tgdt_header = read_validated_chunk_header(reader, *b"tgdt", "tgdt", endian)?;
 
-                        let mut exploded = vec![0u8; tgdt_header.size as usize];
-                        reader.read_exact(&mut exploded)?;
+                        let exploded = read_bounded_bytes(reader, tgdt_header.size as u64, outer_end, "tgdt")?;
 
                         let struct_data = TagStructData::read(
                             layout,
                             resource_struct_definition,
                             reader,
                             endian,
+                            outer_end,
+                            depth,
                         )?;
 
                         TagResourceChunk::Exploded {
@@ -1167,8 +1198,7 @@ fn read_sub_chunks<R: Seek + Read>(
                         // bytes and the version so the monolithic
                         // hydration pass can pick the right xsync
                         // state shape downstream.
-                        let mut payload = vec![0u8; outer_header.size as usize];
-                        reader.read_exact(&mut payload)?;
+                        let payload = read_bounded_bytes(reader, outer_header.size as u64, outer_end, "tgxc")?;
                         TagResourceChunk::Xsync { version: outer_header.version, payload }
                     }
 
@@ -1365,14 +1395,25 @@ pub(crate) struct TagBlockData {
 impl TagBlockData {
     /// Parse a `tgbl` chunk. Complex vs simple shape is decided by
     /// `flags` bit 0.
+    ///
+    /// The layout must have passed [`TagLayout::read`]'s validation. `end`
+    /// is where the enclosing chunk ends: nothing in this block may claim
+    /// bytes past it. `depth` counts the blocks enclosing this one; past
+    /// [`MAX_BLOCK_NESTING`] the read fails rather than recursing on.
     pub(crate) fn read<R: Seek + Read>(
         layout: &TagLayout,
         definition: &TagBlockLayout,
         reader: &mut std::io::BufReader<R>,
         endian: Endian,
+        end: u64,
+        depth: u32,
     ) -> Result<Self, TagReadError> {
+        if depth > MAX_BLOCK_NESTING {
+            return Err(TagReadError::NestingTooDeep { limit: MAX_BLOCK_NESTING });
+        }
         let tag_block_header = read_validated_chunk_header(reader, *b"tgbl", "tgbl", endian)?;
         let tag_block_offset = reader.stream_position()?;
+        let tag_block_end = bounded_chunk_end(tag_block_offset, tag_block_header.size, end, "tgbl")?;
 
         let block_element_count = read_u32(reader, endian)?;
         let block_flags = read_u32(reader, endian)?;
@@ -1380,15 +1421,22 @@ impl TagBlockData {
         let struct_layout = &layout.struct_layouts[definition.struct_index as usize];
         let element_size = struct_layout.size;
 
-        let mut raw_data = vec![0u8; element_size * block_element_count as usize];
-        reader.read_exact(&mut raw_data)?;
+        // A validated struct size fits a u32, so this cannot overflow.
+        let raw_size = element_size as u64 * block_element_count as u64;
+        let raw_data = read_bounded_bytes(reader, raw_size, tag_block_end, "tgbl")?;
 
-        let mut elements = Vec::with_capacity(block_element_count as usize);
+        let complex = (block_flags & 1) == 0;
+        if complex {
+            // Each element is at least a 12-byte tgst header.
+            ensure_available(reader, block_element_count as u64 * 12, tag_block_end, "tgbl")?;
+        }
+        let mut elements = Vec::new();
 
-        if (block_flags & 1) == 0 {
+        if complex {
             // Complex block: per-element tgst sub-chunks.
+            elements.reserve(block_element_count as usize);
             for _ in 0..block_element_count {
-                elements.push(TagStructData::read(layout, struct_layout, reader, endian)?);
+                elements.push(TagStructData::read(layout, struct_layout, reader, endian, tag_block_end, depth)?);
             }
         } else {
             // Simple block: raw bytes only, no per-element tgst on disk.
@@ -1402,6 +1450,15 @@ impl TagBlockData {
             if block_element_count > 0 {
                 let scaffold =
                     TagStructData::new_default(layout, struct_layout.index as usize, endian);
+                // These elements are built, not read, so their bytes do not
+                // bound them: a zero-size struct costs nothing on disk. Hold
+                // each struct instance to at least one byte of the element
+                // data or of what is left of the input.
+                let instances = block_element_count as u64 * scaffold.instance_count();
+                let budget = raw_size + end.saturating_sub(reader.stream_position()?);
+                if instances > budget {
+                    return Err(TagReadError::SizeExceedsInput { chunk: "tgbl", size: instances, available: budget });
+                }
                 elements.resize(block_element_count as usize, scaffold);
             }
         }
@@ -1880,7 +1937,8 @@ mod orphan_empty_tgst_tests {
                 spliced.extend_from_slice(&clean);
 
                 let mut reader = std::io::BufReader::new(std::io::Cursor::new(&spliced));
-                let read = read_sub_chunks(&layout, &layout.struct_layouts[struct_index], &mut reader, Endian::Le)
+                let end = spliced.len() as u64;
+                let read = read_sub_chunks(&layout, &layout.struct_layouts[struct_index], &mut reader, Endian::Le, end, 0)
                     .unwrap_or_else(|e| panic!("{group} struct {struct_index} ({kind:?} first): {e}"));
                 assert!(
                     matches!(read[0].content, TagSubChunkContent::EmptyPlaceholder) && read[0].field_index.is_none(),

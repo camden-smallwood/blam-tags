@@ -31,10 +31,14 @@ impl TagStream {
     /// Read a stream chunk. Caller supplies the expected outer signature
     /// (`b"tag!"`, `b"want"`, `b"info"`, or `b"assd"`); the function
     /// validates it and parses the `blay` + `bdat` body.
+    ///
+    /// `end` is the length of the input: no chunk inside may claim bytes
+    /// past it.
     pub(crate) fn read<R: Seek + Read>(
         chunk_signature: u32,
         reader: &mut std::io::BufReader<R>,
         endian: Endian,
+        end: u64,
     ) -> Result<Self, TagReadError> {
         // Outer chunk: one of tag!/want/info/assd. Errors name it "tag
         // stream" since the dynamic name can't be a `&'static str`.
@@ -45,7 +49,7 @@ impl TagStream {
         // Now we're inside the chunk, read the 'blay' chunk
         //
 
-        let layout = TagLayout::read(reader, endian)?;
+        let layout = TagLayout::read_within(reader, endian, end)?;
         let root_block_layout = &layout.block_layouts[layout.header.tag_group_block_index as usize];
 
         // The 'bdat' chunk — version 1, not 0.
@@ -53,7 +57,8 @@ impl TagStream {
             read_expected_chunk_header(reader, u32::from_be_bytes(*b"bdat"), 1, "bdat", endian)?;
         let block_data_offset = reader.stream_position()?;
 
-        let tag_block_data = TagBlockData::read(&layout, root_block_layout, reader, endian)?;
+        let block_data_end = bounded_chunk_end(block_data_offset, block_data_header.size, end, "bdat")?;
+        let tag_block_data = TagBlockData::read(&layout, root_block_layout, reader, endian, block_data_end, 0)?;
 
         check_chunk_end(reader, "bdat", block_data_offset, block_data_header.size)?;
 
