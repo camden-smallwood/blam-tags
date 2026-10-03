@@ -525,6 +525,9 @@ fn merge_parent_schemas(schema: &mut TagSchema, defs_dir: &Path) {
         for (k, v) in parent_schema.interops {
             schema.interops.entry(k).or_insert(v);
         }
+        for (k, v) in parent_schema.struct_versions {
+            schema.struct_versions.entry(k).or_insert(v);
+        }
 
         current_parent = parent_schema.parent_tag;
     }
