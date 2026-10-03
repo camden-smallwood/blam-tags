@@ -965,7 +965,7 @@ impl JmsFile {
     /// `uncompressed vertices` block — full float position/normal/texcoord
     /// + two node indices and weights — so no dequantization is needed
     /// (the parallel `compressed vertices` block is the 32-bit-packed
-    /// alternate). `triangle data` is a triangle strip stored as 3-index
+    /// alternate). `triangles` is a triangle strip stored as 3-index
     /// chunks with `-1` (`0xFFFF`) restart/padding. Node indices are
     /// global unless the `parts have local nodes` flag is set, in which case
     /// they index each part's local node table. Materials come from
@@ -979,8 +979,8 @@ impl JmsFile {
         // scale" -> 1.0). Without it, models authored with tiling UVs (e.g. the
         // warthog at 2x/3x) collapse into a sub-rect and their textures smear.
         let uv_scale = [
-            root.read_real("base map u scale").filter(|&s| s > 0.0).unwrap_or(1.0),
-            root.read_real("base map v scale").filter(|&s| s > 0.0).unwrap_or(1.0),
+            root.read_real("base map u-scale").filter(|&s| s > 0.0).unwrap_or(1.0),
+            root.read_real("base map v-scale").filter(|&s| s > 0.0).unwrap_or(1.0),
         ];
 
         let shaders_block = root.field_path("shaders").and_then(|f| f.as_block())
@@ -1039,10 +1039,10 @@ impl JmsFile {
                     let uv = match part.field("uncompressed vertices").and_then(|f| f.as_block()) {
                         Some(b) => b, None => continue,
                     };
-                    let td = match part.field("triangle data").and_then(|f| f.as_block()) {
+                    let td = match part.field("triangles").and_then(|f| f.as_block()) {
                         Some(b) => b, None => continue,
                     };
-                    // Flatten the triangle-data chunks (each holds 3 `indices`)
+                    // Flatten the triangle chunks (each holds 3 vertex indices)
                     // into one strip; `-1` becomes the 0xFFFF restart sentinel.
                     let mut strip: Vec<u16> = Vec::with_capacity(td.len() * 3);
                     for k in 0..td.len() {
@@ -1413,8 +1413,8 @@ impl JmsFile {
     /// `uncompressed vertices` blob (an array of 56-byte
     /// position/normal/binormal/tangent/uv vertices) and a
     /// `[surfaces, surfaces+surface count)` range into the top-level
-    /// `surfaces` triangle list, whose `vertex0/1/2 index` are local
-    /// to that material's vertex array. Emits one JMS mesh with a
+    /// `surfaces` triangle list, whose three `vertices` are local to
+    /// that material's vertex array. Emits one JMS mesh with a
     /// single `frame` node (CE structure JMS form: no skeleton, no
     /// regions) and per-shader materials. Vertex floats are read
     /// big-endian to match the CE engine.
@@ -1443,8 +1443,11 @@ impl JmsFile {
             };
             for mi in 0..mats.len() {
                 let material = mats.element(mi).unwrap();
-                let nverts = material.field("rendered vertices").and_then(|f| f.as_struct())
-                    .and_then(|s| s.read_int_any("vertex count")).unwrap_or(0) as usize;
+                // `vertex buffers[0]` describes the rendered vertices,
+                // `[1]` the lightmap vertices that follow them in the blob.
+                let nverts = material.field("vertex buffers").and_then(|f| f.as_array())
+                    .and_then(|a| a.element(0))
+                    .and_then(|b| b.read_int_any("count")).unwrap_or(0) as usize;
                 let surf_start = material.read_int_any("surfaces").unwrap_or(0) as i64;
                 let surf_count = material.read_int_any("surface count").unwrap_or(0) as i64;
                 let blob = match material.field("uncompressed vertices").and_then(|f| f.as_data()) {
@@ -1503,9 +1506,9 @@ impl JmsFile {
                 for si in surf_start..(surf_start + surf_count) {
                     if si < 0 || si as usize >= global_surfaces.len() { continue; }
                     let s = global_surfaces.element(si as usize).unwrap();
-                    let v0 = s.read_int_any("vertex0 index").unwrap_or(-1);
-                    let v1 = s.read_int_any("vertex1 index").unwrap_or(-1);
-                    let v2 = s.read_int_any("vertex2 index").unwrap_or(-1);
+                    let Some(corners) = s.field("vertices").and_then(|f| f.as_array()) else { continue };
+                    let corner = |i: usize| corners.element(i).and_then(|c| c.read_int_any("a")).unwrap_or(-1);
+                    let (v0, v1, v2) = (corner(0), corner(1), corner(2));
                     if v0 < 0 || v1 < 0 || v2 < 0 { continue; }
                     let (v0, v1, v2) = (v0 as u32, v1 as u32, v2 as u32);
                     if (v0 as usize) >= n || (v1 as usize) >= n || (v2 as usize) >= n { continue; }
@@ -2081,7 +2084,9 @@ fn read_nodes(root: &TagStruct<'_>) -> Result<Vec<JmsNode>, JmsError> {
             // H2/H3 store the node name as a string_id; Halo CE uses a
             // 32-byte inline `string` — accept either.
             name: n.read_string_id("name").or_else(|| n.read_string("name")).unwrap_or_default(),
-            parent: n.read_block_index("parent node"),
+            // Halo CE's gbxmodel names it `parent node index`.
+            parent: n.field("parent node").or_else(|| n.field("parent node index"))
+                .and_then(|f| f.value()).and_then(|v| v.int_any()).map_or(-1, |v| v as i16),
             rotation: n.read_quat("default rotation"),
             // H2/H3 declare `default translation` as real_point_3d; Halo CE
             // as real_vector_3d — accept either.
@@ -3401,12 +3406,10 @@ pub(crate) fn read_h2_vertex(v: &TagStruct<'_>) -> JmsVertex {
 }
 
 /// Read one Halo CE `uncompressed vertices[]` element into a JMS vertex.
-/// Position is a `real_vector_3d` (Halo 1's convention); node binding is
-/// the fixed two-influence `node0/node1` index+weight pair, through the part's
-/// local node table when the model has one.
+/// Node binding is the fixed two-influence `node0/node1` index+weight pair,
+/// through the part's local node table when the model has one.
 fn read_ce_vertex(v: &TagStruct<'_>, local_nodes: Option<&[i32]>) -> JmsVertex {
-    let p = v.read_vec3("position");
-    let position = RealPoint3d { x: p.i, y: p.j, z: p.k } * SCALE;
+    let position = v.read_point3d("position") * SCALE;
     let normal = v.read_vec3("normal");
     let uv = v.read_point2d("texture coords");
     let node_sets = crate::render_model::gbxmodel_vertex_influences(v, local_nodes)

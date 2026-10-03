@@ -754,14 +754,9 @@ impl ColorPlate {
 /// big-endian `u32` uncompressed-size prefix followed by a zlib stream
 /// that inflates to `width*height` ARGB8888 pixels (little-endian
 /// `0xAARRGGBB`, i.e. memory order `[B, G, R, A]`); we swap R↔B to get
-/// RGBA. CE nests the fields under a `color plate` struct; H2 has them
-/// at the tag root — handled transparently.
+/// RGBA. The fields sit at the tag root in both CE and H2.
 pub fn color_plate(tag: &TagFile) -> Result<Option<ColorPlate>, BitmapError> {
-    let root = tag.root();
-    let src = root
-        .field_path("color plate")
-        .and_then(|f| f.as_struct())
-        .unwrap_or(root);
+    let src = tag.root();
 
     let Some(blob) = src.field("compressed color plate data").and_then(|f| f.as_data()) else {
         return Ok(None);

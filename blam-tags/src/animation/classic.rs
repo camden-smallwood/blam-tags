@@ -4,8 +4,8 @@
 //! the root-level `animations` block stores its frames as two raw blobs —
 //! `default data` (static, shared across all frames) and `frame data`
 //! (`frame count` consecutive frames, each `frame size` bytes) — plus three
-//! 64-bit node-flag masks (`node rotation flag data` / `node transform flag
-//! data` / `node scale flag data`, each two `long_integer`s). For each node,
+//! 64-bit node-flag masks (`node rotation flag data` / `node trans. flag
+//! data` / `node scale flag data`, each a two-`long_integer` array). For each node,
 //! a flag bit decides per component (rotation, translation, scale) whether
 //! that component is **animated** (set → read per-frame from `frame data`)
 //! or **static** (clear → read once from `default data`). Components are
@@ -51,9 +51,8 @@ pub struct CeAnimation<'a> {
     pub name: Option<String>,
     /// `base` / `overlay` / `replacement`.
     pub animation_type: Option<String>,
-    /// Movement kind, normalized to the comma form the shared
-    /// [`JmaKind`](super::JmaKind) / [`MovementKind`] expect
-    /// (CE spells it `dx dy`, gen3 `dx,dy`).
+    /// Movement kind, in the comma form (`dx,dy`) the shared
+    /// [`JmaKind`](super::JmaKind) / [`MovementKind`] expect.
     pub frame_info_type: Option<String>,
     /// `flags / world relative` (bit 1) — selects JMW for base animations.
     pub world_relative: bool,
@@ -109,7 +108,7 @@ impl<'a> CeAnimations<'a> {
                 index: i,
                 name: e.read_string("name").or_else(|| e.read_string_id("name")),
                 animation_type: e.read_enum_name("type"),
-                frame_info_type: e.read_enum_name("frame info type").map(|n| normalize_frame_info(&n)),
+                frame_info_type: e.read_enum_name("frame info type"),
                 world_relative: (flags >> 1) & 1 == 1,
                 frame_count: e.read_int_any("frame count").unwrap_or(0).max(0) as u16,
                 node_count,
@@ -119,7 +118,7 @@ impl<'a> CeAnimations<'a> {
                 compressed_offset,
                 be: detect_be(tag_be, compressed, frame_data, compressed_offset),
                 rotation_mask: read_flag_mask(&e, "node rotation flag data"),
-                translation_mask: read_flag_mask(&e, "node transform flag data"),
+                translation_mask: read_flag_mask(&e, "node trans. flag data"),
                 scale_mask: read_flag_mask(&e, "node scale flag data"),
                 default_data: e.field("default data").and_then(|f| f.as_data()).unwrap_or(&[]),
                 frame_data,
@@ -391,28 +390,17 @@ fn decode_keyframe_track<T: Copy>(
     Some(out)
 }
 
-/// Read both `long_integer`s of a CE flag field (low dword = nodes 0–31,
-/// high dword = nodes 32–63) into a 64-bit mask. The two dwords share the
-/// same field name in the schema, so we collect them by iterating fields.
+/// Read a CE flag array's two `long_integer`s (low dword = nodes 0–31,
+/// high dword = nodes 32–63) into a 64-bit mask.
 fn read_flag_mask(elem: &crate::api::TagStruct<'_>, name: &str) -> u64 {
-    let mut words = elem.fields()
-        .filter(|f| f.name() == name)
-        .filter_map(|f| f.value().and_then(super::int_value))
-        .map(|v| v as u32 as u64);
-    let lo = words.next().unwrap_or(0);
-    let hi = words.next().unwrap_or(0);
-    lo | (hi << 32)
-}
-
-/// Normalize CE's space-separated `frame info type` enum names to the comma
-/// form the shared [`MovementKind`] / [`JmaKind`](super::JmaKind) expect.
-fn normalize_frame_info(name: &str) -> String {
-    match name {
-        "dx dy" => "dx,dy".into(),
-        "dx dy dyaw" => "dx,dy,dyaw".into(),
-        "dx dy dz dyaw" => "dx,dy,dz,dyaw".into(),
-        other => other.to_string(),
-    }
+    let Some(words) = elem.field(name).and_then(|f| f.as_array()) else { return 0 };
+    let word = |i: usize| -> u64 {
+        words.element(i)
+            .and_then(|w| w.fields().next()?.value())
+            .and_then(super::int_value)
+            .map_or(0, |v| v as u32 as u64)
+    };
+    word(0) | (word(1) << 32)
 }
 
 #[inline]
@@ -590,13 +578,5 @@ mod tests {
         }
         // tag is big-endian; LE reading is in bounds → block is little-endian.
         assert!(!detect_be(true, true, &blk, 0));
-    }
-
-    #[test]
-    fn normalize_frame_info_maps_ce_spelling() {
-        assert_eq!(normalize_frame_info("dx dy"), "dx,dy");
-        assert_eq!(normalize_frame_info("dx dy dyaw"), "dx,dy,dyaw");
-        assert_eq!(normalize_frame_info("dx dy dz dyaw"), "dx,dy,dz,dyaw");
-        assert_eq!(normalize_frame_info("none"), "none");
     }
 }

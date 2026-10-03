@@ -206,9 +206,8 @@ impl BitmapFormat {
     /// match those in `definitions/<game>/bitmap.json` and are stable
     /// across halo3_mcc and haloreach_mcc.
     pub fn from_schema_name(name: &str) -> Option<Self> {
-        // Match case-insensitively: gen3/gen4 schemas use lowercase
-        // (`dxt3`), but the classic Halo CE schema uses uppercase
-        // (`DXT3`, `A8R8G8B8`) for the same formats.
+        // Match case-insensitively, so a schema that spells a format in
+        // capitals (`DXT3`, `A8R8G8B8`) resolves the same.
         Some(match name.to_ascii_lowercase().as_str() {
             "a8" => Self::A8,
             "y8" => Self::Y8,

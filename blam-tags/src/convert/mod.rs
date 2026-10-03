@@ -662,9 +662,12 @@ struct ConversionMappingCatalog {
     flattened_structs: Vec<FlattenedStructRule>,
 }
 
-/// A source struct the target flattened into its parent: Halo 1 files a
-/// bitmap's `processing`, `color plate` and `more processing` values in
-/// sub-structs that Halo 2 keeps on the root, under the same names.
+/// A source struct the target flattened into its parent, keeping the
+/// struct's fields one level up under the same names. No pair needs one at
+/// present: the Halo 1 bitmap sub-structs that did (`processing`, `color
+/// plate`, `more processing`) were an artifact of the HABT-derived Halo 1
+/// definitions, and the tool.exe-derived ones keep those fields on the root
+/// exactly as Halo 2 does.
 ///
 /// Declared rather than derived. Lifting *every* unmatched struct's children by
 /// name was tried and measured: across a Halo 1 -> Halo 2 sweep it placed 108
@@ -4659,19 +4662,16 @@ struct LiftedFields {
 /// [`fill_nested_target_from_flat_source`]. Only for a struct a
 /// `flattened_structs` rule declares.
 ///
-/// Halo 1 groups a bitmap's root into `processing`, `sprite budget`, `color
-/// plate`, `more processing` and `sprite processing` sub-structs, where Halo 2
-/// keeps every one of those fields on the root. The ordinary matcher pairs
-/// fields within one struct level, so each sub-struct went unmatched as a whole
-/// and every value in it was dropped. The colour plate among them, whose
-/// target field then kept whatever the native layout template held: a
-/// converted bitmap arrived with *another tag's* source image.
+/// The ordinary matcher pairs fields within one struct level, so a source
+/// sub-struct the target has flattened goes unmatched as a whole and every
+/// value in it is dropped, leaving each target field holding whatever the
+/// native layout template held.
 ///
 /// Conservative on purpose. Only a declared source struct the plan left
 /// unmatched is opened, only a target field the plan left unmatched is filled,
 /// each at most once, and only by cleaned name and compatible shape; nothing is
 /// placed positionally, and a child with no home is reported on its own. One
-/// level deep, which is what the Halo 1 layouts need.
+/// level deep.
 fn lift_unmatched_source_structs(
     source: TagStruct<'_>,
     target: &mut TagStructMut<'_>,
@@ -11400,10 +11400,8 @@ mod tests {
     /// from — reaches Halo 2 and decodes to the same image, and one without a
     /// colour plate arrives without one.
     ///
-    /// Halo 1 nests the plate (and `processing`, `sprite budget`, …) in
-    /// sub-structs where Halo 2 keeps the fields on the root, so the matcher
-    /// dropped all of it, and the target kept the native layout template's
-    /// plate: a converted bitmap carried another tag's source image. Checked by
+    /// When the matcher dropped the plate, the target kept the native layout
+    /// template's: a converted bitmap carried another tag's source image. Checked by
     /// decoding with [`crate::bitmap::color_plate`] rather than by bytes alone,
     /// so width, height and blob have to agree with each other on arrival.
     #[test]
@@ -11456,8 +11454,7 @@ mod tests {
                         path.display()
                     );
                     assert!(landed.rgba == plate.rgba, "{}: plate pixels differ", path.display());
-                    // The rest of `processing` comes up to the root with it.
-                    // Halo 1 stores it as a `real`, Halo 2 as a `real_fraction`.
+                    // The rest of the bitmap's processing settings come with it.
                     let fade = |tag: &TagFile, at: &str| match tag
                         .root()
                         .field_path(at)
@@ -11470,12 +11467,12 @@ mod tests {
                     };
                     assert_eq!(
                         fade(&draft.tag, "detail fade factor"),
-                        fade(&source, "processing/detail fade factor"),
+                        fade(&source, "detail fade factor"),
                         "{}: detail fade factor",
                         path.display()
                     );
                     assert!(
-                        fade(&source, "processing/detail fade factor").is_some(),
+                        fade(&source, "detail fade factor").is_some(),
                         "{}: the source has no fade factor to compare",
                         path.display()
                     );
@@ -11501,16 +11498,15 @@ mod tests {
         assert!(without_plate > 0, "no Halo 1 bitmap without a colour plate in the first 300");
     }
 
-    /// A struct no rule declares flattened stays unlifted, even where the
-    /// target has a same-named field one level up.
+    /// Repeated field names pair in order.
     ///
-    /// Halo 1's `hud_globals` has three colour structs — `help text color`,
-    /// `not much time left color`, `time out color` — each with a `default
-    /// color`, and Halo 2's root has one `default color`. Lifting by name alone
-    /// put the help text's colour there, a guess that no report would show.
-    /// Undeclared, the struct's values are reported as not carried instead.
+    /// Halo 1's `hud_globals` root carries its help-text, objective and other
+    /// colours as runs of the same fields — `default color`, `flashing color`,
+    /// … — and Halo 2's root repeats them in the same order. Each source field
+    /// must land in the same-numbered target field of its name: the objective
+    /// colours in the second run, not over the help-text colours in the first.
     #[test]
-    fn an_undeclared_struct_is_reported_not_lifted() {
+    fn repeated_field_names_pair_in_order() {
         let (Some(h1), Some(h2)) = (
             kit_tags("BLAM_TEST_HCEEK", "HCEEK"),
             kit_tags("BLAM_TEST_H2EK", "H2EK"),
@@ -11539,15 +11535,20 @@ mod tests {
             Some(h2.as_path()),
         )
         .unwrap_or_else(|error| panic!("{} refused: {error}", path.display()));
+        let runs = |tag: &TagFile| -> Vec<String> {
+            tag.root()
+                .fields()
+                .filter(|field| clean_field_key(field.name()) == "default color")
+                .map(|field| format!("{:?}", field.value()))
+                .collect()
+        };
+        let (from, to) = (runs(&source), runs(&draft.tag));
         assert!(
-            draft
-                .report
-                .issues
-                .iter()
-                .any(|issue| issue.path.starts_with("help text color/")),
-            "{}: `help text color` was lifted onto the root instead of reported",
+            from.iter().collect::<std::collections::BTreeSet<_>>().len() > 1,
+            "{}: the runs need distinct colours to tell apart: {from:?}",
             path.display()
         );
+        assert_eq!(to, from, "{}: each `default color` in its own run", path.display());
     }
 
     /// The user asked for this specifically: everything else in the geometry
@@ -11557,9 +11558,9 @@ mod tests {
     /// converted bitmap arrived with all its metadata and no image.
     ///
     /// Asserts the bytes are carried whole, not merely non-empty, and that the
-    /// per-bitmap offset into the shared blob survives the `pixel data offset` ->
-    /// `pixels offset` rename. Without the rename every entry points at offset 0
-    /// and shows the first image's pixels for the whole group.
+    /// per-bitmap `pixels offset` into the shared blob survives. Without it every
+    /// entry points at offset 0 and shows the first image's pixels for the whole
+    /// group.
     #[test]
     fn a_halo1_bitmaps_pixels_arrive_in_halo2() {
         let (Some(h1), Some(h2)) = (
@@ -11623,8 +11624,7 @@ mod tests {
                 pixels.len(),
                 landed.len()
             );
-            // At least one entry past the first must carry a non-zero offset,
-            // which only happens if the rename resolved.
+            // At least one entry past the first must carry a non-zero offset.
             let offsets: Vec<i128> = field_by_key(draft.tag.root(), "bitmaps")
                 .and_then(|field| field.as_block())
                 .map(|block| {
@@ -11638,8 +11638,7 @@ mod tests {
                 .unwrap_or_default();
             assert!(
                 offsets.iter().any(|offset| *offset != 0),
-                "{} carried {entries} bitmaps but every pixels offset is 0, so the \
-                 `pixel data offset` rename did not resolve",
+                "{} carried {entries} bitmaps but every pixels offset is 0",
                 path.display()
             );
             checked += 1;
@@ -12843,7 +12842,6 @@ mod tests {
     fn every_flattened_struct_lands_whole_on_the_target() {
         let catalog = ConversionMappingCatalog::load().unwrap();
         let definitions = locate_definitions_root();
-        assert!(!catalog.flattened_structs.is_empty(), "the bitmap rules should be here");
         for rule in &catalog.flattened_structs {
             for source_game in &rule.source_games {
                 let path = definitions.join(source_game).join(format!("{}.json", rule.group));

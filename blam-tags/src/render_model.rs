@@ -1483,10 +1483,8 @@ impl RenderModel {
             flags: Flags::default(),
             regions: read_gbxmodel_regions(&root, geometry_count)?,
             instance_placements: Vec::new(),
-            // CE nodes use a different layout (`default translation` is a
-            // real_vector_3d, not real_point_3d) and carry none of the H3
-            // inverse-bind fields, so they need their own reader. They provide
-            // the bind pose that places markers.
+            // CE nodes carry none of the H3 inverse-bind fields, so they need
+            // their own reader. They provide the bind pose that places markers.
             nodes: read_gbxmodel_nodes(&root),
             marker_groups: read_gbxmodel_markers(&root),
             materials: read_gbxmodel_materials(&root),
@@ -1927,10 +1925,9 @@ fn read_gbxmodel_regions(
     Ok(out)
 }
 
-/// CE `gbxmodel` nodes → [`Node`]s. CE stores `default translation` as a
-/// `real_vector_3d` (H3 uses `real_point_3d`) and carries none of the H3
-/// inverse-bind fields; only the hierarchy + default pose are needed to place
-/// markers, so the inverse-bind fields are left zeroed.
+/// CE `gbxmodel` nodes → [`Node`]s. CE carries none of the H3 inverse-bind
+/// fields; only the hierarchy + default pose are needed to place markers, so
+/// the inverse-bind fields are left zeroed.
 fn read_gbxmodel_nodes(root: &TagStruct<'_>) -> Vec<Node> {
     let Some(block) = root.field("nodes").and_then(|f| f.as_block()) else {
         return Vec::new();
@@ -1938,7 +1935,7 @@ fn read_gbxmodel_nodes(root: &TagStruct<'_>) -> Vec<Node> {
     let mut out = Vec::with_capacity(block.len());
     for i in 0..block.len() {
         let n = block.element(i).unwrap();
-        let t = n.read_vec3("default translation");
+        let t = n.read_point3d("default translation");
         // CE stores each node's `default rotation` as the INVERSE of its
         // parent-relative bind rotation (General-101's toolset applies
         // `.inverted()` on Halo 1 only — H2/H3 use it directly). Conjugate
@@ -1947,10 +1944,10 @@ fn read_gbxmodel_nodes(root: &TagStruct<'_>) -> Vec<Node> {
         let r = n.read_quat("default rotation");
         out.push(Node {
             name: n.read_string("name").unwrap_or_default(),
-            parent_node: n.read_int_any("parent node").unwrap_or(-1) as i16,
-            first_child_node: n.read_int_any("first child node").unwrap_or(-1) as i16,
-            next_sibling_node: n.read_int_any("next sibling node").unwrap_or(-1) as i16,
-            default_translation: RealPoint3d { x: t.i, y: t.j, z: t.k },
+            parent_node: n.read_block_index("parent node index"),
+            first_child_node: n.read_block_index("first child node index"),
+            next_sibling_node: n.read_block_index("next sibling node index"),
+            default_translation: t,
             default_rotation: RealQuaternion { i: -r.i, j: -r.j, k: -r.k, w: r.w },
             inverse_forward: RealVector3d { i: 0.0, j: 0.0, k: 0.0 },
             inverse_left: RealVector3d { i: 0.0, j: 0.0, k: 0.0 },
@@ -1986,12 +1983,11 @@ fn read_gbxmodel_markers(root: &TagStruct<'_>) -> Vec<MarkerGroup> {
             for mi in 0..markers.len() {
                 let m = markers.element(mi).unwrap();
                 let name = m.read_string("name").unwrap_or_default();
-                let t = m.read_vec3("translation");
                 let marker = Marker {
                     region_index: ri as i8,
                     permutation_index: pi as i8,
                     node_index: m.read_int_any("node index").unwrap_or(-1) as i8,
-                    translation: RealPoint3d { x: t.i, y: t.j, z: t.k },
+                    translation: m.read_point3d("translation"),
                     rotation: m.read_quat("rotation"),
                     scale: 1.0,
                 };
@@ -2033,15 +2029,15 @@ fn read_gbxmodel_materials(root: &TagStruct<'_>) -> Vec<Material> {
 
 /// Decode CE geometry: one [`RenderMesh`] per `geometries[i]`, so a permutation's
 /// resolved geometry index directly indexes the result. Each `geometries[i]`
-/// holds `parts[]` with their own `uncompressed vertices` pool + `triangle data`
+/// holds `parts[]` with their own `uncompressed vertices` pool + `triangles`
 /// (3-index chunks, `-1`/`0xFFFF` restart). CE has no authored tangent basis.
 fn derive_render_meshes_gbxmodel(tag: &TagFile) -> Result<Vec<RenderMesh>, RenderModelError> {
     let root = tag.root();
     // Model-level base-map UV scale the engine multiplies into every texcoord
     // (0 → "no scale" → 1.0). Without it, tiled-UV models (warthog 2x/3x) smear.
     let uv_scale = [
-        root.read_real("base map u scale").filter(|&s| s > 0.0).unwrap_or(1.0),
-        root.read_real("base map v scale").filter(|&s| s > 0.0).unwrap_or(1.0),
+        root.read_real("base map u-scale").filter(|&s| s > 0.0).unwrap_or(1.0),
+        root.read_real("base map v-scale").filter(|&s| s > 0.0).unwrap_or(1.0),
     ];
     let geometries = root
         .field("geometries")
@@ -2056,20 +2052,19 @@ fn derive_render_meshes_gbxmodel(tag: &TagFile) -> Result<Vec<RenderMesh>, Rende
 /// gbxmodel `flags` bit 1, `parts have local nodes`.
 const GBXMODEL_PARTS_HAVE_LOCAL_NODES: i128 = 1 << 1;
 
-/// A CE part's local node table: the first `local node count` of its
-/// `local node indices`, each a global node. Vertex node indices in a part of
+/// A CE part's local node table: the first `num_nodes` entries of its
+/// `local_node_table`, each a global node. Vertex node indices in a part of
 /// a `parts have local nodes` model index this table — the engine uploads
 /// matrix `table[i]` to skinning slot `i` (`rasterizer_model_setupnodeparts`,
 /// CE Anniversary X360). All 265 such parts in haloce_mcc stay within it.
 pub(crate) fn gbxmodel_part_local_nodes(part: &TagStruct<'_>) -> Vec<i32> {
-    let count = part.read_int_any("local node count").unwrap_or(0).max(0) as usize;
-    part.fields()
-        .filter(|field| field.name() == "local node indices")
-        .filter_map(|field| match field.value() {
-            Some(TagFieldData::CharInteger(node)) => Some(node as i32),
-            _ => None,
-        })
-        .take(count)
+    let count = part.read_int_any("num_nodes").unwrap_or(0).max(0) as usize;
+    let Some(table) = part.field("local_node_table").and_then(|f| f.as_array()) else {
+        return Vec::new();
+    };
+    (0..table.len().min(count))
+        .filter_map(|i| table.element(i)?.read_int_any("node index"))
+        .map(|node| node as i32)
         .collect()
 }
 
@@ -2114,10 +2109,10 @@ fn read_gbxmodel_geometry(geo: &TagStruct<'_>, uv_scale: [f32; 2], local_nodes: 
                     vertices.push(vertex);
                 }
             }
-            // Flatten the triangle-data chunks (each holds 3 `indices`) into one
+            // Flatten the triangle chunks (each holds 3 vertex indices) into one
             // strip; `-1` becomes the 0xFFFF restart sentinel for strip_to_list.
             let mut strip: Vec<u16> = Vec::new();
-            if let Some(td) = part.field("triangle data").and_then(|f| f.as_block()) {
+            if let Some(td) = part.field("triangles").and_then(|f| f.as_block()) {
                 for k in 0..td.len() {
                     let t = td.element(k).unwrap();
                     for f in t.fields() {
@@ -2167,10 +2162,9 @@ fn read_gbxmodel_geometry(geo: &TagStruct<'_>, uv_scale: [f32; 2], local_nodes: 
 /// authored tangent basis (the preview derives one). UV is unflipped. Skinning
 /// is filled by the caller, which knows the part's local node table.
 fn read_gbxmodel_render_vertex(v: &TagStruct<'_>, uv_scale: [f32; 2]) -> RenderVertex {
-    let p = v.read_vec3("position");
     let uv = v.read_point2d("texture coords");
     RenderVertex {
-        position: RealPoint3d { x: p.i, y: p.j, z: p.k },
+        position: v.read_point3d("position"),
         texcoord: RealPoint2d { x: uv.x * uv_scale[0], y: uv.y * uv_scale[1] },
         normal: v.read_vec3("normal"),
         tangent: RealVector3d { i: 0.0, j: 0.0, k: 0.0 },
