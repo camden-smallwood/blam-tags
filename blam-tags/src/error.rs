@@ -189,6 +189,35 @@ pub enum TagReadError {
     /// The main `tag!` stream's root block has no element, so the tag has no
     /// root struct to read.
     EmptyRootBlock,
+
+    /// A monolithic cache data-array entry names a slot past the array's
+    /// declared `maximum_count`.
+    DatumIndexOutOfRange {
+        /// Which array (e.g. `"LruvCache blocks"`).
+        context: &'static str,
+        index: u32,
+        maximum_count: u32,
+    },
+
+    /// A count stored as a signed integer is negative.
+    NegativeCount {
+        context: &'static str,
+        count: i32,
+    },
+
+    /// A chunk the format requires is absent (e.g. a monolithic
+    /// `blob_index.dat` with no `indx`).
+    MissingChunk {
+        context: &'static str,
+        signature: [u8; 4],
+    },
+
+    /// A monolithic cache has no tag with this group and name.
+    TagNotFound {
+        /// Its group, as ASCII (e.g. `bipd`).
+        group: [u8; 4],
+        name: String,
+    },
 }
 
 impl fmt::Display for TagReadError {
@@ -265,6 +294,17 @@ impl fmt::Display for TagReadError {
                 write!(f, "blocks nest more than {limit} deep")
             }
             Self::EmptyRootBlock => f.write_str("the tag's root block has no element"),
+            Self::DatumIndexOutOfRange { context, index, maximum_count } => write!(
+                f,
+                "{context} entry {index} is past the array's maximum count {maximum_count}",
+            ),
+            Self::NegativeCount { context, count } => write!(f, "{context} count is negative ({count})"),
+            Self::MissingChunk { context, signature } => {
+                write!(f, "{context} has no {} chunk", show_sig(signature))
+            }
+            Self::TagNotFound { group, name } => {
+                write!(f, "no {} tag named {name:?} in the cache", show_sig(group))
+            }
         }
     }
 }

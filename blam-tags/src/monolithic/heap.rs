@@ -98,7 +98,31 @@ pub struct DataArrayHeader {
     pub signature: u32,
 }
 
+/// Datum indices are 16 bits, so no array has more addressable slots than
+/// this, whatever its header's `maximum_count` says.
+const ADDRESSABLE_SLOTS: usize = 1 << 16;
+
+/// How many deep the chunk walkers follow container chunks. Real caches nest
+/// them a few deep; each level costs only a 12-byte header, so without a limit
+/// a crafted file nests them until the stack overflows.
+pub(crate) const MAX_CHUNK_NESTING: u32 = 16;
+
 impl DataArrayHeader {
+    /// Room for this array's slots: `maximum_count`, but never more than a
+    /// 16-bit index can reach (the count is the file's word).
+    fn slots<T>(&self) -> Vec<Option<T>> {
+        (0..(self.maximum_count as usize).min(ADDRESSABLE_SLOTS)).map(|_| None).collect()
+    }
+
+    /// `handle`'s slot, checked against `maximum_count`.
+    fn slot(&self, handle: DatumHandle, context: &'static str) -> Result<usize, TagReadError> {
+        let index = handle.index() as u32;
+        if index >= self.maximum_count {
+            return Err(TagReadError::DatumIndexOutOfRange { context, index, maximum_count: self.maximum_count });
+        }
+        Ok(index as usize)
+    }
+
     pub fn read<R: Read + Seek>(
         reader: &mut std::io::BufReader<R>,
     ) -> Result<Self, TagReadError> {
@@ -277,8 +301,7 @@ impl LruvCache {
         let header = LruvPersistHeader::read(reader)?;
         let blocks_header = DataArrayHeader::read(reader)?;
 
-        let mut blocks: Vec<Option<(u16, LruvBlock)>> =
-            vec![None; blocks_header.maximum_count as usize];
+        let mut blocks: Vec<Option<(u16, LruvBlock)>> = blocks_header.slots();
         for _ in 0..blocks_header.actual_count {
             let datum_index = read_u32(reader, Endian::Be)?;
             let block = LruvBlock::read(reader)?;
@@ -287,7 +310,7 @@ impl LruvCache {
                 return Err(unexpected_footer("LruvBlock", FOOTER_BANG, footer));
             }
             let handle = DatumHandle(datum_index);
-            blocks[handle.index() as usize] = Some((handle.salt(), block));
+            blocks[blocks_header.slot(handle, "LruvCache blocks")?] = Some((handle.salt(), block));
         }
 
         let arr_footer = read_u32(reader, Endian::Be)?;
@@ -374,7 +397,7 @@ impl PartitionHeap {
         chunk: MonolithicChunk,
     ) -> Result<Self, TagReadError> {
         let mut state = PartitionHeapState::default();
-        state.walk(reader, chunk.payload_end())?;
+        state.walk(reader, chunk.payload_end(), 0)?;
         Ok(Self { entries: state.entries, partitions: state.partitions })
     }
 
@@ -410,13 +433,17 @@ impl PartitionHeapState {
         &mut self,
         reader: &mut std::io::BufReader<R>,
         end: u64,
+        depth: u32,
     ) -> Result<(), TagReadError> {
+        if depth > MAX_CHUNK_NESTING {
+            return Err(TagReadError::NestingTooDeep { limit: MAX_CHUNK_NESTING });
+        }
         while reader.stream_position()? < end {
             let chunk = MonolithicChunk::read(reader)?;
             match &chunk.signature.to_be_bytes() {
                 // Pure containers — recurse into their contents.
                 b"mtag" | b"disk" | b"heap" | b"ptls" => {
-                    self.walk(reader, chunk.payload_end())?;
+                    self.walk(reader, chunk.payload_end(), depth + 1)?;
                 }
                 b"hpls" => {
                     self.read_hpls(reader)?;
@@ -439,7 +466,9 @@ impl PartitionHeapState {
     ) -> Result<(), TagReadError> {
         let count = read_u32(reader, Endian::Be)?;
         let _maximum_count = read_u32(reader, Endian::Be)?;
-        self.entries.reserve(count as usize);
+        // Each entry is read from the file, so the count need not be trusted
+        // up front: reserve a little and let the reads bound the rest.
+        self.entries.reserve((count as usize).min(4096));
         for _ in 0..count {
             self.entries.push(PartitionedHeapEntry::read(reader)?);
         }
@@ -494,16 +523,14 @@ impl TagFileBlocks {
         let wide_header = WideDataArrayHeader::read(reader)?;
         let partitions_header = DataArrayHeader::read(reader)?;
 
-        let mut partitions: Vec<Option<(u16, TagFileBlocksPartition)>> =
-            (0..partitions_header.maximum_count).map(|_| None).collect();
+        let mut partitions: Vec<Option<(u16, TagFileBlocksPartition)>> = partitions_header.slots();
 
         for _ in 0..partitions_header.actual_count {
             let outer_datum_index = read_u32(reader, Endian::Be)?;
             let outer_handle = DatumHandle(outer_datum_index);
 
             let inner_header = DataArrayHeader::read(reader)?;
-            let mut blocks: Vec<Option<(u16, TagFileBlock)>> =
-                vec![None; inner_header.maximum_count as usize];
+            let mut blocks: Vec<Option<(u16, TagFileBlock)>> = inner_header.slots();
 
             for _ in 0..inner_header.actual_count {
                 let inner_datum_index = read_u32(reader, Endian::Be)?;
@@ -513,7 +540,7 @@ impl TagFileBlocks {
                     return Err(unexpected_footer("TagFileBlock", FOOTER_BANG, footer));
                 }
                 let h = DatumHandle(inner_datum_index);
-                blocks[h.index() as usize] = Some((h.salt(), block));
+                blocks[inner_header.slot(h, "TagFileBlocks inner array")?] = Some((h.salt(), block));
             }
 
             // Inner array footer: `d@ft` + `!@#$`.
@@ -534,7 +561,7 @@ impl TagFileBlocks {
                 ));
             }
 
-            partitions[outer_handle.index() as usize] = Some((
+            partitions[partitions_header.slot(outer_handle, "TagFileBlocks partitions")?] = Some((
                 outer_handle.salt(),
                 TagFileBlocksPartition { header: inner_header, blocks },
             ));

@@ -121,15 +121,24 @@ impl TagFileIndex {
 
         let header = TagFileIndexHeader::read(reader)?;
 
-        let count = header.tag_file_count as usize;
+        // Both sizes are the file's word: refuse a negative one, and one the
+        // chunk has no room for, before allocating for it.
+        let end = chunk.payload_end();
+        let count = usize::try_from(header.tag_file_count).map_err(|_| TagReadError::NegativeCount {
+            context: "indx tag file",
+            count: header.tag_file_count,
+        })?;
+        crate::io::ensure_available(reader, count as u64 * 0x1C, end, "indx entries")?;
         let mut compressed: Vec<CompressedEntry> = Vec::with_capacity(count);
         for _ in 0..count {
             compressed.push(CompressedEntry::read(reader)?);
         }
 
-        let name_buffer_size = header.name_buffer_size as usize;
-        let mut name_buffer = vec![0u8; name_buffer_size];
-        reader.read_exact(&mut name_buffer)?;
+        let name_buffer_size = u64::try_from(header.name_buffer_size).map_err(|_| TagReadError::NegativeCount {
+            context: "indx name buffer",
+            count: header.name_buffer_size,
+        })?;
+        let name_buffer = crate::io::read_bounded_bytes(reader, name_buffer_size, end, "indx names")?;
 
         let mut entries = Vec::with_capacity(count);
         for c in compressed {

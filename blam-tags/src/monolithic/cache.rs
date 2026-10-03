@@ -100,25 +100,26 @@ impl MonolithicCache {
         walk_tgin(
             &mut reader,
             tgin.payload_end(),
+            0,
             &mut tag_index,
             &mut tag_heap,
             &mut cache_heap,
             &mut tag_blocks,
         )?;
 
-        let tag_index = tag_index.ok_or(TagReadError::UnknownSubChunkSignature {
+        let tag_index = tag_index.ok_or(TagReadError::MissingChunk {
             context: "blob_index.dat",
             signature: *b"indx",
         })?;
-        let tag_heap = tag_heap.ok_or(TagReadError::UnknownSubChunkSignature {
+        let tag_heap = tag_heap.ok_or(TagReadError::MissingChunk {
             context: "blob_index.dat",
             signature: *b"tags",
         })?;
-        let cache_heap = cache_heap.ok_or(TagReadError::UnknownSubChunkSignature {
+        let cache_heap = cache_heap.ok_or(TagReadError::MissingChunk {
             context: "blob_index.dat",
             signature: *b"cash",
         })?;
-        let tag_blocks = tag_blocks.ok_or(TagReadError::UnknownSubChunkSignature {
+        let tag_blocks = tag_blocks.ok_or(TagReadError::MissingChunk {
             context: "blob_index.dat",
             signature: *b"blok",
         })?;
@@ -259,12 +260,10 @@ impl MonolithicCache {
         group_tag: u32,
         name: &str,
     ) -> Result<TagFile, TagReadError> {
-        let entry =
-            self.find_tag(group_tag, name)
-                .ok_or_else(|| TagReadError::UnknownSubChunkSignature {
-                    context: "tag not found in monolithic cache",
-                    signature: group_tag.to_be_bytes(),
-                })?;
+        let entry = self.find_tag(group_tag, name).ok_or_else(|| TagReadError::TagNotFound {
+            group: group_tag.to_be_bytes(),
+            name: name.to_owned(),
+        })?;
         self.read_tag(entry)
     }
 
@@ -302,10 +301,11 @@ impl MonolithicCache {
                 handles.get_mut(&key).unwrap()
             }
         };
+        // The block's extent comes from the index: check it against the
+        // partition file before allocating for it.
+        let end = crate::io::stream_len(reader)?;
         reader.seek(SeekFrom::Start(offset))?;
-        let mut bytes = vec![0u8; size as usize];
-        reader.read_exact(&mut bytes)?;
-        Ok(bytes)
+        crate::io::read_bounded_bytes(reader, size, end, "partition block")
     }
 }
 
@@ -535,16 +535,20 @@ fn slice_or_revert(cache_bytes: &[u8], offset: u32, size: u32) -> Result<&[u8], 
 fn walk_tgin<R: Read + Seek>(
     reader: &mut std::io::BufReader<R>,
     end: u64,
+    depth: u32,
     tag_index: &mut Option<TagFileIndex>,
     tag_heap: &mut Option<PartitionHeap>,
     cache_heap: &mut Option<PartitionHeap>,
     tag_blocks: &mut Option<TagFileBlocks>,
 ) -> Result<(), TagReadError> {
+    if depth > super::heap::MAX_CHUNK_NESTING {
+        return Err(TagReadError::NestingTooDeep { limit: super::heap::MAX_CHUNK_NESTING });
+    }
     while reader.stream_position()? < end {
         let chunk = MonolithicChunk::read(reader)?;
         match &chunk.signature.to_be_bytes() {
             b"mtfi" | b"mtag" => {
-                walk_tgin(reader, chunk.payload_end(), tag_index, tag_heap, cache_heap, tag_blocks)?;
+                walk_tgin(reader, chunk.payload_end(), depth + 1, tag_index, tag_heap, cache_heap, tag_blocks)?;
             }
             b"indx" => {
                 *tag_index = Some(TagFileIndex::read(reader, chunk)?);
@@ -566,4 +570,186 @@ fn walk_tgin<R: Read + Seek>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod malformed {
+    //! Synthetic `blob_index.dat` files (the format is big-endian
+    //! throughout). The module had no tests; each case below was a panic,
+    //! an abort or a misleading error.
+    use super::{MonolithicCache, PartitionKey};
+    use crate::error::TagReadError;
+    use std::path::PathBuf;
+
+    const BANG: u32 = 0x2140_2324; // `!@#$`
+    const DFT: u32 = 0x6440_6674; // `d@ft`
+
+    fn chunk(signature: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut out = signature.to_vec();
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn be(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|w| w.to_be_bytes()).collect()
+    }
+
+    /// A 0x3C-byte `indx` header and nothing after it unless given.
+    fn indx(tag_file_count: i32, name_buffer_size: i32, rest: &[u8]) -> Vec<u8> {
+        let mut out = be(&[0, 6, 0, 0]);
+        out.extend_from_slice(&[0; 16]);
+        out.extend_from_slice(&be(&[tag_file_count as u32, 0, 0, 0, 0, name_buffer_size as u32, 0]));
+        out.extend_from_slice(rest);
+        chunk(b"indx", &out)
+    }
+
+    /// A data-array header (32-byte name, size, maximum, actual, next id,
+    /// signature).
+    fn array(maximum_count: u32, actual_count: u32) -> Vec<u8> {
+        let mut out = vec![0; 32];
+        out.extend_from_slice(&be(&[16, maximum_count, actual_count, 0, 0]));
+        out
+    }
+
+    /// A `blok` holding a partition (with no blocks of its own) at each datum
+    /// index in `partitions`, in an array of `maximum_count` slots.
+    fn blok(maximum_count: u32, partitions: &[u32]) -> Vec<u8> {
+        let mut out = vec![0; 48]; // the wide header
+        out.extend_from_slice(&array(maximum_count, partitions.len() as u32));
+        for &index in partitions {
+            out.extend_from_slice(&be(&[index]));
+            out.extend_from_slice(&array(1, 0));
+            out.extend_from_slice(&be(&[DFT, BANG]));
+        }
+        out.extend_from_slice(&be(&[DFT]));
+        out.extend_from_slice(b"load");
+        chunk(b"blok", &out)
+    }
+
+    fn blob_index(children: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = vec![0x11; 16];
+        out.extend_from_slice(&chunk(b"tgin", &children.concat()));
+        out
+    }
+
+    fn minimal() -> Vec<Vec<u8>> {
+        vec![indx(0, 0, &[]), chunk(b"tags", &[]), chunk(b"cash", &[]), blok(4, &[0])]
+    }
+
+    fn open(name: &str, bytes: &[u8]) -> (Result<MonolithicCache, TagReadError>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("blam-tags-monolithic-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("blobs")).unwrap();
+        std::fs::write(dir.join("blob_index.dat"), bytes).unwrap();
+        (MonolithicCache::open(&dir), dir)
+    }
+
+    #[test]
+    fn a_minimal_cache_opens_and_a_missing_tag_is_not_found() {
+        let (cache, dir) = open("minimal", &blob_index(&minimal()));
+        let cache = cache.expect("minimal cache");
+        assert_eq!(cache.len(), 0);
+        let result = cache.read_tag_by_name(u32::from_be_bytes(*b"bipd"), "objects/missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(&result, Err(TagReadError::TagNotFound { group, name }) if group == b"bipd" && name == "objects/missing"),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn a_cache_without_a_block_table_says_so() {
+        let mut children = minimal();
+        children.pop();
+        let (cache, dir) = open("no-blok", &blob_index(&children));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(cache, Err(TagReadError::MissingChunk { signature, .. }) if &signature == b"blok"),
+            "{:?}",
+            cache.err()
+        );
+    }
+
+    /// A negative tag count, cast to usize, reserved room for 2^64 entries.
+    #[test]
+    fn a_negative_tag_count_is_refused() {
+        let mut children = minimal();
+        children[0] = indx(-1, 0, &[]);
+        let (cache, dir) = open("negative", &blob_index(&children));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(cache, Err(TagReadError::NegativeCount { .. })), "{:?}", cache.err());
+    }
+
+    #[test]
+    fn a_name_buffer_larger_than_its_chunk_is_refused() {
+        let mut children = minimal();
+        children[0] = indx(0, 0x7fff_0000, &[]);
+        let (cache, dir) = open("names", &blob_index(&children));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(cache, Err(TagReadError::SizeExceedsInput { .. })), "{:?}", cache.err());
+    }
+
+    /// A partition at slot 5 of a 2-slot array indexed past the vector.
+    #[test]
+    fn a_datum_past_the_maximum_count_is_refused() {
+        let mut children = minimal();
+        children[3] = blok(2, &[5]);
+        let (cache, dir) = open("datum", &blob_index(&children));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(cache, Err(TagReadError::DatumIndexOutOfRange { .. })), "{:?}", cache.err());
+    }
+
+    /// A partition-block slot index past a `part` array's maximum count.
+    #[test]
+    fn a_partition_block_past_the_maximum_count_is_refused() {
+        let mut part = be(&[0]); // file index
+        part.extend_from_slice(&[0; 60]); // LRUV persist header
+        part.extend_from_slice(&array(1, 1));
+        part.extend_from_slice(&be(&[3, 0, 1, 0, 0, 0, 0, BANG, DFT]));
+        let mut children = minimal();
+        children[1] = chunk(b"tags", &chunk(b"part", &part));
+        let (cache, dir) = open("part", &blob_index(&children));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(cache, Err(TagReadError::DatumIndexOutOfRange { .. })), "{:?}", cache.err());
+    }
+
+    /// Four billion partition slots claimed, none present: datum indices are
+    /// 16 bits, so only 65,536 can be addressed and only those are built.
+    #[test]
+    fn a_huge_maximum_count_allocates_only_addressable_slots() {
+        let mut children = minimal();
+        children[3] = blok(u32::MAX, &[0]);
+        let (cache, dir) = open("huge-max", &blob_index(&children));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = cache.expect("huge maximum count");
+        assert_eq!(cache.tag_blocks.partitions.len(), 1 << 16);
+    }
+
+    /// Container chunks nested a hundred thousand deep, twelve bytes each.
+    #[test]
+    fn containers_nested_past_any_real_cache_are_refused() {
+        let mut nested = Vec::new();
+        for _ in 0..100_000 {
+            nested = chunk(b"mtag", &nested);
+        }
+        let (cache, dir) = open("nested", &blob_index(&[nested]));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(cache, Err(TagReadError::NestingTooDeep { .. })), "{:?}", cache.err());
+    }
+
+    /// A partition block whose extent runs far past its blob file.
+    #[test]
+    fn a_partition_block_past_its_file_is_refused() {
+        let (cache, dir) = open("blob", &blob_index(&minimal()));
+        let cache = cache.expect("minimal cache");
+        std::fs::write(dir.join("blobs/tags_0"), [0u8; 64]).unwrap();
+        let huge = cache.read_partition_bytes(PartitionKey::Tags(0), 0, 1 << 40);
+        let fits = cache.read_partition_bytes(PartitionKey::Tags(0), 32, 32);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(huge, Err(TagReadError::SizeExceedsInput { .. })), "{:?}", huge.err());
+        assert_eq!(fits.expect("in range").len(), 32);
+    }
 }
