@@ -339,29 +339,37 @@ impl IoStoreArchive {
             return Err(IoStoreError::MultiPartition(partition_count));
         }
 
-        // Walk the body cursors in serialized order.
-        let mut p = HEADER_SIZE;
-        let chunkid_off = p;
-        p += entry_count as usize * 12; // FIoChunkId[]
-        let offlen_off = p;
-        p += entry_count as usize * 10; // FIoOffsetAndLength[]
-        p += perfhash_seed_count as usize * 4; // perfect-hash seeds (i32)
-        p += without_hash_count as usize * 4; // chunks-without-perfect-hash (i32)
-        let cblock_off = p;
-        p += cblock_count as usize * 12; // FIoStoreTocCompressedBlockEntry[]
-        p += cmeth_count as usize * cmeth_len as usize; // method-name strings
+        // Walk the body cursors in serialized order. Every count is the
+        // file's word, so each step is checked to stay inside the TOC: the
+        // tables found here are indexed directly later, and an unchecked sum
+        // can wrap past the bounds check in a release build.
+        let len = toc.len() as u64;
+        let mut p = HEADER_SIZE as u64;
+        let mut advance = |count: u64, size: u64, what: &'static str| -> Result<usize> {
+            let start = p;
+            p = count
+                .checked_mul(size)
+                .and_then(|bytes| p.checked_add(bytes))
+                .filter(|&end| end <= len)
+                .ok_or(IoStoreError::Truncated(what))?;
+            Ok(start as usize)
+        };
+        let chunkid_off = advance(entry_count as u64, 12, "chunk ids")?; // FIoChunkId[]
+        let offlen_off = advance(entry_count as u64, 10, "offsets and lengths")?; // FIoOffsetAndLength[]
+        advance(perfhash_seed_count as u64, 4, "perfect-hash seeds")?; // i32[]
+        advance(without_hash_count as u64, 4, "chunks without perfect hash")?; // i32[]
+        let cblock_off = advance(cblock_count as u64, 12, "compression blocks")?; // FIoStoreTocCompressedBlockEntry[]
+        advance(cmeth_count as u64, cmeth_len as u64, "compression method names")?;
         if flags & FLAG_SIGNED != 0 {
             // int32 hashSize, tocSig[hashSize], blockSig[hashSize], FSHAHash[cblock_count]
-            if p + 4 > toc.len() {
-                return Err(IoStoreError::Truncated("signature header"));
-            }
-            let hash_size = i32::from_le_bytes(toc[p..p + 4].try_into().unwrap()) as usize;
-            p += 4 + hash_size * 2 + cblock_count as usize * 20;
+            let at = advance(1, 4, "signature header")?;
+            let hash_size = i32::from_le_bytes(toc[at..at + 4].try_into().unwrap());
+            let hash_size =
+                u64::try_from(hash_size).map_err(|_| IoStoreError::Truncated("negative signature hash size"))?;
+            advance(hash_size, 2, "signatures")?;
+            advance(cblock_count as u64, 20, "block hashes")?;
         }
-        let diridx_off = p;
-        if diridx_off + diridx_size > toc.len() {
-            return Err(IoStoreError::Truncated("directory index"));
-        }
+        let diridx_off = advance(1, diridx_size as u64, "directory index")?;
 
         // Override containers carry no directory index (chunks are addressed by
         // id, not path); tolerate an absent one.
@@ -777,11 +785,20 @@ fn parse_directory_index(di: &[u8]) -> Result<Vec<Entry>> {
     let files_off = c.p;
     c.skip(nfile * 12)?; // FIoFileIndexEntry: 3 x u32
     let nstr = c.u32()? as usize;
+    // Each string is at least its 4-byte length.
+    if nstr > (c.d.len() - c.p) / 4 {
+        return Err(IoStoreError::Truncated("dir index strings"));
+    }
     let mut strings = Vec::with_capacity(nstr);
     for _ in 0..nstr {
         strings.push(c.fstring()?);
     }
 
+    // Indices into the two tables come from the file: check each against its
+    // table before reading the entry, and walk each entry at most once, so a
+    // sibling or file chain that loops back ends instead of spinning.
+    let mut dir_seen = vec![false; ndir];
+    let mut file_seen = vec![false; nfile];
     let dir_field = |i: usize, f: usize| -> u32 {
         let o = dirs_off + i * 16 + f * 4;
         u32::from_le_bytes(di[o..o + 4].try_into().unwrap())
@@ -790,19 +807,27 @@ fn parse_directory_index(di: &[u8]) -> Result<Vec<Entry>> {
         let o = files_off + i * 12 + f * 4;
         u32::from_le_bytes(di[o..o + 4].try_into().unwrap())
     };
+    let visit = |seen: &mut [bool], i: u32, what: &'static str| -> Result<usize> {
+        let slot = seen.get_mut(i as usize).ok_or(IoStoreError::Truncated(what))?;
+        if std::mem::replace(slot, true) {
+            return Err(IoStoreError::Truncated("dir index entries form a cycle"));
+        }
+        Ok(i as usize)
+    };
 
     const INVALID: u32 = 0xFFFF_FFFF;
     let mut out = Vec::new();
     // Iterative tree walk (avoid recursion for deep trees). Stack of
-    // (dir_index, path_prefix).
-    let mut stack: Vec<(u32, String)> = vec![(0, String::new())];
+    // (dir_index, path_prefix). No directories at all is an empty index.
+    let mut stack: Vec<(u32, String)> = if ndir == 0 { Vec::new() } else { vec![(0, String::new())] };
     while let Some((di_idx, prefix)) = stack.pop() {
         let mut d = di_idx;
         while d != INVALID {
-            let name = dir_field(d as usize, 0);
-            let first_child = dir_field(d as usize, 1);
-            let next_sib = dir_field(d as usize, 2);
-            let first_file = dir_field(d as usize, 3);
+            let d_index = visit(&mut dir_seen, d, "dir index directory out of range")?;
+            let name = dir_field(d_index, 0);
+            let first_child = dir_field(d_index, 1);
+            let next_sib = dir_field(d_index, 2);
+            let first_file = dir_field(d_index, 3);
 
             let path = if name == INVALID {
                 prefix.clone()
@@ -818,9 +843,10 @@ fn parse_directory_index(di: &[u8]) -> Result<Vec<Entry>> {
             // Files directly under this dir.
             let mut fe = first_file;
             while fe != INVALID {
-                let fname = file_field(fe as usize, 0);
-                let next_file = file_field(fe as usize, 1);
-                let user_data = file_field(fe as usize, 2);
+                let fe_index = visit(&mut file_seen, fe, "dir index file out of range")?;
+                let fname = file_field(fe_index, 0);
+                let next_file = file_field(fe_index, 1);
+                let user_data = file_field(fe_index, 2);
                 let seg = strings.get(fname as usize).map(String::as_str).unwrap_or("");
                 let full = if path.is_empty() {
                     seg.to_string()
@@ -911,7 +937,7 @@ impl Cursor<'_> {
             let s = bytes.split(|&b| b == 0).next().unwrap_or(&[]);
             Ok(String::from_utf8_lossy(s).into_owned())
         } else {
-            let n = (-len) as usize;
+            let n = len.checked_neg().ok_or(IoStoreError::Truncated("fstring length"))? as usize;
             let bytes = n * 2;
             if self.p + bytes > self.d.len() {
                 return Err(IoStoreError::Truncated("fstring utf16"));
@@ -1002,5 +1028,193 @@ mod tests {
             }
         }
         assert!(tags > 400, "expected the sample to contain real tags, got {tags}");
+    }
+}
+
+#[cfg(test)]
+mod malformed {
+    //! Crafted `.utoc` headers and directory indices. Each was a panic, an
+    //! overflow, a hang or a runaway allocation; each must now be an error.
+    use super::*;
+    use crate::iostore::package::name_map::FMappedName;
+    use crate::iostore::package::ser::ReadExt;
+    use crate::iostore::package::zen::FExternalDependencyArc;
+
+    /// A version-8, single-partition TOC header and nothing else, with
+    /// `fill` given a chance to set fields.
+    fn toc(fill: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+        let mut toc = vec![0u8; HEADER_SIZE];
+        toc[..16].copy_from_slice(TOC_MAGIC);
+        toc[16] = MIN_VERSION;
+        toc[52..56].copy_from_slice(&1u32.to_le_bytes());
+        fill(&mut toc);
+        toc
+    }
+
+    fn put(toc: &mut [u8], at: usize, value: u32) {
+        toc[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /// Open `bytes` as a `.utoc` (no `.ucas` beside it: each case must fail
+    /// before getting that far).
+    fn open(name: &str, bytes: &[u8]) -> Result<IoStoreArchive> {
+        let dir = std::env::temp_dir().join(format!("blam-tags-malformed-toc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.utoc"));
+        std::fs::write(&path, bytes).unwrap();
+        let result = IoStoreArchive::open(&path);
+        let _ = std::fs::remove_file(&path);
+        result
+    }
+
+    /// A signed TOC whose signature size is negative. Cast to usize it wrapped:
+    /// an overflow panic in a debug build, a wrong directory offset in release.
+    #[test]
+    fn a_negative_signature_size_is_refused() {
+        let bytes = toc(|t| {
+            put(t, 80, FLAG_SIGNED);
+            t.extend_from_slice(&(-1i32).to_le_bytes());
+            t.extend_from_slice(&[0; 64]);
+        });
+        let result = open("negative-hash", &bytes);
+        assert!(matches!(result, Err(IoStoreError::Truncated(_))), "{:?}", result.err());
+    }
+
+    /// Method-name counts whose product, added to the cursor, overflows.
+    #[test]
+    fn table_sizes_that_overflow_are_refused() {
+        let bytes = toc(|t| {
+            put(t, 36, u32::MAX);
+            put(t, 40, u32::MAX);
+            put(t, 24, u32::MAX);
+        });
+        let result = open("overflow", &bytes);
+        assert!(matches!(result, Err(IoStoreError::Truncated(_))), "{:?}", result.err());
+    }
+
+    /// A well-formed TOC with no tables reaches the `.ucas` (absent here):
+    /// the checks above are not refusing everything.
+    #[test]
+    fn an_empty_toc_gets_as_far_as_the_partition() {
+        let result = open("empty", &toc(|_| {}));
+        assert!(matches!(result, Err(IoStoreError::Io(_))), "{:?}", result.err());
+    }
+
+    /// A directory index: empty mount, the given directory and file entries
+    /// (4 and 3 words each), and the given strings.
+    fn index(dirs: &[[u32; 4]], files: &[[u32; 3]], strings: &[&str]) -> Vec<u8> {
+        let mut out = 0i32.to_le_bytes().to_vec();
+        out.extend_from_slice(&(dirs.len() as u32).to_le_bytes());
+        for word in dirs.iter().flatten() {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+        out.extend_from_slice(&(files.len() as u32).to_le_bytes());
+        for word in files.iter().flatten() {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+        out.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+        for string in strings {
+            out.extend_from_slice(&(string.len() as i32 + 1).to_le_bytes());
+            out.extend_from_slice(string.as_bytes());
+            out.push(0);
+        }
+        out
+    }
+
+    const NONE: u32 = u32::MAX;
+
+    #[test]
+    fn a_well_formed_directory_index_lists_its_files() {
+        // root -> "a" -> file "b.uasset"
+        let blob = index(
+            &[[NONE, 1, NONE, NONE], [0, NONE, NONE, 0]],
+            &[[1, NONE, 7]],
+            &["a", "b.uasset"],
+        );
+        let entries = parse_directory_index(&blob).expect("index");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "a/b.uasset");
+        assert_eq!(entries[0].chunk_index, 7);
+    }
+
+    #[test]
+    fn a_directory_past_the_end_of_its_table_is_refused() {
+        let blob = index(&[[NONE, 5, NONE, NONE]], &[], &[]);
+        assert!(matches!(parse_directory_index(&blob), Err(IoStoreError::Truncated(_))));
+    }
+
+    #[test]
+    fn a_file_past_the_end_of_its_table_is_refused() {
+        let blob = index(&[[NONE, NONE, NONE, 3]], &[[NONE, NONE, 0]], &[]);
+        assert!(matches!(parse_directory_index(&blob), Err(IoStoreError::Truncated(_))));
+    }
+
+    /// A directory that is its own next sibling looped forever.
+    #[test]
+    fn a_sibling_chain_that_loops_is_refused() {
+        let blob = index(&[[NONE, NONE, 0, NONE]], &[], &[]);
+        assert!(matches!(parse_directory_index(&blob), Err(IoStoreError::Truncated(_))));
+    }
+
+    /// A file that is its own next file looped forever, growing the list.
+    #[test]
+    fn a_file_chain_that_loops_is_refused() {
+        let blob = index(&[[NONE, NONE, NONE, 0]], &[[NONE, 0, 0]], &[]);
+        assert!(matches!(parse_directory_index(&blob), Err(IoStoreError::Truncated(_))));
+    }
+
+    /// No directories: nothing to walk, not directory 0 read out of bounds.
+    #[test]
+    fn an_index_with_no_directories_is_empty() {
+        let blob = index(&[], &[], &[]);
+        assert_eq!(parse_directory_index(&blob).expect("empty").len(), 0);
+    }
+
+    /// Four billion strings in a few bytes: refused before reserving room.
+    #[test]
+    fn a_string_count_larger_than_the_index_is_refused() {
+        let mut blob = index(&[], &[], &[]);
+        let at = blob.len() - 4;
+        blob[at..].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            parse_directory_index(&blob),
+            Err(IoStoreError::Truncated("dir index strings"))
+        ));
+    }
+
+    /// An FString length of i32::MIN has no negation.
+    #[test]
+    fn an_fstring_of_minimum_length_is_refused() {
+        let mut blob = i32::MIN.to_le_bytes().to_vec();
+        blob.extend_from_slice(&[0; 16]);
+        assert!(matches!(parse_directory_index(&blob), Err(IoStoreError::Truncated(_))));
+        assert!(crate::iostore::package::ser::read_string_data(i32::MIN, &mut std::io::Cursor::new([0u8; 16])).is_err());
+    }
+
+    /// An external dependency arc whose command type is not one.
+    #[test]
+    fn an_unknown_export_command_type_is_refused() {
+        let mut bytes = 0i32.to_le_bytes().to_vec();
+        bytes.push(7);
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        let result = std::io::Cursor::new(&bytes).de::<FExternalDependencyArc>();
+        assert!(result.is_err());
+        bytes[4] = 1;
+        assert!(std::io::Cursor::new(&bytes).de::<FExternalDependencyArc>().is_ok());
+    }
+
+    /// A mapped name of type 3 (there are three types, 0-2). It read, and
+    /// asking its kind panicked.
+    #[test]
+    fn an_unknown_mapped_name_type_is_refused() {
+        let mut bytes = (3u32 << 30 | 5).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        if let Ok(name) = std::io::Cursor::new(&bytes).de::<FMappedName>() {
+            panic!("type 3 read as {:?}", name.kind());
+        }
+        bytes[3] = 2 << 6;
+        let name = std::io::Cursor::new(&bytes).de::<FMappedName>().expect("type 2");
+        assert_eq!(name.kind(), crate::iostore::package::name_map::EMappedNameType::Global);
+        assert_eq!(name.index(), 5);
     }
 }

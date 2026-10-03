@@ -320,12 +320,18 @@ impl FMappedName {
     }
     pub fn kind(self) -> EMappedNameType {
         let kind: u32 = (self.index_and_type & Self::TYPE_MASK) >> Self::TYPE_SHIFT;
-        EMappedNameType::from_repr(kind).unwrap()
+        // `create` and `de` admit only the three defined types.
+        EMappedNameType::from_repr(kind).unwrap_or_default()
     }
 }
 impl Readable for FMappedName {
     fn de<S: Read>(s: &mut S) -> Result<Self> {
-        Ok(Self { index_and_type: s.de()?, number: s.de()? })
+        let name = Self { index_and_type: s.de()?, number: s.de()? };
+        let kind = name.index_and_type >> Self::TYPE_SHIFT;
+        if EMappedNameType::from_repr(kind).is_none() {
+            bail!("unknown EMappedNameType {kind}");
+        }
+        Ok(name)
     }
 }
 impl Writeable for FMappedName {

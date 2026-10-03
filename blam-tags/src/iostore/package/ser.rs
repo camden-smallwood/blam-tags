@@ -289,7 +289,10 @@ where
 
 pub fn read_string_data<S: Read>(len: i32, stream: &mut S) -> Result<String> {
     if len < 0 {
-        let chars = read_array((-len) as usize, stream, |r| Ok(r.read_u16::<LE>()?))?;
+        let Some(count) = len.checked_neg() else {
+            bail!("FString length {len} has no UTF-16 character count");
+        };
+        let chars = read_array(count as usize, stream, |r| Ok(r.read_u16::<LE>()?))?;
         let length = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
         // Lossy, not `unwrap`: a corrupt package is an error to report, not a
         // reason to unwind out of a parser.

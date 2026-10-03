@@ -676,7 +676,8 @@ impl Readable for FExternalDependencyArc {
         Ok(Self {
             from_import_index,
             // EExportCommandType serialization is inconsistent: it is serialized as uint8 in external arcs, but as uint32 in export bundle entries
-            from_command_type: EExportCommandType::from_repr(from_command_type as u32).unwrap(),
+            from_command_type: EExportCommandType::from_repr(from_command_type as u32)
+                .ok_or_else(|| anyhow!("unknown EExportCommandType {from_command_type}"))?,
             to_export_bundle_index,
         })
     }

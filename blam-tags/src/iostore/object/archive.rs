@@ -168,7 +168,7 @@ impl<'a> Reader<'a> {
             s.trailing = bytes.get(end + 1..).unwrap_or(&[]).to_vec();
             Ok(s)
         } else {
-            let chars = (-n) as usize;
+            let chars = n.checked_neg().with_context(|| format!("FString length {n} (@ {})", self.o - 4))? as usize;
             let bytes = self.take(chars * 2)?;
             let units: Vec<u16> =
                 bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
@@ -423,6 +423,18 @@ mod tests {
     /// Every primitive must survive write→read unchanged. This is the floor the
     /// whole write path stands on: if a scalar or a name cannot round-trip,
     /// nothing built above it can either.
+    /// An FString length of i32::MIN has no negation (UTF-16 lengths are
+    /// stored negated).
+    #[test]
+    fn an_fstring_of_minimum_length_is_an_error() {
+        let mut bytes = i32::MIN.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&[0; 16]);
+        assert!(Reader::new(&bytes, &[]).fstring().is_err());
+        let mut bytes = (-2i32).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&[b'a', 0, 0, 0]);
+        assert_eq!(Reader::new(&bytes, &[]).fstring().expect("UTF-16 \"a\"").to_string(), "a");
+    }
+
     #[test]
     fn primitives_round_trip() {
         let mut w = Writer::new();
