@@ -83,19 +83,9 @@ fn mount_key(path: &Path) -> (u32, u32, String) {
         .and_then(|stem| stem.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let patch = stem.ends_with("_p");
-    let patch_version = if patch {
-        stem.strip_suffix("_p")
-            .and_then(|stem| stem.rsplit_once('_').map(|(_, tail)| tail))
-            .and_then(|tail| tail.parse::<u32>().ok())
-            .unwrap_or(1)
-    } else {
-        0
-    };
-    let score = if patch {
-        4u32.saturating_add(100u32.saturating_mul(patch_version))
-    } else {
-        4
+    let score = match patch_version(&stem) {
+        Some(version) => 4u32.saturating_add(100u32.saturating_mul(version)),
+        None => 4,
     };
     let chunk = stem
         .strip_prefix("pakchunk")
@@ -114,6 +104,39 @@ fn mount_key(path: &Path) -> (u32, u32, String) {
             .replace('\\', "/")
             .to_ascii_lowercase(),
     )
+}
+
+/// The chunk version Unreal gives a patch container (`*_P`), or `None` for a
+/// container that is not one. Mirrors `FPakPlatformFile::Mount` in 5.5.4
+/// (IPlatformFilePak.cpp): the text between the last two underscores, when
+/// `FCString::IsNumeric` and `Atoi` of it is at least 1, gives version n + 1
+/// ("so that the first patch file still gets more priority than the base pak
+/// file"); anything else, including no number, 0 and negatives, gives 1. The
+/// mount order then rises by 100 per version. So `_0_P` outranks the base
+/// paks and `_1_P` outranks a plain `_P`.
+fn patch_version(stem: &str) -> Option<u32> {
+    let rest = stem.strip_suffix("_p")?;
+    let number = rest.rsplit_once('_').map(|(_, tail)| tail);
+    Some(match number.and_then(unreal_numeric_value) {
+        Some(n) if n >= 1 => n as u32 + 1,
+        _ => 1,
+    })
+}
+
+/// `FCString::Atoi` of `text`, if `FCString::IsNumeric` accepts it: an
+/// optional sign, then digits with at most one `.` (an empty string passes,
+/// and reads as 0). Atoi stops at the first non-digit and saturates here.
+fn unreal_numeric_value(text: &str) -> Option<i64> {
+    let unsigned = text.strip_prefix(['-', '+']).unwrap_or(text);
+    let dots = unsigned.chars().filter(|&c| c == '.').count();
+    if dots > 1 || !unsigned.chars().all(|c| c == '.' || c.is_ascii_digit()) {
+        return None;
+    }
+    let magnitude = unsigned
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .fold(0i64, |n, digit| (n * 10 + i64::from(digit as u8 - b'0')).min(i32::MAX as i64));
+    Some(if text.starts_with('-') { -magnitude } else { magnitude })
 }
 
 fn compare_mount_paths(a: &PathBuf, b: &PathBuf) -> Ordering {
@@ -948,5 +971,40 @@ mod tests {
             record.active_provider().map(|provider| provider.container),
             Some(2)
         );
+    }
+}
+
+#[cfg(test)]
+mod mount_order {
+    use super::mount_key;
+    use std::path::Path;
+
+    fn priority(name: &str) -> u32 {
+        mount_key(Path::new(&format!("Meteorite/Content/Paks/{name}.utoc"))).0
+    }
+
+    /// Unreal 5.5.4's `FPakPlatformFile::Mount`: base paks at the path
+    /// order, a `_P` patch 100 above per chunk version, where `_N_P` is
+    /// version N + 1 for N >= 1 and every other `_P` is version 1.
+    #[test]
+    fn patch_containers_rank_as_unreal_ranks_them() {
+        let base = priority("pakchunk0-WinGDK");
+        assert_eq!(base, 4);
+        assert_eq!(priority("pakchunk0-WinGDK_P"), base + 100);
+        // `_0_P` is not a version: it is a plain patch, above the base paks.
+        assert_eq!(priority("pakchunk0-WinGDK_0_P"), base + 100);
+        // `_1_P` is version 2: above a plain `_P`, not tied with it.
+        assert_eq!(priority("pakchunk0-WinGDK_1_P"), base + 200);
+        assert!(priority("mod_2_P") > priority("mod_1_P"));
+        // A later name does not outrank a higher version.
+        assert!(priority("a_2_P") > priority("z_P"));
+        // Case makes no difference to the rank.
+        assert_eq!(priority("B_P"), priority("a_P"));
+        assert_eq!(priority("x_1_p"), priority("x_1_P"));
+        // FCString::IsNumeric + Atoi: a decimal reads as its integer part,
+        // and a negative or non-number is version 1.
+        assert_eq!(priority("x_1.5_P"), base + 200);
+        assert_eq!(priority("x_-3_P"), base + 100);
+        assert_eq!(priority("x_beta_P"), base + 100);
     }
 }
