@@ -70,20 +70,24 @@ pub struct ResolvedAnimation {
 /// any object-inheriting tag that points at a `.model`, a Halo CE
 /// `.model_animations` (antr), or a Halo CE object-inheriting tag that points
 /// at one. `actor_name` is used both as the folder
-/// stem and as the JMA header actor name.
+/// stem and as the JMA header actor name. `target` is the game whose tools
+/// will import the files; it picks the JMA version
+/// ([`Game::jma_version`]), so it need not be the game `input` came from.
 pub fn animations_to_dir(
     input: &TagFile,
     resolver: &dyn TagResolver,
     out_dir: &Path,
     actor_name: &str,
+    target: Game,
 ) -> Result<AnimSummary, ExtractError> {
+    let version = target.jma_version();
     // Halo CE `model_animations` (antr) predates the gen3 codec-pack model
     // entirely — route it through the classic decoder.
     if &input.header.group_tag.to_be_bytes() == b"antr" {
-        return ce_animations_to_dir(input, None, out_dir, actor_name);
+        return ce_animations_to_dir(input, None, out_dir, actor_name, version);
     }
     if let Some(ce) = resolve_ce_animation_graph(input, resolver)? {
-        return ce_animations_to_dir(&ce.antr, ce.model.as_ref(), out_dir, actor_name);
+        return ce_animations_to_dir(&ce.antr, ce.model.as_ref(), out_dir, actor_name, version);
     }
 
     let resolved = resolve_animation_inputs(input, resolver)?;
@@ -148,7 +152,7 @@ pub fn animations_to_dir(
         let clip = group.decode()?;
         write_group_jma(
             group, &clip, &animation, &graph, &skeleton, &defaults, reorient.as_deref(),
-            actor_name, &dest,
+            actor_name, &dest, version,
         )?;
         summary.written += 1;
     }
@@ -165,6 +169,7 @@ fn ce_animations_to_dir(
     model: Option<&TagFile>,
     out_dir: &Path,
     actor_name: &str,
+    version: u16,
 ) -> Result<AnimSummary, ExtractError> {
     let animations = CeAnimations::new(tag);
     if animations.is_empty() {
@@ -207,7 +212,7 @@ fn ce_animations_to_dir(
         }
 
         let clip = group.decode();
-        write_ce_group_jma(group, &clip, &skeleton, &defaults, None, actor_name, &dest)?;
+        write_ce_group_jma(group, &clip, &skeleton, &defaults, None, actor_name, &dest, version)?;
         summary.written += 1;
     }
 
@@ -610,7 +615,8 @@ pub fn jma_kind_for(group: &AnimationGroup<'_>) -> JmaKind {
 }
 
 /// Compose and write one gen3 animation group as a JMA-family file at
-/// `dest`. `defaults` is the per-bone rest pose from [`build_defaults`].
+/// `dest`. `defaults` is the per-bone rest pose from [`build_defaults`];
+/// `version` is the JMA version to write ([`Game::jma_version`]).
 #[allow(clippy::too_many_arguments)]
 pub fn write_group_jma(
     group: &AnimationGroup<'_>,
@@ -622,6 +628,7 @@ pub fn write_group_jma(
     reorient: Option<&[RealQuaternion]>,
     actor_name: &str,
     dest: &Path,
+    version: u16,
 ) -> Result<(), ExtractError> {
     let kind = jma_kind_for(group);
     // Overlay/replacement codec values are deltas authored against a
@@ -677,6 +684,7 @@ pub fn write_group_jma(
         kind,
         actor_name,
         Some(&clip.movement),
+        version,
     )?;
     writer.flush()?;
     Ok(())
@@ -692,6 +700,7 @@ pub fn write_ce_group_jma(
     reorient: Option<&[RealQuaternion]>,
     actor_name: &str,
     dest: &Path,
+    version: u16,
 ) -> Result<(), ExtractError> {
     let kind = JmaKind::from_metadata(
         group.animation_type.as_deref(),
@@ -726,6 +735,7 @@ pub fn write_ce_group_jma(
         kind,
         actor_name,
         Some(&clip.movement),
+        version,
     )?;
     writer.flush().ok();
     Ok(())

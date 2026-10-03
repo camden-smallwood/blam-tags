@@ -97,19 +97,23 @@ impl Game {
     }
 
     /// The JMA-family (animation) text-format version this game's tools
-    /// read/write.
+    /// read/write, as their MCC tool.exe readers accept it:
     ///
-    /// Unlike JMS/ASS, all three generations share version **16392** —
-    /// the `header + node{name,first_child,next_sibling} + per-frame
-    /// transforms` layout. HABT (`io_scene_halo/file_jma`) lists 16392 as
-    /// valid for CE/H2/H3 (`__init__.py`: `16390` = "CE/H2/H3"), and our
-    /// writer already emits 16392 with H3+Reach corpus validation. The
-    /// later `16395` H2/H3 variant only adds an optional biped-controller
-    /// transform block, which extraction doesn't need; keeping one version
-    /// per game here gives a single dispatch point should that change.
+    /// - **Halo 1: 16392.** Halo CE tool.exe parses 16390–16393 only, and
+    ///   writes 16392 itself.
+    /// - **Halo 2 and Halo 3+: 16394.** Both parse 16390–16395, but Halo 2's
+    ///   refuses anything below 16394 ("ANIMATION FILE IS OUTDATED! …
+    ///   expected at least version 16394") and Halo 3's warns that the import
+    ///   "may have problems later".
+    ///
+    /// 16394 is a different layout, not a renumbering; see
+    /// [`crate::animation::JMA_ABSOLUTE_VERSION`]. The later 16395 only adds
+    /// an optional per-frame root transform block, which extraction does not
+    /// need.
     pub fn jma_version(self) -> u16 {
         match self {
-            Game::Halo1 | Game::Halo2 | Game::Halo3 => 16392,
+            Game::Halo1 => 16392,
+            Game::Halo2 | Game::Halo3 => crate::animation::JMA_ABSOLUTE_VERSION,
         }
     }
 }

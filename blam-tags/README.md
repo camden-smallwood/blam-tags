@@ -266,6 +266,7 @@ Both the DDS and the TIFF path were validated by corpus-wide sweeps over the Hal
 
 ```rust
 use blam_tags::{Animation, JmaKind, NodeTransform, Skeleton, TagFile};
+use blam_tags::game::Game;
 use std::fs::File;
 use std::io::BufWriter;
 
@@ -292,7 +293,7 @@ for group in animation.iter() {
     let pose = clip.pose(&skeleton, pose_defaults);
     let path = format!("{}.{}", group.name.as_deref().unwrap_or("anim"), kind.extension());
     let mut out = BufWriter::new(File::create(path)?);
-    pose.write_jma(&mut out, &skeleton, &defaults, group.node_list_checksum, kind, "actor", Some(&clip.movement))?;
+    pose.write_jma(&mut out, &skeleton, &defaults, group.node_list_checksum, kind, "actor", Some(&clip.movement), Game::of(&tag).jma_version())?;
 }
 ```
 

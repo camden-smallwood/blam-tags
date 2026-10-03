@@ -31,7 +31,7 @@ pub use graph::{
     AnimationGraph, GraphAction, GraphActionAnimation, GraphMode, GraphSet, GraphTransition,
     GraphWeaponClass, GraphWeaponType,
 };
-pub use jma::JmaKind;
+pub use jma::{JmaKind, JMA_ABSOLUTE_VERSION};
 pub use name::{base_state_candidates, AnimationName, AnimationStateType};
 pub use pose::{NodeTransform, Pose, Skeleton, SkeletonNode};
 

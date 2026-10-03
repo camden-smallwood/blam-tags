@@ -215,6 +215,7 @@ pub fn run(
                     reorient.as_deref(),
                     &stem,
                     &destinations[i],
+                    blam_tags::game::Game::of(jmad_tag).jma_version(),
                 )?;
                 let kind = jma_kind_for(group);
                 println!(
@@ -313,7 +314,7 @@ fn run_ce(
 
         // Base kinds pose against the rest defaults; overlay/replacement
         // compose deltas onto the rest pose (CE base resolution is N/A).
-        write_ce_group_jma(group, &clip, &skeleton, &defaults, None, &stem, &dest)?;
+        write_ce_group_jma(group, &clip, &skeleton, &defaults, None, &stem, &dest, blam_tags::game::Game::Halo1.jma_version())?;
         println!("{}: {} frames × {} bones [{}]  movement={:?}",
             dest.display(), clip.frame_count, skeleton.len(), kind.extension(), clip.movement.kind);
     }
