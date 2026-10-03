@@ -339,6 +339,17 @@ fn unsupported_pair_message(source_game: &str, target_game: &str) -> String {
 
 const CONVERSION_MAPPING_CATALOG: &str = include_str!("conversion_mappings.json");
 
+/// The conversion mapping catalog compiled into the converter, as the JSON
+/// text it parses: reviewed group aliases, struct and field mappings, and
+/// accepted field drops, keyed by game profile.
+///
+/// For tools that report on the same judgement the converter applies (such
+/// as a tag-compatibility database) and must not read a copy that can drift
+/// from it.
+pub fn conversion_mapping_catalog() -> &'static str {
+    CONVERSION_MAPPING_CATALOG
+}
+
 
 #[cfg(test)]
 
@@ -20552,5 +20563,23 @@ mod per_game_group_names {
             })
             .unwrap_or_default();
         assert_eq!(found, ["a.model_collision_geometry"]);
+    }
+}
+
+#[cfg(test)]
+mod embedded_catalog {
+    /// The public catalog is the one the converter loads: it parses as the
+    /// converter's own type, and carries the reviewed groups a caller would
+    /// otherwise have to find in a file.
+    #[test]
+    fn the_public_catalog_is_the_converters() {
+        let text = super::conversion_mapping_catalog();
+        assert_eq!(text, include_str!("conversion_mappings.json"));
+        let catalog = super::ConversionMappingCatalog::load().expect("the embedded catalog loads");
+        let value: serde_json::Value = serde_json::from_str(text).expect("JSON");
+        assert_eq!(value["version"], 1);
+        let covered = value["covered_groups"].as_array().expect("covered_groups");
+        assert!(!covered.is_empty());
+        assert_eq!(covered.len(), catalog.covered_groups.len());
     }
 }
