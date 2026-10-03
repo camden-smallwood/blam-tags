@@ -92,9 +92,13 @@ pub(crate) enum TagSubChunkContent {
     /// tags are modeled.
     Resource(TagResourceChunk),
     /// An empty `tgst` chunk (size=0) that doesn't correspond to any
-    /// layout field. MCC's writer emits these as a placeholder before
-    /// the real tgst for a struct sub-chunk field, and as trailing
-    /// filler at the end of some struct contents. Preserved verbatim
+    /// layout field: the chunk of a zero-byte struct that the writer
+    /// emits from the code layout although the persisted layout records
+    /// the field as a `custom` (see `absorb_empty_tgsts`). It can sit
+    /// before any chunk-writing field or trail a struct's contents. Never
+    /// created for a new element: the chunk is a writer bug, so an element
+    /// added here omits it while its siblings read from disk keep theirs —
+    /// which differs from what the kits write, though both read back. Preserved verbatim
     /// (as the entry's position within the parent's `sub_chunks`) so
     /// write-side can re-emit them at the correct byte offset.
     EmptyPlaceholder,
@@ -571,11 +575,11 @@ impl TagStructData {
         let sub_chunks = if tag_struct_header.size != 0 {
             let mut sub_chunks = read_sub_chunks(layout, definition, reader, endian)?;
 
-            // Trailing empty-tgst absorb: MCC's writer occasionally
-            // emits size=0 tgst chunks at the end of a struct's
-            // content that don't correspond to any layout field.
-            // Preserve them as EmptyPlaceholder entries so write-side
-            // re-emits them at the same position.
+            // Trailing empty-tgst absorb: the chunk of a zero-byte
+            // struct the layout dropped (see `absorb_empty_tgsts`)
+            // lands here when no later field writes a chunk. Preserve
+            // them as EmptyPlaceholder entries so write-side re-emits
+            // them at the same position.
             let mut end_offset = reader.stream_position()?;
             let expected_offset = tag_struct_offset + tag_struct_header.size as u64;
 
@@ -933,6 +937,46 @@ impl TagStructData {
     }
 }
 
+/// Consume any empty (size 0) `tgst` chunks at the reader's position as
+/// [`TagSubChunkContent::EmptyPlaceholder`] entries, stopping at the first
+/// chunk that is anything else.
+///
+/// These are the chunks of zero-byte structs the tag's own layout no longer
+/// lists. The writer walks the code layout and emits a `tgst` for every struct
+/// field, including one with no bytes, but the persisted `blay` drops such a
+/// field to a `custom` — and a `custom` there is indistinguishable from any
+/// other, so nothing in the layout predicts the chunk. Halo 3 / ODST / Reach
+/// `scenario_effect_scenery_block` is the shipped case: its `effect scenery
+/// data` (`scenario_effect_scenery_datum_struct`, no fields) is a `custom` in
+/// every tag, yet each element carries its empty `tgst` — trailing in Halo 3,
+/// ahead of `multiplayer data` in Reach. The chunk can sit before any field
+/// that writes one, so every such field absorbs ahead of itself.
+fn absorb_empty_tgsts<R: Seek + Read>(
+    reader: &mut std::io::BufReader<R>,
+    endian: Endian,
+    sub_chunks: &mut Vec<TagSubChunkEntry>,
+) -> Result<(), TagReadError> {
+    loop {
+        let header_offset = reader.stream_position()?;
+        let header = read_chunk_header(reader, endian)?;
+
+        if header.signature != u32::from_be_bytes(*b"tgst") || header.size != 0 {
+            reader.seek(SeekFrom::Start(header_offset))?;
+            return Ok(());
+        }
+        if header.version != 0 {
+            return Err(TagReadError::BadChunkVersion {
+                chunk: "empty placeholder tgst",
+                version: header.version,
+            });
+        }
+        sub_chunks.push(TagSubChunkEntry {
+            field_index: None,
+            content: TagSubChunkContent::EmptyPlaceholder,
+        });
+    }
+}
+
 /// Walk a struct definition's fields, reading each sub-chunk-producing
 /// field's chunk from the stream. Primitive / pad / skip / custom /
 /// explanation / terminator fields contribute nothing here — their
@@ -955,40 +999,14 @@ fn read_sub_chunks<R: Seek + Read>(
             TagFieldType::Struct => {
                 let nested_definition = &layout.struct_layouts[field.definition as usize];
 
-                // Placeholder-skip: MCC may emit size=0 tgst placeholder(s) before
-                // the real tgst when the nested struct expects sub-chunks.
-                let expected_children = layout.get_struct_expected_children(field.definition as usize);
-
-                if expected_children > 0 {
-                    loop {
-                        let header_offset = reader.stream_position()?;
-                        let header = read_chunk_header(reader, endian)?;
-
-                        if header.signature != u32::from_be_bytes(*b"tgst") {
-                            return Err(TagReadError::BadChunkSignature {
-                                offset: header_offset,
-                                expected: *b"tgst",
-                                got: header.signature.to_be_bytes(),
-                            });
-                        }
-
-                        if header.size == 0 {
-                            if header.version != 0 {
-                                return Err(TagReadError::BadChunkVersion {
-                                    chunk: "empty placeholder tgst",
-                                    version: header.version,
-                                });
-                            }
-                            sub_chunks.push(TagSubChunkEntry {
-                                field_index: None,
-                                content: TagSubChunkContent::EmptyPlaceholder,
-                            });
-                            continue;
-                        }
-
-                        reader.seek(SeekFrom::Start(header_offset))?;
-                        break;
-                    }
+                // A struct that expects no sub-chunks writes an empty tgst of its
+                // own, which an orphan placeholder cannot be told apart from —
+                // so only absorb ahead of a struct whose real tgst has content.
+                // Taking the first empty tgst as the struct's own is harmless:
+                // any orphan behind it is absorbed by the next field or as a
+                // trailer, and position alone drives the write.
+                if layout.get_struct_expected_children(field.definition as usize) > 0 {
+                    absorb_empty_tgsts(reader, endian, &mut sub_chunks)?;
                 }
 
                 let nested = TagStructData::read(layout, nested_definition, reader, endian)?;
@@ -1022,6 +1040,7 @@ fn read_sub_chunks<R: Seek + Read>(
             }
 
             TagFieldType::Block => {
+                absorb_empty_tgsts(reader, endian, &mut sub_chunks)?;
                 let block_layout = &layout.block_layouts[field.definition as usize];
                 let block_data = TagBlockData::read(layout, block_layout, reader, endian)?;
 
@@ -1036,6 +1055,7 @@ fn read_sub_chunks<R: Seek + Read>(
             | TagFieldType::OldStringId
             | TagFieldType::Data
             | TagFieldType::ApiInterop => {
+                absorb_empty_tgsts(reader, endian, &mut sub_chunks)?;
                 let (signature, chunk, content) =
                     leaf_chunk(field.field_type).expect("a leaf field type");
                 sub_chunks.push(TagSubChunkEntry {
@@ -1066,6 +1086,7 @@ fn read_sub_chunks<R: Seek + Read>(
                         len: layout.struct_layouts.len(),
                     })?;
 
+                absorb_empty_tgsts(reader, endian, &mut sub_chunks)?;
                 let outer_header = read_chunk_header(reader, endian)?;
                 let outer_content_offset = reader.stream_position()?;
 
@@ -1766,5 +1787,82 @@ mod new_element_block_index_default_tests {
             Some(-1),
             "pills[0]/base/phantom (inside inline `base` struct) should default to NONE, not 0",
         );
+    }
+}
+
+/// An orphan empty `tgst` — the chunk of a zero-byte struct the persisted
+/// layout records as a `custom` — must be absorbed ahead of whatever chunk
+/// follows it and re-emitted in place. The shipped tags only ever put one ahead
+/// of a struct or at the end of a struct, so these are synthetic: real structs
+/// whose first chunk-writing field is each of the other kinds, with an empty
+/// `tgst` spliced in front of that field's chunk.
+#[cfg(test)]
+mod orphan_empty_tgst_tests {
+    use super::{read_sub_chunks, write_sub_chunks, TagStructData, TagSubChunkContent};
+    use crate::fields::TagFieldType;
+    use crate::io::{write_tag_chunk_header, Endian};
+    use crate::layout::TagLayout;
+
+    /// The first field of `struct_index` that writes a chunk of its own, if it
+    /// is not an array (arrays write none, their elements' fields do).
+    fn first_chunk_field(layout: &TagLayout, struct_index: usize) -> Option<TagFieldType> {
+        let mut field_index = layout.struct_layouts[struct_index].first_field_index as usize;
+        loop {
+            let field = &layout.fields[field_index];
+            match field.field_type {
+                TagFieldType::Terminator | TagFieldType::Array => return None,
+                _ if layout.field_types[field.type_index as usize].needs_sub_chunk != 0 => {
+                    return Some(field.field_type);
+                }
+                _ => field_index += 1,
+            }
+        }
+    }
+
+    #[test]
+    fn an_orphan_empty_tgst_is_absorbed_ahead_of_any_chunk() {
+        let wanted = [
+            TagFieldType::Block,
+            TagFieldType::TagReference,
+            TagFieldType::StringId,
+            TagFieldType::Data,
+            TagFieldType::PageableResource,
+        ];
+        let mut covered = Vec::new();
+
+        for group in ["scenario", "render_model", "bitmap", "sound", "model_animation_graph"] {
+            let layout = TagLayout::from_json(format!("../definitions/halo3_mcc/{group}.json"))
+                .unwrap_or_else(|e| panic!("{group}: {e}"));
+            for struct_index in 0..layout.struct_layouts.len() {
+                let Some(kind) = first_chunk_field(&layout, struct_index) else { continue };
+                if !wanted.contains(&kind) || covered.contains(&kind) {
+                    continue;
+                }
+
+                let data = TagStructData::new_default(&layout, struct_index, Endian::Le);
+                let mut clean = Vec::new();
+                write_sub_chunks(&data.sub_chunks, &layout, &mut clean).unwrap();
+
+                let mut spliced = Vec::new();
+                write_tag_chunk_header(&mut spliced, u32::from_be_bytes(*b"tgst"), 0, 0).unwrap();
+                spliced.extend_from_slice(&clean);
+
+                let mut reader = std::io::BufReader::new(std::io::Cursor::new(&spliced));
+                let read = read_sub_chunks(&layout, &layout.struct_layouts[struct_index], &mut reader, Endian::Le)
+                    .unwrap_or_else(|e| panic!("{group} struct {struct_index} ({kind:?} first): {e}"));
+                assert!(
+                    matches!(read[0].content, TagSubChunkContent::EmptyPlaceholder) && read[0].field_index.is_none(),
+                    "{group} struct {struct_index}: orphan not recorded as a placeholder ahead of the {kind:?}"
+                );
+                assert_eq!(read.len(), data.sub_chunks.len() + 1);
+
+                let mut rewritten = Vec::new();
+                write_sub_chunks(&read, &layout, &mut rewritten).unwrap();
+                assert_eq!(rewritten, spliced, "{group} struct {struct_index}: not byte-exact");
+
+                covered.push(kind);
+            }
+        }
+        assert_eq!(covered.len(), wanted.len(), "kinds covered: {covered:?}");
     }
 }

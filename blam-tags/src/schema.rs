@@ -566,6 +566,12 @@ fn merge_parent_schemas(schema: &mut TagSchema, defs_dir: &Path) {
 ///
 /// A template with no ancestors (`mat `) or one that will not resolve (`ssfx`,
 /// which no `_meta.json` lists) folds nothing and is left exactly as it was.
+///
+/// The cause is an engine bug, not a convention: the struct field after the
+/// `tmpl` custom is compiled to point at the derived-only definition — left
+/// over from the Halo 2 legacy field-set setup that Halo 4 and earlier still
+/// run at initialization — when it should name the combined struct the modern
+/// tag layout uses. Folding the base back in reconstructs that combined struct.
 fn fold_template_bases(schema: &mut TagSchema, defs_dir: &Path) {
     // (template group tag, name of the struct field that follows it). Collected
     // before mutating because the walk borrows `schema.structs`.
