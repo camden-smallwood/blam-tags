@@ -6,7 +6,6 @@
 
 use crate::classic::{ClassicHeader, read_classic_tag_file};
 use crate::file::TagFileHeader;
-use crate::paths::group_tag_to_extension;
 use crate::{
     ApiInteropData, Endian, FunctionFlags, FunctionType, StringIdData, TagBlock, TagField,
     TagFieldData, TagFieldMut, TagFieldPath, TagFieldType, TagFile, TagLayout, TagOptions,
@@ -112,8 +111,7 @@ pub fn read_tag_for_conversion(
     if ClassicHeader::parse(&bytes).is_some() {
         let game = game.ok_or("classic tag requires a detected game profile")?;
         let definitions_root = definitions_root.ok_or("classic tag requires a definitions root")?;
-        let group_name =
-            group_tag_to_extension(group_tag).ok_or("unknown group for classic tag layout")?;
+        let group_name = game_group_name(definitions_root, game, group_tag)?;
         let definition = definitions_root.join(game).join(format!("{group_name}.json"));
         let layout = TagLayout::from_json(&definition).map_err(|error| {
             format!("failed to load classic layout {}: {error}", definition.display())
@@ -122,6 +120,20 @@ pub fn read_tag_for_conversion(
             .map_err(|error| format!("failed to decode classic tag: {error}"));
     }
     TagFile::read(path).map_err(|error| format!("Could not read {}: {error}", path.display()))
+}
+
+/// The name `game` gives `group_tag`, from its own `_meta.json` tag index.
+///
+/// Not [`crate::paths::group_tag_to_extension`]: that table merges every game
+/// and lets Halo 3 win a collision, so for Halo CE it turns `coll` into
+/// `collision_model` where CE's group is `model_collision_geometry` (likewise
+/// `mode`, `fog `, `rain`, `smet`, and Halo 2's `gldf`). The name is both the
+/// definition file's stem and the tag's file extension.
+fn game_group_name(definitions_root: &Path, game: &str, group_tag: u32) -> Result<String, String> {
+    GameTagIndex::load(definitions_root, game)?
+        .by_tag
+        .remove(&group_tag)
+        .ok_or_else(|| format!("{game} has no tag group '{}'", format_group_tag(group_tag)))
 }
 
 pub const CONVERSION_GAMES: &[&str] = &[
@@ -509,10 +521,11 @@ pub struct NativeTemplateIndex {
 
 impl NativeTemplateIndex {
     pub fn build(tags_root: &Path, groups: &GameTagIndex) -> Self {
+        // A game's group name is its file extension; the cross-game table
+        // would index Halo CE's `.model_collision_geometry` tags as nothing.
         let mut by_extension = HashMap::new();
         for (group_tag, group_name) in &groups.by_tag {
-            let extension = group_tag_to_extension(*group_tag).unwrap_or(group_name);
-            by_extension.insert(extension.to_ascii_lowercase(), *group_tag);
+            by_extension.insert(group_name.to_ascii_lowercase(), *group_tag);
         }
         let mut result = Self::default();
         for item in walk_files(tags_root) {
@@ -1891,8 +1904,7 @@ fn reparse_intermediate(
     if ClassicHeader::parse(bytes).is_some() {
         let (header, _) = ClassicHeader::parse(bytes).expect("checked above");
         let group_tag = u32::from_be_bytes(header.group_tag);
-        let group_name =
-            group_tag_to_extension(group_tag).ok_or("unknown group for classic intermediate")?;
+        let group_name = game_group_name(definitions_root, game, group_tag)?;
         let definition = definitions_root.join(game).join(format!("{group_name}.json"));
         let layout = TagLayout::from_json(&definition)
             .map_err(|error| format!("failed to load {}: {error}", definition.display()))?;
@@ -2398,9 +2410,7 @@ fn analyze_conversion_inner(
     }
     context.report.fail_closed_losses = fail_closed_losses;
 
-    let target_extension = group_tag_to_extension(target_group_tag)
-        .unwrap_or(&target_group_name)
-        .to_owned();
+    let target_extension = target_group_name.clone();
     Ok(TagConversionDraft {
         tag: target,
         companion_tags: context.companion_tags,
@@ -4070,9 +4080,7 @@ fn create_companion_tag(
         (tag, None)
     };
     apply_editing_kit_mcc_header(&mut tag, context.target_game)?;
-    let extension = group_tag_to_extension(group_tag)
-        .unwrap_or(group_name)
-        .to_owned();
+    let extension = group_name.to_owned();
     Ok(CompanionTagDraft {
         key: key.to_owned(),
         file_suffix: file_suffix.to_owned(),
@@ -20451,5 +20459,98 @@ mod x360_cache_conversion {
             "{label}\tapi resource={has_resource}\tmeshes with verts={with}/{}\tverts={verts}\tindices={idx}\t{first}",
             pmt.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod per_game_group_names {
+    use super::{GameTagIndex, NativeTemplateIndex, read_tag_for_conversion, reparse_intermediate};
+    use crate::TagLayout;
+    use std::path::{Path, PathBuf};
+
+    const COLL: u32 = u32::from_be_bytes(*b"coll");
+
+    fn definitions_root() -> &'static Path {
+        Path::new("../definitions")
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("blam-tags-per-game-group-names-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A Halo CE `coll` tag with nothing in it: the 64-byte classic header
+    /// (big-endian `blam` engine word) and a zeroed root element, which reads
+    /// as every block empty and every reference null.
+    fn empty_ce_collision() -> Vec<u8> {
+        let definition = definitions_root().join("haloce_mcc/model_collision_geometry.json");
+        let layout = TagLayout::from_json(&definition).expect("CE collision layout");
+        let root_block = layout.header.tag_group_block_index as usize;
+        let root_struct = layout.block_layouts[root_block].struct_index as usize;
+        let size = layout.struct_layouts[root_struct].size as usize;
+        let mut bytes = vec![0u8; 64 + size];
+        bytes[36..40].copy_from_slice(b"coll");
+        bytes[56..58].copy_from_slice(&1u16.to_be_bytes());
+        bytes[40..44].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+        bytes[60..64].copy_from_slice(b"blam");
+        bytes
+    }
+
+    /// The Halo 3 name for `coll` has no Halo CE definition; CE's own does.
+    #[test]
+    fn the_cross_game_name_is_not_a_halo_ce_definition() {
+        assert_eq!(crate::paths::group_tag_to_extension(COLL), Some("collision_model"));
+        assert!(!definitions_root().join("haloce_mcc/collision_model.json").exists());
+        let index = GameTagIndex::load(definitions_root(), "haloce_mcc").unwrap();
+        assert_eq!(index.by_tag.get(&COLL).map(String::as_str), Some("model_collision_geometry"));
+    }
+
+    #[test]
+    fn a_halo_ce_collision_tag_reads_through_its_own_definition() {
+        let dir = scratch("read");
+        let path = dir.join("empty.model_collision_geometry");
+        std::fs::write(&path, empty_ce_collision()).unwrap();
+        let read = read_tag_for_conversion(&path, Some("haloce_mcc"), Some(definitions_root()), COLL);
+        let _ = std::fs::remove_dir_all(&dir);
+        let tag = read.expect("CE coll reads");
+        assert_eq!(tag.group().tag, COLL);
+        assert!(tag.root().field("materials").is_some());
+    }
+
+    #[test]
+    fn a_halo_ce_collision_intermediate_reparses_through_its_own_definition() {
+        let tag = reparse_intermediate(&empty_ce_collision(), "haloce_mcc", definitions_root())
+            .expect("CE coll reparses");
+        assert_eq!(tag.group().tag, COLL);
+    }
+
+    /// A group the game does not have is an error naming it, not a guess.
+    #[test]
+    fn a_group_the_game_lacks_is_refused() {
+        let mut bytes = empty_ce_collision();
+        bytes[36..40].copy_from_slice(b"zzzz");
+        let error = reparse_intermediate(&bytes, "haloce_mcc", definitions_root()).unwrap_err();
+        assert!(error.contains("zzzz"), "{error}");
+    }
+
+    #[test]
+    fn halo_ce_kit_templates_are_indexed_by_their_own_extension() {
+        let dir = scratch("templates");
+        std::fs::write(dir.join("a.model_collision_geometry"), []).unwrap();
+        std::fs::write(dir.join("b.collision_model"), []).unwrap();
+        let groups = GameTagIndex::load(definitions_root(), "haloce_mcc").unwrap();
+        let index = NativeTemplateIndex::build(&dir, &groups);
+        let _ = std::fs::remove_dir_all(&dir);
+        let found: Vec<String> = index
+            .by_group
+            .get(&COLL)
+            .map(|paths| {
+                paths.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(found, ["a.model_collision_geometry"]);
     }
 }
