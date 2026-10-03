@@ -227,8 +227,10 @@ impl TagFile {
         // is set" holds, and `TagLayout::from_json` writes -1 and a guid. The
         // table lives in `convert` and is deliberately not repeated here; a
         // profile it does not know leaves the header zeroed, as before.
-        if let Some(game) = schema_profile_name(schema_path) {
-            let _ = crate::convert::apply_editing_kit_mcc_header(&mut tag, &game);
+        for game in schema_profile_names(schema_path) {
+            if crate::convert::apply_editing_kit_mcc_header(&mut tag, &game).is_ok() {
+                break;
+            }
         }
         Ok(tag)
     }
@@ -836,11 +838,21 @@ fn save_temp_location(path: &Path) -> std::io::Result<(PathBuf, String)> {
 /// The profile a schema path belongs to — the directory name that holds it,
 /// confirmed against the `_meta.json` sitting beside it so a path that merely
 /// looks like `<something>/<group>.json` cannot be mistaken for a kit profile.
-fn schema_profile_name(schema_path: &Path) -> Option<String> {
-    let directory = schema_path.parent()?;
-    let bytes = std::fs::read(directory.join("_meta.json")).ok()?;
-    let meta: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    Some(meta.get("game")?.as_str()?.to_owned())
+/// The profile names a schema may answer to, most specific first: the
+/// definitions folder it sits in (what every profile table is keyed by),
+/// then the `game` its `_meta.json` declares. The two agree for every game
+/// but Campaign Evolved, whose folder is `haloce_evolved` and whose meta says
+/// `halocampaignevolved`.
+fn schema_profile_names(schema_path: &Path) -> Vec<String> {
+    let Some(directory) = schema_path.parent() else { return Vec::new() };
+    let mut names: Vec<String> =
+        directory.file_name().and_then(|name| name.to_str()).map(str::to_owned).into_iter().collect();
+    let declared = std::fs::read(directory.join("_meta.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|meta| Some(meta.get("game")?.as_str()?.to_owned()));
+    names.extend(declared.filter(|game| !names.contains(game)));
+    names
 }
 
 fn patch_live_reload_checksum(bytes: &mut [u8], main_stream: std::ops::Range<usize>) {
@@ -887,4 +899,26 @@ fn copy_file_overwrite(from: &Path, to: &Path) -> std::io::Result<()> {
 #[cfg(not(windows))]
 fn copy_file_overwrite(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::copy(from, to).map(|_| ())
+}
+
+#[cfg(test)]
+mod new_tag_generation {
+    use super::TagFile;
+
+    fn generation(game: &str) -> (i32, i32, u32) {
+        let tag = TagFile::new(format!("../definitions/{game}/collision_model.json"))
+            .unwrap_or_else(|error| panic!("{game}: {error}"));
+        (tag.header.build_version, tag.header.build_number, tag.header.version)
+    }
+
+    /// Campaign Evolved's tags are Reach-format and carry Reach's generation.
+    /// Its `_meta.json` names the game `halocampaignevolved`, not its folder
+    /// `haloce_evolved`, and the header table is keyed by folder, so a new CE
+    /// tag was left with the all-zero header no shipped tag has.
+    #[test]
+    fn a_new_campaign_evolved_tag_carries_reachs_generation() {
+        assert_eq!(generation("haloreach_mcc"), (1, 2, u32::MAX));
+        assert_eq!(generation("haloce_evolved"), crate::convert::CAMPAIGN_EVOLVED_GENERATION);
+        assert_eq!(generation("halo3_mcc"), (1, 1, u32::MAX));
+    }
 }
