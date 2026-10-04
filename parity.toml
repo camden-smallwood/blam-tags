@@ -1,0 +1,183 @@
+# What the shell can do, and whether Python can do the same.
+#
+# Every `blam-tag-shell` subcommand has a `[cli.<name>]` entry, and every
+# word the REPL handles itself has a `[repl."<word>"]` entry. Tests keep the
+# lists honest in both directions:
+#
+#   - blam-tag-shell (`cargo test -p blam-tag-shell`) fails when a subcommand
+#     or REPL verb has no entry here, or when an entry names one that no
+#     longer exists.
+#   - blam-tags-py (`pytest blam-tags-py/tests/test_shell_parity.py`) fails
+#     when an attribute listed under `python` is missing from the module.
+#
+# Each entry sets exactly one of:
+#   python = ["Class.method", ...]  the Python attributes that cover it
+#   gap    = "..."                  Python cannot do this yet, and why
+#   na     = "..."                  the verb has no meaning outside the shell
+# and may add `note` for a partial match.
+
+# --- tag files -------------------------------------------------------------
+
+[cli.new]
+python = ["TagFile.new"]
+
+[cli.inspect]
+python = ["TagFile.read", "TagFile.root", "TagStruct.fields", "TagField.value"]
+note = "TagFile.read reads MCC-layout tags only; classic (CE/H2) tags cannot be opened from Python."
+
+[cli.get]
+python = ["TagStruct.field_path", "TagField.value"]
+
+[cli.set]
+python = ["TagField.set"]
+
+[cli.flag]
+python = ["TagField.get_flag", "TagField.set_flag"]
+
+[cli.options]
+python = ["TagField.options", "TagOptions.names", "TagOptions.flags"]
+
+[cli.block]
+python = ["TagBlock.add", "TagBlock.insert", "TagBlock.duplicate", "TagBlock.delete", "TagBlock.swap", "TagBlock.move_element", "TagBlock.clear"]
+
+[cli.header]
+python = ["TagFileHeader.peek"]
+note = "Tag files only; the shell's cache-file header view is not bound."
+
+[cli.deps]
+python = ["TagFile.read_dependency_references"]
+
+[cli.export]
+gap = "No Python equivalent of dumping a tag as replayable `set` commands."
+
+[cli.check]
+gap = "The enum/flag/real/reference checker is not bound."
+
+[cli.layout-diff]
+gap = "Schema comparison (module `schema_compare`) is not bound."
+
+[cli.data-diff]
+gap = "Value-level tag diff is not bound."
+
+[cli.add-dependency-list]
+python = ["TagFile.add_dependency_list"]
+
+[cli.remove-dependency-list]
+python = ["TagFile.remove_dependency_list"]
+
+[cli.rebuild-dependency-list]
+gap = "Rebuilding the dependency list from the tag's references is not bound."
+
+[cli.add-import-info]
+python = ["TagFile.add_import_info"]
+
+[cli.remove-import-info]
+python = ["TagFile.remove_import_info"]
+
+[cli.add-asset-depot-storage]
+python = ["TagFile.add_asset_depot_storage"]
+
+[cli.remove-asset-depot-storage]
+python = ["TagFile.remove_asset_depot_storage"]
+
+# --- corpora and caches ----------------------------------------------------
+
+[cli.list]
+gap = "No directory walker over tags is bound."
+
+[cli.find]
+gap = "Deep value search across a directory is not bound."
+
+[cli.list-cache]
+gap = "Halo 4 monolithic tag caches (module `monolithic`) are not bound."
+
+# --- extraction ------------------------------------------------------------
+
+[cli.extract-bitmap]
+gap = "Bitmap extraction (module `bitmap`) is not bound."
+
+[cli.extract-geometry]
+gap = "Geometry extraction (modules `extract`, `jms`) is not bound."
+
+[cli.extract-data]
+gap = "Data-field extraction (module `extract`) is not bound."
+
+[cli.extract-import-info]
+gap = "Import-info extraction (module `extract`) is not bound."
+
+[cli.list-animations]
+gap = "Animation graphs (module `animation`) are not bound."
+
+[cli.extract-animation]
+gap = "Animation extraction (module `animation`) is not bound."
+
+# --- import and conversion -------------------------------------------------
+
+[cli.import]
+gap = "JMS/ASS import (modules `render_import`, `collision_import`, `physics_import`, `sbsp_import`) is not bound."
+
+[cli.gltf-to-jms]
+gap = "glTF conversion (module `gltf`) is not bound."
+
+[cli.split-jms]
+gap = "JMS splitting (module `jms_split`) is not bound."
+
+[cli.jms-to-physics]
+gap = "Physics import (module `physics_import`) is not bound."
+
+[cli.jms-to-render]
+gap = "Render-model import (module `render_import`) is not bound."
+
+[cli.jms-to-collision]
+gap = "Collision import (module `collision_import`) is not bound."
+
+[cli.collision-bsp-test]
+gap = "Collision verification (module `collision_verify`) is not bound."
+
+# --- interactive session ---------------------------------------------------
+
+[cli.repl]
+na = "An interactive shell; Python is its own REPL."
+
+[repl.open]
+python = ["TagFile.read"]
+
+[repl.save]
+python = ["TagFile.write", "TagFile.write_atomic"]
+
+[repl.revert]
+python = ["TagFile.read"]
+note = "Re-read the file; there is no in-place revert."
+
+[repl.close]
+na = "A Python TagFile is closed by dropping it."
+
+[repl.edit-block]
+python = ["TagStruct.descend"]
+
+[repl.cd]
+python = ["TagStruct.descend"]
+
+[repl.back]
+na = "Python code keeps its own handles instead of a navigation stack."
+
+[repl.exit-to]
+na = "Python code keeps its own handles instead of a navigation stack."
+
+[repl.pwd]
+python = ["TagStruct.path"]
+
+[repl.help]
+na = "Shell help; Python uses help() and the .pyi stubs."
+
+[repl."?"]
+na = "Alias of `help`."
+
+[repl.exit]
+na = "Leaves the shell."
+
+[repl.quit]
+na = "Alias of `exit`."
+
+[repl.repl]
+na = "Refused inside the REPL."

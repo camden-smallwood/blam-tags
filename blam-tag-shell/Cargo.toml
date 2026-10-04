@@ -28,3 +28,7 @@ rustyline = "14"
 shlex = "1"
 dirs = "5"
 flate2 = "1"
+
+[dev-dependencies]
+# Reads `parity.toml` in the shell-parity test.
+toml = "1"

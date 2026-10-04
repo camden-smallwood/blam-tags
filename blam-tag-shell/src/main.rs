@@ -1115,3 +1115,126 @@ fn ensure_loaded(ctx: &mut CliContext, file: &str, reload: bool) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod parity_tests {
+    //! Keeps the workspace's `parity.toml` in step with the shell: every
+    //! subcommand and every REPL-handled word needs an entry, and every
+    //! entry must name something that still exists.
+
+    use std::collections::BTreeSet;
+
+    use clap::CommandFactory;
+
+    use crate::Cli;
+    use crate::repl::REPL_VERBS;
+
+    const PARITY: &str = include_str!("../../parity.toml");
+
+    fn table<'a>(doc: &'a toml::Table, key: &str) -> &'a toml::Table {
+        doc.get(key)
+            .and_then(|v| v.as_table())
+            .unwrap_or_else(|| panic!("parity.toml has no [{key}] table"))
+    }
+
+    /// Names in `actual` with no entry, and entries naming nothing.
+    fn mismatch(actual: &BTreeSet<String>, listed: &BTreeSet<String>) -> (Vec<String>, Vec<String>) {
+        (
+            actual.difference(listed).cloned().collect(),
+            listed.difference(actual).cloned().collect(),
+        )
+    }
+
+    fn assert_agrees(kind: &str, actual: &BTreeSet<String>, listed: &BTreeSet<String>) {
+        let (missing, stale) = mismatch(actual, listed);
+        assert!(
+            missing.is_empty() && stale.is_empty(),
+            "parity.toml [{kind}] is out of date.\n  not listed: {missing:?}\n  listed but gone: {stale:?}",
+        );
+    }
+
+    fn subcommands() -> BTreeSet<String> {
+        Cli::command()
+            .get_subcommands()
+            .map(|c| c.get_name().to_string())
+            .collect()
+    }
+
+    fn repl_words() -> BTreeSet<String> {
+        REPL_VERBS.iter().map(|(word, _)| word.to_string()).collect()
+    }
+
+    fn doc() -> toml::Table {
+        PARITY.parse().expect("parity.toml parses")
+    }
+
+    #[test]
+    fn every_subcommand_is_listed() {
+        let doc = doc();
+        let listed = table(&doc, "cli").keys().cloned().collect();
+        assert_agrees("cli", &subcommands(), &listed);
+    }
+
+    #[test]
+    fn every_repl_verb_is_listed() {
+        let doc = doc();
+        let listed = table(&doc, "repl").keys().cloned().collect();
+        assert_agrees("repl", &repl_words(), &listed);
+    }
+
+    #[test]
+    fn every_entry_says_exactly_one_thing() {
+        let doc = doc();
+        for kind in ["cli", "repl"] {
+            for (name, entry) in table(&doc, kind) {
+                let entry = entry.as_table().unwrap_or_else(|| panic!("[{kind}.{name}] is not a table"));
+                let set: Vec<&str> = ["python", "gap", "na"]
+                    .into_iter()
+                    .filter(|k| entry.contains_key(*k))
+                    .collect();
+                assert_eq!(set.len(), 1, "[{kind}.{name}] must set exactly one of python/gap/na, has {set:?}");
+                for key in entry.keys() {
+                    assert!(
+                        ["python", "gap", "na", "note"].contains(&key.as_str()),
+                        "[{kind}.{name}] has unknown key `{key}`",
+                    );
+                }
+                match set[0] {
+                    "python" => {
+                        let attrs = entry["python"].as_array().expect("python is a list");
+                        assert!(!attrs.is_empty(), "[{kind}.{name}] python list is empty");
+                        assert!(attrs.iter().all(|a| a.as_str().is_some_and(|s| !s.is_empty())));
+                    }
+                    other => assert!(
+                        entry[other].as_str().is_some_and(|s| !s.trim().is_empty()),
+                        "[{kind}.{name}] {other} needs a reason",
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The comparison has to be able to disagree: a subcommand left out of
+    /// the file and an entry for a removed one must both be reported.
+    #[test]
+    fn mismatch_reports_both_directions() {
+        let mut listed = subcommands();
+        let dropped = listed.pop_first().unwrap();
+        listed.insert("no-such-command".to_string());
+        let (missing, stale) = mismatch(&subcommands(), &listed);
+        assert_eq!(missing, vec![dropped]);
+        assert_eq!(stale, vec!["no-such-command".to_string()]);
+    }
+
+    #[test]
+    fn repl_verbs_do_not_shadow_subcommands_except_repl() {
+        // A REPL word that is also a subcommand would make the subcommand
+        // unreachable from the REPL. `repl` is the one deliberate case.
+        let shadowed: Vec<String> = repl_words()
+            .intersection(&subcommands())
+            .filter(|w| *w != "repl")
+            .cloned()
+            .collect();
+        assert!(shadowed.is_empty(), "REPL verbs hide subcommands: {shadowed:?}");
+    }
+}

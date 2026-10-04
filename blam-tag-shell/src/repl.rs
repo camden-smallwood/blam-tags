@@ -91,6 +91,45 @@ enum LineOutcome {
     Error(anyhow::Error),
 }
 
+/// A verb the REPL handles itself instead of passing to clap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplVerb {
+    Exit,
+    Help,
+    Open,
+    Close,
+    Save,
+    Revert,
+    EditBlock,
+    Back,
+    ExitTo,
+    Pwd,
+    Repl,
+}
+
+/// Every word the REPL intercepts before clap sees the line, aliases
+/// included. `parity.toml` lists each one; a test checks the two agree.
+pub(crate) const REPL_VERBS: &[(&str, ReplVerb)] = &[
+    ("exit", ReplVerb::Exit),
+    ("quit", ReplVerb::Exit),
+    ("help", ReplVerb::Help),
+    ("?", ReplVerb::Help),
+    ("open", ReplVerb::Open),
+    ("close", ReplVerb::Close),
+    ("save", ReplVerb::Save),
+    ("revert", ReplVerb::Revert),
+    ("edit-block", ReplVerb::EditBlock),
+    ("cd", ReplVerb::EditBlock),
+    ("back", ReplVerb::Back),
+    ("exit-to", ReplVerb::ExitTo),
+    ("pwd", ReplVerb::Pwd),
+    ("repl", ReplVerb::Repl),
+];
+
+fn repl_verb(word: &str) -> Option<ReplVerb> {
+    REPL_VERBS.iter().find(|(name, _)| *name == word).map(|(_, verb)| *verb)
+}
+
 fn handle_line(ctx: &mut CliContext, line: &str) -> LineOutcome {
     let Some(words) = shlex::split(line) else {
         return LineOutcome::Error(anyhow::anyhow!("unbalanced quotes"));
@@ -102,25 +141,31 @@ fn handle_line(ctx: &mut CliContext, line: &str) -> LineOutcome {
     let verb = words[0].as_str();
     let rest = &words[1..];
 
+    let Some(verb) = repl_verb(verb) else {
+        return match dispatch_via_clap(ctx, &words) {
+            Ok(()) => LineOutcome::Continue,
+            Err(e) => LineOutcome::Error(e),
+        };
+    };
+
     let result: Result<_, anyhow::Error> = match verb {
-        "exit" | "quit" => {
+        ReplVerb::Exit => {
             return if rest.is_empty() || rest[0] != "--force" {
                 if confirm_discard_dirty(ctx, "exit") { LineOutcome::Exit } else { LineOutcome::Continue }
             } else {
                 LineOutcome::Exit
             };
         }
-        "help" | "?" => { print_help(ctx); return LineOutcome::Continue; }
-        "open" => repl_open(ctx, rest),
-        "close" => repl_close(ctx),
-        "save" => repl_save(ctx, rest),
-        "revert" => repl_revert(ctx),
-        "edit-block" | "cd" => repl_edit_block(ctx, rest),
-        "back" => repl_back(ctx),
-        "exit-to" => repl_exit_to(ctx, rest),
-        "pwd" => { print_pwd(ctx); Ok(()) }
-        "repl" => Err(anyhow::anyhow!("already in a REPL")),
-        _ => dispatch_via_clap(ctx, &words),
+        ReplVerb::Help => { print_help(ctx); return LineOutcome::Continue; }
+        ReplVerb::Open => repl_open(ctx, rest),
+        ReplVerb::Close => repl_close(ctx),
+        ReplVerb::Save => repl_save(ctx, rest),
+        ReplVerb::Revert => repl_revert(ctx),
+        ReplVerb::EditBlock => repl_edit_block(ctx, rest),
+        ReplVerb::Back => repl_back(ctx),
+        ReplVerb::ExitTo => repl_exit_to(ctx, rest),
+        ReplVerb::Pwd => { print_pwd(ctx); Ok(()) }
+        ReplVerb::Repl => Err(anyhow::anyhow!("already in a REPL")),
     };
 
     match result {
