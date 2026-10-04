@@ -1597,9 +1597,16 @@ impl<'a> TagFieldMut<'a> {
             return Err(TagSetError::NotAssignable);
         }
         let got = value.field_type();
-        if got != ft {
-            return Err(TagSetError::TypeMismatch { expected: ft.name(), got: got.name() });
-        }
+        let value = if got == ft {
+            value
+        } else {
+            match self.coerce_integer(&value) {
+                Some(coerced) => coerced,
+                None => {
+                    return Err(TagSetError::TypeMismatch { expected: ft.name(), got: got.name() });
+                }
+            }
+        };
         let size = self
             .layout
             .field_types
@@ -1611,6 +1618,24 @@ impl<'a> TagFieldMut<'a> {
             return Err(TagSetError::SizeMismatch { expected: size, got: bytes.len() });
         }
         self.struct_data.set_field(self.layout, &mut *self.struct_raw, self.field_index, value, self.endian)
+    }
+
+    /// `value` as this field's own integer type, when both are integers and it
+    /// fits. Integer-shaped fields differ between games and layouts (`mesh
+    /// index` is a short integer in one and a short block index in another; a
+    /// field widens from long to int64), and writers that carry a number
+    /// across them would otherwise be refused. It fits when the field's range
+    /// holds it, or when the two types are the same width, which writes the
+    /// same bits a same-width write always did. Enums, flags and every other
+    /// type still have to match exactly.
+    fn coerce_integer(&self, value: &TagFieldData) -> Option<TagFieldData> {
+        let number = value.integer()?;
+        let current = self.as_ref().value()?;
+        current.integer()?;
+        let coerced = current.with_int(i64::try_from(number).ok()?)?;
+        let fits = coerced.integer() == Some(number);
+        let same_width = integer_width(value) == integer_width(&coerced);
+        (fits || same_width).then_some(coerced)
     }
 
     /// Look up a single flag by name and return a mutable handle.
@@ -2236,6 +2261,18 @@ impl<'a> TagField<'a> {
 // Errors
 //================================================================================
 
+/// The width in bytes of an integer-shaped value, `None` for anything else.
+fn integer_width(value: &TagFieldData) -> Option<u8> {
+    use TagFieldData as D;
+    Some(match value {
+        D::CharInteger(_) | D::ByteInteger(_) | D::CharBlockIndex(_) | D::CustomCharBlockIndex(_) => 1,
+        D::ShortInteger(_) | D::WordInteger(_) | D::ShortBlockIndex(_) | D::CustomShortBlockIndex(_) => 2,
+        D::LongInteger(_) | D::DwordInteger(_) | D::LongBlockIndex(_) | D::CustomLongBlockIndex(_) => 4,
+        D::Int64Integer(_) | D::QwordInteger(_) => 8,
+        _ => return None,
+    })
+}
+
 /// Failure modes for [`TagFieldMut::set`].
 #[derive(Debug)]
 pub enum TagSetError {
@@ -2501,6 +2538,36 @@ mod set_type_tests {
             bounds(&tag),
             Some(TagFieldData::Rectangle2d(Rectangle2d { top: 1, left: 2, bottom: 3, right: 4 }))
         ));
+    }
+
+    /// Integer-shaped fields differ between games and layouts (a `mesh index`
+    /// is a short integer in one and a short block index in another), so an
+    /// integer of another shape is written as the field's own type when it
+    /// fits. A value that does not fit, and anything that is not an integer,
+    /// is still refused.
+    #[test]
+    fn an_integer_of_another_shape_is_written_as_the_fields_own_type_when_it_fits() {
+        let mut tag = widget();
+        let read = |tag: &TagFile| tag.root().field("render depth bias").and_then(|field| field.value());
+        tag.root_mut()
+            .field_mut("render depth bias")
+            .expect("render depth bias")
+            .set(TagFieldData::LongInteger(-7))
+            .expect("a long that fits a short");
+        assert!(matches!(read(&tag), Some(TagFieldData::ShortInteger(-7))));
+        tag.root_mut()
+            .field_mut("render depth bias")
+            .expect("render depth bias")
+            .set(TagFieldData::ShortBlockIndex(5))
+            .expect("a block index of the same width");
+        assert!(matches!(read(&tag), Some(TagFieldData::ShortInteger(5))));
+        let result = tag
+            .root_mut()
+            .field_mut("render depth bias")
+            .expect("render depth bias")
+            .set(TagFieldData::ShortEnum { value: 1, name: None });
+        assert!(matches!(result, Err(TagSetError::TypeMismatch { .. })), "{result:?}");
+        assert!(matches!(read(&tag), Some(TagFieldData::ShortInteger(5))), "nothing written");
     }
 
     #[test]
