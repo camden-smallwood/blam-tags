@@ -945,3 +945,252 @@ fn an_empty_particle_model_is_refused() {
     let out = TempDir::new("particle_empty");
     assert!(blam_tags::extract::particle_model::particle_model_to_dir(&tag, out.path(), "nothing").is_err());
 }
+
+// -------------------------------------------------------------- animation
+
+/// Frames in the synthetic animation.
+const ANIM_FRAMES: usize = 3;
+
+/// `bone`'s rotation about +Z at each frame, in radians.
+const BONE_YAW: [f32; ANIM_FRAMES] = [0.0, std::f32::consts::FRAC_PI_4, std::f32::consts::FRAC_PI_2];
+/// `bone`'s X translation at each frame, in world units.
+const BONE_X: [f32; ANIM_FRAMES] = [0.1, 0.2, 0.3];
+/// `frame`'s rest translation, held by the static stream.
+const ROOT_Z: f32 = 1.0;
+
+fn put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+fn put_f32(out: &mut Vec<u8>, v: f32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+/// A fullframe codec header: codec, node counts, the absolute offsets of
+/// the translation and scale runs, and the per-node strides.
+fn codec_header(codec: u8, counts: [u8; 3], offsets: [u32; 2], strides: [u32; 3]) -> Vec<u8> {
+    let mut h = vec![codec, counts[0], counts[1], counts[2]];
+    h.extend_from_slice(&[0; 8]); // error value, compression rate
+    put_u32(&mut h, offsets[0]);
+    put_u32(&mut h, offsets[1]);
+    for s in strides {
+        put_u32(&mut h, s);
+    }
+    assert_eq!(h.len(), 32);
+    h
+}
+
+/// A Halo 3 `animation_data` blob for a two-node skeleton, laid out the
+/// way the H3 decoder reads it:
+///
+/// * the static stream (codec 1, uncompressed static): `frame`'s
+///   rotation and translation, and both nodes' scale;
+/// * the animated stream (codec 2, uncompressed animated): `bone`'s
+///   rotation (f32 quaternions) and translation, per frame;
+/// * the static and then the animated node-flag bit arrays, three
+///   32-bit words each (rotation, translation, scale).
+///
+/// Returns the blob and the `(default_data, animated stream)` sizes.
+fn two_node_blob() -> (Vec<u8>, usize, usize) {
+    // Static: one rotated, one translated, two scaled node(s).
+    let mut s = codec_header(1, [1, 1, 2], [40, 52], [0, 0, 0]);
+    for c in [0i16, 0, 0, 32767] {
+        s.extend_from_slice(&c.to_le_bytes());
+    }
+    for c in [0.0, 0.0, ROOT_Z] {
+        put_f32(&mut s, c);
+    }
+    put_f32(&mut s, 1.0);
+    put_f32(&mut s, 1.0);
+    assert_eq!(s.len(), 60);
+
+    // Animated: one rotated and one translated node over three frames.
+    let rot_stride = 16 * ANIM_FRAMES as u32;
+    let trans_stride = 12 * ANIM_FRAMES as u32;
+    let trans_at = 32 + rot_stride;
+    let mut a = codec_header(2, [1, 1, 0], [trans_at, trans_at + trans_stride], [rot_stride, trans_stride, 0]);
+    for yaw in BONE_YAW {
+        for c in [0.0, 0.0, (yaw / 2.0).sin(), (yaw / 2.0).cos()] {
+            put_f32(&mut a, c);
+        }
+    }
+    for x in BONE_X {
+        for c in [x, 0.0, 0.0] {
+            put_f32(&mut a, c);
+        }
+    }
+    let animated_len = a.len();
+
+    let mut blob = s;
+    blob.extend_from_slice(&a);
+    // Static flags: rotation {frame}, translation {frame}, scale {frame, bone}.
+    for word in [0b01u32, 0b01, 0b11] {
+        put_u32(&mut blob, word);
+    }
+    // Animated flags: rotation {bone}, translation {bone}, scale {}.
+    for word in [0b10u32, 0b10, 0b00] {
+        put_u32(&mut blob, word);
+    }
+    (blob, 60, animated_len)
+}
+
+/// A Halo 3 animation graph: skeleton `frame` -> `bone`, one base
+/// animation `combat:idle` whose payload lives in a tag resource.
+fn two_node_jmad() -> TagFile {
+    use blam_tags::{StringIdData, TagFieldData as D};
+    let sid = |s: &str| D::StringId(StringIdData { string: s.into() });
+    let (blob, default_data, _) = two_node_blob();
+
+    let mut tag = TagFile::new(schema("halo3_mcc", "model_animation_graph")).unwrap();
+    let mut root = tag.root_mut();
+    {
+        let mut f = root.field_path_mut("definitions/skeleton nodes").expect("skeleton nodes");
+        let mut nodes = f.as_block_mut().unwrap();
+        for (name, parent, first_child) in [("frame", -1i16, 1i16), ("bone", 0, -1)] {
+            let i = nodes.add_element();
+            let mut n = nodes.element_mut(i).unwrap();
+            n.field_mut("name").unwrap().set(sid(name)).unwrap();
+            n.field_mut("parent node index").unwrap().set(D::ShortBlockIndex(parent)).unwrap();
+            n.field_mut("first child node index").unwrap().set(D::ShortBlockIndex(first_child)).unwrap();
+            n.field_mut("next sibling node index").unwrap().set(D::ShortBlockIndex(-1)).unwrap();
+        }
+    }
+    {
+        let mut f = root.field_path_mut("definitions/animations").expect("animations");
+        let mut anims = f.as_block_mut().unwrap();
+        let i = anims.add_element();
+        let mut a = anims.element_mut(i).unwrap();
+        a.field_mut("name").unwrap().set(sid("combat:idle")).unwrap();
+        a.field_mut("node count").unwrap().set(D::CharInteger(2)).unwrap();
+        a.field_mut("frame count").unwrap().set(D::ShortInteger(ANIM_FRAMES as i16)).unwrap();
+        a.field_mut("animation type").unwrap().set(D::CharEnum { value: 0, name: None }).unwrap();
+        a.field_mut("frame info type").unwrap().set(D::CharEnum { value: 0, name: None }).unwrap();
+        a.field_mut("node list checksum").unwrap().set(D::LongInteger(0x1234_5678)).unwrap();
+        a.field_mut("resource_group").unwrap().set(D::ShortInteger(0)).unwrap();
+        a.field_mut("resource_group_member").unwrap().set(D::ShortInteger(0)).unwrap();
+    }
+    {
+        let mut f = root.field_path_mut("tag resource groups").expect("tag resource groups");
+        let mut groups = f.as_block_mut().unwrap();
+        let i = groups.add_element();
+        let mut g = groups.element_mut(i).unwrap();
+        let mut rf = g.field_mut("tag_resource").expect("tag_resource");
+        rf.init_resource().expect("a fresh resource");
+        let mut header = rf.as_resource_struct_mut().expect("the resource's struct");
+        let mut mf = header.field_mut("group_members").expect("group_members");
+        let mut members = mf.as_block_mut().unwrap();
+        let k = members.add_element();
+        let mut m = members.element_mut(k).unwrap();
+        m.field_mut("animation_index").unwrap().set(D::LongInteger(0)).unwrap();
+        m.field_mut("frame count").unwrap().set(D::ShortInteger(ANIM_FRAMES as i16)).unwrap();
+        m.field_mut("node count").unwrap().set(D::CharInteger(2)).unwrap();
+        {
+            let mut sf = m.field_mut("data sizes").expect("data sizes");
+            let mut sizes = sf.as_struct_mut().unwrap();
+            sizes.field_mut("static_node_flags").unwrap().set(D::CharInteger(12)).unwrap();
+            sizes.field_mut("animated_node_flags").unwrap().set(D::CharInteger(12)).unwrap();
+            sizes.field_mut("default_data").unwrap().set(D::ShortInteger(default_data as i16)).unwrap();
+            sizes
+                .field_mut("uncompressed_data")
+                .unwrap()
+                .set(D::LongInteger((blob.len() - default_data - 24) as i32))
+                .unwrap();
+        }
+        m.field_mut("animation_data").unwrap().set(D::Data(blob)).unwrap();
+    }
+    tag
+}
+
+fn approx(a: f32, b: f32, tol: f32) -> bool {
+    (a - b).abs() <= tol
+}
+
+/// The animation graph reads back as one base animation whose static
+/// and animated streams decode to the frames written, and whose pose
+/// puts each node where those frames say.
+#[test]
+fn a_synthetic_animation_graph_decodes_and_poses() {
+    use blam_tags::animation::{AnimatedStreamStatus, Animation, Skeleton};
+    let tag = TagFile::read_from_bytes(&two_node_jmad().write_to_bytes().unwrap()).expect("reread jmad");
+    let animation = Animation::new(&tag).expect("an animation graph");
+    assert_eq!(animation.len(), 1);
+    assert!(animation.parent().is_none());
+    let group = animation.find("combat:idle").expect("found by name");
+    assert_eq!(group.animation_type.as_deref(), Some("base"));
+    assert_eq!(group.frame_count, ANIM_FRAMES as i16);
+    assert_eq!(group.node_count, 2);
+    assert_eq!(group.codec_byte, Some(1), "the blob opens with the static stream");
+    assert_eq!(group.animated_codec_byte(), Some(2), "the animated stream follows at default_data");
+
+    let clip = group.decode().expect("decode");
+    assert!(matches!(clip.animated_status, AnimatedStreamStatus::Decoded), "{:?}", clip.animated_status);
+    assert_eq!(clip.frame_count as usize, ANIM_FRAMES);
+
+    let skeleton = Skeleton::from_tag(&tag);
+    assert_eq!(skeleton.nodes.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(), ["frame", "bone"]);
+    assert_eq!(skeleton.nodes[1].parent, 0);
+
+    let pose = clip.pose(&skeleton, None);
+    assert_eq!(pose.frames.len(), ANIM_FRAMES);
+    for (f, frame) in pose.frames.iter().enumerate() {
+        assert_eq!(frame.len(), 2);
+        let root = frame[0];
+        assert!(approx(root.translation.z, ROOT_Z, 1e-6), "frame {f}: root {:?}", root.translation);
+        assert!(approx(root.rotation.w.abs(), 1.0, 1e-4), "frame {f}: root rotation {:?}", root.rotation);
+        let bone = frame[1];
+        assert!(approx(bone.translation.x, BONE_X[f], 1e-6), "frame {f}: bone at {:?}", bone.translation);
+        let half = BONE_YAW[f] / 2.0;
+        assert!(
+            approx(bone.rotation.k, half.sin(), 1e-5) && approx(bone.rotation.w, half.cos(), 1e-5),
+            "frame {f}: bone rotation {:?}, wanted yaw {}",
+            bone.rotation,
+            BONE_YAW[f]
+        );
+        assert!(approx(bone.scale, 1.0, 1e-6) && approx(root.scale, 1.0, 1e-6));
+    }
+}
+
+/// The JMA a graph extracts to carries the same frames, in object space
+/// and centimetres, with the held trailing frame Tool expects.
+#[test]
+fn a_synthetic_animation_graph_extracts_to_jmm() {
+    let tag = TagFile::read_from_bytes(&two_node_jmad().write_to_bytes().unwrap()).expect("reread jmad");
+    let out = TempDir::new("animation");
+    let summary = blam_tags::extract::animation::animations_to_dir(
+        &tag,
+        &MemoryResolver(Vec::new()),
+        out.path(),
+        "synthetic",
+        blam_tags::game::Game::Halo3,
+    )
+    .expect("extract");
+    assert_eq!((summary.written, summary.skipped), (1, 0), "{:?}", summary.warnings);
+
+    let path = out.path().join("synthetic").join("animations").join("combat idle.JMM"); // `:` becomes a space
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} was not written: {e}", path.display()));
+    let mut t = text.split_whitespace();
+    let mut next = || t.next().expect("the JMA ended early");
+    assert_eq!(next(), "16394", "Halo 3 writes the absolute JMA version");
+    assert_eq!(next(), (0x1234_5678).to_string(), "the node list checksum");
+    assert_eq!(next(), (ANIM_FRAMES + 1).to_string(), "codec frames plus the held frame");
+    assert_eq!(next(), "30");
+    assert_eq!(next(), "1");
+    assert_eq!(next(), "synthetic");
+    assert_eq!(next(), "2");
+    assert_eq!((next(), next()), ("frame", "-1"));
+    assert_eq!((next(), next()), ("bone", "0"));
+
+    let mut read = |n: usize| -> Vec<f32> { (0..n).map(|_| next().parse::<f32>().expect("a number")).collect() };
+    for f in 0..=ANIM_FRAMES {
+        let src = f.min(ANIM_FRAMES - 1); // the last frame is held
+        let root = read(8);
+        assert!(approx(root[2], ROOT_Z * 100.0, 1e-3), "frame {f}: root {root:?}");
+        let bone = read(8);
+        // Object space: the bone sits on top of the root.
+        assert!(approx(bone[0], BONE_X[src] * 100.0, 1e-3), "frame {f}: bone {bone:?}");
+        assert!(approx(bone[2], ROOT_Z * 100.0, 1e-3), "frame {f}: bone {bone:?}");
+        let half = BONE_YAW[src] / 2.0;
+        assert!(approx(bone[5], half.sin(), 1e-4) && approx(bone[6], half.cos(), 1e-4), "frame {f}: bone {bone:?}");
+    }
+    assert!(t.next().is_none(), "nothing after the last frame");
+}
