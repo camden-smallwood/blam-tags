@@ -7,40 +7,17 @@
 //! on and asks what specifically differs, which is the thing that has to
 //! be known before it can be fixed.
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use std::path::PathBuf;
 
 use blam_tags::ass::{AssFile, AssObjectPayload};
 use blam_tags::sbsp_import::{role_of_material, MeshRole, SbspOptions};
 use blam_tags::TagFile;
 
-fn h3ek() -> Option<PathBuf> {
-    ["D:/SteamLibrary/steamapps/common", "C:/Program Files (x86)/Steam/steamapps/common"]
-        .iter()
-        .map(|r| PathBuf::from(r).join("H3EK"))
-        .find(|p| p.join("tags").is_dir())
-}
-
 fn schema() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../definitions/halo3_mcc/scenario_structure_bsp.json")
-}
-
-fn walk(root: &Path, ext: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if p.extension().and_then(|x| x.to_str()).is_some_and(|x| x == ext) {
-                out.push(p);
-            }
-        }
-    }
-    out.sort();
-    out
 }
 
 type Mesh<'a> = (&'a Vec<blam_tags::ass::AssVertex>, &'a Vec<blam_tags::ass::AssTriangle>);
@@ -159,15 +136,12 @@ fn centre(m: &Mesh<'_>) -> [f32; 3] {
 #[test]
 #[ignore = "diagnostic; run with --ignored"]
 fn what_differs_about_instanced_geometry() {
-    let Some(kit) = h3ek() else {
-        eprintln!("skipping: need an H3EK install");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
     let schema = schema();
     let limit: usize =
         std::env::var("BLAM_SBSP_MODELS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
 
-    for path in walk(&kit.join("tags"), "scenario_structure_bsp").iter().take(limit) {
+    for path in common::walk(&kit.tags(), "scenario_structure_bsp").iter().take(limit) {
         let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
         let Ok(tag) = TagFile::read(path) else { continue };
         let Ok(source) = AssFile::from_scenario_structure_bsp(&tag) else { continue };

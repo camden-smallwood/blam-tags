@@ -8,38 +8,9 @@
 //!
 //! Diagnostic, not an assertion — run it with `--nocapture`.
 
-use std::path::{Path, PathBuf};
+mod common;
 
 use blam_tags::TagFile;
-
-fn h3ek() -> Option<PathBuf> {
-    [
-        "D:/SteamLibrary/steamapps/common",
-        "C:/Program Files (x86)/Steam/steamapps/common",
-        "E:/SteamLibrary/steamapps/common",
-    ]
-    .iter()
-    .map(|root| PathBuf::from(root).join("H3EK"))
-    .find(|path| path.join("tags").is_dir())
-}
-
-fn walk(root: &Path, ext: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if p.extension().and_then(|x| x.to_str()).is_some_and(|x| x == ext) {
-                out.push(p);
-            }
-        }
-    }
-    out.sort();
-    out
-}
 
 /// A shipped `bsp3d_node`: plane in bits 0..16, back in 16..40, front in
 /// 40..64, each child flagged in its top bit.
@@ -95,15 +66,12 @@ fn depth_of(nodes: &[i64]) -> usize {
 #[test]
 #[ignore = "measures the shipped corpus; run with --ignored"]
 fn how_deep_are_tools_own_collision_trees() {
-    let Some(ek) = h3ek() else {
-        eprintln!("no H3EK; skipping");
-        return;
-    };
+    let Some(ek) = common::kit("BLAM_TEST_H3EK") else { return };
 
     let mut rows: Vec<(usize, usize, String)> = Vec::new();
     let mut over_128 = 0usize;
 
-    for path in walk(&ek.join("tags"), "collision_model") {
+    for path in common::walk(&ek.tags(), "collision_model") {
         let Ok(tag) = TagFile::read(&path) else { continue };
         let root = tag.root();
         let Some(regions) = root.field_path("regions").and_then(|f| f.as_block()) else {
@@ -165,16 +133,13 @@ fn how_deep_are_tools_own_collision_trees() {
 #[test]
 #[ignore = "measures the shipped corpus; run with --ignored"]
 fn are_tools_collision_surfaces_triangles() {
-    let Some(ek) = h3ek() else {
-        eprintln!("no H3EK; skipping");
-        return;
-    };
+    let Some(ek) = common::kit("BLAM_TEST_H3EK") else { return };
 
     let mut hist = [0usize; 12]; // ring length, 0..11, 11 meaning "longer"
     let mut surfaces_total = 0usize;
     let mut guardian: Option<(usize, [usize; 12])> = None;
 
-    for path in walk(&ek.join("tags"), "collision_model") {
+    for path in common::walk(&ek.tags(), "collision_model") {
         let Ok(tag) = TagFile::read(&path) else { continue };
         let root = tag.root();
         let Some(regions) = root.field_path("regions").and_then(|f| f.as_block()) else {
@@ -268,12 +233,9 @@ fn are_tools_collision_surfaces_triangles() {
 #[test]
 #[ignore = "measures the shipped corpus; run with --ignored"]
 fn how_many_planes_does_tool_keep() {
-    let Some(ek) = h3ek() else {
-        eprintln!("no H3EK; skipping");
-        return;
-    };
+    let Some(ek) = common::kit("BLAM_TEST_H3EK") else { return };
     let mut rows: Vec<(String, usize, usize, usize)> = Vec::new();
-    for path in walk(&ek.join("tags"), "collision_model") {
+    for path in common::walk(&ek.tags(), "collision_model") {
         let Ok(tag) = TagFile::read(&path) else { continue };
         let root = tag.root();
         let Some(regions) = root.field_path("regions").and_then(|f| f.as_block()) else {
@@ -328,13 +290,10 @@ fn how_many_planes_does_tool_keep() {
 #[test]
 #[ignore = "measures the shipped corpus; run with --ignored"]
 fn how_many_bsps_per_permutation() {
-    let Some(ek) = h3ek() else {
-        eprintln!("no H3EK; skipping");
-        return;
-    };
+    let Some(ek) = common::kit("BLAM_TEST_H3EK") else { return };
     let mut hist: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
     let mut perms_total = 0usize;
-    for path in walk(&ek.join("tags"), "collision_model") {
+    for path in common::walk(&ek.tags(), "collision_model") {
         let Ok(tag) = TagFile::read(&path) else { continue };
         let root = tag.root();
         let Some(regions) = root.field_path("regions").and_then(|f| f.as_block()) else {
@@ -373,15 +332,12 @@ fn how_many_bsps_per_permutation() {
 #[test]
 #[ignore = "measures the shipped corpus; run with --ignored"]
 fn how_big_do_tools_leaves_get() {
-    let Some(ek) = h3ek() else {
-        eprintln!("no H3EK; skipping");
-        return;
-    };
+    let Some(ek) = common::kit("BLAM_TEST_H3EK") else { return };
     let mut hist: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
     let mut leaves_total = 0usize;
     let mut biggest: Vec<(usize, String)> = Vec::new();
 
-    for path in walk(&ek.join("tags"), "collision_model") {
+    for path in common::walk(&ek.tags(), "collision_model") {
         let Ok(tag) = TagFile::read(&path) else { continue };
         let root = tag.root();
         let Some(regions) = root.field_path("regions").and_then(|f| f.as_block()) else {

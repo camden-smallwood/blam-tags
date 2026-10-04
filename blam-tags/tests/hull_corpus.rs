@@ -10,62 +10,24 @@
 //! That is a far stronger check than any synthetic test: it is the same
 //! input, and the answer is already in the tag.
 //!
-//! Skips gracefully with no kit installed. Point `BLAM_TEST_H3EK` at an
-//! install, or let it find one in a Steam library.
+//! Needs the H3EK kit: point `BLAM_TEST_H3EK` at its root. Without it the
+//! tests pass after printing `skipped: no BLAM_TEST_H3EK`.
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use std::path::PathBuf;
 
 use blam_tags::hull::{convex_hull, HullError};
 use blam_tags::jms::JmsFile;
 use blam_tags::TagFile;
 use flate2::read::ZlibDecoder;
 
-fn h3ek() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("BLAM_TEST_H3EK") {
-        let path = PathBuf::from(path);
-        return path.is_dir().then_some(path);
-    }
-    [
-        "D:/SteamLibrary/steamapps/common",
-        "C:/Program Files (x86)/Steam/steamapps/common",
-        "C:/Program Files/Steam/steamapps/common",
-        "E:/SteamLibrary/steamapps/common",
-    ]
-    .iter()
-    .map(|root| PathBuf::from(root).join("H3EK"))
-    .find(|path| path.join("data").is_dir() && path.join("tags").is_dir())
-}
-
-fn walk(root: &Path, ext: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if p.extension().and_then(|x| x.to_str()).is_some_and(|x| x == ext) {
-                out.push(p);
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
 /// Every convex shape in every shipped physics JMS must produce a hull,
 /// and every input point must lie inside it.
 #[test]
 fn every_shipped_convex_shape_builds_a_valid_hull() {
-    let Some(kit) = h3ek() else {
-        eprintln!("skipping: no H3EK install found (set BLAM_TEST_H3EK)");
-        return;
-    };
-    let files: Vec<PathBuf> = walk(&kit.join("data"), "JMS")
-        .into_iter()
-        .chain(walk(&kit.join("data"), "jms"))
-        .collect();
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
+    let files: Vec<PathBuf> = common::walk(&kit.data(), "jms");
     if files.is_empty() {
         eprintln!("skipping: no JMS files");
         return;
@@ -148,11 +110,8 @@ fn every_shipped_convex_shape_builds_a_valid_hull() {
 /// tag's own `info` stream as the matched source.
 #[test]
 fn our_hull_agrees_with_havoks_on_shipped_physics_models() {
-    let Some(kit) = h3ek() else {
-        eprintln!("skipping: no H3EK install found (set BLAM_TEST_H3EK)");
-        return;
-    };
-    let tags = walk(&kit.join("tags"), "physics_model");
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
+    let tags = common::walk(&kit.tags(), "physics_model");
     if tags.is_empty() {
         eprintln!("skipping: no physics_model tags");
         return;
@@ -310,14 +269,11 @@ fn our_hull_agrees_with_havoks_on_shipped_physics_models() {
 #[test]
 #[ignore = "calibration sweep; run explicitly when changing HullOptions defaults"]
 fn fit_hull_tolerances_against_havok() {
-    let Some(kit) = h3ek() else {
-        eprintln!("skipping: no H3EK install found (set BLAM_TEST_H3EK)");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
 
     // Collect the matched (source shapes, Havok's counts) pairs once.
     let mut cases: Vec<(Vec<blam_tags::jms::JmsConvex>, usize, usize)> = Vec::new();
-    for tag_path in walk(&kit.join("tags"), "physics_model").iter().take(200) {
+    for tag_path in common::walk(&kit.tags(), "physics_model").iter().take(200) {
         let Ok(tag) = TagFile::read(tag_path) else { continue };
         let root = tag.root();
         let count = |name: &str| root.field_path(name).and_then(|f| f.as_block()).map(|b| b.len());

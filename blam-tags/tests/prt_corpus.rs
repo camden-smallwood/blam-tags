@@ -9,39 +9,11 @@
 //!
 //! Diagnostic. Run with `--ignored --nocapture`.
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use std::path::PathBuf;
 
 use blam_tags::TagFile;
-
-fn h3ek() -> Option<PathBuf> {
-    [
-        "D:/SteamLibrary/steamapps/common",
-        "C:/Program Files (x86)/Steam/steamapps/common",
-        "E:/SteamLibrary/steamapps/common",
-    ]
-    .iter()
-    .map(|root| PathBuf::from(root).join("H3EK"))
-    .find(|path| path.join("tags").is_dir())
-}
-
-fn walk(root: &Path, ext: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if p.extension().and_then(|x| x.to_str()).is_some_and(|x| x == ext) {
-                out.push(p);
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
 
 fn source_jms(tag: &TagFile) -> Option<blam_tags::jms::JmsFile> {
     let info = tag.import_info()?;
@@ -99,10 +71,7 @@ fn source_matches_tag(tag: &TagFile, jms: &blam_tags::jms::JmsFile) -> bool {
 #[test]
 #[ignore = "measures the shipped corpus; run with --ignored"]
 fn what_prt_do_shipped_render_models_carry() {
-    let Some(kit) = h3ek() else {
-        eprintln!("skipping: no H3EK install");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
 
     const NAMES: [&str; 4] = ["No PRT", "PRT Ambient", "PRT Linear", "PRT Quadratic"];
     let mut by_type = [0usize; 8];
@@ -114,7 +83,7 @@ fn what_prt_do_shipped_render_models_carry() {
     /// `(prt type, bytes per vertex, bytes, vertices)`
     let mut ratios: Vec<(usize, f64, usize, usize)> = Vec::new();
 
-    for path in walk(&kit.join("tags"), "render_model") {
+    for path in common::walk(&kit.tags(), "render_model") {
         let Ok(tag) = TagFile::read(&path) else { continue };
         let root = tag.root();
         let Some(ms) = root.field_path("render geometry/meshes").and_then(|f| f.as_block()) else {
@@ -205,7 +174,7 @@ fn what_prt_do_shipped_render_models_carry() {
         let mut differ = 0usize;
         let (mut lo, mut hi) = (f32::MAX, f32::MIN);
         let mut shown = 0usize;
-        for path in walk(&kit.join("tags"), "render_model").iter().take(400) {
+        for path in common::walk(&kit.tags(), "render_model").iter().take(400) {
             let Ok(tag) = TagFile::read(path) else { continue };
             let root = tag.root();
             let (Some(ms), Some(pd)) = (
@@ -293,10 +262,7 @@ fn what_prt_do_shipped_render_models_carry() {
 #[test]
 #[ignore = "compares against the shipped corpus; run with --ignored"]
 fn ambient_transfer_against_tools_own_values() {
-    let Some(kit) = h3ek() else {
-        eprintln!("skipping: no H3EK install");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
     let schema = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../definitions/halo3_mcc/render_model.json");
     if !schema.exists() {
@@ -311,7 +277,7 @@ fn ambient_transfer_against_tools_own_values() {
 
     let mut compared = 0usize;
     let mut worst: Vec<(f32, String)> = Vec::new();
-    for path in walk(&kit.join("tags"), "render_model").iter().take(600) {
+    for path in common::walk(&kit.tags(), "render_model").iter().take(600) {
         let Ok(tag) = TagFile::read(path) else { continue };
         let root = tag.root();
         let (Some(ms), Some(pd)) = (
@@ -417,15 +383,12 @@ fn ambient_transfer_against_tools_own_values() {
 #[test]
 #[ignore = "measures the shipped corpus; run with --ignored"]
 fn what_frame_are_the_linear_coefficients_in() {
-    let Some(kit) = h3ek() else {
-        eprintln!("skipping: no H3EK install");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
 
     // Per coefficient slot, the values seen across many vertices.
     let mut slots: Vec<Vec<f32>> = vec![Vec::new(); 4];
     let mut shown = 0usize;
-    for path in walk(&kit.join("tags"), "render_model").iter().take(500) {
+    for path in common::walk(&kit.tags(), "render_model").iter().take(500) {
         let Ok(tag) = TagFile::read(path) else { continue };
         let root = tag.root();
         let (Some(ms), Some(pd)) = (
@@ -491,10 +454,7 @@ fn what_frame_are_the_linear_coefficients_in() {
 #[test]
 #[ignore = "compares against the shipped corpus; run with --ignored"]
 fn linear_transfer_against_tools_own_values() {
-    let Some(kit) = h3ek() else {
-        eprintln!("skipping: no H3EK install");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
 
     let deciles = |mut v: Vec<f32>| -> Vec<f32> {
         v.sort_by(f32::total_cmp);
@@ -503,7 +463,7 @@ fn linear_transfer_against_tools_own_values() {
 
     let mut compared = 0usize;
     let mut gaps: Vec<f32> = Vec::new();
-    for path in walk(&kit.join("tags"), "render_model").iter().take(600) {
+    for path in common::walk(&kit.tags(), "render_model").iter().take(600) {
         let Ok(tag) = TagFile::read(path) else { continue };
         let root = tag.root();
         let (Some(ms), Some(pd)) = (

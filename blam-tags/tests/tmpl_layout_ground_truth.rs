@@ -28,26 +28,15 @@
 //! Self-skips without a kit. A green run on a machine with no kits proves
 //! nothing here.
 
+mod common;
+
 use std::path::PathBuf;
 
 use blam_tags::{TagFieldType, TagFile};
 
-/// An editing kit's `tags` directory, from `env_var` (the kit root, as every
-/// other kit-gated suite takes it) or a Steam library.
-fn kit_tags(env_var: &str, kit: &str) -> Option<PathBuf> {
-    if let Ok(path) = std::env::var(env_var) {
-        let path = PathBuf::from(path).join("tags");
-        return path.is_dir().then_some(path);
-    }
-    [
-        "C:/Program Files (x86)/Steam/steamapps/common",
-        "C:/Program Files/Steam/steamapps/common",
-        "D:/SteamLibrary/steamapps/common",
-        "E:/SteamLibrary/steamapps/common",
-    ]
-    .iter()
-    .map(|root| PathBuf::from(root).join(kit).join("tags"))
-    .find(|path| path.is_dir())
+/// An editing kit's `tags` directory, from `env_var` (the kit root).
+fn kit_tags(env_var: &str) -> Option<PathBuf> {
+    common::kit(env_var).map(|kit| kit.tags())
 }
 
 fn definitions() -> PathBuf {
@@ -82,10 +71,7 @@ fn find_one(tags: &PathBuf, extension: &str) -> Option<PathBuf> {
 /// changed their mind and splicing becomes the right answer after all.
 #[test]
 fn a_shipped_reach_particle_keeps_its_render_method_in_an_unnamed_slot() {
-    let Some(tags) = kit_tags("BLAM_TEST_HREK", "HREK") else {
-        eprintln!("skipping: no HREK editing kit (set BLAM_TEST_HREK to the kit root)");
-        return;
-    };
+    let Some(tags) = kit_tags("BLAM_TEST_HREK") else { return };
     let Some(path) = find_one(&tags, "particle") else {
         eprintln!("skipping: HREK has no .particle tag under {}", tags.display());
         return;
@@ -146,10 +132,7 @@ fn find_all(tags: &PathBuf, extension: &str) -> Vec<PathBuf> {
 /// (a `tmpl` splice, say) has to keep that true, which is what this pins.
 #[test]
 fn h3ek_ships_particles_at_several_root_sizes_and_the_dump_matches_one() {
-    let Some(tags) = kit_tags("BLAM_TEST_H3EK", "H3EK") else {
-        eprintln!("skipping: no H3EK editing kit (set BLAM_TEST_H3EK to the kit root)");
-        return;
-    };
+    let Some(tags) = kit_tags("BLAM_TEST_H3EK") else { return };
     let paths = find_all(&tags, "particle");
     if paths.is_empty() {
         eprintln!("skipping: H3EK has no .particle tag under {}", tags.display());
@@ -247,10 +230,7 @@ fn a_zero_width_template_hole_is_still_named() {
 /// go back to the schema. Kit-gated — it needs a real tag.
 #[test]
 fn a_shipped_layout_carries_no_template_metadata() {
-    let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else {
-        eprintln!("skipping: no HREK");
-        return;
-    };
+    let Some(reach) = kit_tags("BLAM_TEST_HREK") else { return };
     let Some(path) = find_one(&reach, "particle") else {
         eprintln!("skipping: HREK ships no .particle");
         return;

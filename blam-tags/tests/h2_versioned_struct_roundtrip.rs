@@ -7,13 +7,18 @@
 //! often the whole tag) corrupts on the next open. See
 //! `classic::synthesize_h2_struct_header`.
 //!
-//! Skips silently when the local game tags aren't present on this machine.
+//! Needs the Halo 2 kit: set `BLAM_TEST_H2EK` to its root.
+
+mod common;
 
 use blam_tags::classic::read_classic_tag_file;
 use blam_tags::layout::TagLayout;
 use std::path::Path;
 
-const TAGS: &str = "/Users/camden/Halo/halo2_mcc/tags";
+/// The Halo 2 kit's tags, from `BLAM_TEST_H2EK` (the kit root).
+fn tags() -> Option<std::path::PathBuf> {
+    common::kit("BLAM_TEST_H2EK").map(|kit| kit.tags())
+}
 const DEFS: &str = "../definitions/halo2_mcc";
 
 fn layout(group: &str) -> Option<TagLayout> {
@@ -21,7 +26,7 @@ fn layout(group: &str) -> Option<TagLayout> {
 }
 
 fn load_h2(rel: &str, group: &str) -> Option<blam_tags::file::TagFile> {
-    let bytes = std::fs::read(Path::new(TAGS).join(rel)).ok()?;
+    let bytes = std::fs::read(tags()?.join(rel)).ok()?;
     read_classic_tag_file(&bytes, layout(group)?).ok()
 }
 
@@ -87,7 +92,8 @@ fn fresh_h2_function_struct_keeps_version_on_roundtrip() {
 /// headerless version-0 structs stay headerless — no spurious headers added).
 #[test]
 fn real_h2_shaders_roundtrip_byte_exact() {
-    let dir = Path::new(TAGS).join("incompetent/shaders");
+    let Some(tags) = tags() else { return };
+    let dir = tags.join("incompetent/shaders");
     let Ok(entries) = std::fs::read_dir(&dir) else {
         eprintln!("skip: {} not present", dir.display());
         return;

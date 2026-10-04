@@ -15,36 +15,10 @@
 //!
 //! Skips silently when no H3 editing kit is present.
 
-use std::path::PathBuf;
+mod common;
 
 use blam_tags::bitmap::decode::decode_to_rgba8;
 use blam_tags::{Bitmap, BitmapFormat, TagFile};
-
-/// An H3EK install's `tags`, via `BLAM_TEST_H3EK` or the conventional Steam
-/// roots.
-///
-/// The variable names the kit, as it does for every other corpus test here;
-/// its `tags` directory is accepted too. This harness used to take only
-/// `tags`, so no one setting ran it alongside the others: with the kit root it
-/// found none of its bump maps and failed, reading like a kit that lacks them.
-fn h3ek_tags() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("BLAM_TEST_H3EK") {
-        let p = PathBuf::from(p);
-        let tags = p.join("tags");
-        if tags.is_dir() {
-            return Some(tags);
-        }
-        return p.is_dir().then_some(p);
-    }
-    [
-        "C:/Program Files (x86)/Steam/steamapps/common/H3EK/tags",
-        "D:/SteamLibrary/steamapps/common/H3EK/tags",
-        "E:/SteamLibrary/steamapps/common/H3EK/tags",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .find(|p| p.is_dir())
-}
 
 /// Fraction of texels whose stored X/Y form a vector no longer than the
 /// unit normal they are meant to be two thirds of.
@@ -66,10 +40,8 @@ fn fraction_within_unit_circle(rgba: &[u8]) -> f32 {
 /// that are actually normalized, with a blue channel that varies.
 #[test]
 fn shipped_h3_bump_bitmaps_decode_to_unit_normals() {
-    let Some(tags) = h3ek_tags() else {
-        eprintln!("skipping: no H3 editing kit (set BLAM_TEST_H3EK to it)");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
+    let tags = kit.tags();
 
     const BUMPS: [&str; 2] = [
         "levels/dlc/bunkerworld/bitmaps/nature/grassdirt_bump.bitmap",

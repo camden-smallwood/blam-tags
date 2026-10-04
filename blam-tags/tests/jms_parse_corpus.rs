@@ -15,32 +15,16 @@
 //!    that turned out to be a finding rather than a bug. See below.
 //! 3. **`parse` ∘ `write` is the identity** on the modelled fields.
 //!
-//! Skips gracefully with no kit installed, the same convention as the
-//! other kit-gated suites: point `BLAM_TEST_H3EK` at an install, or let
-//! it find one in a Steam library.
+//! Needs the H3EK kit, as the other kit-gated suites do: point
+//! `BLAM_TEST_H3EK` at its root.
+
+mod common;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use blam_tags::jms::JmsFile;
 use blam_tags::jms_parse::JmsParseError;
-
-/// H3EK's `data` directory, via `BLAM_TEST_H3EK` or a Steam library.
-fn h3ek_data() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("BLAM_TEST_H3EK") {
-        let path = PathBuf::from(path).join("data");
-        return path.is_dir().then_some(path);
-    }
-    [
-        "D:/SteamLibrary/steamapps/common",
-        "C:/Program Files (x86)/Steam/steamapps/common",
-        "C:/Program Files/Steam/steamapps/common",
-        "E:/SteamLibrary/steamapps/common",
-    ]
-    .iter()
-    .map(|root| PathBuf::from(root).join("H3EK").join("data"))
-    .find(|path| path.is_dir())
-}
 
 /// Match on the filename ending rather than `Path::extension()`.
 ///
@@ -67,10 +51,8 @@ fn jms_files(root: &Path) -> Vec<PathBuf> {
 /// consistent.
 #[test]
 fn the_shipped_corpus_parses_completely() {
-    let Some(data) = h3ek_data() else {
-        eprintln!("skipping: no H3EK install found (set BLAM_TEST_H3EK)");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
+    let data = kit.data();
     let files = jms_files(&data);
     if files.is_empty() {
         eprintln!("skipping: H3EK data directory has no JMS files");
@@ -229,10 +211,8 @@ fn the_shipped_corpus_parses_completely() {
 /// without adding coverage.
 #[test]
 fn writing_then_reparsing_round_trips() {
-    let Some(data) = h3ek_data() else {
-        eprintln!("skipping: no H3EK install found (set BLAM_TEST_H3EK)");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
+    let data = kit.data();
     let files = jms_files(&data);
     if files.is_empty() {
         eprintln!("skipping: H3EK data directory has no JMS files");

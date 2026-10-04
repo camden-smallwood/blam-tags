@@ -14,51 +14,17 @@
 //! * the tree must be at most 128 deep, because the traversal stack is
 //!   128 entries and overruns without stopping.
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use std::path::PathBuf;
 
 use blam_tags::collision_import::{collision_model_from_jms, CollisionError, CollisionOptions};
 use blam_tags::jms::JmsFile;
 use blam_tags::TagFile;
 use flate2::read::ZlibDecoder;
 
-fn h3ek() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("BLAM_TEST_H3EK") {
-        let path = PathBuf::from(path);
-        return path.is_dir().then_some(path);
-    }
-    [
-        "D:/SteamLibrary/steamapps/common",
-        "C:/Program Files (x86)/Steam/steamapps/common",
-        "C:/Program Files/Steam/steamapps/common",
-        "E:/SteamLibrary/steamapps/common",
-    ]
-    .iter()
-    .map(|root| PathBuf::from(root).join("H3EK"))
-    .find(|path| path.join("data").is_dir() && path.join("tags").is_dir())
-}
-
-fn schema() -> Option<PathBuf> {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../definitions/halo3_mcc/collision_model.json");
-    p.exists().then_some(p)
-}
-
-fn walk(root: &Path, ext: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if p.extension().and_then(|x| x.to_str()).is_some_and(|x| x == ext) {
-                out.push(p);
-            }
-        }
-    }
-    out.sort();
-    out
+fn schema() -> PathBuf {
+    common::definitions("halo3_mcc").join("collision_model.json")
 }
 
 fn source_jms(tag: &TagFile) -> Option<JmsFile> {
@@ -242,10 +208,8 @@ fn collect_2d(d: &Decoded, node: i32, out: &mut Vec<usize>) {
 
 #[test]
 fn every_surface_of_a_built_collision_model_is_reachable() {
-    let (Some(kit), Some(schema)) = (h3ek(), schema()) else {
-        eprintln!("skipping: need an H3EK install and definitions/halo3_mcc/collision_model.json");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
+    let schema = schema();
 
     let opts = CollisionOptions::default();
     let mut built = 0usize;
@@ -258,7 +222,7 @@ fn every_surface_of_a_built_collision_model_is_reachable() {
     let mut dropped = 0usize;
     let mut rows: Vec<String> = Vec::new();
 
-    for tag_path in walk(&kit.join("tags"), "collision_model").iter().take(150) {
+    for tag_path in common::walk(&kit.tags(), "collision_model").iter().take(150) {
         let Ok(tag) = TagFile::read(tag_path) else { continue };
         let Some(jms) = source_jms(&tag) else { continue };
         let name = tag_path.file_name().unwrap_or_default().to_string_lossy().to_string();

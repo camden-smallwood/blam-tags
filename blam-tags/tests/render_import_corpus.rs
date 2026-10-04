@@ -7,7 +7,9 @@
 //! source vertices scaled by 0.01 with V flipped, so agreement there
 //! means the scale, the flip and the welding all landed correctly.
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use std::path::PathBuf;
 
 use blam_tags::jms::JmsFile;
 use blam_tags::render_import::{render_model_from_jms, RenderError, RenderOptions};
@@ -15,44 +17,8 @@ use blam_tags::weld::{weld, WeldTolerances, WeldVertex};
 use blam_tags::TagFile;
 use flate2::read::ZlibDecoder;
 
-fn h3ek() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("BLAM_TEST_H3EK") {
-        let path = PathBuf::from(path);
-        return path.is_dir().then_some(path);
-    }
-    [
-        "D:/SteamLibrary/steamapps/common",
-        "C:/Program Files (x86)/Steam/steamapps/common",
-        "C:/Program Files/Steam/steamapps/common",
-        "E:/SteamLibrary/steamapps/common",
-    ]
-    .iter()
-    .map(|root| PathBuf::from(root).join("H3EK"))
-    .find(|path| path.join("data").is_dir() && path.join("tags").is_dir())
-}
-
-fn schema() -> Option<PathBuf> {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../definitions/halo3_mcc/render_model.json");
-    p.exists().then_some(p)
-}
-
-fn walk(root: &Path, ext: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if p.extension().and_then(|x| x.to_str()).is_some_and(|x| x == ext) {
-                out.push(p);
-            }
-        }
-    }
-    out.sort();
-    out
+fn schema() -> PathBuf {
+    common::definitions("halo3_mcc").join("render_model.json")
 }
 
 fn source_jms(tag: &TagFile) -> Option<JmsFile> {
@@ -107,10 +73,8 @@ fn position_bounds(tag: &TagFile) -> Option<[f32; 6]> {
 
 #[test]
 fn we_rebuild_shipped_render_models_from_their_own_source() {
-    let (Some(kit), Some(schema)) = (h3ek(), schema()) else {
-        eprintln!("skipping: need an H3EK install and definitions/halo3_mcc/render_model.json");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
+    let schema = schema();
 
     let opts = RenderOptions::default();
     let mut compared = 0usize;
@@ -124,7 +88,7 @@ fn we_rebuild_shipped_render_models_from_their_own_source() {
     let mut weld_ratio_best = f64::MAX;
     let mut rows: Vec<String> = Vec::new();
 
-    for tag_path in walk(&kit.join("tags"), "render_model").iter().take(120) {
+    for tag_path in common::walk(&kit.tags(), "render_model").iter().take(120) {
         let Ok(tag) = TagFile::read(tag_path) else { continue };
         let Some(jms) = source_jms(&tag) else { continue };
         let want_meshes = block_len(&tag, "render geometry/meshes");
@@ -263,19 +227,13 @@ fn we_rebuild_shipped_render_models_from_their_own_source() {
 #[test]
 #[ignore = "fits a constant against the kit; run with --ignored"]
 fn fit_indices_per_triangle() {
-    let Some(kit) = h3ek() else {
-        eprintln!("skipping: no H3EK install");
-        return;
-    };
-    let Some(schema) = schema() else {
-        eprintln!("skipping: no render_model schema");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
+    let schema = schema();
 
     // Every loose render JMS in the kit, plus the JMS baked into shipped
     // render_model tags, so the sample is not just hand-authored content.
     let mut sources: Vec<(String, JmsFile)> = Vec::new();
-    for path in walk(&kit.join("data"), "JMS") {
+    for path in common::walk(&kit.data(), "JMS") {
         if !path.parent().is_some_and(|d| d.ends_with("render")) {
             continue;
         }
@@ -373,10 +331,8 @@ fn fit_indices_per_triangle() {
 #[test]
 #[ignore = "compares against the shipped corpus; run with --ignored"]
 fn indices_against_tools_own_output() {
-    let (Some(kit), Some(schema)) = (h3ek(), schema()) else {
-        eprintln!("skipping: need an H3EK install and the render_model schema");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
+    let schema = schema();
 
     /// Every index tool wrote into this tag.
     ///
@@ -428,7 +384,7 @@ fn indices_against_tools_own_output() {
     let mut tool_per_tri: Vec<f64> = Vec::new();
     let mut refused = 0usize;
 
-    for path in walk(&kit.join("tags"), "render_model").iter().take(400) {
+    for path in common::walk(&kit.tags(), "render_model").iter().take(400) {
         let Ok(tag) = TagFile::read(path) else { continue };
         let Some((theirs, their_verts, their_meshes, their_parts)) = shipped_counts(&tag)
         else {
@@ -622,10 +578,7 @@ fn source_matches_tag(tag: &TagFile, jms: &JmsFile) -> bool {
 #[test]
 #[ignore = "diagnostic; needs an H3EK install"]
 fn what_splits_vertices_tool_keeps() {
-    let Some(kit) = h3ek() else {
-        eprintln!("skipping: no H3EK install");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
 
     // A few models spanning the range: the worst, a middling one, and
     // one where this importer already matches.
@@ -635,7 +588,7 @@ fn what_splits_vertices_tool_keeps() {
         ("guardian.render_model", 0),
     ];
 
-    for path in walk(&kit.join("tags"), "render_model") {
+    for path in common::walk(&kit.tags(), "render_model") {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let Some(&(_, tool_verts)) = wanted.iter().find(|(w, _)| *w == name) else { continue };
         let Ok(tag) = TagFile::read(&path) else { continue };
@@ -741,14 +694,11 @@ fn what_splits_vertices_tool_keeps() {
 #[test]
 #[ignore = "fits constants against the kit; run with --ignored"]
 fn fit_weld_tolerances_against_tool() {
-    let Some(kit) = h3ek() else {
-        eprintln!("skipping: no H3EK install");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
 
     // (source vertices, tool's vertex count, name)
     let mut cases: Vec<(Vec<WeldVertex>, usize, String)> = Vec::new();
-    for path in walk(&kit.join("tags"), "render_model").iter().take(400) {
+    for path in common::walk(&kit.tags(), "render_model").iter().take(400) {
         let Ok(tag) = TagFile::read(path) else { continue };
         let root = tag.root();
         let Some(meshes) = root.field_path("render geometry/meshes").and_then(|f| f.as_block())
@@ -856,14 +806,11 @@ fn fit_weld_tolerances_against_tool() {
 #[test]
 #[ignore = "diagnostic; needs an H3EK install"]
 fn does_tool_split_on_tangents_or_colour() {
-    let Some(kit) = h3ek() else {
-        eprintln!("skipping: no H3EK install");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
 
     let mut cases: Vec<(JmsFile, usize, String)> = Vec::new();
     let mut mismatched = 0usize;
-    for path in walk(&kit.join("tags"), "render_model").iter().take(400) {
+    for path in common::walk(&kit.tags(), "render_model").iter().take(400) {
         let Ok(tag) = TagFile::read(path) else { continue };
         let root = tag.root();
         let Some(meshes) = root.field_path("render geometry/meshes").and_then(|f| f.as_block())
@@ -1120,10 +1067,7 @@ fn does_tool_split_on_tangents_or_colour() {
 #[test]
 #[ignore = "diagnostic; needs an H3EK install"]
 fn does_the_info_stream_jms_match_the_tag() {
-    let Some(kit) = h3ek() else {
-        eprintln!("skipping: no H3EK install");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
     let wanted = [
         "h2a_magnum.render_model",
         "ark_cheap.render_model",
@@ -1134,7 +1078,7 @@ fn does_the_info_stream_jms_match_the_tag() {
         "reach_flak_cannon.render_model",
     ];
 
-    for path in walk(&kit.join("tags"), "render_model") {
+    for path in common::walk(&kit.tags(), "render_model") {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         if !wanted.contains(&name.as_str()) {
             continue;

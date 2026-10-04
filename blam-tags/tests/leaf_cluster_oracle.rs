@@ -11,48 +11,20 @@
 //! This scores candidate rules against that key before any of them go
 //! into the importer.
 
-use std::path::{Path, PathBuf};
+mod common;
 
 use blam_tags::TagFile;
-
-fn h3ek() -> Option<PathBuf> {
-    ["D:/SteamLibrary/steamapps/common", "C:/Program Files (x86)/Steam/steamapps/common"]
-        .iter()
-        .map(|r| PathBuf::from(r).join("H3EK"))
-        .find(|p| p.join("tags").is_dir())
-}
-
-fn walk(root: &Path, ext: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if p.extension().and_then(|x| x.to_str()).is_some_and(|x| x == ext) {
-                out.push(p);
-            }
-        }
-    }
-    out.sort();
-    out
-}
 
 #[test]
 #[ignore = "diagnostic; run with --ignored"]
 fn how_tool_assigns_leaves_to_clusters() {
-    let Some(kit) = h3ek() else {
-        eprintln!("skipping: need an H3EK install");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
     let limit: usize =
         std::env::var("BLAM_SBSP_MODELS").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
 
     let (mut total, mut in_bounds_hit, mut nearest_hit, mut unreached) = (0usize, 0, 0, 0);
 
-    for path in walk(&kit.join("tags"), "scenario_structure_bsp").iter().take(limit) {
+    for path in common::walk(&kit.tags(), "scenario_structure_bsp").iter().take(limit) {
         let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
         let Ok(tag) = TagFile::read(path) else { continue };
         let root = tag.root();

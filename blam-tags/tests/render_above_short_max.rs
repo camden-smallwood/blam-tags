@@ -19,10 +19,8 @@ use blam_tags::render_import::{render_model_from_jms, RenderOptions};
 use blam_tags::TagFile;
 use std::path::PathBuf;
 
-fn schema() -> Option<PathBuf> {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../definitions/halo3_mcc/render_model.json");
-    p.exists().then_some(p)
+fn schema() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../definitions/halo3_mcc/render_model.json")
 }
 
 /// A strip of quads, `quads` wide, as one region and one material.
@@ -69,10 +67,7 @@ fn ribbon(quads: usize) -> JmsFile {
 
 #[test]
 fn a_mesh_may_hold_more_vertices_than_a_signed_word_counts() {
-    let Some(schema) = schema() else {
-        eprintln!("skipping: need definitions/halo3_mcc/render_model.json");
-        return;
-    };
+    let schema = schema();
 
     // 20,000 quads is 40,002 vertices — comfortably past 32,767 and
     // inside the format's 65,535.

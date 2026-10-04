@@ -17,13 +17,18 @@
 //! character whose "ready properties" block is empty, then write+reread. The
 //! reread previously failed verification; after the fix the element survives.
 //!
-//! Skips silently when the local game tags aren't present on this machine.
+//! Needs the Halo 2 kit: set `BLAM_TEST_H2EK` to its root.
+
+mod common;
 
 use blam_tags::classic::read_classic_tag_file;
 use blam_tags::layout::TagLayout;
 use std::path::Path;
 
-const TAGS: &str = "/Users/camden/Halo/halo2_mcc/tags";
+/// The Halo 2 kit's tags, from `BLAM_TEST_H2EK` (the kit root).
+fn tags() -> Option<std::path::PathBuf> {
+    common::kit("BLAM_TEST_H2EK").map(|kit| kit.tags())
+}
 const DEFS: &str = "../definitions/halo2_mcc";
 // A character with a populated "ready properties" block (the copy source).
 const SOURCE: &str = "objects/characters/jackal/ai/jackal.character";
@@ -36,7 +41,7 @@ fn layout(group: &str) -> Option<TagLayout> {
 }
 
 fn load_h2(rel: &str, group: &str) -> Option<blam_tags::file::TagFile> {
-    let bytes = std::fs::read(Path::new(TAGS).join(rel)).ok()?;
+    let bytes = std::fs::read(tags()?.join(rel)).ok()?;
     read_classic_tag_file(&bytes, layout(group)?).ok()
 }
 

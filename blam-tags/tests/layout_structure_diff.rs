@@ -31,15 +31,14 @@
 //! descended into. Block element shapes are unmeasured, and for `effect` that is
 //! where the substance lives.
 
+mod common;
+
 use blam_tags::convert::clean_field_key;
 use blam_tags::{TagFile, TagStruct};
 use std::path::PathBuf;
 
 fn kit(name: &str) -> Option<PathBuf> {
-    let path = PathBuf::from("D:/SteamLibrary/steamapps/common")
-        .join(name)
-        .join(if name == "H4EK" { "tog" } else { "tags" });
-    path.is_dir().then_some(path)
+    common::kit(&format!("BLAM_TEST_{name}")).map(|kit| kit.tags())
 }
 
 fn walk_files(root: &std::path::Path) -> Vec<PathBuf> {
@@ -128,7 +127,7 @@ fn built_tag_against_kit_tag() {
         eprintln!("skipping: needs HREK");
         return;
     };
-    let definitions = PathBuf::from("../../blam-tag-gui/definitions");
+    let definitions = common::definitions_root();
     let files = walk_files(&reach);
     for group in ["effect", "particle", "cheap_particle_emitter", "decal_system"] {
         eprintln!("=== haloreach_mcc {group}");

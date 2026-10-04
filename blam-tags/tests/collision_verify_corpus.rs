@@ -8,7 +8,9 @@
 //!
 //! Without that control the verifier is just another opinion.
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use std::path::PathBuf;
 
 use blam_tags::collision_import::{collision_model_from_jms, CollisionOptions};
 use blam_tags::collision_verify::{test_collision_model, VerifyError};
@@ -22,39 +24,8 @@ fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-fn h3ek() -> Option<PathBuf> {
-    [
-        "D:/SteamLibrary/steamapps/common",
-        "C:/Program Files (x86)/Steam/steamapps/common",
-        "E:/SteamLibrary/steamapps/common",
-    ]
-    .iter()
-    .map(|root| PathBuf::from(root).join("H3EK"))
-    .find(|path| path.join("tags").is_dir())
-}
-
-fn schema() -> Option<PathBuf> {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../definitions/halo3_mcc/collision_model.json");
-    p.exists().then_some(p)
-}
-
-fn walk(root: &Path, ext: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if p.extension().and_then(|x| x.to_str()).is_some_and(|x| x == ext) {
-                out.push(p);
-            }
-        }
-    }
-    out.sort();
-    out
+fn schema() -> PathBuf {
+    common::definitions("halo3_mcc").join("collision_model.json")
 }
 
 fn source_jms(tag: &TagFile) -> Option<JmsFile> {
@@ -85,10 +56,7 @@ fn source_jms(tag: &TagFile) -> Option<JmsFile> {
 /// judge anything, which is the entire reason this control exists.
 #[test]
 fn the_verifier_passes_tools_own_collision_models() {
-    let Some(kit) = h3ek() else {
-        eprintln!("skipping: no H3EK install");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
 
     #[allow(non_snake_case)]
     let (SAMPLE, RAYS, BYTES) = (
@@ -102,7 +70,7 @@ fn the_verifier_passes_tools_own_collision_models() {
 
     let mut unusable: Vec<String> = Vec::new();
     let mut too_big = 0usize;
-    for path in walk(&kit.join("tags"), "collision_model").iter().take(SAMPLE) {
+    for path in common::walk(&kit.tags(), "collision_model").iter().take(SAMPLE) {
         // The ground-truth side scans every surface for every ray, so the
         // check is quadratic in a model's size. Skip the largest rather
         // than let one tag dominate the run — and say how many, because a
@@ -188,10 +156,8 @@ fn the_verifier_passes_tools_own_collision_models() {
 ///
 #[test]
 fn what_this_importer_builds_passes_the_same_check() {
-    let (Some(kit), Some(schema)) = (h3ek(), schema()) else {
-        eprintln!("skipping: need an H3EK install and the collision_model schema");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
+    let schema = schema();
 
     #[allow(non_snake_case)]
     let (SAMPLE, RAYS, BYTES) = (
@@ -205,7 +171,7 @@ fn what_this_importer_builds_passes_the_same_check() {
     let mut bad: Vec<String> = Vec::new();
 
     let mut too_big = 0usize;
-    for path in walk(&kit.join("tags"), "collision_model").iter().take(SAMPLE) {
+    for path in common::walk(&kit.tags(), "collision_model").iter().take(SAMPLE) {
         if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > BYTES as u64 {
             too_big += 1;
             continue;

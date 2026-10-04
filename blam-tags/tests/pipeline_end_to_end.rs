@@ -13,20 +13,11 @@
 //! and `structure/` for a level — and every stage has to survive:
 //! parse, import, serialise, and read the tag back.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 use blam_tags::TagFile;
-
-fn h3ek() -> Option<PathBuf> {
-    [
-        "D:/SteamLibrary/steamapps/common",
-        "C:/Program Files (x86)/Steam/steamapps/common",
-        "E:/SteamLibrary/steamapps/common",
-    ]
-    .iter()
-    .map(|root| PathBuf::from(root).join("H3EK"))
-    .find(|path| path.join("data").is_dir())
-}
 
 fn schema(name: &str) -> Option<PathBuf> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -147,10 +138,7 @@ fn survives_a_round_trip(tag: &TagFile) -> Result<(), String> {
 
 #[test]
 fn every_source_file_in_the_kit_imports() {
-    let Some(kit) = h3ek() else {
-        eprintln!("skipping: need an H3EK install");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
     let (Some(mode), Some(coll), Some(phmo), Some(sbsp)) = (
         schema("render_model"),
         schema("collision_model"),
@@ -161,7 +149,7 @@ fn every_source_file_in_the_kit_imports() {
         return;
     };
 
-    let data = kit.join("data");
+    let data = kit.data();
     let mut failures: Vec<String> = Vec::new();
     let (mut render, mut collision, mut physics, mut structure) = (0, 0, 0, 0);
     let (mut unparsed, mut unrouted) = (0usize, 0usize);

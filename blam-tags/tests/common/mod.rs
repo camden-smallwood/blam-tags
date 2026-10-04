@@ -65,9 +65,11 @@ pub fn kit(env: &str) -> Option<KitRoot> {
     Some(KitRoot { root })
 }
 
-/// Every file under `root` whose extension is `ext`, compared without regard
+/// Every file under `root` whose name ends in `.ext`, compared without regard
 /// to case (`.JMS` and `.jms` both ship), sorted so a run is repeatable.
-/// A missing `root` yields nothing.
+/// Matched on the name rather than `Path::extension`, which reads the two
+/// kit files named exactly `.JMS` as having none. A missing `root` yields
+/// nothing.
 pub fn walk(root: &Path, ext: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -77,11 +79,11 @@ pub fn walk(root: &Path, ext: &str) -> Vec<PathBuf> {
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
-            } else if path
-                .extension()
-                .and_then(|x| x.to_str())
-                .is_some_and(|x| x.eq_ignore_ascii_case(ext))
-            {
+            } else if path.file_name().and_then(|n| n.to_str()).is_some_and(|name| {
+                name.len() > ext.len()
+                    && name.as_bytes()[name.len() - ext.len() - 1] == b'.'
+                    && name[name.len() - ext.len()..].eq_ignore_ascii_case(ext)
+            }) {
                 out.push(path);
             }
         }

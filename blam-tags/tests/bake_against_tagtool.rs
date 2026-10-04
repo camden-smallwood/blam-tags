@@ -1,7 +1,7 @@
 //! Engine-faithful bake validation.
 //!
 //! Loads real H3 MCC author-format `.shader` tags from
-//! `~/Halo/halo3_mcc/tags/...`, runs [`RenderMethod::bake`], and checks
+//! the H3EK kit named by `BLAM_TEST_H3EK`, runs [`RenderMethod::bake`], and checks
 //! the resulting `postprocess_definition` against ground-truth values
 //! captured from TagTool's `exportcommands` dump of the same shader as
 //! it appears in a cache-compiled map (i.e. what tool.exe wrote).
@@ -13,6 +13,8 @@
 //! Tests are gated on the H3 MCC tag tree existing on disk — they skip
 //! gracefully when run on a machine without the asset corpus.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 use blam_tags::render_method::{
@@ -22,9 +24,7 @@ use blam_tags::render_method::{
 use blam_tags::TagFile;
 
 fn tags_root() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let p = PathBuf::from(home).join("Halo/halo3_mcc/tags");
-    p.is_dir().then_some(p)
+    common::kit("BLAM_TEST_H3EK").map(|kit| kit.tags())
 }
 
 fn load_tag(path: &Path) -> TagFile {
@@ -49,10 +49,7 @@ fn load_rmop(tags_root: &Path, tag_relative: &str) -> Option<RenderMethodOption>
 
 #[test]
 fn shrine_clouds_sandstorm_bake_matches_tagtool() {
-    let Some(tags) = tags_root() else {
-        eprintln!("skipping: ~/Halo/halo3_mcc/tags not present");
-        return;
-    };
+    let Some(tags) = tags_root() else { return };
 
     // Load rmsh
     let rmsh_path = tags.join("levels/multi/shrine/sky/shaders/shrine_clouds_sandstorm.shader");

@@ -11,8 +11,10 @@
 //! Then the splitter itself: it must preserve every triangle and vertex,
 //! leave in-budget files untouched, and leave nothing over budget.
 //!
-//! Skips gracefully with no kit installed. Point `BLAM_TEST_H3EK` at an
-//! install, or let it find one in a Steam library.
+//! Needs the H3EK kit: point `BLAM_TEST_H3EK` at its root. Without it the
+//! tests pass after printing `skipped: no BLAM_TEST_H3EK`.
+
+mod common;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -22,22 +24,6 @@ use blam_tags::jms_split::{
     split_oversized_sections, MaterialLabel, SplitBudget, SplitError,
 };
 use blam_tags::TagFile;
-
-fn h3ek() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("BLAM_TEST_H3EK") {
-        let path = PathBuf::from(path);
-        return path.is_dir().then_some(path);
-    }
-    [
-        "D:/SteamLibrary/steamapps/common",
-        "C:/Program Files (x86)/Steam/steamapps/common",
-        "C:/Program Files/Steam/steamapps/common",
-        "E:/SteamLibrary/steamapps/common",
-    ]
-    .iter()
-    .map(|root| PathBuf::from(root).join("H3EK"))
-    .find(|path| path.join("data").is_dir() && path.join("tags").is_dir())
-}
 
 fn jms_files(root: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = blam_tags::convert::walk_files(root)
@@ -67,8 +53,8 @@ fn section_sizes(jms: &JmsFile) -> BTreeMap<(String, String, String), usize> {
 
 /// `data/<path>/render/x.jms` paired with `tags/<path>/y.render_model`,
 /// where each side has exactly one candidate.
-fn matched_pairs(kit: &Path) -> Vec<(PathBuf, PathBuf, String)> {
-    let (data, tags) = (kit.join("data"), kit.join("tags"));
+fn matched_pairs(kit: &common::KitRoot) -> Vec<(PathBuf, PathBuf, String)> {
+    let (data, tags) = (kit.data(), kit.tags());
     let mut out = Vec::new();
     for jms in jms_files(&data) {
         let Some(dir) = jms.parent() else { continue };
@@ -112,10 +98,7 @@ fn matched_pairs(kit: &Path) -> Vec<(PathBuf, PathBuf, String)> {
 /// meshes `tool.exe` built.
 #[test]
 fn material_labels_predict_the_built_section_count() {
-    let Some(kit) = h3ek() else {
-        eprintln!("skipping: no H3EK install found (set BLAM_TEST_H3EK)");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
     let pairs = matched_pairs(&kit);
     if pairs.is_empty() {
         eprintln!("skipping: no matched JMS/render_model pairs");
@@ -160,11 +143,8 @@ fn material_labels_predict_the_built_section_count() {
 /// Splitting preserves geometry exactly and respects the budget.
 #[test]
 fn splitting_the_corpus_preserves_everything() {
-    let Some(kit) = h3ek() else {
-        eprintln!("skipping: no H3EK install found (set BLAM_TEST_H3EK)");
-        return;
-    };
-    let files = jms_files(&kit.join("data"));
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
+    let files = jms_files(&kit.data());
     if files.is_empty() {
         eprintln!("skipping: no JMS files");
         return;
@@ -181,7 +161,7 @@ fn splitting_the_corpus_preserves_everything() {
     for path in &files {
         let Ok(text) = std::fs::read_to_string(path) else { continue };
         let Ok((mut jms, _)) = JmsFile::parse(&text) else { continue };
-        let name = path.strip_prefix(kit.join("data")).unwrap_or(path).display().to_string();
+        let name = path.strip_prefix(kit.data()).unwrap_or(path).display().to_string();
 
         let before = section_sizes(&jms);
         largest_section = largest_section.max(before.values().copied().max().unwrap_or(0));
@@ -272,10 +252,7 @@ fn splitting_the_corpus_preserves_everything() {
 /// A split file still parses, and its sections are all within budget.
 #[test]
 fn a_split_file_survives_a_write_and_reparse() {
-    let Some(kit) = h3ek() else {
-        eprintln!("skipping: no H3EK install found (set BLAM_TEST_H3EK)");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
     // Force splitting on real content by shrinking the budget hard, so
     // this exercises the write path on genuine artist data rather than a
     // synthetic mesh.
@@ -287,7 +264,7 @@ fn a_split_file_survives_a_write_and_reparse() {
     let limit = budget.triangles_per_section();
 
     let mut exercised = 0usize;
-    for path in jms_files(&kit.join("data")).into_iter().take(60) {
+    for path in jms_files(&kit.data()).into_iter().take(60) {
         let Ok(text) = std::fs::read_to_string(&path) else { continue };
         let Ok((mut jms, version)) = JmsFile::parse(&text) else { continue };
         let tris_before = jms.triangles.len();

@@ -27,22 +27,24 @@
 //!
 //! Skips silently when the corresponding tag set is absent.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 use blam_tags::particle_model::read_particle_model;
 use blam_tags::{JmsFile, TagFile};
 
-/// Root of an extracted MCC tag set, via `BLAM_TEST_<KIT>_TAGS` or the
-/// conventional local layout.
+/// A kit's `tags` folder, from the `BLAM_TEST_*` variable naming that kit's
+/// root, as every kit-gated suite takes it.
 fn kit_tags(kit: &str) -> Option<PathBuf> {
-    let var = format!("BLAM_TEST_{}_TAGS", kit.to_uppercase());
-    if let Ok(p) = std::env::var(&var) {
-        let p = PathBuf::from(p);
-        return p.is_dir().then_some(p);
-    }
-    let home = std::env::var("HOME").ok()?;
-    let p = PathBuf::from(home).join("Halo").join(format!("{kit}_mcc")).join("tags");
-    p.is_dir().then_some(p)
+    let env = match kit {
+        "halo2" => "BLAM_TEST_H2EK",
+        "halo3" => "BLAM_TEST_H3EK",
+        "haloreach" => "BLAM_TEST_HREK",
+        "halo4" => "BLAM_TEST_H4EK",
+        _ => panic!("no kit variable for {kit}"),
+    };
+    common::kit(env).map(|kit| kit.tags())
 }
 
 /// Mean dot(face normal, averaged vertex normal) over a JMS's

@@ -22,6 +22,8 @@
 //! extracted `.scenario_structure_bsp` to run the first test; the Reach
 //! half self-locates a kit and both skip gracefully when absent.
 
+mod common;
+
 use std::path::PathBuf;
 
 use blam_tags::{AssFile, AssObjectPayload, TagFile};
@@ -32,21 +34,17 @@ fn ce_sbsp() -> Option<PathBuf> {
     p.is_file().then_some(p)
 }
 
-/// A Reach BSP from an HREK install, if one is on this machine.
+/// A Reach BSP: `BLAM_TEST_REACH_SBSP` names one, or the HREK kit
+/// (`BLAM_TEST_HREK`) supplies Beaver Creek's.
 fn reach_sbsp() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("BLAM_TEST_REACH_SBSP") {
         let p = PathBuf::from(p);
         return p.is_file().then_some(p);
     }
-    let roots = [
-        "C:/Program Files (x86)/Steam/steamapps/common/HREK",
-        "D:/SteamLibrary/steamapps/common/HREK",
-    ];
-    let rel = "tags/levels/dlc/cex_beaver_creek/cex_beaver_creek.scenario_structure_bsp";
-    roots
-        .iter()
-        .map(|r| PathBuf::from(r).join(rel))
-        .find(|p| p.is_file())
+    let kit = common::kit("BLAM_TEST_HREK")?;
+    let path = kit.tags().join("levels/dlc/cex_beaver_creek/cex_beaver_creek.scenario_structure_bsp");
+    assert!(path.is_file(), "{} is missing from the HREK kit", path.display());
+    Some(path)
 }
 
 fn has_collision_material(ass: &AssFile) -> bool {
@@ -117,10 +115,7 @@ fn campaign_evolved_bsp_exports_instanced_collision() {
 /// usable render mesh.
 #[test]
 fn reach_bsp_still_exports_render_geometry() {
-    let Some(path) = reach_sbsp() else {
-        eprintln!("skipping: no HREK install found (set BLAM_TEST_REACH_SBSP to override)");
-        return;
-    };
+    let Some(path) = reach_sbsp() else { return };
     let tag = TagFile::read(&path).expect("read Reach sbsp");
 
     let pmt_len = tag

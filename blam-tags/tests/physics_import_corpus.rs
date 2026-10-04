@@ -11,57 +11,20 @@
 //! from ours at the margins, and two of the serialized header fields are
 //! live pointers.
 //!
-//! Skips gracefully with no kit installed. Point `BLAM_TEST_H3EK` at an
-//! install, or let it find one in a Steam library.
+//! Needs the H3EK kit: point `BLAM_TEST_H3EK` at its root. Without it the
+//! tests pass after printing `skipped: no BLAM_TEST_H3EK`.
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use std::path::PathBuf;
 
 use blam_tags::jms::JmsFile;
 use blam_tags::physics_import::{physics_model_from_jms, PhysicsError, PhysicsOptions};
 use blam_tags::TagFile;
 use flate2::read::ZlibDecoder;
 
-fn h3ek() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("BLAM_TEST_H3EK") {
-        let path = PathBuf::from(path);
-        return path.is_dir().then_some(path);
-    }
-    [
-        "D:/SteamLibrary/steamapps/common",
-        "C:/Program Files (x86)/Steam/steamapps/common",
-        "C:/Program Files/Steam/steamapps/common",
-        "E:/SteamLibrary/steamapps/common",
-    ]
-    .iter()
-    .map(|root| PathBuf::from(root).join("H3EK"))
-    .find(|path| path.join("data").is_dir() && path.join("tags").is_dir())
-}
-
-fn schema() -> Option<PathBuf> {
-    // Integration tests run with the *crate* as cwd, so reach the
-    // workspace-level `definitions/` through the manifest directory —
-    // same convention as `tmpl_layout_ground_truth.rs`.
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../definitions/halo3_mcc/physics_model.json");
-    p.exists().then_some(p)
-}
-
-fn walk(root: &Path, ext: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if p.extension().and_then(|x| x.to_str()).is_some_and(|x| x == ext) {
-                out.push(p);
-            }
-        }
-    }
-    out.sort();
-    out
+fn schema() -> PathBuf {
+    common::definitions("halo3_mcc").join("physics_model.json")
 }
 
 /// Recover the single source JMS a tag was built from, if it has one.
@@ -92,10 +55,8 @@ fn block_len(tag: &TagFile, name: &str) -> usize {
 
 #[test]
 fn we_rebuild_shipped_physics_models_from_their_own_source() {
-    let (Some(kit), Some(schema)) = (h3ek(), schema()) else {
-        eprintln!("skipping: need an H3EK install and definitions/halo3_mcc/physics_model.json");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
+    let schema = schema();
 
     let opts = PhysicsOptions::default();
     let mut compared = 0usize;
@@ -104,7 +65,7 @@ fn we_rebuild_shipped_physics_models_from_their_own_source() {
     let (mut bodies_ok, mut mats_ok, mut regions_ok, mut shapes_ok) = (0, 0, 0, 0);
     let mut rows: Vec<String> = Vec::new();
 
-    for tag_path in walk(&kit.join("tags"), "physics_model").iter().take(150) {
+    for tag_path in common::walk(&kit.tags(), "physics_model").iter().take(150) {
         let Ok(tag) = TagFile::read(tag_path) else { continue };
         let Some(jms) = source_jms(&tag) else { continue };
 
@@ -203,11 +164,9 @@ fn we_rebuild_shipped_physics_models_from_their_own_source() {
 /// A built tag must be structurally valid on its own terms.
 #[test]
 fn a_built_tag_has_the_right_header_and_survives_a_round_trip() {
-    let (Some(kit), Some(schema)) = (h3ek(), schema()) else {
-        eprintln!("skipping: need an H3EK install and the definitions");
-        return;
-    };
-    let Some(jms_path) = walk(&kit.join("data"), "JMS")
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
+    let schema = schema();
+    let Some(jms_path) = common::walk(&kit.data(), "JMS")
         .into_iter()
         .find(|p| p.parent().is_some_and(|d| d.ends_with("physics")))
     else {
@@ -239,10 +198,8 @@ fn a_built_tag_has_the_right_header_and_survives_a_round_trip() {
 /// every sphere at the origin; clippy caught that, a test should.
 #[test]
 fn shape_positions_match_the_shipped_tag() {
-    let (Some(kit), Some(schema)) = (h3ek(), schema()) else {
-        eprintln!("skipping: need an H3EK install and the definitions");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
+    let schema = schema();
 
     /// Every sphere's world position in a physics_model, sorted so the
     /// comparison does not depend on emission order.
@@ -265,7 +222,7 @@ fn shape_positions_match_the_shipped_tag() {
     let mut worst = 0.0f32;
     let mut examples: Vec<String> = Vec::new();
 
-    for tag_path in walk(&kit.join("tags"), "physics_model").iter().take(150) {
+    for tag_path in common::walk(&kit.tags(), "physics_model").iter().take(150) {
         let Ok(tag) = TagFile::read(tag_path) else { continue };
         let want = sphere_positions(&tag);
         if want.is_empty() {

@@ -18,44 +18,15 @@
 //!   triangle list as a strip produces a mesh that looks plausible and
 //!   is wrong everywhere, so this is where that would surface.
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use std::path::PathBuf;
 
 use blam_tags::ass::{AssFile, AssObjectPayload};
 use blam_tags::TagFile;
 
-fn h3ek() -> Option<PathBuf> {
-    [
-        "D:/SteamLibrary/steamapps/common",
-        "C:/Program Files (x86)/Steam/steamapps/common",
-        "E:/SteamLibrary/steamapps/common",
-    ]
-    .iter()
-    .map(|root| PathBuf::from(root).join("H3EK"))
-    .find(|path| path.join("tags").is_dir())
-}
-
-fn schema() -> Option<PathBuf> {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../definitions/halo3_mcc/scenario_structure_bsp.json");
-    p.exists().then_some(p)
-}
-
-fn walk(root: &Path, ext: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if p.extension().and_then(|x| x.to_str()).is_some_and(|x| x == ext) {
-                out.push(p);
-            }
-        }
-    }
-    out.sort();
-    out
+fn schema() -> PathBuf {
+    common::definitions("halo3_mcc").join("scenario_structure_bsp.json")
 }
 
 /// The **render** meshes, in order, with their geometry.
@@ -181,10 +152,8 @@ fn meshes(ass: &AssFile) -> Vec<(&Vec<blam_tags::ass::AssVertex>, &Vec<blam_tags
 
 #[test]
 fn a_scene_survives_being_written_into_a_tag_and_read_back() {
-    let (Some(kit), Some(schema)) = (h3ek(), schema()) else {
-        eprintln!("skipping: need an H3EK install and the sbsp schema");
-        return;
-    };
+    let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
+    let schema = schema();
 
     let limit: usize =
         std::env::var("BLAM_SBSP_MODELS").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
@@ -203,7 +172,6 @@ fn a_scene_survives_being_written_into_a_tag_and_read_back() {
     let mut solid_n = 0usize;
     let (mut p_leaf, mut p_region, mut p_cluster) = (0usize, 0usize, 0usize);
 
-
     let (mut clusters_out, mut tool_clusters) = (0usize, 0usize);
     let mut worst_placement = 0.0f32;
     let (mut coll_surfaces, mut coll_dropped) = (0usize, 0usize);
@@ -217,7 +185,7 @@ fn a_scene_survives_being_written_into_a_tag_and_read_back() {
     let (mut my_graze, mut my_solid) = (0usize, 0.0f32);
     let mut bad: Vec<String> = Vec::new();
 
-    for path in walk(&kit.join("tags"), "scenario_structure_bsp").iter().take(limit) {
+    for path in common::walk(&kit.tags(), "scenario_structure_bsp").iter().take(limit) {
         let Ok(tag) = TagFile::read(path) else {
             skipped += 1;
             continue;
