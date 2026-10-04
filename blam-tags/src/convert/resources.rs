@@ -18,7 +18,7 @@ use crate::monolithic::{ControlReadTally, FixupAddress, FixupTier};
 /// struct a resource payload is an opaque codec stream — for an animation graph
 /// it is the compressed animation data itself — so there is no partial or
 /// best-effort translation to attempt. It fits or it does not.
-pub fn transfer_resource(
+pub(crate) fn transfer_resource(
     source: TagField<'_>,
     target: &mut TagFieldMut<'_>,
     path: &str,

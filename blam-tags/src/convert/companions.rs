@@ -165,7 +165,7 @@ fn verify_roundtrip(tag: &TagFile, output: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn convert_h3_player_responses_to_reach_companions(
+pub(crate) fn convert_h3_player_responses_to_reach_companions(
     source: TagStruct<'_>,
     target: &mut TagStructMut<'_>,
     context: &mut ConversionContext<'_>,
