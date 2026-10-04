@@ -1214,6 +1214,65 @@ mod parity_tests {
         }
     }
 
+    /// Each `[engine.*]` area says how the shell and Python stand on it, and
+    /// every subcommand it names exists.
+    #[test]
+    fn engine_areas_name_real_subcommands() {
+        let doc = doc();
+        let subcommands = subcommands();
+        let engine = table(&doc, "engine");
+        assert!(!engine.is_empty());
+        for (area, entry) in engine {
+            let entry = entry.as_table().unwrap_or_else(|| panic!("[engine.{area}] is not a table"));
+            for key in entry.keys() {
+                assert!(
+                    ["symbols", "features", "shell", "shell_gap", "python", "python_gap"].contains(&key.as_str()),
+                    "[engine.{area}] has unknown key `{key}`",
+                );
+            }
+            for (have, gap) in [("shell", "shell_gap"), ("python", "python_gap")] {
+                assert!(
+                    entry.contains_key(have) != entry.contains_key(gap),
+                    "[engine.{area}] must set exactly one of {have}/{gap}",
+                );
+                if let Some(reason) = entry.get(gap) {
+                    assert!(reason.as_str().is_some_and(|s| !s.trim().is_empty()), "[engine.{area}] {gap} needs a reason");
+                }
+                if let Some(list) = entry.get(have) {
+                    let list = list.as_array().unwrap_or_else(|| panic!("[engine.{area}] {have} is not a list"));
+                    assert!(!list.is_empty(), "[engine.{area}] {have} is empty");
+                }
+            }
+            for name in entry.get("shell").and_then(|v| v.as_array()).into_iter().flatten() {
+                let name = name.as_str().expect("subcommand name is a string");
+                assert!(
+                    subcommands.contains(name),
+                    "[engine.{area}] names `{name}`, which is not a blam-tag-shell subcommand",
+                );
+            }
+        }
+    }
+
+    /// The counts line in the file's header matches the tables.
+    #[test]
+    fn header_counts_are_current() {
+        let doc = doc();
+        let engine = table(&doc, "engine");
+        let cli = table(&doc, "cli");
+        let has = |t: &toml::Value, k: &str| t.as_table().is_some_and(|t| t.contains_key(k));
+        let shell_gaps = engine.values().filter(|e| has(e, "shell_gap")).count();
+        let python_gaps = engine.values().filter(|e| has(e, "python_gap")).count();
+        let both = engine.values().filter(|e| has(e, "shell_gap") && has(e, "python_gap")).count();
+        let cli_gaps = cli.values().filter(|e| has(e, "gap")).count();
+        let expected = format!(
+            "# counts: {} engine areas, {shell_gaps} with no shell command, {python_gaps} with no Python binding\n\
+             # ({both} with neither); {} subcommands, {cli_gaps} with no Python equivalent.",
+            engine.len(),
+            cli.len(),
+        );
+        assert!(PARITY.contains(&expected), "parity.toml's counts line should read:\n{expected}");
+    }
+
     /// The comparison has to be able to disagree: a subcommand left out of
     /// the file and an entry for a removed one must both be reported.
     #[test]

@@ -1,16 +1,28 @@
-# What the shell can do, and whether Python can do the same.
+# What blam-tags can do, and whether the shell and Python can do the same.
 #
-# Every `blam-tag-shell` subcommand has a `[cli.<name>]` entry, and every
-# word the REPL handles itself has a `[repl."<word>"]` entry. Tests keep the
-# lists honest in both directions:
+# counts: 46 engine areas, 14 with no shell command, 31 with no Python binding
+# (12 with neither); 37 subcommands, 21 with no Python equivalent.
+#
+# Three kinds of table:
+#
+#   [cli.<name>]     every `blam-tag-shell` subcommand
+#   [repl."<word>"]  every word the REPL handles itself
+#   [engine.<area>]  every engine capability, with or without a command;
+#                    see the header of that section for its keys
+#
+# Tests keep the file honest:
 #
 #   - blam-tag-shell (`cargo test -p blam-tag-shell`) fails when a subcommand
-#     or REPL verb has no entry here, or when an entry names one that no
-#     longer exists.
+#     or REPL verb has no entry, when an entry names one that no longer
+#     exists, when an engine area names a subcommand that does not exist, or
+#     when the counts line above is out of date.
+#   - blam-tags (`cargo test -p blam-tags --all-features`) fails to build
+#     when an engine symbol is renamed or removed, and fails when its
+#     generated symbol file no longer matches this one.
 #   - blam-tags-py (`pytest blam-tags-py/tests/test_shell_parity.py`) fails
 #     when an attribute listed under `python` is missing from the module.
 #
-# Each entry sets exactly one of:
+# Each [cli] and [repl] entry sets exactly one of:
 #   python = ["Class.method", ...]  the Python attributes that cover it
 #   gap    = "..."                  Python cannot do this yet, and why
 #   na     = "..."                  the verb has no meaning outside the shell
@@ -181,3 +193,288 @@ na = "Alias of `exit`."
 
 [repl.repl]
 na = "Refused inside the REPL."
+
+# ===========================================================================
+# Engine capabilities
+# ===========================================================================
+#
+# One `[engine.<area>]` table per capability `blam-tags` offers, whether or
+# not the shell has a command for it. Each sets:
+#   symbols  = ["blam_tags::...", ...]  public paths that implement it; a
+#              path ending in a lowercase name (a function or `Type::method`)
+#              is named as a value, anything else is imported. A generic
+#              function names its type arguments (`f::<&str>`); one that
+#              takes `impl Trait` is coerced to a pointer instead
+#              (`f as fn(&'static str) -> _`).
+#   features = [...]                    engine features the symbols need
+#   shell = ["<subcommand>", ...]  or  shell_gap = "..."
+#   python = ["Class.attr", ...]   or  python_gap = "..."
+#
+# blam-tags/tests/parity_symbols.rs names every symbol in a generated file,
+# so renaming or removing one breaks the build until this file is updated.
+
+# --- tag files and the data facade -----------------------------------------
+
+[engine.tag-file-io]
+symbols = ["blam_tags::TagFile::read::<&str>", "blam_tags::TagFile::read_from_bytes", "blam_tags::TagFile::write::<&str>", "blam_tags::TagFile::write_atomic::<&str>", "blam_tags::TagFile::write_to_bytes", "blam_tags::TagFile::recompute_checksum"]
+shell = ["inspect", "set"]
+python = ["TagFile.read", "TagFile.read_from_bytes", "TagFile.write", "TagFile.write_atomic", "TagFile.write_to_bytes", "TagFile.recompute_checksum"]
+
+[engine.tag-file-new]
+symbols = ["blam_tags::TagFile::new::<&str>", "blam_tags::TagLayout::from_json as fn(&'static str) -> _", "blam_tags::TagGroupMeta", "blam_tags::TagSchemaError"]
+shell = ["new"]
+python = ["TagFile.new"]
+
+[engine.tag-header]
+symbols = ["blam_tags::TagFileHeader::peek::<&str>", "blam_tags::TagFile::group"]
+shell = ["header"]
+python = ["TagFileHeader.peek", "TagFile.group_tag", "TagFile.group_version"]
+
+[engine.classic-read]
+symbols = ["blam_tags::classic::read_classic_tag_file", "blam_tags::classic::ClassicEngine", "blam_tags::classic::ClassicHeader", "blam_tags::classic::classic_roundtrip", "blam_tags::TagFile::classic_engine"]
+shell = ["inspect"]
+python_gap = "TagFile.read reads MCC-layout tags only; nothing binds read_classic_tag_file, which needs a layout from --game."
+
+[engine.field-read]
+symbols = ["blam_tags::TagFile::root", "blam_tags::TagStruct::fields", "blam_tags::TagStruct::field", "blam_tags::TagStruct::field_path", "blam_tags::TagStruct::descend", "blam_tags::TagField::value", "blam_tags::TagField::type_name", "blam_tags::TagFieldData"]
+shell = ["inspect", "get"]
+python = ["TagFile.root", "TagStruct.fields", "TagStruct.field", "TagStruct.field_path", "TagStruct.descend", "TagField.value", "TagField.type_name"]
+
+[engine.field-write]
+symbols = ["blam_tags::TagFile::root_mut", "blam_tags::TagStructMut::field_path_mut", "blam_tags::TagFieldMut::set", "blam_tags::TagSetError"]
+shell = ["set"]
+python = ["TagField.set"]
+
+[engine.flags-and-enums]
+symbols = ["blam_tags::TagField::flag", "blam_tags::TagField::options", "blam_tags::TagFieldMut::flag_mut", "blam_tags::TagFlagMut::toggle", "blam_tags::TagOptions"]
+shell = ["flag", "options"]
+python = ["TagField.flag_names", "TagField.get_flag", "TagField.set_flag", "TagField.options"]
+
+[engine.blocks]
+symbols = ["blam_tags::TagBlockMut::add_element", "blam_tags::TagBlockMut::insert_element", "blam_tags::TagBlockMut::duplicate_element", "blam_tags::TagBlockMut::delete_element", "blam_tags::TagBlockMut::swap_elements", "blam_tags::TagBlockMut::move_element", "blam_tags::TagBlockMut::clear", "blam_tags::TagBlockMut::paste_element", "blam_tags::TagBlock::element_snapshot"]
+shell = ["block"]
+python = ["TagBlock.add", "TagBlock.insert", "TagBlock.duplicate", "TagBlock.delete", "TagBlock.swap", "TagBlock.move_element", "TagBlock.clear", "TagBlock.paste", "TagBlock.snapshot"]
+
+[engine.arrays]
+symbols = ["blam_tags::TagArray::element", "blam_tags::TagArrayMut::swap", "blam_tags::TagArrayMut::replace_element"]
+shell = ["get"]
+python = ["TagArray.swap", "TagArray.replace", "TagArray.snapshot"]
+
+[engine.resources]
+symbols = ["blam_tags::TagResource::kind", "blam_tags::TagResource::inline_bytes", "blam_tags::TagResource::exploded_payload", "blam_tags::TagResource::xsync_payload"]
+shell = ["get"]
+python = ["TagResource.kind", "TagResource.inline_bytes", "TagResource.exploded_payload", "TagResource.xsync_payload"]
+
+[engine.resource-copy]
+symbols = ["blam_tags::TagFieldMut::copy_resource_from", "blam_tags::TagFieldMut::init_resource", "blam_tags::TagFieldMut::clear_resource"]
+shell_gap = "No command copies, creates or clears a resource."
+python_gap = "TagResource is read-only from Python."
+
+[engine.definitions]
+symbols = ["blam_tags::TagFile::definitions", "blam_tags::TagStructDefinition", "blam_tags::TagFieldDefinition", "blam_tags::TagBlockDefinition"]
+shell = ["inspect"]
+python_gap = "The schema facade borrows with a lifetime and is not bound (bindings.toml: module.definition)."
+
+[engine.field-paths]
+symbols = ["blam_tags::TagFieldPath", "blam_tags::TagFieldPathSegment", "blam_tags::TagFieldPath::push_name as fn(&mut _, &'static str)", "blam_tags::clean_field_name", "blam_tags::parse_field_name"]
+shell = ["get", "set"]
+python = ["TagField.path", "TagField.clean_name", "TagStruct.field_path"]
+
+[engine.group-tags]
+symbols = ["blam_tags::parse_group_tag", "blam_tags::format_group_tag"]
+shell = ["list", "header"]
+python = ["parse_group_tag", "format_group_tag"]
+
+[engine.games]
+symbols = ["blam_tags::game::Game::of", "blam_tags::game::Title"]
+shell = ["extract-geometry", "extract-animation"]
+python = ["Game", "Title"]
+
+[engine.math]
+symbols = ["blam_tags::math::RealQuaternion", "blam_tags::math::RealPoint3d", "blam_tags::math::RealMatrix4x3"]
+shell_gap = "Value types used by every command; no command of their own."
+python = ["RealQuaternion", "RealPoint3d", "RealMatrix4x3"]
+
+# --- streams -----------------------------------------------------------------
+
+[engine.dependency-streams]
+symbols = ["blam_tags::TagFile::add_dependency_list::<&str>", "blam_tags::TagFile::remove_dependency_list", "blam_tags::TagFile::add_import_info::<&str>", "blam_tags::TagFile::remove_import_info", "blam_tags::TagFile::add_asset_depot_storage::<&str>", "blam_tags::TagFile::remove_asset_depot_storage", "blam_tags::TagFile::dependency_list", "blam_tags::TagFile::import_info", "blam_tags::TagFile::read_dependency_references::<&str>"]
+shell = ["add-dependency-list", "remove-dependency-list", "add-import-info", "remove-import-info", "add-asset-depot-storage", "remove-asset-depot-storage", "extract-import-info", "deps"]
+python = ["TagFile.add_dependency_list", "TagFile.remove_dependency_list", "TagFile.add_import_info", "TagFile.remove_import_info", "TagFile.add_asset_depot_storage", "TagFile.remove_asset_depot_storage", "TagFile.dependency_list", "TagFile.import_info", "TagFile.read_dependency_references"]
+
+[engine.dependency-rebuild]
+symbols = ["blam_tags::TagFile::rebuild_dependency_list::<&str>"]
+shell = ["rebuild-dependency-list"]
+python_gap = "rebuild_dependency_list is not bound."
+
+
+# --- schemas -----------------------------------------------------------------
+
+[engine.layout-compare]
+symbols = ["blam_tags::schema_compare::compare_root_layout", "blam_tags::schema_compare::LayoutComparison"]
+shell = ["layout-diff"]
+python_gap = "Module `schema_compare` is not bound."
+
+[engine.schema-compat]
+symbols = ["blam_tags::schema_compat::compare_group_layouts", "blam_tags::schema_compat::struct_trees_are_wire_identical", "blam_tags::schema_compat::GroupComparison"]
+shell_gap = "No command compares two games' layouts for a group."
+python_gap = "Module `schema_compat` is not bound."
+
+# --- conversion --------------------------------------------------------------
+
+[engine.conversion]
+symbols = ["blam_tags::convert::analyze_conversion", "blam_tags::convert::analyze_conversion_routed", "blam_tags::convert::conversion_routes", "blam_tags::convert::conversion_targets_for", "blam_tags::convert::read_tag_for_conversion", "blam_tags::convert::TagConversionReport", "blam_tags::convert::LossPolicy", "blam_tags::convert::prepare_companion_outputs", "blam_tags::convert::CompanionTagDraft"]
+shell_gap = "No command converts a tag between games."
+python_gap = "Module `convert` is not bound."
+
+
+# --- Halo 4 monolithic caches -----------------------------------------------
+
+[engine.monolithic-cache]
+symbols = ["blam_tags::monolithic::MonolithicCache::open as fn(&'static str) -> _", "blam_tags::monolithic::MonolithicCache::iter_tags", "blam_tags::monolithic::MonolithicCache::read_tag", "blam_tags::monolithic::MonolithicCache::read_tag_by_name"]
+shell = ["list-cache", "inspect"]
+python_gap = "Module `monolithic` is not bound."
+
+# --- Campaign Evolved IoStore ------------------------------------------------
+
+[engine.iostore-containers]
+symbols = ["blam_tags::iostore::IoStoreArchive::open as fn(&'static str) -> _", "blam_tags::iostore::IoStoreArchive::entries", "blam_tags::iostore::IoStoreArchive::read", "blam_tags::iostore::is_tag_payload", "blam_tags::iostore::parse_ublock_stem"]
+features = ["iostore"]
+shell_gap = "No command opens an IoStore container."
+python_gap = "Module `iostore` is not bound."
+
+[engine.iostore-world]
+symbols = ["blam_tags::iostore::world::World::open as fn(&'static str, _) -> _", "blam_tags::iostore::world::World::packages", "blam_tags::iostore::world::World::read_package", "blam_tags::iostore::world::compare_mount_paths", "blam_tags::iostore::world::package_name_from_entry"]
+features = ["iostore"]
+shell_gap = "No command mounts a Campaign Evolved install."
+python_gap = "Module `iostore` is not bound."
+
+[engine.unreal-meshes]
+symbols = ["blam_tags::JmsFile::from_ue_skeletal_mesh", "blam_tags::JmsFile::from_ue_meshes"]
+features = ["iostore"]
+shell_gap = "No command exports an Unreal mesh."
+python_gap = "Modules `iostore` and `jms` are not bound."
+
+# --- sound -------------------------------------------------------------------
+
+[engine.sound-banks]
+symbols = ["blam_tags::audio::SoundBanks::open_pc", "blam_tags::audio::SoundBanks::resolve", "blam_tags::audio::fsb5::Fsb5::open as fn(&'static str) -> _", "blam_tags::audio::fsb5::fmod_bank_subsound_id_hash", "blam_tags::audio::bank_path_from_tags_root", "blam_tags::audio::WwiseBanks::open_pc", "blam_tags::audio::WwiseBanks::open_pc_language"]
+features = ["audio"]
+shell_gap = "No command resolves or plays a sound, from FMOD or Wwise banks."
+python_gap = "Module `audio` is not bound."
+
+
+[engine.sound-decode]
+symbols = ["blam_tags::audio::vorbis::decode_subsound", "blam_tags::audio::vorbis::decode_ogg_vorbis", "blam_tags::audio::classic::decode_opus", "blam_tags::audio::classic::decode_xbox_adpcm", "blam_tags::audio::classic::decode_pcm"]
+features = ["audio"]
+shell_gap = "No command decodes sound."
+python_gap = "Module `audio` is not bound."
+
+[engine.sound-encode]
+symbols = ["blam_tags::audio::vorbis::encode_ogg_vorbis", "blam_tags::audio::classic::encode_opus", "blam_tags::audio::classic::encode_xbox_adpcm", "blam_tags::audio::classic::encode_pcm"]
+features = ["audio"]
+shell_gap = "No command encodes sound."
+python_gap = "Module `audio` is not bound."
+
+# --- shaders and functions ---------------------------------------------------
+
+[engine.render-method-resolve]
+symbols = ["blam_tags::render_method::ResolvedRenderMethod::resolve as fn(&_, &_, fn(&str) -> Option<_>) -> _", "blam_tags::render_method::RenderMethodChoices::resolve", "blam_tags::render_method::ResolvedParameter"]
+shell_gap = "No command resolves a shader's parameters."
+python_gap = "Module `render_method` is not bound."
+
+[engine.render-method-bake]
+symbols = ["blam_tags::render_method::RenderMethod::bake as fn(&mut _, &_, &_, fn(&str) -> Option<_>, f32) -> _", "blam_tags::render_method::resolve_pixel_user_cbuffer", "blam_tags::render_method::rebuild_cbuffer_bytes_at_time", "blam_tags::render_method::BakeError"]
+shell_gap = "No command bakes a shader's constant buffers."
+python_gap = "Module `render_method` is not bound."
+
+[engine.tag-functions]
+symbols = ["blam_tags::tag_function::TagFunction::parse", "blam_tags::tag_function::TagFunction::evaluate", "blam_tags::tag_function::TagFunction::as_constant", "blam_tags::tag_function::H2Function"]
+shell_gap = "No command evaluates a function."
+python = ["TagField.as_function", "TagFunction.evaluate", "TagFunction.evaluate_legacy", "TagFunction.as_constant"]
+
+[engine.function-editor]
+symbols = ["blam_tags::tag_function::editor::TagFunctionEditor::parse", "blam_tags::tag_function::editor::TagFunctionEditor::set_function_type", "blam_tags::tag_function::editor::TagFunctionEditor::set_clamp_range", "blam_tags::tag_function::editor::TagFunctionEditor::to_bytes"]
+shell_gap = "No command edits a function."
+python_gap = "TagFunction is read-only from Python; the editor is not bound."
+
+# --- bitmaps -----------------------------------------------------------------
+
+[engine.bitmaps]
+symbols = ["blam_tags::Bitmap::new", "blam_tags::Bitmap::image", "blam_tags::BitmapImage", "blam_tags::BitmapFormat", "blam_tags::bitmap::color_plate", "blam_tags::bitmap::ColorPlate"]
+shell = ["extract-bitmap"]
+python_gap = "Module `bitmap` is not bound."
+
+
+# --- geometry extraction -----------------------------------------------------
+
+[engine.model-to-jms]
+symbols = ["blam_tags::JmsFile::from_render_model", "blam_tags::JmsFile::from_gbxmodel", "blam_tags::JmsFile::from_collision_model", "blam_tags::JmsFile::from_physics_model_with_skeleton", "blam_tags::JmsFile::write::<Vec<u8>>"]
+shell = ["extract-geometry"]
+python_gap = "Module `jms` is not bound."
+
+[engine.bsp-to-ass]
+symbols = ["blam_tags::AssFile::from_scenario_structure_bsp", "blam_tags::AssFile::from_render_model", "blam_tags::extract::geometry::scenario_geometry", "blam_tags::extract::geometry::emit_ce_bsp_jms"]
+shell = ["extract-geometry"]
+python_gap = "Modules `ass` and `extract` are not bound."
+
+[engine.particle-models]
+symbols = ["blam_tags::particle_model::read_particle_model", "blam_tags::extract::particle_model::particle_model_geometry", "blam_tags::JmiFile"]
+shell = ["extract-geometry"]
+python_gap = "Modules `particle_model`, `jmi` and `extract` are not bound."
+
+[engine.render-geometry]
+symbols = ["blam_tags::render_geometry::RenderGeometryResource::parse", "blam_tags::render_geometry::decode_vertex_buffer", "blam_tags::render_geometry::hydrate"]
+shell = ["extract-geometry"]
+python_gap = "Module `render_geometry` is not bound."
+
+# --- animation ---------------------------------------------------------------
+
+[engine.animation-graphs]
+symbols = ["blam_tags::AnimationGraph::from_tag", "blam_tags::Animation::new", "blam_tags::animation::classic::CeAnimations::new"]
+shell = ["list-animations"]
+python_gap = "Module `animation` is not bound."
+
+[engine.animation-export]
+symbols = ["blam_tags::extract::animation::write_group_jma", "blam_tags::extract::animation::write_ce_group_jma", "blam_tags::extract::animation::animations_to_dir", "blam_tags::animation::jma::JmaKind"]
+shell = ["extract-animation"]
+python_gap = "Modules `animation` and `extract` are not bound."
+
+# --- import ------------------------------------------------------------------
+
+[engine.render-import]
+symbols = ["blam_tags::render_import::render_model_from_jms", "blam_tags::render_import::RenderOptions", "blam_tags::prt::sh_transfer"]
+shell = ["import", "jms-to-render"]
+python_gap = "Modules `render_import` and `prt` are not bound."
+
+[engine.collision-import]
+symbols = ["blam_tags::collision_import::collision_model_from_jms", "blam_tags::collision_import::collision_bsp_from_triangles"]
+shell = ["import", "jms-to-collision"]
+python_gap = "Module `collision_import` is not bound."
+
+[engine.physics-import]
+symbols = ["blam_tags::physics_import::physics_model_from_jms", "blam_tags::hull::convex_hull"]
+shell = ["import", "jms-to-physics"]
+python_gap = "Modules `physics_import` and `hull` are not bound."
+
+[engine.structure-import]
+symbols = ["blam_tags::sbsp_import::structure_bsp_from_ass_with", "blam_tags::ass_parse::parse"]
+shell = ["import"]
+python_gap = "Modules `sbsp_import` and `ass_parse` are not bound."
+
+[engine.jms-sources]
+symbols = ["blam_tags::JmsFile::parse", "blam_tags::jms_split::split_oversized_sections", "blam_tags::gltf::jms_from_gltf_path"]
+shell = ["split-jms", "gltf-to-jms"]
+python_gap = "Modules `jms`, `jms_split` and `gltf` are not bound."
+
+[engine.collision-verify]
+symbols = ["blam_tags::collision_verify::test_collision_model", "blam_tags::collision_verify::test_collision_bsp"]
+shell = ["collision-bsp-test"]
+python_gap = "Module `collision_verify` is not bound."
+
+# --- filesystem --------------------------------------------------------------
+
+[engine.tag-paths]
+symbols = ["blam_tags::paths::derive_tags_root", "blam_tags::paths::tag_stem", "blam_tags::paths::resolve_tag_path", "blam_tags::paths::group_tag_to_extension"]
+shell = ["extract-bitmap", "extract-geometry"]
+python_gap = "Module `paths` is not bound."

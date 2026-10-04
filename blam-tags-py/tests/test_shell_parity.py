@@ -1,8 +1,9 @@
 """Checks the Python side of `parity.toml` at the repository root.
 
-The shell's own tests keep that file's list of commands complete; this one
-checks that every attribute it names under `python` exists on the module, so
-the file cannot claim Python covers a command it does not.
+The shell's own tests keep that file's list of commands complete, and the
+engine's tests check its engine symbols; this one checks that every attribute
+it names under `python`, for a shell command or an engine area, exists on the
+module, so the file cannot claim Python covers something it does not.
 """
 
 import os
@@ -23,7 +24,7 @@ PARITY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "p
 def _entries():
     with open(PARITY, "rb") as f:
         doc = tomllib.load(f)
-    for kind in ("cli", "repl"):
+    for kind in ("cli", "repl", "engine"):
         for name, entry in doc[kind].items():
             yield kind, name, entry
 

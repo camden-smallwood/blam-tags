@@ -53,6 +53,8 @@ ruzstd = { version = "0.7", optional = true }
 # dependency above, so nothing new is pulled in.
 [dev-dependencies]
 flate2 = "1"
+# Reads the workspace `parity.toml` in tests/parity_symbols.rs.
+toml = "1"
 
 [features]
 audio = ["dep:lewton", "dep:log", "dep:opus", "dep:vorbis_rs"]
