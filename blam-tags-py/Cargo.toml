@@ -9,6 +9,14 @@ name = "blam_tags"
 # `cdylib` is what Python loads; `rlib` keeps the crate testable from Rust.
 crate-type = ["cdylib", "rlib"]
 
+# The engine's optional capabilities are on by default so the wheel can reach
+# Halo sound and Campaign Evolved IoStore containers; the generated bindings
+# are produced from rustdoc built with the same features.
+[features]
+default = ["audio", "iostore"]
+audio = ["blam-tags/audio"]
+iostore = ["blam-tags/iostore"]
+
 [dependencies]
 blam-tags = { path = "../blam-tags" }
 # `abi3-py38` builds one wheel per platform that works on CPython 3.8+,

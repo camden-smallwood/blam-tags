@@ -7,6 +7,15 @@ edition = "2024"
 name = "blam-tag-shell"
 path = "src/main.rs"
 
+# The engine's optional capabilities are on by default so the released CLI can
+# reach Halo sound and Campaign Evolved IoStore containers; build with
+# `--no-default-features` to leave out their native (Opus) and decompression
+# dependencies.
+[features]
+default = ["audio", "iostore"]
+audio = ["blam-tags/audio"]
+iostore = ["blam-tags/iostore"]
+
 [dependencies]
 blam-tags = { path = "../blam-tags" }
 clap = { version = "4", features = ["derive"] }
