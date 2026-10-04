@@ -1396,6 +1396,59 @@ mod tests {
         assert!(checked > 30, "only {checked} permutations checked");
     }
 
+    /// A Halo 2 block that gains its first element is written with a block
+    /// header, whatever its layout looks like. The editors synthesize one only
+    /// for layouts with tagged or versioned structs; `color_table` has neither,
+    /// so adding a colour wrote the element with no header, and the reader then
+    /// took the element's first 16 bytes for one (33 of the 120 Halo 2 groups
+    /// were affected).
+    #[test]
+    fn a_halo_2_block_that_gains_elements_is_written_with_a_header() {
+        let layout = crate::TagLayout::from_json("../definitions/halo2_mcc/color_table.json")
+            .expect("H2 color_table layout");
+        // The premise: nothing in this layout looks like Halo 2.
+        assert!(layout.struct_tags.iter().all(|tag| *tag == 0));
+        assert!(layout.struct_version_table.iter().all(Option::is_none));
+
+        let mut bytes = vec![0u8; 64];
+        bytes[36..40].copy_from_slice(b"oloc"); // `colo`, stored reversed
+        bytes[60..64].copy_from_slice(b"!MLB");
+        bytes.extend_from_slice(b"dfbt");
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&12u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 12]); // `colors`: empty
+        let mut tag = super::read_classic_tag_file(&bytes, layout.clone()).expect("read");
+
+        {
+            let mut root = tag.root_mut();
+            let mut colors = root.field_mut("colors").unwrap();
+            let mut colors = colors.as_block_mut().unwrap();
+            for name in ["red", "green"] {
+                let index = colors.add_element();
+                let mut color = colors.element_mut(index).unwrap();
+                color
+                    .field_mut("name")
+                    .unwrap()
+                    .set(crate::TagFieldData::String(name.to_owned()))
+                    .unwrap();
+            }
+        }
+        let written = tag.write_to_bytes().unwrap();
+        // Root header + root element + block header + two 48-byte colours.
+        assert_eq!(written.len(), 64 + 16 + 12 + 16 + 2 * 48);
+        assert_eq!(&written[92..96], b"dfbt");
+        assert_eq!(written[100..104], 2u32.to_le_bytes(), "count");
+        assert_eq!(written[104..108], 48u32.to_le_bytes(), "element size");
+
+        let read = super::read_classic_tag_file(&written, layout).expect("read back");
+        let colors = read.root().field("colors").and_then(|f| f.as_block()).unwrap();
+        let names: Vec<String> =
+            colors.iter().map(|color| color.read_string("name").unwrap_or_default()).collect();
+        assert_eq!(names, ["red", "green"]);
+        assert_eq!(read.write_to_bytes().unwrap(), written);
+    }
+
     #[test]
     fn checksum_matches_crc32_without_final_xor() {
         // Standard CRC32("123456789") = 0xCBF43926 (with final inversion).
@@ -1440,8 +1493,9 @@ fn encode_block(layout: &TagLayout, block: &TagBlockData, engine: ClassicEngine,
 /// the count word re-synced. For a structurally edited H2 block the 16-byte
 /// header is rebuilt from scratch (`dfbt` + inferred version + count +
 /// on-disk element size) so it matches the body we emit; the legacy 12-byte
-/// form only carries a count, so it is just re-synced. Returns `None` when
-/// the block has no header (e.g. MCC/CE, or an empty H2 block).
+/// form only carries a count, so it is just re-synced. A non-empty H2 block
+/// with no header gets a fresh one. Returns `None` when the block has no
+/// header (Halo CE, or an empty H2 block).
 fn canonical_h2_block_header(
     layout: &TagLayout,
     block: &TagBlockData,
@@ -1449,7 +1503,33 @@ fn canonical_h2_block_header(
     sz: usize,
     engine: ClassicEngine,
 ) -> Option<Vec<u8>> {
-    let hdr = block.classic_block_header.as_ref()?;
+    let Some(hdr) = block.classic_block_header.as_ref() else {
+        // A Halo 2 block that has elements but no header gained them after it
+        // was read (or was never read). The editors synthesize one when a
+        // block gains its first element, but only for layouts that look like
+        // Halo 2 (tagged or versioned structs), and a group with neither —
+        // `color_table`, `item_collection`, `style` and about thirty more —
+        // got none: its elements were written without the header the reader
+        // needs, which then read the first element as a header. The encoder
+        // knows the engine, so it writes the header itself.
+        if !engine.is_halo2() || elem_count == 0 {
+            return None;
+        }
+        let base_struct_index = layout.block_layouts[block.block_index as usize].struct_index;
+        let resolved_struct_index = block.elements[0].struct_index;
+        let version = infer_struct_version(layout, base_struct_index, resolved_struct_index);
+        let mut out = Vec::with_capacity(16);
+        out.extend_from_slice(&h2_classic_block_signature());
+        if engine.legacy_header() {
+            out.extend_from_slice(&(version as i16).to_le_bytes());
+            out.extend_from_slice(&(elem_count as i16).to_le_bytes());
+        } else {
+            out.extend_from_slice(&version.to_le_bytes());
+            out.extend_from_slice(&(elem_count as u32).to_le_bytes());
+        }
+        out.extend_from_slice(&(sz as u32).to_le_bytes());
+        return Some(out);
+    };
     let mut out = hdr.clone();
     if !engine.is_halo2() || !block.classic_structural_dirty {
         if out.len() == 12 {
