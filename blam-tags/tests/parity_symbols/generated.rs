@@ -49,6 +49,11 @@ pub fn bsp_to_ass() {
     let _ = blam_tags::extract::geometry::emit_ce_bsp_jms;
 }
 
+pub fn classic_new() {
+    let _ = blam_tags::TagFile::new_classic::<&str>;
+    use blam_tags::classic::NewClassicTagError as _;
+}
+
 pub fn classic_read() {
     let _ = blam_tags::classic::read_classic_tag_file;
     use blam_tags::classic::ClassicEngine as _;

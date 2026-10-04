@@ -1,7 +1,7 @@
 # What blam-tags can do, and whether the shell and Python can do the same.
 #
-# counts: 46 engine areas, 14 with no shell command, 31 with no Python binding
-# (12 with neither); 37 subcommands, 21 with no Python equivalent.
+# counts: 47 engine areas, 15 with no shell command, 32 with no Python binding
+# (13 with neither); 37 subcommands, 21 with no Python equivalent.
 #
 # Three kinds of table:
 #
@@ -224,6 +224,11 @@ python = ["TagFile.read", "TagFile.read_from_bytes", "TagFile.write", "TagFile.w
 symbols = ["blam_tags::TagFile::new::<&str>", "blam_tags::TagLayout::from_json as fn(&'static str) -> _", "blam_tags::TagGroupMeta", "blam_tags::TagSchemaError"]
 shell = ["new"]
 python = ["TagFile.new"]
+
+[engine.classic-new]
+symbols = ["blam_tags::TagFile::new_classic::<&str>", "blam_tags::classic::NewClassicTagError"]
+shell_gap = "`new` builds MCC tags only; nothing creates a Halo CE or Halo 2 tag."
+python_gap = "TagFile.new builds MCC tags only; new_classic is not bound."
 
 [engine.tag-header]
 symbols = ["blam_tags::TagFileHeader::peek::<&str>", "blam_tags::TagFile::group"]
