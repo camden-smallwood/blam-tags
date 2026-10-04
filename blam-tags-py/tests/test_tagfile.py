@@ -1,7 +1,5 @@
 """Exercises the generated `file`, `game`, and `error` bindings.
 
-Run from the repository root — the schema paths are relative to it.
-
 This covers the shapes `math` could not: `Result` returns surfacing as Python
 exceptions, `P: AsRef<Path>` parameters, byte payloads, a non-`Clone` wrapper
 that can only be passed by reference, and a fieldless enum.
@@ -12,7 +10,10 @@ import tempfile
 
 import blam_tags as bt
 
-SCHEMA = "definitions/halo3_mcc/biped.json"
+# Resolved from this file so the tests run from any directory.
+SCHEMA = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "definitions", "halo3_mcc", "biped.json"
+)
 
 
 def _fresh():

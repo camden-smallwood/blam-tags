@@ -1,7 +1,5 @@
 """Exercises the hand-written borrowing facade.
 
-Run from the repository root — the schema path is relative to it.
-
 The facade is the part that could not be generated: `TagStruct`, `TagField`,
 and `TagBlock` all borrow from the owning `TagFile` in Rust, so here they are
 path handles that re-resolve on every access. These tests cover what that
@@ -9,9 +7,14 @@ design can plausibly get wrong — values that do not reach the bytes, writes
 that change a field's type, and handles that outlive the element they name.
 """
 
+import os
+
 import blam_tags as bt
 
-SCHEMA = "definitions/halo3_mcc/biped.json"
+# Resolved from this file so the tests run from any directory.
+SCHEMA = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "definitions", "halo3_mcc", "biped.json"
+)
 
 
 def _tag():

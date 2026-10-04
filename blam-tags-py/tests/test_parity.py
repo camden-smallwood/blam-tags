@@ -1,13 +1,16 @@
 """Exercises the facade methods added for parity with the Rust `api` surface:
 enum/flag option discovery, enum-set-by-name, array/resource/function access,
 struct/block extras, and the dependency-list / import-info anchors.
-
-Run from the repository root — the schema path is relative to it.
 """
+
+import os
 
 import blam_tags as bt
 
-SCHEMA = "definitions/halo3_mcc/biped.json"
+# Resolved from this file so the tests run from any directory.
+SCHEMA = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "definitions", "halo3_mcc", "biped.json"
+)
 
 
 def _tag():

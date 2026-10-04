@@ -92,11 +92,11 @@ seats[0].field("label").set("driver")
 tag.write("masterchief.biped")
 ```
 
-Run the tests from the repository root, since the schema paths are relative
-to it:
+Run the tests with pytest after `maturin develop`; they find the schemas and
+`parity.toml` relative to their own files, so any directory works:
 
 ```sh
-for t in math tagfile fields facade; do python blam-tags-py/tests/test_$t.py; done
+pytest blam-tags-py/tests
 ```
 
 ## The facade is hand-written
