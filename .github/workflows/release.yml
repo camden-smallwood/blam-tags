@@ -9,6 +9,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # The shell's default `audio` feature builds the vendored libopus with
+  # CMake (audiopus_sys). Its CMakeLists targets an old CMake; let the
+  # runners' CMake 4.x configure it.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 concurrency:
   group: release-${{ github.ref }}
@@ -50,8 +54,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev
 
+      - name: Install Windows CMake generator
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          choco install ninja --no-progress -y
+          echo "CMAKE_GENERATOR=Ninja" >> "$GITHUB_ENV"
+
+      # Only the shell ships; its default features include sound and IoStore.
       - name: Build release
-        run: cargo build --release
+        run: cargo build --release -p blam-tag-shell
 
       - name: Stage artifact
         shell: bash
