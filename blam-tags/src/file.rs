@@ -161,8 +161,11 @@ pub struct TagFile {
     /// serializes — MCC chunks vs classic flat bytes.
     pub container: TagContainer,
     /// Wire byte order detected on read (LE for PC/MCC, BE for Xbox
-    /// 360 / legacy debug builds). Preserved so writers can round-trip
-    /// to the same endian the file was loaded from.
+    /// 360 / legacy debug builds). Field values are decoded with it. Writing
+    /// does not convert: an MCC tag is always written little-endian, so a
+    /// big-endian MCC tag is refused by [`TagFile::write_to_bytes`] rather than
+    /// written with little-endian chunks around big-endian field bytes.
+    /// Classic tags carry their own engine's byte order and are unaffected.
     pub endian: Endian,
     /// The `tag!` stream — carries the tag's main payload. Access
     /// the root via [`TagFile::root`] / [`TagFile::root_mut`].
@@ -532,6 +535,16 @@ impl TagFile {
         // reconstructed 64-byte header — no MCC chunking.
         if let TagContainer::Classic { engine, header } = &self.container {
             return Ok(crate::classic::write_classic_tag(self, *engine, header));
+        }
+        // The MCC writer emits little-endian chunk headers and copies field
+        // bytes as they are held. A big-endian tag's field bytes are big-endian,
+        // so writing one would produce a file whose header says little-endian
+        // around big-endian values: it would read back as garbage. Refuse it.
+        if self.endian == Endian::Be {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a big-endian (Xbox 360) MCC tag cannot be written: the writer emits little-endian tags only",
+            ));
         }
         let mut bytes = Vec::new();
         self.write_mcc_into(&mut bytes)?;
@@ -920,5 +933,25 @@ mod new_tag_generation {
         assert_eq!(generation("haloreach_mcc"), (1, 2, u32::MAX));
         assert_eq!(generation("haloce_evolved"), crate::convert::CAMPAIGN_EVOLVED_GENERATION);
         assert_eq!(generation("halo3_mcc"), (1, 1, u32::MAX));
+    }
+}
+
+#[cfg(test)]
+mod big_endian_write {
+    use super::TagFile;
+    use crate::io::Endian;
+
+    /// The MCC writer only produces little-endian tags. A big-endian tag's
+    /// field bytes are big-endian, so writing it would wrap them in
+    /// little-endian chunks and the result would read back as garbage; it is
+    /// refused instead.
+    #[test]
+    fn a_big_endian_mcc_tag_is_refused_rather_than_written_mixed() {
+        let mut tag = TagFile::new("../definitions/halo3_mcc/collision_model.json")
+            .expect("a new Halo 3 tag");
+        assert!(tag.write_to_bytes().is_ok(), "a little-endian tag writes");
+        tag.endian = Endian::Be;
+        let error = tag.write_to_bytes().expect_err("a big-endian MCC tag is refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 }
