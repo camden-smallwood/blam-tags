@@ -17,7 +17,7 @@
 //! by visibility, instancing of repeated props, and agreement with tool's
 //! own output byte for byte.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use blam_tags::ass::{AssFile, AssInstance, AssMaterial, AssObject, AssObjectPayload, AssTriangle, AssVertex};
 use blam_tags::math::{RealPoint2d, RealPoint3d, RealQuaternion, RealRgbColor, RealVector3d};
@@ -712,4 +712,236 @@ fn the_verifier_reports_an_empty_model_as_empty() {
         blam_tags::collision_verify::test_collision_model(&tag, 8).unwrap_err(),
         blam_tags::collision_verify::VerifyError::Empty
     );
+}
+
+/// A fresh, empty directory under the system temp dir, removed on drop.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(label: &str) -> Self {
+        let p = std::env::temp_dir().join(format!(
+            "blam_tags_synthetic_{label}_{}_{:?}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        Self(p)
+    }
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+// ---------------------------------------------------------------- extract
+
+/// Resolves references against tags held as bytes, so every resolve
+/// reads a fresh tag the way one off disk would.
+struct MemoryResolver(Vec<(String, Vec<u8>)>);
+
+impl blam_tags::extract::TagResolver for MemoryResolver {
+    fn resolve(
+        &self,
+        reference: &str,
+        _group_ext: &str,
+        _group_tag: u32,
+    ) -> Result<TagFile, blam_tags::extract::ExtractError> {
+        let (_, bytes) = self
+            .0
+            .iter()
+            .find(|(p, _)| p.eq_ignore_ascii_case(reference))
+            .ok_or_else(|| blam_tags::extract::ExtractError::msg(format!("no tag `{reference}`")))?;
+        TagFile::read_from_bytes(bytes).map_err(|e| blam_tags::extract::ExtractError::msg(e.to_string()))
+    }
+}
+
+/// A Halo 3 scenario whose `structure bsps` names each of these paths.
+fn scenario_naming(bsps: &[&str]) -> TagFile {
+    use blam_tags::{TagFieldData, TagReferenceData};
+    let mut tag = TagFile::new(schema("halo3_mcc", "scenario")).unwrap();
+    let mut root = tag.root_mut();
+    let mut f = root.field_mut("structure bsps").expect("structure bsps");
+    let mut block = f.as_block_mut().unwrap();
+    for path in bsps {
+        let i = block.add_element();
+        let mut el = block.element_mut(i).unwrap();
+        el.field_mut("structure bsp")
+            .expect("structure bsp")
+            .set(TagFieldData::TagReference(TagReferenceData {
+                group_tag_and_name: Some((u32::from_be_bytes(*b"sbsp"), (*path).to_owned())),
+            }))
+            .unwrap();
+    }
+    tag
+}
+
+/// A scenario's structure is written out as an ASS under the source-tree
+/// layout, and that file reads back as the box: the extraction glue, not
+/// just the exporter it calls.
+#[test]
+fn a_scenario_extracts_its_structure_as_ass() {
+    let (sbsp, _) = sbsp_from(&box_ass());
+    let resolver = MemoryResolver(vec![(r"levels\synthetic\box".into(), sbsp.write_to_bytes().unwrap())]);
+    let scenario = scenario_naming(&[r"levels\synthetic\box"]);
+    let out = TempDir::new("geometry");
+
+    let summary = blam_tags::extract::geometry::scenario_geometry_to_dir(&scenario, &resolver, out.path(), "synthetic")
+        .expect("extract");
+    assert_eq!(summary.emitted.len(), 1);
+    let emitted = &summary.emitted[0];
+    assert_eq!(emitted.bsp_index, 0);
+    assert_eq!(emitted.path, out.path().join("synthetic").join("structure").join("box.ASS"));
+    assert!(
+        summary.warnings.iter().any(|w| w.contains("no lighting_info")),
+        "a missing lighting reference is reported: {:?}",
+        summary.warnings
+    );
+
+    let text = std::fs::read_to_string(&emitted.path).expect("the ASS was written");
+    let (ass, version) = blam_tags::ass_parse::parse(&text).expect("the written ASS parses");
+    assert_eq!(version, 7, "Halo 3 structure is written as ASS 7");
+    let box_mesh = ass
+        .objects
+        .iter()
+        .find(|o| match &o.payload {
+            AssObjectPayload::Mesh { triangles, .. } => triangles
+                .first()
+                .is_some_and(|t| ass.materials[t.material as usize].name == "box_mat"),
+            _ => false,
+        })
+        .expect("the box's cluster is in the file");
+    assert_eq!((box_mesh.vertices_len(), box_mesh.triangles_len()), (24, 12));
+    let (lo, hi) = bounds_of(&mesh_positions(&AssFile { objects: vec![box_mesh.clone()], ..Default::default() }));
+    assert_close3(lo, LO, 1e-2, "extracted lower bound (cm)");
+    assert_close3(hi, HI, 1e-2, "extracted upper bound (cm)");
+    // The cluster and the sealed world, 24 vertices and 12 triangles
+    // each, placed under the scene root; the three marker materials are
+    // always declared.
+    assert_eq!(emitted.summary, "4 mats, 2 objects (0 lights), 3 instances, 48 verts, 24 tris");
+}
+
+/// The flat layout names the file after the scenario and the BSP, and a
+/// reference that cannot be resolved is a warning beside the BSPs that
+/// can, not a failure of the whole extraction.
+#[test]
+fn a_scenario_extracts_flat_and_reports_a_missing_bsp() {
+    let (sbsp, _) = sbsp_from(&box_ass());
+    let resolver = MemoryResolver(vec![(r"levels\synthetic\box".into(), sbsp.write_to_bytes().unwrap())]);
+    let scenario = scenario_naming(&[r"levels\synthetic\missing", r"levels\synthetic\box"]);
+    let out = TempDir::new("geometry_flat");
+
+    let summary = blam_tags::extract::geometry::scenario_geometry(&scenario, &resolver, out.path(), "synthetic", true)
+        .expect("one BSP still extracts");
+    assert_eq!(summary.emitted.len(), 1);
+    assert_eq!(summary.emitted[0].bsp_index, 1, "the second entry is the one that resolved");
+    assert_eq!(summary.emitted[0].path, out.path().join("synthetic.box.ass"));
+    assert!(summary.emitted[0].path.is_file());
+    assert!(
+        summary.warnings.iter().any(|w| w.starts_with("structure_bsps[0]") && w.contains("missing")),
+        "{:?}",
+        summary.warnings
+    );
+
+    // Nothing resolvable at all is an error, not an empty success.
+    let none = scenario_naming(&[r"levels\synthetic\missing"]);
+    assert!(blam_tags::extract::geometry::scenario_geometry_to_dir(&none, &resolver, out.path(), "x").is_err());
+    let empty = scenario_naming(&[]);
+    assert!(blam_tags::extract::geometry::scenario_geometry_to_dir(&empty, &resolver, out.path(), "x").is_err());
+}
+
+/// A Halo 3 particle model holding one quad as a four-index strip.
+///
+/// No compression info, so positions and texcoords are stored as they
+/// are; no variants, so the whole buffer is one object named after the
+/// stem.
+fn quad_particle_model() -> TagFile {
+    use blam_tags::TagFieldData as D;
+    let mut tag = TagFile::new(schema("halo3_mcc", "particle_model")).unwrap();
+    let mut root = tag.root_mut();
+    let mut f = root.field_path_mut("render geometry/per mesh temporary").expect("per mesh temporary");
+    let mut pmt = f.as_block_mut().unwrap();
+    let i = pmt.add_element();
+    let mut mesh = pmt.element_mut(i).unwrap();
+    {
+        let mut vf = mesh.field_mut("raw vertices").expect("raw vertices");
+        let mut verts = vf.as_block_mut().unwrap();
+        // A strip 0-1-2-3 over a unit quad in the XY plane, facing +Z.
+        for (p, uv) in [
+            ([0.0f32, 0.0], [0.125f32, 0.25]),
+            ([1.0, 0.0], [0.625, 0.25]),
+            ([0.0, 2.0], [0.125, 0.875]),
+            ([1.0, 2.0], [0.625, 0.875]),
+        ] {
+            let k = verts.add_element();
+            let mut v = verts.element_mut(k).unwrap();
+            v.field_mut("position").unwrap().set(D::RealPoint3d(RealPoint3d { x: p[0], y: p[1], z: 0.5 })).unwrap();
+            v.field_mut("normal").unwrap().set(D::RealPoint3d(RealPoint3d { x: 0.0, y: 0.0, z: 1.0 })).unwrap();
+            v.field_mut("texcoord").unwrap().set(D::RealPoint2d(RealPoint2d { x: uv[0], y: uv[1] })).unwrap();
+        }
+    }
+    let mut xf = mesh.field_mut("raw indices").expect("raw indices");
+    let mut idx = xf.as_block_mut().unwrap();
+    for n in [0i16, 1, 2, 3] {
+        let k = idx.add_element();
+        idx.element_mut(k).unwrap().field_mut("word").unwrap().set(D::ShortInteger(n)).unwrap();
+    }
+    tag
+}
+
+/// A particle model extracts to its manifest and one JMS, and the JMS
+/// holds the quad: two triangles from a four-index strip, in
+/// centimetres, with V flipped back.
+#[test]
+fn a_particle_model_extracts_its_manifest_and_jms() {
+    let tag = TagFile::read_from_bytes(&quad_particle_model().write_to_bytes().unwrap()).expect("reread pmdf");
+    let out = TempDir::new("particle");
+    let summary = blam_tags::extract::particle_model::particle_model_to_dir(&tag, out.path(), "quad").expect("extract");
+
+    assert!(!summary.names_are_authentic, "gen3 stores no object names");
+    assert_eq!(summary.emitted.len(), 2, "the manifest and one JMS");
+    assert_eq!(summary.emitted[0].object, None);
+    assert_eq!(summary.emitted[0].path, out.path().join("quad").join("quad.jmi"));
+    assert_eq!(summary.emitted[1].object.as_deref(), Some("quad"));
+    assert_eq!(summary.emitted[1].path, out.path().join("quad").join("quad").join("render").join("quad.JMS"));
+
+    let jmi = std::fs::read_to_string(&summary.emitted[0].path).expect("manifest written");
+    assert!(jmi.lines().any(|l| l.trim() == "quad"), "manifest names the object:\n{jmi}");
+
+    let text = std::fs::read_to_string(&summary.emitted[1].path).expect("JMS written");
+    let (jms, version) = JmsFile::parse(&text).expect("the written JMS parses");
+    assert_eq!(version, 8213, "Halo 3's JMS version");
+    assert_eq!(jms.triangles.len(), 2, "a four-index strip is two triangles");
+    let pos: Vec<[f32; 3]> = jms.vertices.iter().map(|v| [v.position.x, v.position.y, v.position.z]).collect();
+    let (lo, hi) = bounds_of(&pos);
+    assert_close3(lo, [0.0, 0.0, 50.0], 1e-3, "quad lower bound (cm)");
+    assert_close3(hi, [100.0, 200.0, 50.0], 1e-3, "quad upper bound (cm)");
+    // Both triangles face the stored normal: the strip's alternating
+    // winding was undone.
+    for t in &jms.triangles {
+        let [a, b, c] = t.v.map(|i| pos[i as usize]);
+        let z = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+        assert!(z > 0.0, "triangle {:?} faces away from +Z", t.v);
+    }
+    for v in &jms.vertices {
+        let uv = v.uvs[0];
+        assert!(
+            QUAD_UV.iter().any(|q| (q[0] - uv.x).abs() < 1e-4 && (1.0 - q[1] - uv.y).abs() < 1e-4),
+            "texcoord {:?} is not a stored one with V flipped",
+            (uv.x, uv.y)
+        );
+    }
+}
+
+/// A particle model with no geometry is refused, not written as an
+/// empty manifest.
+#[test]
+fn an_empty_particle_model_is_refused() {
+    let tag = TagFile::new(schema("halo3_mcc", "particle_model")).unwrap();
+    let out = TempDir::new("particle_empty");
+    assert!(blam_tags::extract::particle_model::particle_model_to_dir(&tag, out.path(), "nothing").is_err());
 }
