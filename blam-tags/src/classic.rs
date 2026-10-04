@@ -582,6 +582,109 @@ pub fn read_classic_tag_file(bytes: &[u8], mut layout: TagLayout) -> Result<TagF
     ))
 }
 
+/// Why [`TagFile::new_classic`] could not create a tag.
+#[derive(Debug)]
+pub enum NewClassicTagError {
+    /// The group's definition did not build a layout.
+    Schema(crate::schema::TagSchemaError),
+    /// A Halo 2 form older than `BLM!`. Those exist only as tags written by
+    /// older tools; nothing writes a new one, so there is nothing to match.
+    LegacyEngine(ClassicEngine),
+}
+
+impl std::fmt::Display for NewClassicTagError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Schema(error) => write!(f, "{error}"),
+            Self::LegacyEngine(engine) => {
+                write!(f, "{engine:?} is a legacy Halo 2 form; new tags are written as Halo2V4")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NewClassicTagError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Schema(error) => Some(error),
+            Self::LegacyEngine(_) => None,
+        }
+    }
+}
+
+impl From<crate::schema::TagSchemaError> for NewClassicTagError {
+    fn from(error: crate::schema::TagSchemaError) -> Self {
+        Self::Schema(error)
+    }
+}
+
+/// The 64-byte header of a new classic tag of `group_tag` at
+/// `group_version`, as the MCC tool.exe writes one: no name, the group, a
+/// checksum slot (the writer fills it), the header size, the group version,
+/// `0x00 0xFF`, and the engine signature. Halo CE stores the words big-endian;
+/// Halo 2 stores them little-endian, so its FOURCCs read reversed on disk.
+fn new_classic_header(group_tag: u32, group_version: u16, engine: ClassicEngine) -> Vec<u8> {
+    let mut header = vec![0u8; 64];
+    match engine {
+        ClassicEngine::HaloCe => {
+            header[36..40].copy_from_slice(&group_tag.to_be_bytes());
+            header[44..48].copy_from_slice(&64u32.to_be_bytes());
+            header[56..58].copy_from_slice(&group_version.to_be_bytes());
+            header[60..64].copy_from_slice(b"blam");
+        }
+        _ => {
+            header[36..40].copy_from_slice(&group_tag.to_le_bytes());
+            header[44..48].copy_from_slice(&64u32.to_le_bytes());
+            header[56..58].copy_from_slice(&group_version.to_le_bytes());
+            header[60..64].copy_from_slice(&u32::from_be_bytes(*b"BLM!").to_le_bytes());
+        }
+    }
+    header[59] = 0xFF;
+    header
+}
+
+impl TagFile {
+    /// Create a new classic (Halo CE or Halo 2) tag from its group's JSON
+    /// definition: a header as tool.exe writes one, and a root block holding
+    /// one zero-filled element (nested blocks empty, references null), the
+    /// classic counterpart of [`TagFile::new`]. [`TagFile::write_to_bytes`]
+    /// serializes it in the classic flat form and computes its checksum.
+    ///
+    /// Halo 2 tags are created in the current `BLM!` form
+    /// ([`ClassicEngine::Halo2V4`]); the older forms are refused.
+    pub fn new_classic<P: AsRef<std::path::Path>>(
+        schema_path: P,
+        engine: ClassicEngine,
+    ) -> Result<Self, NewClassicTagError> {
+        if !matches!(engine, ClassicEngine::HaloCe | ClassicEngine::Halo2V4) {
+            return Err(NewClassicTagError::LegacyEngine(engine));
+        }
+        let (layout, meta) = TagLayout::from_json_with_meta(schema_path)?;
+        let root_block_index = layout.header.tag_group_block_index;
+        // A Halo 2 body opens with the root block's header; the encoder builds
+        // it from the element the block holds (signature, the variant's
+        // version, count, size), as it does for any block that has none.
+        let root = TagBlockData::new_root_default(&layout, root_block_index, engine.body_endian());
+        let file_header = TagFileHeader {
+            pad: [0u8; 36],
+            build_version: 0,
+            build_number: 0,
+            version: meta.version,
+            group_tag: meta.tag,
+            group_version: 0,
+            checksum: 0,
+            signature: u32::from_be_bytes(*b"BLAM"),
+        };
+        let header = new_classic_header(meta.tag, meta.version as u16, engine);
+        Ok(TagFile::from_parts(
+            file_header,
+            TagContainer::Classic { engine, header },
+            engine.body_endian(),
+            TagStream { layout, data: root },
+        ))
+    }
+}
+
 /// Classic tag checksum: CRC32 (poly `0xEDB88320`, init `0xFFFFFFFF`)
 /// over the body, with **no final XOR inversion** (matches HABT
 /// `checksum_calculate`). Verified against real CE tags.
@@ -1396,6 +1499,61 @@ mod tests {
         assert!(checked > 30, "only {checked} permutations checked");
     }
 
+    /// A new Halo CE tag has tool.exe's header — big-endian group, header
+    /// size, group version, `00 FF`, `blam` — a checksum over its body, a body
+    /// exactly one root element long, and it reads back to the same bytes.
+    #[test]
+    fn a_new_halo_ce_tag_has_tool_s_header_and_reads_back() {
+        let path = "../definitions/haloce_mcc/scenery.json";
+        let tag = crate::TagFile::new_classic(path, super::ClassicEngine::HaloCe).expect("new scenery");
+        let bytes = tag.write_to_bytes().unwrap();
+        let root_size = crate::TagLayout::from_json(path)
+            .map(|layout| {
+                let root = layout.block_layouts[layout.header.tag_group_block_index as usize].struct_index;
+                layout.struct_layouts[root as usize].size
+            })
+            .unwrap();
+        assert_eq!(bytes.len(), 64 + root_size);
+        assert_eq!(&bytes[..36], &[0u8; 36]);
+        assert_eq!(&bytes[36..40], b"scen");
+        assert_eq!(bytes[40..44], classic_checksum(&bytes[64..]).to_be_bytes());
+        assert_eq!(&bytes[44..64], &[0, 0, 0, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0xFF, b'b', b'l', b'a', b'm']);
+
+        let layout = crate::TagLayout::from_json(path).unwrap();
+        let read = super::read_classic_tag_file(&bytes, layout).expect("read back");
+        assert_eq!(read.classic_engine(), Some(super::ClassicEngine::HaloCe));
+        assert_eq!(read.header.group_tag, u32::from_be_bytes(*b"scen"));
+        assert_eq!(read.write_to_bytes().unwrap(), bytes);
+    }
+
+    /// A new Halo 2 tag stores its words little-endian, opens its body with
+    /// the root block's `dfbt` header (count 1, the root element's size, and
+    /// the version of the newest variant), and reads back to the same bytes.
+    #[test]
+    fn a_new_halo_2_tag_has_a_root_block_header_and_reads_back() {
+        let path = "../definitions/halo2_mcc/weapon.json";
+        let tag = crate::TagFile::new_classic(path, super::ClassicEngine::Halo2V4).expect("new weapon");
+        let bytes = tag.write_to_bytes().unwrap();
+        assert_eq!(&bytes[36..40], b"paew");
+        assert_eq!(bytes[40..44], classic_checksum(&bytes[64..]).to_le_bytes());
+        assert_eq!(&bytes[44..64], &[0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0xFF, b'!', b'M', b'L', b'B']);
+
+        let layout = crate::TagLayout::from_json(path).unwrap();
+        let root = layout.block_layouts[layout.header.tag_group_block_index as usize].struct_index;
+        let versions = layout.struct_version_table[root as usize].clone().unwrap_or_default();
+        let newest = versions.iter().position(|variant| *variant == root).unwrap_or(0) as u32;
+        let size = layout.struct_layouts[root as usize].size as u32;
+        assert_eq!(&bytes[64..68], b"dfbt");
+        assert_eq!(bytes[68..72], newest.to_le_bytes(), "root block version");
+        assert_eq!(bytes[72..76], 1u32.to_le_bytes(), "root block count");
+        assert_eq!(bytes[76..80], size.to_le_bytes(), "root element size");
+
+        let read = super::read_classic_tag_file(&bytes, layout).expect("read back");
+        assert_eq!(read.classic_engine(), Some(super::ClassicEngine::Halo2V4));
+        assert_eq!(read.header.group_tag, u32::from_be_bytes(*b"weap"));
+        assert_eq!(read.write_to_bytes().unwrap(), bytes);
+    }
+
     /// A Halo 2 block that gains its first element is written with a block
     /// header, whatever its layout looks like. The editors synthesize one only
     /// for layouts with tagged or versioned structs; `color_table` has neither,
@@ -1447,6 +1605,15 @@ mod tests {
             colors.iter().map(|color| color.read_string("name").unwrap_or_default()).collect();
         assert_eq!(names, ["red", "green"]);
         assert_eq!(read.write_to_bytes().unwrap(), written);
+    }
+
+    /// Only the forms tools write today can be created.
+    #[test]
+    fn a_legacy_halo_2_form_is_refused() {
+        for engine in [super::ClassicEngine::Halo2V1, super::ClassicEngine::Halo2V2, super::ClassicEngine::Halo2V3] {
+            let result = crate::TagFile::new_classic("../definitions/halo2_mcc/weapon.json", engine);
+            assert!(matches!(result, Err(super::NewClassicTagError::LegacyEngine(e)) if e == engine));
+        }
     }
 
     #[test]
