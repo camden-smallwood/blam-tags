@@ -1095,10 +1095,32 @@ impl<'a> Emitter<'a> {
             }
             for c in impl_members(self.krate, inner, "assoc_const") {
                 let cname = Crate::name(c).unwrap_or("?");
+                // Only a constant of the bound type itself becomes a class
+                // attribute; any other type (an array of it, say) is
+                // reported rather than wrapped as if it were one.
+                let ty = &c["inner"]["assoc_const"]["type"];
+                let is_self = ty["generic"].as_str() == Some("Self")
+                    || match &ty["resolved_path"]["id"] {
+                        Value::Number(id) => id.to_string() == target.id,
+                        Value::String(id) => *id == target.id,
+                        _ => false,
+                    };
+                if !is_self {
+                    skips.push((
+                        format!("{}::{cname}", target.py_name),
+                        "constant is not of the bound type".to_owned(),
+                    ));
+                    continue;
+                }
+                let wrap = if target.is_enum {
+                    format!("Self::from({expr_path}::{cname})")
+                } else {
+                    format!("Self({expr_path}::{cname})")
+                };
                 let _ = writeln!(rs, "    #[classattr]");
                 let _ = writeln!(
                     rs,
-                    "    #[allow(non_snake_case)]\n    fn {cname}() -> Self {{ Self({expr_path}::{cname}) }}"
+                    "    #[allow(non_snake_case)]\n    fn {cname}() -> Self {{ {wrap} }}"
                 );
                 let _ = writeln!(pyi, "    {cname}: {}", target.py_name);
             }

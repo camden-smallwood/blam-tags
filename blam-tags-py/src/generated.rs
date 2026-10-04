@@ -184,6 +184,80 @@ impl PyGame {
     fn __repr__(&self) -> String { format!("{:?}", blam_tags::game::Game::from(*self)) }
 }
 
+/// Which game a tag set belongs to, identified by its game id: the editing
+/// kit folder name (`"halo4_mcc"`), or `"haloce_evolved"` for Halo: Campaign
+/// Evolved.
+/// 
+/// This is a *different axis* from [`Game`]: [`Game`] is the tag-format
+/// generation derived from the tag bytes, and H3, ODST, Reach, H4 and H2A all
+/// share `Game::Halo3` because their `render_model`/JMS/ASS structures are
+/// identical. The game id captures which of those engines a tag set is for —
+/// a distinction the tag bytes don't encode, but that matters for engine
+/// details like the HDR tonemap (H3/Reach use a cubic curve, H4 a Hable
+/// filmic). It comes from the loading context (the editing kit or the
+/// installed game), not the tag, so it's parsed from the game-id string
+/// rather than `of(tag)`.
+#[pyclass(name = "GameId", module = "blam_tags", from_py_object, eq, eq_int, frozen)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PyGameId {
+    HaloCe,
+    Halo2,
+    Halo2Amp,
+    Halo3,
+    Halo3Odst,
+    HaloReach,
+    Halo4,
+    CampaignEvolved,
+}
+
+impl From<blam_tags::game::GameId> for PyGameId {
+    fn from(v: blam_tags::game::GameId) -> Self {
+        match v {
+            blam_tags::game::GameId::HaloCe => Self::HaloCe,
+            blam_tags::game::GameId::Halo2 => Self::Halo2,
+            blam_tags::game::GameId::Halo2Amp => Self::Halo2Amp,
+            blam_tags::game::GameId::Halo3 => Self::Halo3,
+            blam_tags::game::GameId::Halo3Odst => Self::Halo3Odst,
+            blam_tags::game::GameId::HaloReach => Self::HaloReach,
+            blam_tags::game::GameId::Halo4 => Self::Halo4,
+            blam_tags::game::GameId::CampaignEvolved => Self::CampaignEvolved,
+        }
+    }
+}
+
+impl From<PyGameId> for blam_tags::game::GameId {
+    fn from(v: PyGameId) -> Self {
+        match v {
+            PyGameId::HaloCe => Self::HaloCe,
+            PyGameId::Halo2 => Self::Halo2,
+            PyGameId::Halo2Amp => Self::Halo2Amp,
+            PyGameId::Halo3 => Self::Halo3,
+            PyGameId::Halo3Odst => Self::Halo3Odst,
+            PyGameId::HaloReach => Self::HaloReach,
+            PyGameId::Halo4 => Self::Halo4,
+            PyGameId::CampaignEvolved => Self::CampaignEvolved,
+        }
+    }
+}
+
+#[pymethods]
+impl PyGameId {
+    /// Parse a game id (`"halo4_mcc"`, `"haloce_evolved"`). Exact and
+    /// case-sensitive, as ids are written; `None` for anything else.
+    #[staticmethod]
+    fn from_id(id: String) -> Option<PyGameId> { blam_tags::game::GameId::from_id(id.as_str()).map(|v| PyGameId::from(v)) }
+    /// The game id, as [`GameId::from_id`] reads it.
+    fn as_str(&self) -> String { blam_tags::game::GameId::from(*self).as_str().to_string() }
+    /// The tag-format generation this game's tags use.
+    fn generation(&self) -> PyGame { PyGame::from(blam_tags::game::GameId::from(*self).generation()) }
+    /// Whether this game's tags are classic (Halo CE or Halo 2 in MCC):
+    /// headers and layouts that predate the self-describing MCC format.
+    fn is_classic(&self) -> bool { blam_tags::game::GameId::from(*self).is_classic() }
+    /// Whether this is Halo: Campaign Evolved.
+    fn is_campaign_evolved(&self) -> bool { blam_tags::game::GameId::from(*self).is_campaign_evolved() }
+    fn __repr__(&self) -> String { format!("{:?}", blam_tags::game::GameId::from(*self)) }
+}
+
 /// A 4×4 transform matrix, row-major (`m[row][col]`), applied to column
 /// vectors (`M * v`) — the same convention as Blender's `mathutils.Matrix`
 /// (so `A * B` then decompose matches Foundry's `A @ B`). Used for the
@@ -1371,64 +1445,20 @@ impl PyTagReferenceData {
     fn __repr__(&self) -> String { "<TagReferenceData object>".to_string() }
 }
 
-/// A specific MCC title / loaded editing kit, identified by its game-id
-/// (the kit folder name, e.g. `"halo4_mcc"`).
-/// 
-/// This is a *different axis* from [`Game`]: [`Game`] is the tag-format
-/// generation derived from the tag bytes, and H3, ODST, Reach, and H4 all share
-/// `Game::Halo3` because their `render_model`/JMS/ASS structures are identical.
-/// The title captures which of those engines is actually loaded — a distinction
-/// the tag bytes don't encode, but that matters for engine details like the HDR
-/// tonemap (H3/Reach use a cubic curve, H4 a Hable filmic). It comes from the
-/// loading context (the editing kit), not the tag, so it's parsed from the
-/// game-id string rather than `of(tag)`.
-#[pyclass(name = "Title", module = "blam_tags", from_py_object, eq, eq_int, frozen)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum PyTitle {
-    HaloCe,
-    Halo2,
-    Halo2A,
-    Halo3,
-    Halo3Odst,
-    HaloReach,
-    Halo4,
-}
-
-impl From<blam_tags::game::Title> for PyTitle {
-    fn from(v: blam_tags::game::Title) -> Self {
-        match v {
-            blam_tags::game::Title::HaloCe => Self::HaloCe,
-            blam_tags::game::Title::Halo2 => Self::Halo2,
-            blam_tags::game::Title::Halo2A => Self::Halo2A,
-            blam_tags::game::Title::Halo3 => Self::Halo3,
-            blam_tags::game::Title::Halo3Odst => Self::Halo3Odst,
-            blam_tags::game::Title::HaloReach => Self::HaloReach,
-            blam_tags::game::Title::Halo4 => Self::Halo4,
-        }
-    }
-}
-
-impl From<PyTitle> for blam_tags::game::Title {
-    fn from(v: PyTitle) -> Self {
-        match v {
-            PyTitle::HaloCe => Self::HaloCe,
-            PyTitle::Halo2 => Self::Halo2,
-            PyTitle::Halo2A => Self::Halo2A,
-            PyTitle::Halo3 => Self::Halo3,
-            PyTitle::Halo3Odst => Self::Halo3Odst,
-            PyTitle::HaloReach => Self::HaloReach,
-            PyTitle::Halo4 => Self::Halo4,
-        }
-    }
-}
+/// A game id that [`GameId::from_id`] does not know.
+#[pyclass(name = "UnknownGameId", module = "blam_tags", from_py_object, eq)]
+#[derive(Clone, PartialEq)]
+pub struct PyUnknownGameId(pub blam_tags::game::UnknownGameId);
 
 #[pymethods]
-impl PyTitle {
-    /// Parse an MCC game-id / editing-kit folder name (e.g. `"halo4_mcc"`).
-    /// Returns `None` for an unrecognized id.
-    #[staticmethod]
-    fn from_game_id(id: String) -> Option<PyTitle> { blam_tags::game::Title::from_game_id(id.as_str()).map(|v| PyTitle::from(v)) }
-    fn __repr__(&self) -> String { format!("{:?}", blam_tags::game::Title::from(*self)) }
+impl PyUnknownGameId {
+    #[getter(value)]
+    fn get_value(&self) -> String { self.0.0.to_string() }
+    #[setter(value)]
+    fn set_value(&mut self, value: String) { self.0.0 = value; }
+    #[new]
+    fn new(value: String) -> Self { Self(blam_tags::game::UnknownGameId(value)) }
+    fn __repr__(&self) -> String { "<UnknownGameId object>".to_string() }
 }
 
 /// Parse an ASCII group-tag string (1-4 chars, e.g. `"bipd"` or
@@ -1451,6 +1481,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyArgbColor>()?;
     m.add_class::<PyEndian>()?;
     m.add_class::<PyGame>()?;
+    m.add_class::<PyGameId>()?;
     m.add_class::<PyMatrix4>()?;
     m.add_class::<PyPoint2d>()?;
     m.add_class::<PyRealAhsvColor>()?;
@@ -1478,7 +1509,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTagFieldType>()?;
     m.add_class::<PyTagFileHeader>()?;
     m.add_class::<PyTagReferenceData>()?;
-    m.add_class::<PyTitle>()?;
+    m.add_class::<PyUnknownGameId>()?;
     m.add_function(pyo3::wrap_pyfunction!(parse_group_tag, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(format_group_tag, m)?)?;
     m.add("AngleBounds", m.getattr("RealBounds")?)?;

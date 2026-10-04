@@ -291,9 +291,9 @@ shell = ["list", "header"]
 python = ["parse_group_tag", "format_group_tag"]
 
 [engine.games]
-symbols = ["blam_tags::game::Game::of", "blam_tags::game::Title"]
+symbols = ["blam_tags::game::Game::of", "blam_tags::game::GameId"]
 shell = ["extract-geometry", "extract-animation"]
-python = ["Game", "Title"]
+python = ["Game", "GameId"]
 
 [engine.math]
 symbols = ["blam_tags::math::RealQuaternion", "blam_tags::math::RealPoint3d", "blam_tags::math::RealMatrix4x3"]

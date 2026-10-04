@@ -150,7 +150,7 @@ pub fn function_editor() {
 
 pub fn games() {
     let _ = blam_tags::game::Game::of;
-    use blam_tags::game::Title as _;
+    use blam_tags::game::GameId as _;
 }
 
 pub fn group_tags() {

@@ -518,13 +518,19 @@ game.ass_version()       # int or None
 game.jma_version()       # int
 ```
 
-`Title` is a *different axis* — which MCC editing kit is loaded. H3, ODST,
-Reach, and H4 all share `Game.Halo3` (identical tag structures) but are distinct
-titles. The title isn't in the tag bytes; it comes from the loading context:
+`GameId` is a *different axis* — which game a tag set is for. H3, ODST,
+Reach, H4 and H2A all share `Game.Halo3` (identical tag structures) but are
+distinct games. The game id isn't in the tag bytes; it comes from the loading
+context (the editing kit folder name, or `haloce_evolved` for Campaign Evolved):
 
 ```python
-bt.Title.from_game_id("halo4_mcc")   # -> bt.Title.Halo4 (or None)
-# variants: HaloCe, Halo2, Halo2A, Halo3, Halo3Odst, HaloReach, Halo4
+game = bt.GameId.from_id("halo4_mcc")   # -> bt.GameId.Halo4 (or None)
+game.as_str()                           # "halo4_mcc"
+game.generation()                       # bt.Game.Halo3
+game.is_classic()                       # False (True for HaloCe and Halo2)
+game.is_campaign_evolved()              # False
+# variants: HaloCe, Halo2, Halo2Amp, Halo3, Halo3Odst, HaloReach, Halo4,
+#           CampaignEvolved
 ```
 
 ---
