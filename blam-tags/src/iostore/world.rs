@@ -139,11 +139,20 @@ fn unreal_numeric_value(text: &str) -> Option<i64> {
     Some(if text.starts_with('-') { -magnitude } else { magnitude })
 }
 
-fn compare_mount_paths(a: &PathBuf, b: &PathBuf) -> Ordering {
+/// The order Unreal mounts two containers in, lowest priority first: patch
+/// containers by their chunk version (see [`patch_version`]), then by
+/// `pakchunk` number, then by path. Anything that layers containers so that a
+/// later one overrides an earlier one (a mod over the game) sorts with this,
+/// so every reader agrees on which copy of a tag or package wins.
+pub fn compare_mount_paths(a: &Path, b: &Path) -> Ordering {
     mount_key(a).cmp(&mount_key(b))
 }
 
-fn package_name_from_entry(path: &str) -> Option<(String, String)> {
+/// The Unreal package a cooked container entry is, as `(lowercased, as
+/// cooked)`: `Meteorite/Content/Tags/x.uasset` is `/Game/Tags/x`, a plugin's
+/// `Plugins/P/Content/y.umap` is `/P/y`. `None` for anything that is not a
+/// `.uasset` or `.umap` under a `Content/` root.
+pub fn package_name_from_entry(path: &str) -> Option<(String, String)> {
     let normalized = path.replace('\\', "/");
     let lower = normalized.to_ascii_lowercase();
     let suffix = if lower.ends_with(".uasset") {
@@ -316,7 +325,7 @@ impl World {
                 .file_name()
                 .is_some_and(|name| name.eq_ignore_ascii_case("global.utoc"))
         });
-        paths.sort_by(compare_mount_paths);
+        paths.sort_by(|a, b| compare_mount_paths(a, b));
 
         // Open all containers first. A pathless override needs the mounted base
         // set in hand before its chunk ids can be named.
@@ -415,7 +424,7 @@ impl World {
         let mut pak_paths = Vec::new();
         collect_paks(paks_dir, &mut pak_paths)
             .with_context(|| format!("read {}", paks_dir.display()))?;
-        pak_paths.sort_by(compare_mount_paths);
+        pak_paths.sort_by(|a, b| compare_mount_paths(a, b));
         let mut pak_archives = Vec::new();
         let mut pak_containers = Vec::new();
         let mut pak_provider_map: BTreeMap<String, (String, Vec<PakProvider>)> = BTreeMap::new();
@@ -911,7 +920,7 @@ mod tests {
             PathBuf::from("Paks/pakchunk2-WinGDK.utoc"),
             PathBuf::from("Paks/~mods/MyMod_P.utoc"),
         ];
-        paths.sort_by(compare_mount_paths);
+        paths.sort_by(|a, b| compare_mount_paths(a, b));
         let names: Vec<&str> = paths
             .iter()
             .filter_map(|path| path.file_name()?.to_str())
