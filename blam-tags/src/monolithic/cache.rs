@@ -740,6 +740,102 @@ mod malformed {
         assert!(matches!(cache, Err(TagReadError::NestingTooDeep { .. })), "{:?}", cache.err());
     }
 
+    /// A whole cache built in the test — index, block table, tag heap and
+    /// one partition blob — read back through every step of the
+    /// resolution chain to the tag's bytes.
+    ///
+    /// Every handle carries its own salt, so a resolver that ignored the
+    /// salts, or confused the partition handle with the datum handle,
+    /// would land on nothing; the tag sits one page into its blob, so one
+    /// that ignored the page index would read zeros.
+    ///
+    /// The tag itself is only the big-endian chunk skeleton a monolithic
+    /// build stores — header, `tag!` and a trailing `want` — not a
+    /// parseable tag. This crate writes tags little-endian only
+    /// (`TagFile::write_to_bytes` ignores `TagFile::endian`), so a real
+    /// big-endian tag cannot be produced here, and `read_tag`'s parse and
+    /// resource hydration still need a real cache.
+    #[test]
+    fn a_synthetic_cache_resolves_its_one_tag_to_its_bytes() {
+        // 64-byte header (`BLAM` big-endian at 60), a `tag!` chunk, a
+        // `want` chunk; then page padding the reader must trim.
+        let mut tag_bytes = vec![0u8; 60];
+        tag_bytes.extend_from_slice(b"BLAM");
+        tag_bytes.extend_from_slice(&chunk(b"tag!", &[0x5A; 100]));
+        tag_bytes.extend_from_slice(&chunk(b"want", &[0x6B; 20]));
+        let pages = tag_bytes.len().div_ceil(512) as u32 + 1;
+
+        const GROUP: u32 = u32::from_be_bytes(*b"wind");
+        const NAME: &str = r"environments\synthetic\breeze";
+        let (partition_salt, datum_salt, heap_salt) = (0x1111u32, 0x2222u32, 0x3333u32);
+        let wide = (u64::from(partition_salt << 16) << 32) | u64::from(datum_salt << 16);
+
+        // `indx`: one entry, its name one byte into the buffer.
+        let mut names = vec![0u8];
+        names.extend_from_slice(NAME.as_bytes());
+        names.push(0);
+        let mut entry = be(&[GROUP, 0xAAAA, 0xBBBB]);
+        entry.extend_from_slice(&wide.to_be_bytes());
+        entry.extend_from_slice(&be(&[42, 1]));
+        entry.extend_from_slice(&names);
+        let index = indx(1, names.len() as i32, &entry);
+
+        // `blok`: partition slot 0 -> block slot 0 -> tag heap entry 0, no
+        // cache entry.
+        let mut blok_body = vec![0; 48];
+        blok_body.extend_from_slice(&array(4, 1));
+        blok_body.extend_from_slice(&be(&[partition_salt << 16]));
+        blok_body.extend_from_slice(&array(4, 1));
+        blok_body.extend_from_slice(&be(&[datum_salt << 16, datum_salt << 16, 0, u32::MAX, 0, BANG]));
+        blok_body.extend_from_slice(&be(&[DFT, BANG, DFT]));
+        blok_body.extend_from_slice(b"load");
+
+        // `tags`: heap entry 0 -> partition 0's block slot 0, which spans
+        // `pages` pages from page 1 of `tags_7`.
+        let hpls = chunk(b"hpls", &be(&[1, 1, 0, heap_salt << 16]));
+        let mut part = be(&[7]);
+        part.extend_from_slice(&[0; 60]);
+        part.extend_from_slice(&array(1, 1));
+        part.extend_from_slice(&be(&[heap_salt << 16, heap_salt << 16, pages, 1, 0, 0, 0, BANG, DFT]));
+        let tags = chunk(b"tags", &[hpls, chunk(b"ptls", &chunk(b"part", &part))].concat());
+
+        let children = vec![chunk(b"mtfi", &chunk(b"mtag", &[index, tags, chunk(b"cash", &[]), chunk(b"blok", &blok_body)].concat()))];
+        let (cache, dir) = open("synthetic", &blob_index(&children));
+        let mut blob = vec![0u8; 512];
+        blob.extend_from_slice(&tag_bytes);
+        blob.resize(512 + pages as usize * 512, 0);
+        std::fs::write(dir.join("blobs/tags_7"), &blob).unwrap();
+
+        let result = (|| {
+            let cache = cache?;
+            assert_eq!(cache.session_guid, [0x11; 16]);
+            assert_eq!(cache.len(), 1);
+            let entry = cache.find_tag(GROUP, NAME).expect("found by group and name").clone();
+            assert_eq!((entry.id, entry.name_offset, entry.wide_block_index), (42, 1, wide));
+            assert_eq!(cache.iter_tags().map(|e| e.name.as_str()).collect::<Vec<_>>(), [NAME]);
+
+            let block = cache.resolve_tag_block(&entry).expect("the chain resolves");
+            assert_eq!((block.file_index, block.offset, block.size), (7, 512, u64::from(pages) * 512));
+            assert!(cache.resolve_cache_block(&entry).is_none(), "no pageable resources");
+
+            // The page padding is trimmed back to the tag's own length.
+            let bytes = cache.read_tag_bytes(&entry)?;
+            assert_eq!(bytes, tag_bytes);
+
+            // A handle with the wrong salt resolves to nothing.
+            let mut stale = entry.clone();
+            stale.wide_block_index ^= 1 << 16;
+            assert!(cache.resolve_tag_block(&stale).is_none());
+            assert!(matches!(cache.read_tag(&stale), Err(TagReadError::TagHasNoDataInCache { .. })));
+            let mut other_partition = entry.clone();
+            other_partition.wide_block_index ^= 1 << 48;
+            assert!(cache.resolve_tag_block(&other_partition).is_none());
+            Ok::<(), TagReadError>(())
+        })();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.expect("the synthetic cache reads back");
+    }
+
     /// A partition block whose extent runs far past its blob file.
     #[test]
     fn a_partition_block_past_its_file_is_refused() {
