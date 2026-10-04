@@ -6,6 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod synthetic;
+
 /// The `definitions/` submodule at the workspace root.
 pub fn definitions_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../definitions")
