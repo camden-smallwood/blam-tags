@@ -987,8 +987,10 @@ mod tests {
 
     /// A real container to validate against. Skipped when absent so CI (which
     /// doesn't ship the 37 GB game) stays green.
-    const PAK0: &str =
-        "/Users/camden/Halo/halo-campaign-evolved_pc/Meteorite/Content/Paks/pakchunk0-WinGDK.utoc";
+    /// Campaign Evolved's `pakchunk0-WinGDK.utoc`, named by `BLAM_TEST_CE_PAK0`.
+    fn pak0() -> Option<std::path::PathBuf> {
+        std::env::var_os("BLAM_TEST_CE_PAK0").map(std::path::PathBuf::from)
+    }
 
     #[test]
     fn stem_split() {
@@ -1002,11 +1004,11 @@ mod tests {
 
     #[test]
     fn mount_and_decode_real_tags() {
-        if !std::path::Path::new(PAK0).exists() {
-            eprintln!("skipping: {PAK0} not present");
+        let Some(pak0) = pak0() else {
+            eprintln!("skipped: no BLAM_TEST_CE_PAK0");
             return;
-        }
-        let archive = IoStoreArchive::open(PAK0).expect("open pakchunk0");
+        };
+        let archive = IoStoreArchive::open(&pak0).expect("open pakchunk0");
         assert!(archive.entries().len() > 100_000, "expected a full directory index");
 
         // Take a sample of name-candidate tags; every one whose payload really

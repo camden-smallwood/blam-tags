@@ -548,19 +548,23 @@ mod tests {
     }
 
     /// Integration: `name#ordinal` positional resolution on a real H2 particle
-    /// (two "Mapping" fields per struct — the reported bug). Skipped when the
-    /// tag/definition aren't present (not in CI).
+    /// (two "Mapping" fields per struct — the reported bug). Needs the Halo 2
+    /// kit (`BLAM_TEST_H2EK`, its root).
     #[test]
     fn positional_path_resolves_exact_field_h2_particle() {
         use crate::classic::read_classic_tag_file;
         use crate::layout::TagLayout;
-        let tag_path = "/Users/camden/Halo/halo2_mcc/tags/effects/generic/smoke/steam.particle";
+        let Some(kit) = std::env::var_os("BLAM_TEST_H2EK").map(std::path::PathBuf::from) else {
+            eprintln!("skipped: no BLAM_TEST_H2EK");
+            return;
+        };
+        let tag_path = kit.join("tags/effects/generic/smoke/steam.particle");
         let def = "../definitions/halo2_mcc/particle.json";
-        if !std::path::Path::new(tag_path).exists() || !std::path::Path::new(def).exists() {
+        if !tag_path.exists() || !std::path::Path::new(def).exists() {
             eprintln!("skipping: H2 particle/definition not present");
             return;
         }
-        let bytes = std::fs::read(tag_path).unwrap();
+        let bytes = std::fs::read(&tag_path).unwrap();
         let layout = TagLayout::from_json(def).unwrap();
         let tag = read_classic_tag_file(&bytes, layout).unwrap();
         let root = tag.root();
@@ -627,13 +631,17 @@ mod tests {
     fn positional_path_resolves_a_real_duplicate_h2_contrail() {
         use crate::classic::read_classic_tag_file;
         use crate::layout::TagLayout;
-        let tag_path = "/Users/camden/Halo/halo2_mcc/tags/effects/objects/weapons/rifle/sniper_rifle/sniper.contrail";
+        let Some(kit) = std::env::var_os("BLAM_TEST_H2EK").map(std::path::PathBuf::from) else {
+            eprintln!("skipped: no BLAM_TEST_H2EK");
+            return;
+        };
+        let tag_path = kit.join("tags/effects/objects/weapons/rifle/sniper_rifle/sniper.contrail");
         let def = "../definitions/halo2_mcc/contrail.json";
-        if !std::path::Path::new(tag_path).exists() || !std::path::Path::new(def).exists() {
+        if !tag_path.exists() || !std::path::Path::new(def).exists() {
             eprintln!("skipping: H2 contrail/definition not present");
             return;
         }
-        let bytes = std::fs::read(tag_path).unwrap();
+        let bytes = std::fs::read(&tag_path).unwrap();
         let layout = TagLayout::from_json(def).unwrap();
         let tag = read_classic_tag_file(&bytes, layout).unwrap();
         let root = tag.root();

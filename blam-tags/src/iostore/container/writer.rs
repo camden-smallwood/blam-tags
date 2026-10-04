@@ -4873,8 +4873,13 @@ mod tests {
         ); // 44 B
     }
 
-    const PAK0: &str =
-        "/Users/camden/Halo/halo-campaign-evolved_pc/Meteorite/Content/Paks/pakchunk0-WinGDK.utoc";
+    /// Campaign Evolved's `pakchunk0-WinGDK.utoc`, named by `BLAM_TEST_CE_PAK0`.
+
+    fn pak0() -> Option<std::path::PathBuf> {
+
+        std::env::var_os("BLAM_TEST_CE_PAK0").map(std::path::PathBuf::from)
+
+    }
 
     /// Take a real tag's `.ubulk` chunk from pak0, write a same-size override
     /// container reusing its id, then read it back through the reader and
@@ -4882,11 +4887,11 @@ mod tests {
     #[test]
     fn override_container_roundtrip() {
         use crate::iostore::{IoStoreArchive, is_tag_payload};
-        if !std::path::Path::new(PAK0).exists() {
-            eprintln!("skipping: {PAK0} not present");
+        let Some(pak0) = pak0() else {
+            eprintln!("skipped: no BLAM_TEST_CE_PAK0");
             return;
-        }
-        let base = IoStoreArchive::open(PAK0).expect("open base");
+        };
+        let base = IoStoreArchive::open(&pak0).expect("open base");
         let entry = base
             .ublock_entries()
             .find(|e| e.path.ends_with("default-sound_combiner.ubulk"))
@@ -5258,11 +5263,11 @@ mod tests {
     #[test]
     fn serial_size_patch_roundtrip() {
         use crate::iostore::IoStoreArchive;
-        if !std::path::Path::new(PAK0).exists() {
-            eprintln!("skipping: {PAK0} not present");
+        let Some(pak0) = pak0() else {
+            eprintln!("skipped: no BLAM_TEST_CE_PAK0");
             return;
-        }
-        let base = IoStoreArchive::open(PAK0).expect("open base");
+        };
+        let base = IoStoreArchive::open(&pak0).expect("open base");
         for tag in [
             "default-sound_combiner",
             "default-biped",
@@ -5312,11 +5317,11 @@ mod tests {
     fn size_changing_override_roundtrip() {
         use crate::file::TagFile;
         use crate::iostore::{IoStoreArchive, is_tag_payload};
-        if !std::path::Path::new(PAK0).exists() {
-            eprintln!("skipping: {PAK0} not present");
+        let Some(pak0) = pak0() else {
+            eprintln!("skipped: no BLAM_TEST_CE_PAK0");
             return;
-        }
-        let base = IoStoreArchive::open(PAK0).expect("open base");
+        };
+        let base = IoStoreArchive::open(&pak0).expect("open base");
 
         for tag_name in [
             "default-biped",
@@ -5450,11 +5455,11 @@ mod tests {
     fn native_create_tag_container() {
         use crate::file::TagFile;
         use crate::iostore::IoStoreArchive;
-        if !std::path::Path::new(PAK0).exists() {
-            eprintln!("skipping: {PAK0} not present");
+        let Some(pak0) = pak0() else {
+            eprintln!("skipped: no BLAM_TEST_CE_PAK0");
             return;
-        }
-        let base = IoStoreArchive::open(PAK0).expect("open base");
+        };
+        let base = IoStoreArchive::open(&pak0).expect("open base");
         let ua = base
             .entries()
             .iter()
@@ -5512,11 +5517,11 @@ mod tests {
     fn write_tag_override_helper_works() {
         use crate::file::TagFile;
         use crate::iostore::IoStoreArchive;
-        if !std::path::Path::new(PAK0).exists() {
-            eprintln!("skipping: {PAK0} not present");
+        let Some(pak0) = pak0() else {
+            eprintln!("skipped: no BLAM_TEST_CE_PAK0");
             return;
-        }
-        let base = IoStoreArchive::open(PAK0).expect("open base");
+        };
+        let base = IoStoreArchive::open(&pak0).expect("open base");
         let ub_path = base
             .entries()
             .iter()

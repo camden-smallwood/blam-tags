@@ -2856,15 +2856,13 @@ mod pack_tests {
 mod real_geometry_tests {
     use super::*;
 
+    /// The H3EK kit root, from `BLAM_TEST_H3EK`.
     fn h3ek() -> Option<std::path::PathBuf> {
-        if let Ok(p) = std::env::var("BLAM_TEST_H3EK") {
-            let p = std::path::PathBuf::from(p);
-            return p.is_dir().then_some(p);
+        let kit = std::env::var_os("BLAM_TEST_H3EK").map(std::path::PathBuf::from);
+        if kit.is_none() {
+            eprintln!("skipped: no BLAM_TEST_H3EK");
         }
-        ["D:/SteamLibrary/steamapps/common", "C:/Program Files (x86)/Steam/steamapps/common"]
-            .iter()
-            .map(|r| std::path::PathBuf::from(r).join("H3EK"))
-            .find(|p| p.join("data").is_dir())
+        kit
     }
 
     /// Find a collision JMS under the kit's `data` tree.
@@ -2947,10 +2945,7 @@ mod real_geometry_tests {
     /// so a plain `Ok` here means no collision went missing.
     #[test]
     fn a_real_collision_jms_builds_a_reachable_tree() {
-        let Some(kit) = h3ek() else {
-            eprintln!("skipping: no H3EK install");
-            return;
-        };
+        let Some(kit) = h3ek() else { return };
         let Some(path) = a_collision_jms(&kit) else {
             eprintln!("skipping: no collision JMS");
             return;
@@ -2998,10 +2993,7 @@ mod real_geometry_tests {
     #[test]
     #[ignore = "diagnostic; needs an H3EK install"]
     fn how_deep_is_each_guardian_bsp() {
-        let Some(kit) = h3ek() else {
-            eprintln!("skipping: no H3EK install");
-            return;
-        };
+        let Some(kit) = h3ek() else { return };
         let path = kit
             .join("data/objects/characters/guardian/collision/Guardian2_collision.JMS");
         let Ok(text) = std::fs::read_to_string(&path) else {

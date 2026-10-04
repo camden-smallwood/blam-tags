@@ -3768,8 +3768,13 @@ mod campaign_evolved_physics_tests {
     use crate::file::TagFile;
     use crate::iostore::IoStoreArchive;
 
-    const PAK0: &str =
-        "/Users/camden/Halo/halo-campaign-evolved_pc/Meteorite/Content/Paks/pakchunk0-WinGDK.utoc";
+    /// Campaign Evolved's `pakchunk0-WinGDK.utoc`, named by `BLAM_TEST_CE_PAK0`.
+
+    fn pak0() -> Option<std::path::PathBuf> {
+
+        std::env::var_os("BLAM_TEST_CE_PAK0").map(std::path::PathBuf::from)
+
+    }
     const PELICAN: &str = "objects/vehicles/human/pelican/pelican";
 
     fn read(archive: &IoStoreArchive, group: &str) -> Option<TagFile> {
@@ -3787,11 +3792,11 @@ mod campaign_evolved_physics_tests {
     /// origin.
     #[test]
     fn pelican_physics_binds_its_hull_and_poses_its_bones() {
-        if !std::path::Path::new(PAK0).exists() {
-            eprintln!("skipping: {PAK0} not present");
+        let Some(pak0) = pak0() else {
+            eprintln!("skipped: no BLAM_TEST_CE_PAK0");
             return;
-        }
-        let archive = IoStoreArchive::open(PAK0).expect("open pakchunk0");
+        };
+        let archive = IoStoreArchive::open(&pak0).expect("open pakchunk0");
         let (Some(phmo), Some(skel)) = (read(&archive, "physics_model"), read(&archive, "skeleton_model"))
         else {
             panic!("pelican physics_model/skeleton_model not found in pakchunk0");
@@ -3826,11 +3831,11 @@ mod campaign_evolved_physics_tests {
     /// counter-rotated so its world placement holds.
     #[test]
     fn reorienting_preserves_where_every_shape_sits() {
-        if !std::path::Path::new(PAK0).exists() {
-            eprintln!("skipping: {PAK0} not present");
+        let Some(pak0) = pak0() else {
+            eprintln!("skipped: no BLAM_TEST_CE_PAK0");
             return;
-        }
-        let archive = IoStoreArchive::open(PAK0).expect("open pakchunk0");
+        };
+        let archive = IoStoreArchive::open(&pak0).expect("open pakchunk0");
         let (Some(phmo), Some(skel)) = (read(&archive, "physics_model"), read(&archive, "skeleton_model"))
         else {
             panic!("pelican physics_model/skeleton_model not found in pakchunk0");
@@ -3878,11 +3883,11 @@ mod campaign_evolved_physics_tests {
     /// origin, whatever skeleton it was given.
     #[test]
     fn pelican_collision_carries_a_posed_armature() {
-        if !std::path::Path::new(PAK0).exists() {
-            eprintln!("skipping: {PAK0} not present");
+        let Some(pak0) = pak0() else {
+            eprintln!("skipped: no BLAM_TEST_CE_PAK0");
             return;
-        }
-        let archive = IoStoreArchive::open(PAK0).expect("open pakchunk0");
+        };
+        let archive = IoStoreArchive::open(&pak0).expect("open pakchunk0");
         let (Some(coll), Some(skel)) = (read(&archive, "collision_model"), read(&archive, "skeleton_model"))
         else {
             panic!("pelican collision_model/skeleton_model not found in pakchunk0");

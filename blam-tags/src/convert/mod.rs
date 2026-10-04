@@ -9262,9 +9262,8 @@ mod tests {
 
     #[test]
     fn native_reach_contrail_fixed_arrays_open_without_panicking() {
-        let path = Path::new(
-            "D:/SteamLibrary/steamapps/common/HREK/tags/cinematics/020lb_halsey/fx/010/mac_projectile.contrail_system",
-        );
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        let path = &reach.join("cinematics/020lb_halsey/fx/010/mac_projectile.contrail_system");
         if !path.is_file() {
             return;
         }
@@ -9447,11 +9446,13 @@ mod tests {
 
     #[test]
     fn h3_contrail_uses_native_reach_layout_when_kits_are_available() {
-        let source_path = Path::new(
-            "D:/SteamLibrary/steamapps/common/H3EK/tags/fx/cinematics/010la_jungle_intro/01/hatch.contrail_system",
-        );
-        let target_root = Path::new("D:/SteamLibrary/steamapps/common/HREK/tags");
-        if !source_path.is_file() || !target_root.is_dir() {
+        let (Some(h3), Some(reach)) = (kit_tags("BLAM_TEST_H3EK", "H3EK"), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            return;
+        };
+        let source_path = &h3.join("fx/cinematics/010la_jungle_intro/01/hatch.contrail_system");
+        let target_root = reach.as_path();
+        if !source_path.is_file() {
             return;
         }
         let definitions = locate_definitions_root();
@@ -12048,33 +12049,18 @@ mod tests {
         total
     }
 
-    /// An editing kit's `tags` directory, via `env_var` or the Steam library
-    /// this repo is developed against.
-    pub fn kit_tags(env_var: &str, kit: &str) -> Option<PathBuf> {
-        if let Ok(path) = std::env::var(env_var) {
-            let path = PathBuf::from(path);
-            // The env var names the kit, the fallback below names its `tags`
-            // directory, and callers join a tag path onto whichever comes back.
-            // Returning the two shapes from the two branches meant every test
-            // that compares against a kit tag found nothing and said
-            // "skipping: the kit and the build share no untouched ..." -- which
-            // reads exactly like a kit that has none, so it went unnoticed while
-            // the oracle tests proved nothing at all.
-            let tags = path.join("tags");
-            if tags.is_dir() {
-                return Some(tags);
-            }
-            return path.is_dir().then_some(path);
-        }
-        [
-            "D:/SteamLibrary/steamapps/common",
-            "C:/Program Files (x86)/Steam/steamapps/common",
-            "C:/Program Files/Steam/steamapps/common",
-            "E:/SteamLibrary/steamapps/common",
-        ]
-        .iter()
-        .map(|root| PathBuf::from(root).join(kit).join("tags"))
-        .find(|path| path.is_dir())
+    /// An editing kit's `tags` directory, from `env_var` naming the kit root.
+    /// `_kit` is the kit's name, kept so call sites read as they did when this
+    /// also searched Steam libraries for it; kits come from the environment
+    /// only now.
+    pub fn kit_tags(env_var: &str, _kit: &str) -> Option<PathBuf> {
+        let Some(root) = std::env::var_os(env_var) else {
+            eprintln!("skipped: no {env_var}");
+            return None;
+        };
+        let tags = PathBuf::from(root).join("tags");
+        assert!(tags.is_dir(), "{env_var} names no kit root with a tags folder: {}", tags.display());
+        Some(tags)
     }
 
     /// Tags this harness wrote itself.
@@ -12955,11 +12941,12 @@ mod tests {
     /// crosses.
     #[test]
     fn a_real_hrek_animation_graph_carries_its_payload_into_campaign_evolved() {
-        let source_path = Path::new(
-            "D:/SteamLibrary/steamapps/common/HREK/tags/cinematics/052lb_reflection/objects/052lb_reflection_030/elevator_1.model_animation_graph",
+        let Some(reach) = kit_tags("BLAM_TEST_HREK", "HREK") else { return };
+        let source_path = &reach.join(
+            "cinematics/052lb_reflection/objects/052lb_reflection_030/elevator_1.model_animation_graph",
         );
         if !source_path.is_file() {
-            eprintln!("skipping: HREK is not installed at the expected path");
+            eprintln!("skipping: {} is not in the HREK kit", source_path.display());
             return;
         }
         let definitions = locate_definitions_root();
@@ -13019,11 +13006,13 @@ mod tests {
 
     #[test]
     fn real_h3_animation_payload_is_rejected_instead_of_written_incomplete() {
-        let source_path = Path::new(
-            "D:/SteamLibrary/steamapps/common/H3EK/tags/fx/null_object/null_up/null_up.model_animation_graph",
-        );
-        let target_root = Path::new("D:/SteamLibrary/steamapps/common/HREK/tags");
-        if !source_path.is_file() || !target_root.is_dir() {
+        let (Some(h3), Some(reach)) = (kit_tags("BLAM_TEST_H3EK", "H3EK"), kit_tags("BLAM_TEST_HREK", "HREK"))
+        else {
+            return;
+        };
+        let source_path = &h3.join("fx/null_object/null_up/null_up.model_animation_graph");
+        let target_root = reach.as_path();
+        if !source_path.is_file() {
             return;
         }
         let definitions = locate_definitions_root();
