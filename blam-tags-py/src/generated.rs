@@ -167,16 +167,19 @@ impl PyGame {
     /// Halo 1 BSP source is JMS).
     fn ass_version(&self) -> Option<u16> { blam_tags::game::Game::from(*self).ass_version() }
     /// The JMA-family (animation) text-format version this game's tools
-    /// read/write.
+    /// read/write, as their MCC tool.exe readers accept it:
     /// 
-    /// Unlike JMS/ASS, all three generations share version **16392** —
-    /// the `header + node{name,first_child,next_sibling} + per-frame
-    /// transforms` layout. HABT (`io_scene_halo/file_jma`) lists 16392 as
-    /// valid for CE/H2/H3 (`__init__.py`: `16390` = "CE/H2/H3"), and our
-    /// writer already emits 16392 with H3+Reach corpus validation. The
-    /// later `16395` H2/H3 variant only adds an optional biped-controller
-    /// transform block, which extraction doesn't need; keeping one version
-    /// per game here gives a single dispatch point should that change.
+    /// - **Halo 1: 16392.** Halo CE tool.exe parses 16390–16393 only, and
+    ///   writes 16392 itself.
+    /// - **Halo 2 and Halo 3+: 16394.** Both parse 16390–16395, but Halo 2's
+    ///   refuses anything below 16394 ("ANIMATION FILE IS OUTDATED! …
+    ///   expected at least version 16394") and Halo 3's warns that the import
+    ///   "may have problems later".
+    /// 
+    /// 16394 is a different layout, not a renumbering; see
+    /// [`crate::animation::JMA_ABSOLUTE_VERSION`]. The later 16395 only adds
+    /// an optional per-frame root transform block, which extraction does not
+    /// need.
     fn jma_version(&self) -> u16 { blam_tags::game::Game::from(*self).jma_version() }
     fn __repr__(&self) -> String { format!("{:?}", blam_tags::game::Game::from(*self)) }
 }
@@ -215,7 +218,7 @@ impl PyMatrix4 {
     /// Decompose into `(translation, rotation, uniform_scale)`. The
     /// uniform scale is the mean of the three column lengths (mirrors
     /// Foundry's `(scale.x + scale.y + scale.z) / 3`).
-    fn decompose(&self) -> (PyRealPoint3d, PyRealQuaternion, f32) { (PyRealPoint3d(self.0.decompose().0), PyRealQuaternion(self.0.decompose().1), self.0.decompose().2) }
+    fn decompose(&self) -> (PyRealPoint3d, PyRealQuaternion, f32) { { let __t = self.0.decompose(); (PyRealPoint3d(__t.0), PyRealQuaternion(__t.1), __t.2) } }
     fn __mul__(&self, rhs: PyMatrix4) -> PyMatrix4 { PyMatrix4(self.0 * rhs.0) }
     fn __repr__(&self) -> String { format!("{:?}", self.0) }
     fn __copy__(&self) -> Self { *self }
@@ -705,6 +708,18 @@ impl PyRealQuaternion {
     fn nlerp(&self, other: PyRealQuaternion, t: f32) -> PyRealQuaternion { PyRealQuaternion(self.0.nlerp(other.0, t)) }
     /// Component quad `[i, j, k, w]`.
     fn to_array(&self) -> Vec<f32> { self.0.to_array().to_vec() }
+    /// A rotation of `yaw` radians about +Z (Halo's up axis).
+    #[staticmethod]
+    fn from_yaw(yaw: f32) -> PyRealQuaternion { PyRealQuaternion(blam_tags::math::RealQuaternion::from_yaw(yaw)) }
+    /// The rotation matrix as its three columns, each `[x, y, z]` — the
+    /// inverse of [`Self::from_basis_columns`].
+    fn to_basis_columns(&self) -> Vec<Vec<f32>> { self.0.to_basis_columns().to_vec().into_iter().map(|v| v.to_vec()).collect() }
+    /// Rotate a point through the rotation matrix ([`Self::to_basis_columns`]).
+    /// 
+    /// The same rotation as [`Self::rotate`], computed another way — and the
+    /// two round differently, so code whose output must stay byte-for-byte
+    /// keeps to the one it was written with. The importers use this one.
+    fn rotate_point(&self, p: PyRealPoint3d) -> PyRealPoint3d { PyRealPoint3d(self.0.rotate_point(p.0)) }
     /// Apply this rotation to a vector. Optimized two-cross-product form:
     /// `v' = v + 2 * cross(q.xyz, cross(q.xyz, v) + q.w * v)`.
     fn rotate(&self, v: PyRealVector3d) -> PyRealVector3d { PyRealVector3d(self.0.rotate(v.0)) }
@@ -1251,6 +1266,10 @@ impl PyTagFieldType {
     /// how we detect new or unhandled type names without panicking.
     #[staticmethod]
     fn from_name(name: String) -> PyTagFieldType { PyTagFieldType::from(blam_tags::fields::TagFieldType::from_name(name.as_str())) }
+    /// The field-type name as the layout's `string_data` stores it — the
+    /// inverse of [`Self::from_name`]. [`TagFieldType::Unknown`] reads as
+    /// `"unknown"`.
+    fn name(&self) -> String { blam_tags::fields::TagFieldType::from(*self).name().to_string() }
     fn __repr__(&self) -> String { format!("{:?}", blam_tags::fields::TagFieldType::from(*self)) }
 }
 
@@ -1297,6 +1316,21 @@ impl PyTagFileHeader {
     fn set_signature(&mut self, value: u32) { self.0.signature = value; }
     #[new]
     fn new(pad: Vec<u8>, build_version: i32, build_number: i32, version: u32, group_tag: u32, group_version: u32, checksum: u32, signature: u32) -> PyResult<Self> { Ok(Self(blam_tags::file::TagFileHeader { pad: __seq_to_array::<_, 36>(pad)?, build_version: build_version, build_number: build_number, version: version, group_tag: group_tag, group_version: group_version, checksum: checksum, signature: signature })) }
+    /// Read only the 64-byte header of a tag file on disk, and the byte order
+    /// it is written in.
+    /// 
+    /// For a caller choosing *between* many tag files rather than opening one.
+    /// Everything the choice usually turns on — group, generation, byte order —
+    /// is in these 64 bytes, and parsing the rest of the file to reach them is
+    /// what makes such a scan cost the size of the corpus instead of the size of
+    /// the question. Measured: sifting Halo Reach's 10,675 shipped bitmaps by
+    /// full parse reads 6.4 GB and takes ~29 seconds; by header, 683 KB.
+    /// 
+    /// Fails on anything without a `BLAM` signature, which includes every
+    /// classic (Halo CE / Halo 2) tag — those carry their signature elsewhere
+    /// and have no MCC header to read.
+    #[staticmethod]
+    fn peek(path: std::path::PathBuf) -> PyResult<(PyTagFileHeader, PyEndian)> { Ok({ let __t = blam_tags::file::TagFileHeader::peek(path).map_err(|e| crate::errors::TagReadError::new_err(e.to_string()))?; (PyTagFileHeader(__t.0), PyEndian::from(__t.1)) }) }
     fn __repr__(&self) -> String { "<TagFileHeader object>".to_string() }
 }
 
@@ -1312,7 +1346,7 @@ pub struct PyTagReferenceData(pub blam_tags::fields::TagReferenceData);
 #[pymethods]
 impl PyTagReferenceData {
     #[getter(group_tag_and_name)]
-    fn get_group_tag_and_name(&self) -> Option<(u32, String)> { self.0.group_tag_and_name.clone().map(|v| (v.0, v.1.to_string())) }
+    fn get_group_tag_and_name(&self) -> Option<(u32, String)> { self.0.group_tag_and_name.clone().map(|v| { let __t = v; (__t.0, __t.1.to_string()) }) }
     #[setter(group_tag_and_name)]
     fn set_group_tag_and_name(&mut self, value: Option<(u32, String)>) { self.0.group_tag_and_name = value.map(|v| (v.0, v.1)); }
     #[new]

@@ -1,13 +1,17 @@
 //! Generates the PyO3 bindings for `blam-tags` from rustdoc JSON.
 //!
 //! ```text
-//! cargo +nightly rustdoc -p blam-tags --features audio -- \
+//! cargo +nightly rustdoc -p blam-tags --features audio,iostore -- \
 //!     -Z unstable-options --output-format json
-//! cargo run -p blam-tags-bindgen
+//! cargo run -p blam-tags-bindgen [-- <rustdoc json> [<bindings.toml>]]
 //! ```
 //!
+//! The features must match the ones `blam-tags-py` enables, or modules
+//! behind them are invisible to the policy check below.
+//!
 //! Only this generator needs nightly. Its output is checked into the
-//! repository, so the `blam-tags-py` wheel builds on stable.
+//! repository, so the `blam-tags-py` wheel builds on stable. CI regenerates
+//! it and fails on any difference.
 
 mod emit;
 mod policy;
@@ -38,6 +42,26 @@ fn run() -> Result<(), String> {
 
     let krate = rdoc::Crate::load(&json)?;
     let policy = policy::Policy::load(&manifest)?;
+
+    // A module the policy does not name used to be skipped silently, so a
+    // new engine module never showed up as a decision anyone made. Every
+    // public module must now be listed, even if only to skip it.
+    let unlisted: Vec<String> = krate
+        .public_top_modules()
+        .into_iter()
+        .filter(|m| !policy.module.contains_key(m))
+        .collect();
+    if unlisted.is_empty() && krate.public_top_modules().is_empty() {
+        return Err(format!("{json}: found no public modules in the crate root"));
+    }
+    if !unlisted.is_empty() {
+        return Err(format!(
+            "{} public module(s) not listed in {manifest}; add a `[module.<name>]` \
+             entry (strategy \"auto\", or \"skip\" with a reason) for each:\n  {}",
+            unlisted.len(),
+            unlisted.join("\n  ")
+        ));
+    }
 
     let mut emitter = emit::Emitter::new(&krate, &policy);
     let (rs, mut pyi, coverage) = emitter.run();

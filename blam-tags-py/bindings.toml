@@ -113,3 +113,191 @@ reason = "path handle; structural edits record their path for handle invalidatio
 [types.TagFile]
 strategy = "manual"
 reason = "root of the facade; owns the edit log that invalidates stale handles"
+
+#---------------------------------------------------------------------------
+# Every other public module
+#---------------------------------------------------------------------------
+# The generator refuses to run while a public module of the crate is missing
+# from this file, so a new engine module is always a recorded decision.
+
+# Capabilities with no Python binding yet. Each is a gap rather than a decision
+# against binding it; parity.toml records the same gaps per capability.
+
+[module.animation]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.audio]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.bitmap]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.classic]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.convert]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.extract]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.iostore]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.monolithic]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.particle_model]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.render_method]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.render_model]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.tag_function]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.schema_compare]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.schema_compat]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.collision_import]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.collision_verify]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.physics_import]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.render_import]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.sbsp_import]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.jms]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.jms_split]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.jmi]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.ass]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.gltf]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.geometry]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.render_geometry]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.prt]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.definition]
+strategy = "skip"
+reason = "lifetime-parameterized schema facade; not bound yet (parity gap)"
+
+# Plumbing the facade and the importers are built on; nothing a Python caller
+# needs directly.
+
+[module.data]
+strategy = "skip"
+reason = "opaque per-tag storage, driven through the facade"
+
+[module.layout]
+strategy = "skip"
+reason = "binary `blay` schema chunk; reached through TagFile"
+
+[module.schema]
+strategy = "skip"
+reason = "JSON schema import; reached through TagFile.new"
+
+[module.stream]
+strategy = "skip"
+reason = "outer `tag!`/`want`/`info` chunks; reached through TagFile"
+
+[module.path]
+strategy = "skip"
+reason = "crate-internal path navigation"
+
+[module.field_path]
+strategy = "skip"
+reason = "the path handles take field paths as strings"
+
+[module.field_name]
+strategy = "skip"
+reason = "field-name markup parsing; names reach Python already cleaned"
+
+[module.typed_enums]
+strategy = "skip"
+reason = "Rust typing helpers over schema enums; Python sets enums by name"
+
+[module.paths]
+strategy = "skip"
+reason = "filesystem and definitions-folder helpers; Python has pathlib"
+
+[module.jms_parse]
+strategy = "skip"
+reason = "text parser behind `jms`; bound with it"
+
+[module.ass_parse]
+strategy = "skip"
+reason = "text parser behind `ass`; bound with it"
+
+[module.jms_generation]
+strategy = "skip"
+reason = "importer internals behind the JMS importers"
+
+[module.hull]
+strategy = "skip"
+reason = "convex-hull helper used by the physics importer"
+
+[module.weld]
+strategy = "skip"
+reason = "vertex-welding helper used by the importers"
+
+[module.tangent]
+strategy = "skip"
+reason = "tangent-space helper used by the importers"
+
+[module.strip]
+strategy = "skip"
+reason = "triangle-strip helper used by geometry extraction"

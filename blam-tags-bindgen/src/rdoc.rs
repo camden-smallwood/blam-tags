@@ -20,6 +20,8 @@ pub struct Crate {
     pub index: HashMap<String, Value>,
     /// `paths`: id → module path + item kind, for nameable items.
     pub paths: HashMap<String, Value>,
+    /// Id of the crate's root module.
+    pub root: String,
 }
 
 impl Crate {
@@ -45,7 +47,13 @@ impl Crate {
                 .unwrap_or_default()
         };
 
-        Ok(Self { index: obj_map("index"), paths: obj_map("paths") })
+        let root_id = match root.get("root") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Number(n)) => n.to_string(),
+            _ => return Err(format!("{path}: no `root` module id")),
+        };
+
+        Ok(Self { index: obj_map("index"), paths: obj_map("paths"), root: root_id })
     }
 
     /// Look up an item in the index by id.
@@ -82,6 +90,32 @@ impl Crate {
             // `{"restricted": {...}}` — crate- or module-private.
             Some(_) => false,
         }
+    }
+
+    /// Names of the public modules declared directly in the crate root —
+    /// the units `bindings.toml` assigns a strategy to.
+    pub fn public_top_modules(&self) -> Vec<String> {
+        let Some(items) = self
+            .item(&self.root)
+            .and_then(|r| r.get("inner")?.get("module")?.get("items")?.as_array())
+        else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = items
+            .iter()
+            .filter_map(|id| {
+                let id = match id {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let item = self.item(&id)?;
+                (Self::kind(item) == Some("module") && Self::is_public(item))
+                    .then(|| Self::name(item).map(str::to_string))
+                    .flatten()
+            })
+            .collect();
+        out.sort();
+        out
     }
 
     /// The top-level module a nameable item lives in (`math`, `api`, …).

@@ -161,13 +161,16 @@ impl Mapped {
             // would drop `expr` — and when the expression *is* the call
             // being wrapped, that silently deletes the call.
             Mapped::Tup(parts) if parts.is_empty() => expr.into(),
+            // Bind the tuple once: `expr` is usually the call itself, and
+            // projecting each field out of it would make the call once per
+            // field (and move its arguments more than once).
             Mapped::Tup(parts) => {
                 let fields = parts
                     .iter()
                     .enumerate()
-                    .map(|(i, p)| p.from_native(&format!("{expr}.{i}")))
+                    .map(|(i, p)| p.from_native(&format!("__t.{i}")))
                     .collect::<Vec<_>>();
-                format!("({})", fields.join(", "))
+                format!("{{ let __t = {expr}; ({}) }}", fields.join(", "))
             }
             Mapped::Path => format!("{expr}.to_path_buf()"),
             // A returned `&[T]` has to be copied out; the borrow cannot
@@ -422,6 +425,24 @@ impl<'a> Emitter<'a> {
                         },
                     );
                 }
+            }
+        }
+
+        // Free functions are emitted only from `auto` modules. Record the
+        // rest here so a function the policy excludes shows up in the
+        // coverage report instead of vanishing.
+        for id in krate.ids_of_kind("function") {
+            let Some(item) = krate.item(id) else { continue };
+            let Some(name) = Crate::name(item) else { continue };
+            if !Crate::is_public(item) {
+                continue;
+            }
+            let module = krate.top_module(id).unwrap_or("?").to_string();
+            if policy.strategy_for(&module, name) != Strategy::Auto {
+                skipped.push((
+                    format!("{module}::{name}()"),
+                    policy.reason_for(&module, name),
+                ));
             }
         }
 
@@ -1183,12 +1204,14 @@ impl<'a> Emitter<'a> {
         let mut call = Vec::new();
         let mut stub_args = Vec::new();
         for input in inputs.iter().skip(if takes_self { 1 } else { 0 }) {
-            let aname = input[0].as_str().ok_or("unnamed arg")?;
+            let raw_name = input[0].as_str().ok_or("unnamed arg")?;
+            // Same keyword rename as for free functions (`from` → `from_`).
+            let aname = sanitize_py_ident(raw_name);
             let mapped = self
                 .map_type_in(&input[1], target, &locals)
-                .ok_or_else(|| format!("parameter `{aname}` has no Python mapping"))?;
+                .ok_or_else(|| format!("parameter `{raw_name}` has no Python mapping"))?;
             args.push(format!("{aname}: {}", mapped.rust_sig()));
-            call.push(mapped.to_native(aname));
+            call.push(mapped.to_native(&aname));
             stub_args.push(format!("{aname}: {}", mapped.py_type()));
         }
 

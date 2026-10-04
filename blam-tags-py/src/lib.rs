@@ -9,7 +9,7 @@
 //! Regenerate with:
 //!
 //! ```text
-//! cargo +nightly rustdoc -p blam-tags --features audio -- \
+//! cargo +nightly rustdoc -p blam-tags --features audio,iostore -- \
 //!     -Z unstable-options --output-format json
 //! cargo run -p blam-tags-bindgen
 //! ```
