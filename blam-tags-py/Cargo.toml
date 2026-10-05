@@ -5,7 +5,10 @@ edition = "2024"
 publish = false
 
 [lib]
-name = "blam_tags"
+# Not `blam_tags`: that is the engine's library name, and two libraries of one
+# name collide in the build directory. The Python module is still `blam_tags`,
+# named by `module-name` in pyproject.toml and by the `#[pymodule]` function.
+name = "blam_tags_py"
 # `cdylib` is what Python loads; `rlib` keeps the crate testable from Rust.
 crate-type = ["cdylib", "rlib"]
 
