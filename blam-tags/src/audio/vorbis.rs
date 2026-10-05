@@ -102,11 +102,17 @@ impl DecodedPcm {
 ///
 /// `data` is the subsound's raw on-disk payload (length-prefixed packets),
 /// `setup_hash` selects the shared codebook setup.
+///
+/// The output is cut to `num_samples` frames, the length FMOD's header gives:
+/// the stream is padded to a whole packet, and without the cut nearly every
+/// Halo 3 and Reach subsound ran up to 1,024 frames long. 0 leaves it as
+/// decoded.
 pub fn decode_subsound(
     data: &[u8],
     channels: u32,
     sample_rate: u32,
     setup_hash: u32,
+    num_samples: u32,
 ) -> Result<DecodedPcm, String> {
     let channels = channels.clamp(1, 8) as u8;
 
@@ -137,7 +143,13 @@ pub fn decode_subsound(
         let packet = &data[pos..pos + plen];
         pos += plen;
 
-        match read_audio_packet(&ident, &setup, packet, &mut pwr) {
+        let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            read_audio_packet(&ident, &setup, packet, &mut pwr)
+        }));
+        let Ok(decoded) = decoded else {
+            return Err(format!("vorbis packet {packet_index} could not be decoded"));
+        };
+        match decoded {
             Ok(chans) => interleave_into(&mut out, &chans, channels as usize),
             Err(e) => {
                 // The very first packet sometimes yields no usable output;
@@ -150,6 +162,9 @@ pub fn decode_subsound(
 
     if out.is_empty() {
         return Err("decoded zero PCM samples".into());
+    }
+    if num_samples > 0 {
+        out.truncate(num_samples as usize * usize::from(channels));
     }
 
     Ok(DecodedPcm {
@@ -238,7 +253,74 @@ pub fn books_loaded() -> usize {
 /// setup headers, this handles a *complete* `OggS` stream — e.g. a Halo CE
 /// `.sound` permutation's inline `samples` blob, which is stored as an ordinary
 /// Ogg Vorbis file.
+///
+/// A Vorbis stream is padded out to a whole packet, and its last page's
+/// granule position is its true length; `lewton` leaves the padding in, which
+/// in Halo CE's tags is up to 1,020 frames on 2,833 of 7,960 permutations: a
+/// fade to silence at the end, a click where a chained permutation continues
+/// it, and a dip at a loop point. The output is cut to that length, where the
+/// stream states one (Wwise's rebuilt streams carry no granules, and are left
+/// as decoded).
+///
+/// `lewton` panics on a few valid streams (one in Halo CE's kit:
+/// `sound/music/spooky1/in.sound`'s second permutation); those, and any it
+/// cannot read, are decoded by libvorbis instead.
 pub fn decode_ogg_vorbis(bytes: &[u8]) -> Result<DecodedPcm, String> {
+    let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_with_lewton(bytes)));
+    let mut pcm = match decoded {
+        Ok(Ok(pcm)) => pcm,
+        Ok(Err(lewton)) => decode_with_libvorbis(bytes).map_err(|libvorbis| format!("{lewton}; {libvorbis}"))?,
+        Err(_) => decode_with_libvorbis(bytes)?,
+    };
+    if let Some(length) = final_granule(bytes)
+        && length > 0
+    {
+        let keep = length as usize * usize::from(pcm.channels.max(1));
+        if keep < pcm.samples.len() {
+            pcm.samples.truncate(keep);
+        }
+    }
+    Ok(pcm)
+}
+
+/// The granule position of an Ogg stream's last page: its length in frames.
+fn final_granule(bytes: &[u8]) -> Option<u64> {
+    let mut at = 0usize;
+    let mut granule = None;
+    while bytes.len() >= at + 27 && &bytes[at..at + 4] == b"OggS" {
+        granule = Some(u64::from_le_bytes(bytes[at + 6..at + 14].try_into().ok()?));
+        let segments = usize::from(bytes[at + 26]);
+        let table = bytes.get(at + 27..at + 27 + segments)?;
+        at += 27 + segments + table.iter().map(|&b| usize::from(b)).sum::<usize>();
+    }
+    // `u64::MAX` (-1) marks a page on which no packet ends.
+    granule.filter(|&g| g != u64::MAX)
+}
+
+/// libvorbis, through `vorbis_rs`: the reference decoder.
+fn decode_with_libvorbis(bytes: &[u8]) -> Result<DecodedPcm, String> {
+    let mut decoder = vorbis_rs::VorbisDecoder::new(std::io::Cursor::new(bytes.to_vec()))
+        .map_err(|e| format!("libvorbis: {e}"))?;
+    let channels = u16::from(decoder.channels().get());
+    let sample_rate = decoder.sampling_frequency().get();
+    let mut samples = Vec::new();
+    while let Some(block) = decoder.decode_audio_block().map_err(|e| format!("libvorbis: {e}"))? {
+        let planes = block.samples();
+        let frames = planes.first().map_or(0, |plane| plane.len());
+        for frame in 0..frames {
+            for plane in planes {
+                samples.push((plane[frame] * 32768.0).round().clamp(-32768.0, 32767.0) as i16);
+            }
+        }
+    }
+    Ok(DecodedPcm {
+        samples,
+        channels,
+        sample_rate,
+    })
+}
+
+fn decode_with_lewton(bytes: &[u8]) -> Result<DecodedPcm, String> {
     use lewton::inside_ogg::OggStreamReader;
     let mut reader = OggStreamReader::new(std::io::Cursor::new(bytes))
         .map_err(|e| format!("ogg header: {e:?}"))?;
@@ -327,6 +409,26 @@ mod tests {
             };
             let (a, b) = (rms(&input), rms(&pcm.samples));
             assert!(a > 0.0 && (a - b).abs() / a < 0.25, "ch{ch}: rms {a} vs {b}");
+        }
+    }
+
+    /// A stream decodes to the length it states, not to the end of its last
+    /// packet. 10,007 frames is no whole number of blocks, so the encoder pads
+    /// the final packet; that padding is cut, for one channel and for two.
+    #[test]
+    fn ogg_vorbis_decodes_to_its_stated_length() {
+        for ch in [1u16, 2] {
+            let frames = 10_007usize;
+            let input: Vec<i16> = (0..frames)
+                .flat_map(|i| {
+                    let s = ((i as f64 * 330.0 * std::f64::consts::TAU / 44_100.0).sin() * 9000.0) as i16;
+                    std::iter::repeat_n(s, usize::from(ch))
+                })
+                .collect();
+            let ogg = encode_ogg_vorbis(&input, ch, 44_100).expect("encode");
+            assert_eq!(final_granule(&ogg), Some(frames as u64), "the encoder states the length");
+            let pcm = decode_ogg_vorbis(&ogg).expect("decode");
+            assert_eq!(pcm.samples.len(), frames * usize::from(ch), "{ch} channel(s)");
         }
     }
 
@@ -430,7 +532,7 @@ mod tests {
                 ss.channels
             );
             let data = bank.read_subsound_data(si).unwrap();
-            let pcm = decode_subsound(&data, ss.channels, ss.frequency, ss.setup_hash).unwrap();
+            let pcm = decode_subsound(&data, ss.channels, ss.frequency, ss.setup_hash, ss.num_samples).unwrap();
             assert_eq!(pcm.channels as u32, expect_ch);
             let (mut samples, mut ch) = (pcm.samples.clone(), pcm.channels);
             if ch > 2 {
