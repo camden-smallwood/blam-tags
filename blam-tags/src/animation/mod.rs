@@ -172,6 +172,9 @@ pub struct AnimationGroup<'a> {
     pub frame_info_type: Option<String>,
     /// Engine-recorded `frame count` (from `animations[i]`).
     pub frame_count: i16,
+    /// `loop frame index`: the frame a looping animation continues from
+    /// after its last. The game restarts at frame 0 when it is 0.
+    pub loop_frame_index: i16,
     /// Engine-recorded `node count` (from `animations[i]`).
     pub node_count: i8,
     /// `node list checksum` from `animations[i]` — used to verify the
@@ -245,6 +248,7 @@ impl<'a> AnimationGroup<'a> {
             animation_type: None,
             frame_info_type: movement_type.clone(),
             frame_count,
+            loop_frame_index: 0,
             node_count,
             node_list_checksum: 0,
             resource_group: -1,
@@ -427,6 +431,10 @@ impl<'a> Animation<'a> {
                 .or_else(|| metadata.read_enum_name("type"));
             let frame_info_type = metadata.read_enum_name("frame info type");
             let frame_count = metadata.read_int_any("frame count").unwrap_or(0) as i16;
+            let loop_frame_index = metadata
+                .read_int_any("loop frame index")
+                .or_else(|| anim.read_int_any("loop frame index"))
+                .unwrap_or(0) as i16;
             let node_count = metadata.read_int_any("node count").unwrap_or(0) as i8;
             let node_list_checksum = metadata.read_int_any("node list checksum").unwrap_or(0) as i32;
             let resource_group = metadata.read_int_any("resource_group").unwrap_or(-1) as i16;
@@ -486,6 +494,7 @@ impl<'a> Animation<'a> {
                 animation_type,
                 frame_info_type,
                 frame_count,
+                loop_frame_index,
                 node_count,
                 node_list_checksum,
                 resource_group,

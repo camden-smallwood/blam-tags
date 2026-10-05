@@ -57,6 +57,9 @@ pub struct CeAnimation<'a> {
     /// `flags / world relative` (bit 1) — selects JMW for base animations.
     pub world_relative: bool,
     pub frame_count: u16,
+    /// `loop frame index`: the frame a looping animation continues from
+    /// after its last. The game restarts at frame 0 when it is 0.
+    pub loop_frame_index: u16,
     pub node_count: usize,
     pub node_list_checksum: i32,
     frame_size: usize,
@@ -111,6 +114,7 @@ impl<'a> CeAnimations<'a> {
                 frame_info_type: e.read_enum_name("frame info type"),
                 world_relative: (flags >> 1) & 1 == 1,
                 frame_count: e.read_int_any("frame count").unwrap_or(0).max(0) as u16,
+                loop_frame_index: e.read_int_any("loop frame index").unwrap_or(0).max(0) as u16,
                 node_count,
                 node_list_checksum: e.read_int_any("node list checksum").unwrap_or(0) as i32,
                 frame_size: e.read_int_any("frame size").unwrap_or(0).max(0) as usize,
