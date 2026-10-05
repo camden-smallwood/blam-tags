@@ -84,8 +84,14 @@ pub fn read_payloads(header: &FZenPackageHeader, package: &[u8]) -> Result<Vec<V
     let base = header.summary.header_size as usize;
     let mut out = Vec::with_capacity(header.export_map.len());
     for (i, entry) in header.export_map.iter().enumerate() {
-        let start = base + entry.cooked_serial_offset as usize;
-        let end = start + entry.cooked_serial_size as usize;
+        // Checked: both are read from the package, and a hostile pair would
+        // otherwise wrap into a range that looks valid.
+        let span = base
+            .checked_add(entry.cooked_serial_offset as usize)
+            .and_then(|start| Some((start, start.checked_add(entry.cooked_serial_size as usize)?)));
+        let Some((start, end)) = span else {
+            bail!("export {i} has an offset and size that overflow");
+        };
         if end > package.len() || start > end {
             bail!(
                 "export {i} spans {start}..{end}, past the {}-byte package",

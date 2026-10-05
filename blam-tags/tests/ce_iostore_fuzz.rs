@@ -28,6 +28,33 @@ use blam_tags::iostore::ue_types::EIoStoreTocVersion;
 use blam_tags::iostore::usmap::Usmap;
 use blam_tags::iostore::zen::FZenPackageHeader;
 
+/// No read of a package under a megabyte has any business asking for more
+/// than a gibibyte. One that does has trusted a count from the input, which
+/// Linux refuses (aborting the run) while macOS hands out the address space
+/// lazily and lets it pass; refusing it here fails the run on every platform.
+/// Refusal is a null return, the allocator's own way to say no.
+struct Capped;
+const ALLOCATION_CAP: usize = 1 << 30;
+unsafe impl std::alloc::GlobalAlloc for Capped {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if layout.size() > ALLOCATION_CAP {
+            return std::ptr::null_mut();
+        }
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        if size > ALLOCATION_CAP {
+            return std::ptr::null_mut();
+        }
+        unsafe { std::alloc::System.realloc(ptr, layout, size) }
+    }
+}
+#[global_allocator]
+static CAPPED: Capped = Capped;
+
 const CV: EIoStoreTocVersion = EIoStoreTocVersion::ReplaceIoChunkHashWithIoHash;
 const HV: EIoContainerHeaderVersion = EIoContainerHeaderVersion::SoftPackageReferences;
 

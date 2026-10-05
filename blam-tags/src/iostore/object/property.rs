@@ -131,8 +131,9 @@ pub(super) fn read_value(
         // `FMulticastScriptDelegate::Serialize`: a count and that many bindings.
         PropertyType::MulticastDelegate => {
             let n = r.i32()?;
-            let mut list = Vec::with_capacity(n.max(0) as usize);
-            for _ in 0..n.max(0) {
+            let n = bounded(n, MAX_CONTAINER_ELEMENTS, "multicast delegate", r.o - 4)?;
+            let mut list = Vec::with_capacity(n.min(PREALLOC_CAP));
+            for _ in 0..n {
                 let object = r.i32()?;
                 let function = r.fname()?;
                 list.push((object, function));
@@ -142,8 +143,9 @@ pub(super) fn read_value(
         // `FFieldPath`: a `TArray<FName>` path then the owner object.
         PropertyType::FieldPath => {
             let n = r.i32()?;
-            let mut path = Vec::with_capacity(n.max(0) as usize);
-            for _ in 0..n.max(0) {
+            let n = bounded(n, MAX_CONTAINER_ELEMENTS, "field path", r.o - 4)?;
+            let mut path = Vec::with_capacity(n.min(PREALLOC_CAP));
+            for _ in 0..n {
                 path.push(r.fname()?);
             }
             let owner = r.i32()?;

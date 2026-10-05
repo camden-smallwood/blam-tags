@@ -791,7 +791,9 @@ impl Readable for FZenPackageImportedPackageNamesContainer {
         let imported_package_name_numbers: Vec<i32> = s.de_ctx(imported_package_names.len())?;
         for (name, number) in imported_package_names.iter_mut().zip(imported_package_name_numbers) {
             if number != 0 {
-                *name = format!("{name}_{}", number - 1)
+                // Widened: the stored number is one more than the suffix, and
+                // `i32::MIN` has no predecessor.
+                *name = format!("{name}_{}", i64::from(number) - 1)
             }
         }
         Ok(Self { imported_package_names })
@@ -952,7 +954,11 @@ impl FZenPackageHeader {
         };
 
         let imported_public_export_hashes: Vec<u64> = if header_version > EIoContainerHeaderVersion::Initial {
-            let imported_public_export_hashes_count = (summary.import_map_offset - summary.imported_public_export_hashes_offset) as usize / size_of::<u64>();
+            let imported_public_export_hashes_count = section_count::<u64>(
+                summary.imported_public_export_hashes_offset,
+                summary.import_map_offset,
+                "imported public export hashes",
+            )?;
             let imported_public_export_hashes_start_offset = package_start_offset + summary.imported_public_export_hashes_offset as u64;
 
             s.seek(SeekFrom::Start(imported_public_export_hashes_start_offset))?;
@@ -961,22 +967,22 @@ impl FZenPackageHeader {
             vec![]
         };
 
-        let import_map_count = (summary.export_map_offset - summary.import_map_offset) as usize / size_of::<FPackageObjectIndex>();
+        let import_map_count = section_count::<FPackageObjectIndex>(summary.import_map_offset, summary.export_map_offset, "import map")?;
         let import_map_start_offset = package_start_offset + summary.import_map_offset as u64;
         s.seek(SeekFrom::Start(import_map_start_offset))?;
         let import_map: Vec<FPackageObjectIndex> = s.de_ctx(import_map_count)?;
 
-        let export_map_count = (cell_import_map_offset - summary.export_map_offset) as usize / size_of::<FExportMapEntry>();
+        let export_map_count = section_count::<FExportMapEntry>(summary.export_map_offset, cell_import_map_offset, "export map")?;
         let export_map_start_offset = package_start_offset + summary.export_map_offset as u64;
         s.seek(SeekFrom::Start(export_map_start_offset))?;
         let export_map: Vec<FExportMapEntry> = s.de_ctx(export_map_count)?;
 
-        let cell_import_map_count = (cell_export_map_offset - cell_import_map_offset) as usize / size_of::<FPackageObjectIndex>();
+        let cell_import_map_count = section_count::<FPackageObjectIndex>(cell_import_map_offset, cell_export_map_offset, "cell import map")?;
         let cell_import_map_start_offset = package_start_offset + cell_import_map_offset as u64;
         s.seek(SeekFrom::Start(cell_import_map_start_offset))?;
         let cell_import_map: Vec<FPackageObjectIndex> = s.de_ctx(cell_import_map_count)?;
 
-        let cell_export_map_count = (summary.export_bundle_entries_offset - cell_export_map_offset) as usize / size_of::<FCellExportMapEntry>();
+        let cell_export_map_count = section_count::<FCellExportMapEntry>(cell_export_map_offset, summary.export_bundle_entries_offset, "cell export map")?;
         let cell_export_map_start_offset = package_start_offset + cell_export_map_offset as u64;
         s.seek(SeekFrom::Start(cell_export_map_start_offset))?;
         let cell_export_map: Vec<FCellExportMapEntry> = s.de_ctx(cell_export_map_count)?;
@@ -990,7 +996,7 @@ impl FZenPackageHeader {
         // New style export bundles entries, UE5.0+. Export bundle entries count is derived from the graph data offset
         let export_bundle_entries_count = if header_version >= EIoContainerHeaderVersion::LocalizedPackages {
             let export_bundle_entries_end_offset = if summary.dependency_bundle_headers_offset > 0 { summary.dependency_bundle_headers_offset } else { summary.graph_data_offset };
-            (export_bundle_entries_end_offset - summary.export_bundle_entries_offset) as usize / size_of::<FExportBundleEntry>()
+            section_count::<FExportBundleEntry>(summary.export_bundle_entries_offset, export_bundle_entries_end_offset, "export bundle entries")?
         } else {
             // Legacy export bundles, bundle headers followed by bundle entries. UE 4.27 and below. Export bundle entries count is derived from the total entry count of all export bundles
             let store_entry = optional_store_entry.as_ref().ok_or_else(|| anyhow!("Zen package versions before ImportedPackageNames cannot be parsed without their associated package store entry"))?;
@@ -1018,7 +1024,7 @@ impl FZenPackageHeader {
         let mut external_package_dependencies: Vec<ExternalPackageDependency> = Vec::new();
 
         if summary.dependency_bundle_headers_offset > 0 && summary.dependency_bundle_entries_offset > 0 {
-            let dependency_bundle_headers_count = (summary.dependency_bundle_entries_offset - summary.dependency_bundle_headers_offset) as usize / size_of::<FDependencyBundleHeader>();
+            let dependency_bundle_headers_count = section_count::<FDependencyBundleHeader>(summary.dependency_bundle_headers_offset, summary.dependency_bundle_entries_offset, "dependency bundle headers")?;
             let dependency_bundle_headers_start_offset = package_start_offset + summary.dependency_bundle_headers_offset as u64;
             if dependency_bundle_headers_count != export_map_count {
                 bail!("Expected to have as many dependency bundle headers as the number of exports. Got {} dependency bundle headers for {} exports", dependency_bundle_headers_count, export_map_count);
@@ -1027,7 +1033,7 @@ impl FZenPackageHeader {
             s.seek(SeekFrom::Start(dependency_bundle_headers_start_offset))?;
             dependency_bundle_headers = s.de_ctx(dependency_bundle_headers_count)?;
 
-            let dependency_bundle_entries_count = (summary.imported_package_names_offset - summary.dependency_bundle_entries_offset) as usize / size_of::<FDependencyBundleEntry>();
+            let dependency_bundle_entries_count = section_count::<FDependencyBundleEntry>(summary.dependency_bundle_entries_offset, summary.imported_package_names_offset, "dependency bundle entries")?;
             let dependency_bundle_entries_start_offset = package_start_offset + summary.dependency_bundle_entries_offset as u64;
 
             s.seek(SeekFrom::Start(dependency_bundle_entries_start_offset))?;
@@ -1441,4 +1447,16 @@ fn heuristic_zen_package_version(optional_package_version: Option<FPackageFileVe
         licensee_version: 0,
         custom_versions: Vec::new(),
     })
+}
+
+/// How many `T` fit between two offsets read from a package header.
+///
+/// Both offsets are the file's, so a malformed or hostile package can put them
+/// in the wrong order: subtracted unchecked, that overflowed (a panic in debug,
+/// a nonsense count in release).
+fn section_count<T>(start: i32, end: i32, what: &str) -> Result<usize> {
+    match end.checked_sub(start) {
+        Some(len) if len >= 0 => Ok(len as usize / size_of::<T>()),
+        _ => bail!("the {what} section ends before it starts ({start}..{end})"),
+    }
 }
