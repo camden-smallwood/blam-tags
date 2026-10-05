@@ -172,7 +172,7 @@ pub const CONVERSION_PROFILES: &[&str] = &[
 ///
 /// They differ from the MCC profiles in ways the converter has to respect: Halo
 /// CE bodies are big-endian, every struct GUID is all-zero (see
-/// [`schema_struct_key`]), Halo 2 carries versioned structs, and neither has an
+/// `schema_struct_key`), Halo 2 carries versioned structs, and neither has an
 /// MCC generation header (see [`apply_editing_kit_mcc_header`]). A classic
 /// *target* also cannot be built by `TagFile::new`, so it needs a kit-authored
 /// template to start from.

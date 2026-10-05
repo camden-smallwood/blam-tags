@@ -767,7 +767,7 @@ const GENERATED_GROUPS: &[&str] = &[
 /// `(object_flags, package_flags)` for a tag wrapper of `group_longname`.
 ///
 /// Measured over all 12,291 shipped tag packages: `0xb`/`0x80002200` for every
-/// group except the five in [`GENERATED_GROUPS`]. 2,563 `sound` and one
+/// group except the five in `GENERATED_GROUPS`. 2,563 `sound` and one
 /// `ai_mission_dialogue` ship `0x3` instead, dropping `RF_Transactional`, which
 /// is inert in a cooked build — so the majority value is used for them too.
 pub fn tag_package_flags(group_longname: &str) -> (u32, u32) {

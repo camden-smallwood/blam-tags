@@ -35,7 +35,7 @@
 //! it is **checkable**: the property a collision BSP has to have is that
 //! a ray striking a surface reaches a leaf that references it, and this
 //! establishes exactly that, per surface, by the same traversal the
-//! runtime uses. [`verify`] runs it.
+//! runtime uses. [`collision_verify`](crate::collision_verify) runs it.
 //!
 //! # Limits that bind
 //!

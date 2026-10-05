@@ -426,7 +426,7 @@ pub struct InPlaceTagDuplicate<'a> {
 /// only as unreachable dead space.
 ///
 /// A perfect-hash table in the target is **dropped** rather than carried over —
-/// see [`plan_toc_append`] for why an appended entry invalidates one.
+/// see `plan_toc_append` for why an appended entry invalidates one.
 pub fn duplicate_tag_in_place_with(
     archive: &IoStoreArchive,
     utoc_path: &Path,
@@ -532,7 +532,7 @@ pub struct InPlacePackageRename<'a> {
 /// The `.ucas` is appended to and never truncated; the old payload stays behind
 /// as dead space. The `.utoc` is replaced atomically and restored if anything
 /// fails. A perfect-hash table in the target is **dropped** — see
-/// [`plan_toc_append`].
+/// `plan_toc_append`.
 pub fn rename_package_in_place_with(
     archive: &IoStoreArchive,
     utoc_path: &Path,

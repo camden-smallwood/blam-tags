@@ -140,7 +140,7 @@ fn unreal_numeric_value(text: &str) -> Option<i64> {
 }
 
 /// The order Unreal mounts two containers in, lowest priority first: patch
-/// containers by their chunk version (see [`patch_version`]), then by
+/// containers by their chunk version (see `patch_version`), then by
 /// `pakchunk` number, then by path. Anything that layers containers so that a
 /// later one overrides an earlier one (a mod over the game) sorts with this,
 /// so every reader agrees on which copy of a tag or package wins.

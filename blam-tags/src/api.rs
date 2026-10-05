@@ -1969,7 +1969,7 @@ impl<'a> TagBlockMut<'a> {
     /// Append a default-initialized element. Returns its new index.
     ///
     /// Block-index fields are initialized to `NONE` (-1), not the raw zero-fill's
-    /// `0` — see [`default_new_element_block_indices`].
+    /// `0` — see `default_new_element_block_indices`.
     pub fn add_element(&mut self) -> usize {
         self.block_data.add_element(self.layout);
         let index = self.block_data.elements.len() - 1;
@@ -1983,7 +1983,7 @@ impl<'a> TagBlockMut<'a> {
     /// (valid range is `0..=len`).
     ///
     /// Block-index fields are initialized to `NONE` (-1), not the raw zero-fill's
-    /// `0` — see [`default_new_element_block_indices`].
+    /// `0` — see `default_new_element_block_indices`.
     pub fn insert_element(&mut self, index: usize) -> Result<(), TagIndexError> {
         let len = self.block_data.elements.len();
         if index > len {

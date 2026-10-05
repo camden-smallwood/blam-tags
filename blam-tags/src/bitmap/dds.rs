@@ -14,7 +14,7 @@
 //! Formats no DDS reader understands — the Halo-specific BC5-shaped
 //! `(luminance, alpha)` `dxn_mono_alpha` among them — are decoded to
 //! A8R8G8B8 through [`super::decode`] before writing
-//! (see [`needs_decode_for_dds`]).
+//! (see `needs_decode_for_dds`).
 
 use std::io::Write;
 
