@@ -96,6 +96,9 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
+        # The tests build tags from definitions/, a submodule.
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
 

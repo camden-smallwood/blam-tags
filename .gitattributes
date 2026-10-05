@@ -1,0 +1,4 @@
+# Text is stored with LF and checked out with LF on every platform. Tests
+# compare checked-in text (parity.toml, generated files) against strings built
+# with `\n`, which a Windows CRLF checkout breaks.
+* text=auto eol=lf
