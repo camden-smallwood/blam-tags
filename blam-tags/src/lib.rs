@@ -188,5 +188,5 @@ pub use animation::{
     Animation, AnimationClip, AnimationError, AnimationGraph, AnimationGroup, AnimationName,
     AnimationStateType, AnimationTracks, AnimatedStreamStatus, BitArray, Codec, JmaKind,
     MovementData, MovementFrame, MovementKind, NodeFlags, NodeTransform, ObjectSpaceParentNode,
-    PackedDataSizes, Pose, SizeLayout, Skeleton, SkeletonNode,
+    OrientationComponents, PackedDataSizes, Pose, SizeLayout, Skeleton, SkeletonNode,
 };

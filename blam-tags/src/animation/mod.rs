@@ -288,6 +288,19 @@ pub struct ObjectSpaceParentNode {
     pub translation: RealPoint3d,
     pub rotation: RealQuaternion,
     pub scale: f32,
+    /// Halo 3's and ODST's `component flags`: which components of the
+    /// node's children the game retargets. `None` where the entry has no
+    /// such field; Reach and Halo 4 store a `parent orientation` with
+    /// `flags` of their own instead.
+    pub components: Option<OrientationComponents>,
+}
+
+/// A set of `orientation_component_flags`, read by option name.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OrientationComponents {
+    pub rotation: bool,
+    pub translation: bool,
+    pub scale: bool,
 }
 
 impl<'a> AnimationGroup<'a> {
@@ -641,9 +654,10 @@ fn read_inline_animation_data<'a>(anim: &TagStruct<'a>) -> Option<&'a [u8]> {
 }
 
 /// Parse the `object-space parent nodes` block from an animation's
-/// metadata struct (empty for H3; populated for Reach/H4 pose overlays).
-/// Each element has a node index, component flags (ignored — we always
-/// apply the full orientation), and a quantized orientation
+/// metadata struct (Halo 3 replacements; Reach/H4 pose overlays and
+/// replacements). Each element has a node index, Halo 3's component flags
+/// (which [`AnimationClip::retargeted_replacement_pose`] honours; the
+/// export reconstruction applies the full orientation), and a quantized orientation
 /// (int16 rotation x/y/z/w `/ 0x7FFF`, real translation, real scale).
 fn read_object_space_parents(metadata: &TagStruct<'_>) -> Vec<ObjectSpaceParentNode> {
     let Some(block) = metadata
@@ -678,11 +692,20 @@ fn read_object_space_parents(metadata: &TagStruct<'_>) -> Vec<ObjectSpaceParentN
         } else {
             rotation.normalized()
         };
+        let components = elem.read_flag_names("component flags").map(|names| {
+            let set = |option: &str| names.iter().any(|(_, name)| name == option);
+            OrientationComponents {
+                rotation: set("rotation"),
+                translation: set("translation"),
+                scale: set("scale"),
+            }
+        });
         out.push(ObjectSpaceParentNode {
             node_index,
             translation: orient.read_point3d("default translation"),
             rotation,
             scale: orient.read_real("default scale").unwrap_or(1.0),
+            components,
         });
     }
     out

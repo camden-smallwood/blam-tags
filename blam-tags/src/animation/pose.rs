@@ -15,7 +15,9 @@
 use crate::file::TagFile;
 use crate::math::{Matrix4, RealPoint3d, RealQuaternion};
 
-use super::{AnimationClip, BitArray, NodeFlags, ObjectSpaceParentNode, TOP_LEVEL_NAMES};
+use super::{
+    AnimationClip, BitArray, NodeFlags, ObjectSpaceParentNode, OrientationComponents, TOP_LEVEL_NAMES,
+};
 
 //================================================================================
 // Skeleton + Pose
@@ -200,6 +202,47 @@ impl Pose {
             }
         }
     }
+}
+
+/// `node`'s object-space orientation in `frame`: its local orientation
+/// composed up through every parent (`parent × child`).
+fn object_orientation(frame: &[NodeTransform], skeleton: &Skeleton, node: usize) -> NodeTransform {
+    let at = |i: usize| frame.get(i).copied().unwrap_or(NodeTransform::IDENTITY);
+    let mut object = at(node);
+    let mut parent = skeleton.nodes[node].parent;
+    let mut guard = 0;
+    while let Ok(index) = usize::try_from(parent) {
+        if index >= skeleton.len() || guard > skeleton.len() {
+            break;
+        }
+        object = orientations_multiply(at(index), object);
+        parent = skeleton.nodes[index].parent;
+        guard += 1;
+    }
+    object
+}
+
+/// The game's `orientations_multiply`: `a` applied after `b`.
+fn orientations_multiply(a: NodeTransform, b: NodeTransform) -> NodeTransform {
+    let rotated = a.rotation.rotate(b.translation.as_vector()) * a.scale;
+    NodeTransform {
+        rotation: a.rotation * b.rotation,
+        translation: RealPoint3d {
+            x: a.translation.x + rotated.i,
+            y: a.translation.y + rotated.j,
+            z: a.translation.z + rotated.k,
+        },
+        scale: b.scale * a.scale,
+    }
+}
+
+/// The game's `orientation_inverse`, including its stand-in of 10000 for
+/// the inverse of a zero scale.
+fn orientation_inverse(a: NodeTransform) -> NodeTransform {
+    let rotation = a.rotation.conjugate();
+    let scale = if a.scale == 0.0 { 10000.0 } else { 1.0 / a.scale };
+    let t = rotation.rotate(a.translation.as_vector()) * scale;
+    NodeTransform { rotation, translation: RealPoint3d { x: -t.i, y: -t.j, z: -t.k }, scale }
 }
 
 /// The node an object-space parent entry actually re-orients: the
@@ -460,6 +503,77 @@ impl AnimationClip {
         (reference, Pose { frames })
     }
 
+    /// Compose a **replacement** the way Halo 3 and ODST play one at full
+    /// weight: [`replacement_pose`](Self::replacement_pose), retargeted by
+    /// the animation's `object-space parent nodes`
+    /// (`build_object_space_correction_data`). Each entry names a node N
+    /// and the object-space orientation it was authored at; the correction
+    /// `inverse(N in object space, from base) × stored` is applied to N's
+    /// **direct children**, and only to the components its `component
+    /// flags` select that the animation itself animates: rotation
+    /// `correction × child`, translation `child + correction` (added, not
+    /// rotated, as the game does) and scale `correction × child`. N itself,
+    /// its other descendants and unflagged components keep the
+    /// replacement's values. Entries without component flags (Reach and
+    /// Halo 4 store a parent orientation instead) are skipped.
+    pub fn retargeted_replacement_pose(
+        &self,
+        skeleton: &Skeleton,
+        base: &[NodeTransform],
+        object_space: &[ObjectSpaceParentNode],
+    ) -> Pose {
+        let mut pose = self.replacement_pose(skeleton, base);
+        let n = skeleton.len();
+        let mut corrections: Vec<Option<(NodeTransform, OrientationComponents)>> = vec![None; n];
+        for entry in object_space {
+            let Some(components) = entry.components else { continue };
+            let Ok(node) = usize::try_from(entry.node_index) else { continue };
+            if node >= n {
+                continue;
+            }
+            let stored = NodeTransform {
+                rotation: entry.rotation,
+                translation: entry.translation,
+                scale: entry.scale,
+            };
+            let correction =
+                orientations_multiply(orientation_inverse(object_orientation(base, skeleton, node)), stored);
+            let mut child = skeleton.nodes[node].first_child;
+            let mut guard = 0;
+            while let Ok(index) = usize::try_from(child) {
+                if index >= n || guard > n {
+                    break;
+                }
+                corrections[index] = Some((correction, components));
+                child = skeleton.nodes[index].next_sibling;
+                guard += 1;
+            }
+        }
+
+        let flags = self.node_flags.as_ref();
+        for (b, correction) in corrections.into_iter().enumerate() {
+            let Some((c, components)) = correction else { continue };
+            let res = BoneResolution::for_bone(b, flags);
+            for frame in &mut pose.frames {
+                let Some(t) = frame.get_mut(b) else { continue };
+                if components.rotation && matches!(res.rotation, TrackSource::Animated(_)) {
+                    t.rotation = c.rotation * t.rotation;
+                }
+                if components.translation && matches!(res.translation, TrackSource::Animated(_)) {
+                    t.translation = RealPoint3d {
+                        x: t.translation.x + c.translation.x,
+                        y: t.translation.y + c.translation.y,
+                        z: t.translation.z + c.translation.z,
+                    };
+                }
+                if components.scale && matches!(res.scale, TrackSource::Animated(_)) {
+                    t.scale *= c.scale;
+                }
+            }
+        }
+        pose
+    }
+
     /// Compose a **replacement** animation against a base/rest pose,
     /// matching Foundry's `compose_replacement_animation` and TagTool's
     /// `Animation.Replace()`. Returns `frame_count` body frames (the JMA
@@ -569,5 +683,119 @@ fn pick_scale(clip: &AnimationClip, res: &BoneResolution, frame: usize) -> Optio
         TrackSource::Animated(i) => clip.animated_tracks.as_ref()
             .and_then(|t| t.scales.get(i)).and_then(|f| f.get(frame.min(f.len() - 1))).copied(),
         TrackSource::Identity => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::animation::{AnimatedStreamStatus, AnimationTracks, Codec, MovementData};
+
+    fn node(name: &str, first_child: i16, next_sibling: i16, parent: i16) -> SkeletonNode {
+        SkeletonNode { name: name.to_owned(), first_child, next_sibling, parent }
+    }
+
+    fn about_z(degrees: f32) -> RealQuaternion {
+        let half = degrees.to_radians() / 2.0;
+        RealQuaternion { i: 0.0, j: 0.0, k: half.sin(), w: half.cos() }
+    }
+
+    fn at(translation: [f32; 3], rotation: RealQuaternion) -> NodeTransform {
+        let [x, y, z] = translation;
+        NodeTransform { rotation, translation: RealPoint3d { x, y, z }, scale: 1.0 }
+    }
+
+    fn tracks(rotations: Vec<RealQuaternion>, translations: Vec<RealPoint3d>) -> AnimationTracks {
+        AnimationTracks {
+            codec: Codec::UncompressedAnimated,
+            frame_count: 1,
+            rotations: rotations.into_iter().map(|q| vec![q]).collect(),
+            translations: translations.into_iter().map(|t| vec![t]).collect(),
+            scales: Vec::new(),
+        }
+    }
+
+    /// One frame; `static_rotation` and `animated_rotation`/`animated_translation`
+    /// are node bitmasks, with one track per set bit in node order.
+    fn clip(
+        static_rotation: (u64, Vec<RealQuaternion>),
+        animated_rotation: (u64, Vec<RealQuaternion>),
+        animated_translation: (u64, Vec<RealPoint3d>),
+    ) -> AnimationClip {
+        AnimationClip {
+            frame_count: 1,
+            static_tracks: tracks(static_rotation.1, Vec::new()),
+            animated_tracks: Some(tracks(animated_rotation.1, animated_translation.1)),
+            animated_status: AnimatedStreamStatus::Decoded,
+            node_flags: Some(NodeFlags {
+                static_rotation: BitArray::from_u64(static_rotation.0),
+                static_translation: BitArray::from_u64(0),
+                static_scale: BitArray::from_u64(0),
+                animated_rotation: BitArray::from_u64(animated_rotation.0),
+                animated_translation: BitArray::from_u64(animated_translation.0),
+                animated_scale: BitArray::from_u64(0),
+            }),
+            movement: MovementData::default(),
+        }
+    }
+
+    fn assert_rotation(got: RealQuaternion, want: RealQuaternion, what: &str) {
+        let dot = got.i * want.i + got.j * want.j + got.k * want.k + got.w * want.w;
+        assert!(dot.abs() > 0.9999, "{what}: {got:?} vs {want:?}");
+    }
+
+    fn assert_translation(got: RealPoint3d, want: [f32; 3], what: &str) {
+        let [x, y, z] = want;
+        let close = (got.x - x).abs() < 1e-5 && (got.y - y).abs() < 1e-5 && (got.z - z).abs() < 1e-5;
+        assert!(close, "{what}: {got:?} vs {want:?}");
+    }
+
+    #[test]
+    fn a_retargeted_replacement_corrects_only_the_nodes_direct_animated_children() {
+        // root ─┬─ spine ── arm
+        //       └─ thigh
+        let skeleton = Skeleton {
+            nodes: vec![
+                node("root", 1, -1, -1),
+                node("spine", 3, 2, 0),
+                node("thigh", -1, -1, 0),
+                node("arm", -1, -1, 1),
+            ],
+        };
+        let base = vec![
+            at([0.0, 0.0, 1.0], about_z(90.0)),
+            at([0.5, 0.0, 0.0], RealQuaternion::IDENTITY),
+            at([0.0, 0.5, 0.0], about_z(5.0)),
+            at([0.25, 0.0, 0.0], RealQuaternion::IDENTITY),
+        ];
+        // spine and arm animated in rotation; spine in translation too.
+        let clip = clip(
+            (0, Vec::new()),
+            (0b1010, vec![about_z(15.0), about_z(25.0)]),
+            (0b0010, vec![RealPoint3d { x: 0.5, y: 0.0, z: 0.0 }]),
+        );
+        let object_space = [ObjectSpaceParentNode {
+            node_index: 0,
+            translation: RealPoint3d { x: 0.0, y: 0.0, z: 2.0 },
+            rotation: RealQuaternion::IDENTITY,
+            scale: 1.0,
+            components: Some(OrientationComponents { rotation: true, translation: true, scale: false }),
+        }];
+
+        let pose = clip.retargeted_replacement_pose(&skeleton, &base, &object_space);
+        let frame = &pose.frames[0];
+        // correction = inverse(root: 90° about z, up 1) × (identity, up 2)
+        //            = (−90° about z, up 1)
+        assert_rotation(frame[1].rotation, about_z(-75.0), "spine is correction × replacement");
+        assert_translation(frame[1].translation, [0.5, 0.0, 1.0], "spine translation gains the correction's, unrotated");
+        assert_rotation(frame[0].rotation, about_z(90.0), "the named node is not moved");
+        assert_rotation(frame[2].rotation, about_z(5.0), "an unanimated child keeps the base");
+        assert_rotation(frame[3].rotation, about_z(25.0), "a grandchild keeps the replacement");
+
+        // The export reconstruction moves the whole tree instead.
+        let mut exported = clip.replacement_pose(&skeleton, &base);
+        let mut reference = base.clone();
+        exported.apply_object_space_corrections(&mut reference, &skeleton, &base, &object_space);
+        assert_rotation(exported.frames[0][0].rotation, RealQuaternion::IDENTITY, "export re-orients the root");
     }
 }
