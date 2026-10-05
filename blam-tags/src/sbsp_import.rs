@@ -432,7 +432,17 @@ pub fn structure_bsp_from_ass_with(
     // The portals come first: their planes are forced into the sealed
     // world so that no cell straddles one, which is what lets the two
     // sides of a portal be different clusters at all.
-    let portal_rings = portal_rings(&portals, &mut report);
+    let mut portal_rings = portal_rings(&portals, &mut report);
+    // The limit is the game's: 1024 for Halo 3 to Reach, 1000 after.
+    if let Some(limit) = block_limit(&tag, "cluster portals")
+        && portal_rings.len() > limit
+    {
+        report.not_written.push(format!(
+            "cluster portals: {} of them, over the {limit} a structure may carry",
+            portal_rings.len()
+        ));
+        portal_rings.clear();
+    }
     let world = world_box(&clusters, &portal_rings);
     let sealed =
         write_structure_collision(&mut tag, collision_source, &portal_rings, world, &mut report)?;
@@ -572,48 +582,9 @@ fn write_structure_collision(
     Ok(Some(bsp))
 }
 
-/// The largest ring a cluster portal may have, and the most portals a
-/// structure may carry. Both are the schema's own limits.
+/// The largest ring a cluster portal may have: the schema's own limit, and
+/// the same in every game.
 const MAX_PORTAL_VERTICES: usize = 128;
-const MAX_PORTALS: usize = 1024;
-
-/// Write the `+portal` meshes back into `cluster portals`.
-///
-/// A portal is one convex polygon, and the exporter fan-triangulates it
-/// from a single vertex — so taking the mesh's vertices in first-use
-/// order recovers the ring it was written from, in order, with no
-/// boundary walk needed.
-///
-/// Three fields are left as NONE rather than guessed. `back cluster` and
-/// `front cluster` say which cluster lies on each side, and `plane
-/// index` names a plane in a table this does not build; both need the
-/// spatial partition that turns authored meshes into real clusters, and
-/// that is not written yet. Inventing them would produce a tag that
-/// looks complete and routes visibility wrongly. The geometry, which was
-/// being dropped on the floor entirely, now survives.
-fn write_cluster_portals(
-    tag: &mut TagFile,
-    portals: &[(&Vec<crate::ass::AssVertex>, &Vec<crate::ass::AssTriangle>)],
-    report: &mut SbspReport,
-) -> R<Vec<Vec<RealPoint3d>>> {
-    if portals.is_empty() {
-        return Ok(Vec::new());
-    }
-    if portals.len() > MAX_PORTALS {
-        report.not_written.push(format!(
-            "cluster portals: {} of them, over the {MAX_PORTALS} a structure may carry",
-            portals.len()
-        ));
-        return Ok(Vec::new());
-    }
-
-    let rings = portal_rings(portals, report);
-    if rings.is_empty() {
-        return Ok(Vec::new());
-    }
-    write_portal_block(tag, &rings, report)?;
-    Ok(rings)
-}
 
 /// The ring of each `+portal` mesh, in world units.
 fn portal_rings(
@@ -849,9 +820,6 @@ fn instanced_objects(
     }
 }
 
-/// The most instanced geometry a structure may carry, per the schema.
-const MAX_INSTANCE_DEFINITIONS: usize = 1024;
-const MAX_INSTANCE_PLACEMENTS: usize = 4096;
 
 /// Write instanced geometry definitions and their placements.
 ///
@@ -876,13 +844,11 @@ fn write_instanced_geometry(
     if definitions.is_empty() {
         return Ok(());
     }
-    if definitions.len() > MAX_INSTANCE_DEFINITIONS {
-        report.not_written.push(format!(
-            "instanced geometry: {} definitions, over the {MAX_INSTANCE_DEFINITIONS} allowed",
-            definitions.len()
-        ));
-        return Ok(());
-    }
+    // Both limits are the game's: Reach and later carry more of each. The
+    // definitions' block sits inside a resource that may not have an element
+    // yet, so its limit is read where the block is reached.
+    let placement_limit = block_limit(tag, "instanced geometry instances").unwrap_or(usize::MAX);
+    let mut over_definition_limit = None;
 
     let mut root = tag.root_mut();
     with_block(&mut root, "resource interface/raw_resources", |raw| {
@@ -898,6 +864,11 @@ fn write_instanced_geometry(
             .as_struct_mut()
             .ok_or_else(|| SbspError::MissingField("raw_items (not a struct)".into()))?;
         with_block(&mut item, "instanced geometries definitions", |defs| {
+            let limit = defs.definition().max_count() as usize;
+            if definitions.len() > limit {
+                over_definition_limit = Some(limit);
+                return Ok(());
+            }
             for (object, verts, _) in definitions.iter() {
                 let di = defs.add_element();
                 let mut el = defs
@@ -913,6 +884,13 @@ fn write_instanced_geometry(
             Ok(())
         })
     })?;
+    if let Some(limit) = over_definition_limit {
+        report.not_written.push(format!(
+            "instanced geometry: {} definitions, over the {limit} allowed",
+            definitions.len()
+        ));
+        return Ok(());
+    }
     report.instance_definitions = definitions.len();
 
     let mut root = tag.root_mut();
@@ -921,7 +899,7 @@ fn write_instanced_geometry(
         for (k, (object, _, _)) in definitions.iter().enumerate() {
             let Some(list) = placements.get(object) else { continue };
             for &pi in list {
-                if written >= MAX_INSTANCE_PLACEMENTS {
+                if written >= placement_limit {
                     break;
                 }
                 let Some(inst) = ass.instances.get(pi) else { continue };
@@ -949,6 +927,17 @@ fn write_instanced_geometry(
         }
         Ok(written)
     })?;
+    let placed: usize = definitions
+        .iter()
+        .filter_map(|(object, _, _)| placements.get(object))
+        .map(Vec::len)
+        .sum();
+    if written < placed {
+        report.not_written.push(format!(
+            "instanced geometry: {placed} placements, over the {placement_limit} allowed; \
+             the first {written} were written"
+        ));
+    }
     report.instance_placements = written;
     Ok(())
 }
@@ -1304,107 +1293,6 @@ fn write_partition(
         Ok(())
     })?;
     Ok(())
-}
-
-/// Does the segment `a`..`b` pass through this polygon?
-///
-/// A portal is a convex polygon, so once the segment crosses its plane
-/// the only question left is whether the crossing point is inside the
-/// outline.
-fn segment_crosses(a: [f32; 3], b: [f32; 3], ring: &[RealPoint3d], n: [f32; 3]) -> bool {
-    if ring.len() < 3 {
-        return false;
-    }
-    let d = n[0] * ring[0].x + n[1] * ring[0].y + n[2] * ring[0].z;
-    let da = n[0] * a[0] + n[1] * a[1] + n[2] * a[2] - d;
-    let db = n[0] * b[0] + n[1] * b[1] + n[2] * b[2] - d;
-    if (da > 0.0) == (db > 0.0) {
-        return false;
-    }
-    let t = da / (da - db);
-    let p = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
-
-    // Inside the outline, tested on the two axes the plane faces least.
-    let axis = (0..3).max_by(|&x, &y| n[x].abs().total_cmp(&n[y].abs())).unwrap_or(0);
-    let (u, v) = match axis {
-        0 => (1, 2),
-        1 => (0, 2),
-        _ => (0, 1),
-    };
-    let at = |q: &RealPoint3d| [[q.x, q.y, q.z][u], [q.x, q.y, q.z][v]];
-    let pt2 = [p[u], p[v]];
-    let mut inside = false;
-    let mut j = ring.len() - 1;
-    for i in 0..ring.len() {
-        let (c, e) = (at(&ring[i]), at(&ring[j]));
-        if (c[1] > pt2[1]) != (e[1] > pt2[1]) {
-            let x = c[0] + (pt2[1] - c[1]) / (e[1] - c[1]) * (e[0] - c[0]);
-            if pt2[0] < x {
-                inside = !inside;
-            }
-        }
-        j = i;
-    }
-    inside
-}
-
-/// File each leaf under the nearest cluster it can see.
-///
-/// Nearest geometry alone ignores the portals, and it showed: 650 of
-/// 1,192 portals came back with the same cluster on both sides, which is
-/// a portal dividing nothing. A cluster is a region and a portal is
-/// where one region stops, so the line from a leaf to the geometry it is
-/// filed under must not pass through one.
-///
-/// Two other shapes were tried first and are worth not repeating. A
-/// breadth-first flood from seeded leaves needs leaf adjacency, and a
-/// cell here is a convex solid bounded by oblique planes: probing along
-/// the six axes from its centre found 3,000 neighbours across 86,000
-/// leaves, because the probes kept landing back in the cell they left.
-/// Marching until the leaf index changed found no more.
-///
-/// This asks the question directly instead. Take the nearest few
-/// clusters, and file the leaf under the first whose closest point it
-/// can reach in a straight line without crossing a portal. If every
-/// candidate is blocked, the nearest one stands — a leaf sealed inside a
-/// wall still has to name a cluster, and tool never writes a negative.
-fn portal_aware_clusters(
-    cells: &[Option<[[f32; 2]; 3]>],
-    grid: &Grid,
-    points: &[Vec<[f32; 3]>],
-    portals: &[Vec<RealPoint3d>],
-) -> (Vec<i16>, usize) {
-    let normals: Vec<[f32; 3]> = portals.iter().map(|r| ring_normal(r)).collect();
-    let mut out = vec![0i16; cells.len()];
-    let mut blocked_off = 0usize;
-    for (i, cell) in cells.iter().enumerate() {
-        let Some(b) = cell else { continue };
-        let p = [
-            0.5 * (b[0][0] + b[0][1]),
-            0.5 * (b[1][0] + b[1][1]),
-            0.5 * (b[2][0] + b[2][1]),
-        ];
-        let cands = grid.nearest_few(points, p, 6);
-        if cands.is_empty() {
-            continue;
-        }
-        let clear = cands.iter().find(|(_, q)| {
-            !portals
-                .iter()
-                .zip(&normals)
-                .any(|(ring, n)| segment_crosses(p, *q, ring, *n))
-        });
-        match clear {
-            Some((ci, _)) => {
-                if *ci != cands[0].0 {
-                    blocked_off += 1;
-                }
-                out[i] = *ci;
-            }
-            None => out[i] = cands[0].0,
-        }
-    }
-    (out, blocked_off)
 }
 
 /// Which cells sit inside solid, worked out by counting crossings.
@@ -1784,75 +1672,18 @@ impl Grid {
         best.1
     }
 
-    /// The nearest few clusters, each with the point of its own geometry
-    /// that comes closest, in increasing distance.
-    fn nearest_few(&self, points: &[Vec<[f32; 3]>], p: [f32; 3], want: usize) -> Vec<(i16, [f32; 3])> {
-        let base = [
-            (((p[0] - self.origin[0]) / self.cell).floor().max(0.0) as usize)
-                .min(self.dims[0] - 1),
-            (((p[1] - self.origin[1]) / self.cell).floor().max(0.0) as usize)
-                .min(self.dims[1] - 1),
-            (((p[2] - self.origin[2]) / self.cell).floor().max(0.0) as usize)
-                .min(self.dims[2] - 1),
-        ];
-        let mut seen: Vec<i16> = Vec::new();
-        let mut hit_at: Option<usize> = None;
-        for r in 0..self.dims[0] {
-            let rr = r as isize;
-            for dz in -rr..=rr {
-                for dy in -rr..=rr {
-                    for dx in -rr..=rr {
-                        if dx.abs() != rr && dy.abs() != rr && dz.abs() != rr {
-                            continue;
-                        }
-                        let (x, y, z) =
-                            (base[0] as isize + dx, base[1] as isize + dy, base[2] as isize + dz);
-                        if x < 0 || y < 0 || z < 0 {
-                            continue;
-                        }
-                        let (x, y, z) = (x as usize, y as usize, z as usize);
-                        if x >= self.dims[0] || y >= self.dims[1] || z >= self.dims[2] {
-                            continue;
-                        }
-                        for &ci in &self.cells[(z * self.dims[1] + y) * self.dims[0] + x] {
-                            if !seen.contains(&ci) {
-                                seen.push(ci);
-                            }
-                        }
-                    }
-                }
-            }
-            // A couple of shells past the first hit, so the candidate
-            // list holds more than whichever cluster happened to be
-            // closest — the point of it is to have somewhere to fall
-            // back to when a portal is in the way.
-            match hit_at {
-                Some(first) if r > first + 1 => break,
-                None if !seen.is_empty() => hit_at = Some(r),
-                _ => {}
-            }
-        }
-        let mut out: Vec<(f32, i16, [f32; 3])> = Vec::new();
-        for ci in seen {
-            let mut best = (f32::MAX, [0.0f32; 3]);
-            for q in &points[ci as usize] {
-                let d = (0..3).map(|k| (p[k] - q[k]) * (p[k] - q[k])).sum::<f32>();
-                if d < best.0 {
-                    best = (d, *q);
-                }
-            }
-            if best.0 < f32::MAX {
-                out.push((best.0, ci, best.1));
-            }
-        }
-        out.sort_by(|a, b| a.0.total_cmp(&b.0));
-        out.truncate(want);
-        out.into_iter().map(|(_, ci, q)| (ci, q)).collect()
-    }
 }
 
 
 /// [`crate::tag_writer::with_block`], failing with this importer's error.
+/// How many elements the block at `path` may hold, by the schema the tag was
+/// built from; `None` where the schema has no such block.
+fn block_limit(tag: &TagFile, path: &str) -> Option<usize> {
+    let root = tag.root();
+    let field = root.field_path(path)?;
+    Some(field.as_block()?.definition().max_count() as usize)
+}
+
 fn with_block<T>(
     root: &mut crate::TagStructMut<'_>,
     path: &str,
