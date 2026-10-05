@@ -104,8 +104,7 @@ impl JmaKind {
             "dx,dy,dyaw" => Self::Jmt,
             // dz-bearing movement (incl. angle-axis and absolute) → JMZ
             // so the writer folds it into the root bone.
-            "dx,dy,dz,dyaw" | "dx,dy,dz,dangle_axis" | "xyz,absolute" | "xyz_absolute"
-            | "x,y,z,absolute" => Self::Jmz,
+            "dx,dy,dz,dyaw" | "dx,dy,dz,dangle-axis" | "x,y,z - absolute" => Self::Jmz,
             _ => Self::Jmm,
         }
     }
@@ -575,5 +574,41 @@ mod tests {
                 assert!((g - w).abs() < 1e-4, "node {index}: {got:?} vs {want:?}");
             }
         }
+    }
+
+    /// Every movement option any game's schema offers resolves to its
+    /// movement kind and extension. The names are matched literally, so a
+    /// spelling the schemas never use (Reach's `dangle-axis` was matched as
+    /// `dangle_axis`) silently drops the animation's movement.
+    #[test]
+    fn every_schema_frame_info_option_has_a_movement_kind() {
+        use crate::animation::MovementKind;
+        let mut checked = 0;
+        for entry in std::fs::read_dir("../definitions").unwrap().flatten() {
+            for group in ["model_animation_graph.json", "model_animations.json"] {
+                let Ok(text) = std::fs::read_to_string(entry.path().join(group)) else { continue };
+                let schema: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let Some(options) = schema["enums_flags"]["frame_info_type_enum"]["options"].as_array() else { continue };
+                for option in options.iter().filter_map(|option| option.as_str()) {
+                    let movement = MovementKind::from_schema_name(option);
+                    let kind = JmaKind::from_metadata(Some("base"), Some(option), false);
+                    let want = match movement {
+                        MovementKind::None => JmaKind::Jmm,
+                        MovementKind::DxDy => JmaKind::Jma,
+                        MovementKind::DxDyDyaw => JmaKind::Jmt,
+                        _ => JmaKind::Jmz,
+                    };
+                    // Halo 4 and H2A also offer `auto`; what it stores isn't
+                    // established, so it stays unmapped rather than guessed.
+                    assert!(
+                        matches!(option, "none" | "auto") || movement != MovementKind::None,
+                        "{}: {option:?} maps to no movement", entry.path().display(),
+                    );
+                    assert_eq!(kind, want, "{}: {option:?}", entry.path().display());
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 32, "only {checked} options found under ../definitions");
     }
 }

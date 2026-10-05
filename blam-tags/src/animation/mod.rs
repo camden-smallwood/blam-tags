@@ -997,8 +997,8 @@ impl MovementKind {
             "dx,dy" => Self::DxDy,
             "dx,dy,dyaw" => Self::DxDyDyaw,
             "dx,dy,dz,dyaw" => Self::DxDyDzDyaw,
-            "dx,dy,dz,dangle_axis" => Self::DxDyDzDangleAxis,
-            "xyz,absolute" | "xyz_absolute" | "x,y,z,absolute" => Self::XyzAbsolute,
+            "dx,dy,dz,dangle-axis" => Self::DxDyDzDangleAxis,
+            "x,y,z - absolute" => Self::XyzAbsolute,
             _ => Self::None,
         }
     }
