@@ -19045,6 +19045,16 @@ mod x360_cache_conversion {
                         if weights > 0.0 {
                             worst_weight = worst_weight.max((weights - 1.0).abs());
                         }
+                        // And its normal is unit length, read the same way.
+                        let normal = match vertex.field("normal").and_then(|f| f.value()) {
+                            Some(TagFieldData::RealVector3d(n)) => Some((n.i, n.j, n.k)),
+                            Some(TagFieldData::RealPoint3d(n)) => Some((n.x, n.y, n.z)),
+                            _ => None,
+                        };
+                        if let Some((x, y, z)) = normal {
+                            let length = (x * x + y * y + z * z).sqrt();
+                            worst_normal = worst_normal.max((length - 1.0).abs());
+                        }
                     }
                 }
                 for name in value.field_names() {
