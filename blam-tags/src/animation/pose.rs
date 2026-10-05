@@ -503,6 +503,46 @@ impl AnimationClip {
         (reference, Pose { frames })
     }
 
+    /// Compose an **overlay** the way the game plays one at full weight
+    /// (Halo 3's `k_overlay_blend`): every component starts at `base`, and
+    /// only **animated** components change, rotation to `base × delta`,
+    /// translation to `base + delta` and scale to `base × delta`. Static
+    /// tracks are never read; the game decodes them for base animations
+    /// only (`internal_compute_node_orientations_new`). Unlike
+    /// [`overlay_pose`](Self::overlay_pose), which keeps an overlay's static
+    /// values as its reference the way an exported JMO does, this is the
+    /// pose the game shows.
+    pub fn runtime_overlay_pose(&self, skeleton: &Skeleton, base: &[NodeTransform]) -> Pose {
+        let bones = skeleton.len();
+        let frames_n = self.frame_count.max(1) as usize;
+        let resolutions: Vec<BoneResolution> = (0..bones)
+            .map(|b| BoneResolution::for_bone(b, self.node_flags.as_ref()))
+            .collect();
+
+        let mut frames = Vec::with_capacity(frames_n);
+        for f in 0..frames_n {
+            let mut row = Vec::with_capacity(bones);
+            for (b, res) in resolutions.iter().enumerate() {
+                let mut transform = base.get(b).copied().unwrap_or(NodeTransform::IDENTITY);
+                if let TrackSource::Animated(_) = res.rotation {
+                    transform.rotation = transform.rotation
+                        * pick_rotation(self, res, f).unwrap_or(RealQuaternion::IDENTITY);
+                }
+                if let TrackSource::Animated(_) = res.translation {
+                    let d = pick_translation(self, res, f).unwrap_or_default();
+                    let t = transform.translation;
+                    transform.translation = RealPoint3d { x: t.x + d.x, y: t.y + d.y, z: t.z + d.z };
+                }
+                if let TrackSource::Animated(_) = res.scale {
+                    transform.scale *= pick_scale(self, res, f).unwrap_or(1.0);
+                }
+                row.push(transform);
+            }
+            frames.push(row);
+        }
+        Pose { frames }
+    }
+
     /// Compose a **replacement** the way Halo 3 and ODST play one at full
     /// weight: [`replacement_pose`](Self::replacement_pose), retargeted by
     /// the animation's `object-space parent nodes`
@@ -748,6 +788,22 @@ mod tests {
         let [x, y, z] = want;
         let close = (got.x - x).abs() < 1e-5 && (got.y - y).abs() < 1e-5 && (got.z - z).abs() < 1e-5;
         assert!(close, "{what}: {got:?} vs {want:?}");
+    }
+
+    #[test]
+    fn a_runtime_overlay_leaves_static_nodes_on_the_base() {
+        let skeleton = Skeleton { nodes: vec![node("root", 1, -1, -1), node("arm", -1, -1, 0)] };
+        let base = vec![at([0.0; 3], about_z(10.0)), at([1.0, 0.0, 0.0], about_z(20.0))];
+        // The root carries a static (authoring reference) value; the arm a delta.
+        let clip = clip((0b01, vec![about_z(70.0)]), (0b10, vec![about_z(30.0)]), (0, Vec::new()));
+
+        let runtime = clip.runtime_overlay_pose(&skeleton, &base);
+        assert_rotation(runtime.frames[0][0].rotation, about_z(10.0), "static root keeps the base");
+        assert_rotation(runtime.frames[0][1].rotation, about_z(50.0), "arm is base × delta");
+
+        // The export composition keeps the static value as its reference.
+        let (_, exported) = clip.overlay_pose(&skeleton, &base);
+        assert_rotation(exported.frames[0][0].rotation, about_z(70.0), "export keeps the static value");
     }
 
     #[test]
