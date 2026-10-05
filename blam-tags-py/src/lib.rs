@@ -6,13 +6,8 @@
 //! types that cannot be mechanically wrapped — live alongside it and are
 //! registered here.
 //!
-//! Regenerate with:
-//!
-//! ```text
-//! cargo +nightly rustdoc -p blam-tags --features audio,iostore -- \
-//!     -Z unstable-options --output-format json
-//! cargo run -p blam-tags-bindgen
-//! ```
+//! Regenerate with `cargo run -p blam-tags-bindgen`, which documents the
+//! engine with its pinned nightly first (see the crate README).
 
 use pyo3::prelude::*;
 

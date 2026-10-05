@@ -141,11 +141,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Documents the engine with the nightly installed above (the generator's
+      # RUSTDOC_TOOLCHAIN), then generates from that.
       - name: Regenerate
-        run: |
-          cargo +nightly-2026-07-02 rustdoc -p blam-tags --features audio,iostore -- \
-            -Z unstable-options --output-format json
-          cargo run -p blam-tags-bindgen
+        run: cargo run -p blam-tags-bindgen
 
       - name: Fail on a difference
         run: |

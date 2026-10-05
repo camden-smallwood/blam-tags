@@ -1,23 +1,31 @@
 //! Generates the PyO3 bindings for `blam-tags` from rustdoc JSON.
 //!
 //! ```text
-//! cargo +nightly rustdoc -p blam-tags --features audio,iostore -- \
-//!     -Z unstable-options --output-format json
 //! cargo run -p blam-tags-bindgen [-- <rustdoc json> [<bindings.toml>]]
 //! ```
 //!
-//! The features must match the ones `blam-tags-py` enables, or modules
-//! behind them are invisible to the policy check below.
+//! With no arguments it documents `blam-tags` itself first, with the pinned
+//! nightly in [`RUSTDOC_TOOLCHAIN`], the features `blam-tags-py` enables by
+//! default, and a target directory of its own. So the input is always the
+//! engine as it stands: a JSON left in `target/doc` could be from before the
+//! last edit, from another toolchain, or deleted by a plain `cargo doc`. A path
+//! given on the command line is read as it is, for when that is the point.
 //!
-//! Only this generator needs nightly. Its output is checked into the
-//! repository, so the `blam-tags-py` wheel builds on stable. CI regenerates
-//! it and fails on any difference.
+//! Only this generator needs nightly (`rustup toolchain install` the pinned
+//! one). Its output is checked into the repository, so the `blam-tags-py`
+//! wheel builds on stable. CI regenerates it and fails on any difference.
 
 mod emit;
 mod policy;
 mod rdoc;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// The nightly whose rustdoc JSON this generator reads. The format is
+/// unstable and changes between nightlies; [`rdoc::EXPECTED_FORMAT_VERSION`]
+/// is this toolchain's. CI installs the same one.
+const RUSTDOC_TOOLCHAIN: &str = "nightly-2026-07-02";
 
 fn main() {
     if let Err(e) = run() {
@@ -33,9 +41,10 @@ fn run() -> Result<(), String> {
         .to_path_buf();
 
     let mut args = std::env::args().skip(1);
-    let json = args
-        .next()
-        .unwrap_or_else(|| root.join("target/doc/blam_tags.json").display().to_string());
+    let json = match args.next() {
+        Some(json) => json,
+        None => document_engine(&root)?.display().to_string(),
+    };
     let manifest = args
         .next()
         .unwrap_or_else(|| root.join("blam-tags-py/bindings.toml").display().to_string());
@@ -88,6 +97,69 @@ fn run() -> Result<(), String> {
     println!("generated {classes} classes, {methods} methods");
     println!("  src/generated.rs, blam_tags.pyi, COVERAGE.md under {}", out.display());
     Ok(())
+}
+
+/// Run rustdoc over `blam-tags` and return the JSON it wrote.
+fn document_engine(root: &Path) -> Result<PathBuf, String> {
+    let features = python_crate_features(&root.join("blam-tags-py/Cargo.toml"))?;
+    let target = root.join("target/bindgen");
+    println!("documenting blam-tags with {RUSTDOC_TOOLCHAIN} (features: {features})");
+    // `cargo` from PATH, which is rustup's proxy and honours `+toolchain`,
+    // rather than `$CARGO`, the stable cargo running this program. The outer
+    // cargo's own settings are not this build's.
+    let status = Command::new("cargo")
+        .arg(format!("+{RUSTDOC_TOOLCHAIN}"))
+        .args(["rustdoc", "-p", "blam-tags", "--features", &features])
+        .arg("--manifest-path")
+        .arg(root.join("Cargo.toml"))
+        .arg("--target-dir")
+        .arg(&target)
+        .args(["--", "-Z", "unstable-options", "--output-format", "json"])
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("RUSTC")
+        .env_remove("RUSTDOC")
+        .env_remove("CARGO_TARGET_DIR")
+        .status()
+        .map_err(|e| format!("running cargo: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "rustdoc failed ({status}); is the toolchain installed? \
+             rustup toolchain install {RUSTDOC_TOOLCHAIN}"
+        ));
+    }
+    Ok(target.join("doc/blam_tags.json"))
+}
+
+/// The engine features `blam-tags-py` enables by default, comma-separated:
+/// each of its default features that forwards to `blam-tags/<name>`. Read
+/// from its manifest, since the bindings have to describe the engine the
+/// wheel is built against, and a module behind a missing feature would be
+/// invisible to the policy check.
+fn python_crate_features(manifest: &Path) -> Result<String, String> {
+    let text = std::fs::read_to_string(manifest)
+        .map_err(|e| format!("reading {}: {e}", manifest.display()))?;
+    let value: toml::Value =
+        toml::from_str(&text).map_err(|e| format!("parsing {}: {e}", manifest.display()))?;
+    let features = value.get("features").and_then(toml::Value::as_table);
+    let list = |name: &str| -> Vec<String> {
+        features
+            .and_then(|table| table.get(name))
+            .and_then(toml::Value::as_array)
+            .map(|items| items.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+            .unwrap_or_default()
+    };
+    let engine: Vec<String> = list("default")
+        .iter()
+        .flat_map(|feature| list(feature))
+        .filter_map(|item| item.strip_prefix("blam-tags/").map(str::to_owned))
+        .collect();
+    if engine.is_empty() {
+        return Err(format!(
+            "{}: no default feature forwards to blam-tags",
+            manifest.display()
+        ));
+    }
+    Ok(engine.join(","))
 }
 
 fn write(path: &std::path::Path, contents: &str) -> Result<(), String> {

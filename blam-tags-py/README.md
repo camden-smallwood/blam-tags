@@ -18,14 +18,21 @@ All three are **checked in**. `blam-tags` itself is untouched and takes no
 ## Regenerating
 
 ```sh
-cargo +nightly rustdoc -p blam-tags --features audio,iostore -- \
-    -Z unstable-options --output-format json
 cargo run -p blam-tags-bindgen
 ```
 
+The generator documents `blam-tags` itself first, with a pinned nightly
+(`RUSTDOC_TOOLCHAIN` in `blam-tags-bindgen/src/main.rs`; install it with
+`rustup toolchain install`) and the features this crate enables by default,
+into `target/bindgen`. So it always reads the engine as it stands, never a
+JSON left over from an earlier build, another nightly or `cargo doc`. To read
+a particular JSON instead, pass its path: `cargo run -p blam-tags-bindgen --
+<rustdoc json> [<bindings.toml>]`.
+
 Only the generator needs nightly — rustdoc's JSON output is an unstable
-format. The wheel itself builds on stable, because it compiles the
-checked-in source rather than regenerating at build time.
+format, and the generator refuses any version but the one it was written
+for. The wheel itself builds on stable, because it compiles the checked-in
+source rather than regenerating at build time.
 
 Generation is deterministic: the same inputs produce a byte-identical
 `generated.rs`. That makes "regenerate and diff" a viable CI check — if a
