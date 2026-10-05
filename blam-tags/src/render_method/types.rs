@@ -407,9 +407,22 @@ pub enum BitmapFilterMode {
     #[strum(serialize = "lightprobe texture array")]   LightprobeTextureArray = 7,
     #[strum(serialize = "comparison point")]           ComparisonPoint        = 8,
     #[strum(serialize = "comparison bilinear")]        ComparisonBilinear     = 9,
+    // ODST's in place of the comparison modes, at 8 and 9.
+    #[strum(serialize = "anisotropic (8)")]            Anisotropic8           = 10,
+    #[strum(serialize = "anisotropic (16)")]           Anisotropic16          = 11,
+    // Reach, Halo 4 and H2A: unused slots at 3 and 5, texture-array modes at
+    // 8 and 9.
+    #[strum(serialize = "UNUSED 0")]                   Unused0                = 12,
+    #[strum(serialize = "UNUSED 1")]                   Unused1                = 13,
+    #[strum(serialize = "texture array quadlinear")]   TextureArrayQuadlinear = 14,
+    #[strum(serialize = "texture array quadanisotropic (2)")]
+    TextureArrayQuadanisotropic2 = 15,
 }
 
 impl BitmapFilterMode {
+    /// A stored mode by Halo 3's positions. Later games reuse positions 3, 5,
+    /// 8 and 9 for other modes, so a mode's name for display comes from the
+    /// option's own [`RenderMethodOption::filter_mode_names`].
     pub fn from_index(i: i128) -> Option<Self> {
         Some(match i {
             0 => Self::Trilinear,
@@ -443,6 +456,9 @@ pub enum BitmapAddressMode {
     #[strum(serialize = "clamp")]        Clamp       = 1,
     #[strum(serialize = "mirror")]       Mirror      = 2,
     #[strum(serialize = "black border")] BlackBorder = 3,
+    // Reach, Halo 4 and H2A.
+    #[strum(serialize = "mirroronce")]        MirrorOnce       = 4,
+    #[strum(serialize = "mirroronce border")] MirrorOnceBorder = 5,
 }
 
 impl BitmapAddressMode {
@@ -452,6 +468,9 @@ impl BitmapAddressMode {
             1 => Self::Clamp,
             2 => Self::Mirror,
             3 => Self::BlackBorder,
+            // Every game lists Halo 3's four first, so these positions hold.
+            4 => Self::MirrorOnce,
+            5 => Self::MirrorOnceBorder,
             _ => return None,
         })
     }
@@ -834,9 +853,21 @@ pub struct RenderMethodOptionParameter {
     pub default_real_value: f32,
     pub default_int_bool_value: i32,
     pub flags: i16,
+    /// Resolved into Halo 3's modes, which is what the renderer samples
+    /// with. A later game's mode Halo 3 lacks (Reach's `texture array
+    /// quadlinear`) resolves to the default; [`Self::default_filter_mode_index`]
+    /// is the value as stored.
     pub default_filter_mode: Enum<BitmapFilterMode, i16>,
     pub default_comparison_function: Enum<BitmapComparisonFunction, i16>,
+    /// As [`Self::default_filter_mode`]: Halo 3's modes, with the stored
+    /// value in [`Self::default_address_mode_index`].
     pub default_address_mode: Enum<BitmapAddressMode, i16>,
+    /// `default filter mode` as stored: an index into
+    /// [`RenderMethodOption::filter_mode_names`].
+    pub default_filter_mode_index: i16,
+    /// `default address mode` as stored: an index into
+    /// [`RenderMethodOption::address_mode_names`].
+    pub default_address_mode_index: i16,
     pub anisotropy_amount: i16,
     pub default_color: ArgbColor,
     pub default_bitmap_scale: f32,
@@ -926,6 +957,14 @@ pub struct RenderMethodTemplate {
 #[derive(Debug, Clone)]
 pub struct RenderMethodOption {
     pub parameters: Vec<RenderMethodOptionParameter>,
+    /// This game's names for the bitmap filter modes, in schema order. The
+    /// list differs by game — ODST, Reach and later replace Halo 3's last
+    /// entries — so a stored mode is named from here, not from
+    /// [`BitmapFilterMode`]. Empty when the option declares no parameters.
+    pub filter_mode_names: Vec<String>,
+    /// This game's names for the bitmap address modes, in schema order:
+    /// Reach and later add `mirroronce` and `mirroronce border`.
+    pub address_mode_names: Vec<String>,
 }
 
 // =============================================================================
@@ -1211,6 +1250,14 @@ impl RenderMethodDefinitionCategoryOption {
 
 // ---- RenderMethodOption ----
 
+/// Every option name of the enum field `field`, in schema order.
+fn enum_option_names(s: &TagStruct<'_>, field: &str) -> Vec<String> {
+    match s.field(field).and_then(|f| f.options()) {
+        Some(crate::TagOptions::Enum { names, .. }) => names.into_iter().map(str::to_owned).collect(),
+        _ => Vec::new(),
+    }
+}
+
 impl RenderMethodOption {
     pub fn from_tag(tag: &TagFile) -> Result<Self, RenderMethodError> {
         check_group(tag, &[GROUP_RMOP])?;
@@ -1218,11 +1265,19 @@ impl RenderMethodOption {
     }
 
     pub fn from_struct(s: &TagStruct<'_>) -> Result<Self, RenderMethodError> {
-        let parameters = s.field("parameters")
-            .and_then(|f| f.as_block())
-            .map(|b| read_block_vec(&b, RenderMethodOptionParameter::from_struct))
+        let block = s.field("parameters").and_then(|f| f.as_block());
+        let parameters = block
+            .as_ref()
+            .map(|b| read_block_vec(b, RenderMethodOptionParameter::from_struct))
             .unwrap_or_default();
-        Ok(Self { parameters })
+        // The names come from the schema, through any one element.
+        let first = block.as_ref().and_then(|b| b.element(0));
+        let names = |field: &str| first.as_ref().map(|e| enum_option_names(e, field)).unwrap_or_default();
+        Ok(Self {
+            parameters,
+            filter_mode_names: names("default filter mode"),
+            address_mode_names: names("default address mode"),
+        })
     }
 }
 
@@ -1247,6 +1302,8 @@ impl RenderMethodOptionParameter {
                 .try_read_enum("default comparison function")
                 .unwrap_or_default(),
             default_address_mode: s.try_read_enum("default address mode").unwrap_or_default(),
+            default_filter_mode_index: s.read_int_any("default filter mode").unwrap_or(0) as i16,
+            default_address_mode_index: s.read_int_any("default address mode").unwrap_or(0) as i16,
             anisotropy_amount: s.read_int_any("anisotropy amount").unwrap_or(0) as i16,
             default_color,
             default_bitmap_scale: s.read_real("default bitmap scale").unwrap_or(0.0),
@@ -1773,5 +1830,44 @@ mod render_method_extern_tests {
             Some(RenderMethodExtern::EmblemBitmapsAndData)
         );
         assert_eq!(RenderMethodExtern::from_index(RenderMethodExtern::COUNT as i128), None);
+    }
+}
+
+#[cfg(test)]
+mod sampler_mode_name_tests {
+    use super::*;
+    use crate::fields::TagFieldData;
+
+    /// A Reach option keeps its own sampler mode names and its stored
+    /// defaults. Halo 3's typed modes have no `mirroronce` or `texture array
+    /// quadlinear`, so through them a Reach default read as wrap / trilinear.
+    #[test]
+    fn a_reach_option_keeps_its_own_sampler_mode_names() {
+        let mut tag = TagFile::new("../definitions/haloreach_mcc/render_method_option.json").unwrap();
+        {
+            let mut root = tag.root_mut();
+            let mut field = root.field_mut("parameters").unwrap();
+            let mut block = field.as_block_mut().unwrap();
+            block.add_element();
+            let mut element = block.element_mut(0).unwrap();
+            for (name, value) in [("default filter mode", 8), ("default address mode", 4)] {
+                element
+                    .field_mut(name)
+                    .unwrap()
+                    .set(TagFieldData::ShortEnum { value, name: None })
+                    .unwrap();
+            }
+        }
+        let option = RenderMethodOption::from_tag(&tag).unwrap();
+        let parameter = &option.parameters[0];
+        assert_eq!(
+            option.filter_mode_names[parameter.default_filter_mode_index as usize],
+            "texture array quadlinear"
+        );
+        assert_eq!(
+            option.address_mode_names[parameter.default_address_mode_index as usize],
+            "mirroronce"
+        );
+        assert_eq!(option.address_mode_names.len(), 6);
     }
 }
