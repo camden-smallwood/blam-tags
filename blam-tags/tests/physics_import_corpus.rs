@@ -19,7 +19,7 @@ mod common;
 use std::path::PathBuf;
 
 use blam_tags::jms::JmsFile;
-use blam_tags::physics_import::{physics_model_from_jms, PhysicsError, PhysicsOptions};
+use blam_tags::physics_import::{physics_model_from_jms, PhysicsOptions};
 use blam_tags::TagFile;
 use flate2::read::ZlibDecoder;
 

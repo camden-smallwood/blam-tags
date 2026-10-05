@@ -8,8 +8,6 @@ use std::fmt::Write as _;
 
 /// A type selected for generation, with everything emission needs.
 pub struct Target {
-    /// Rust type name (`RealVector3d`).
-    pub rust_name: String,
     /// Fully-qualified Rust path (`blam_tags::math::RealVector3d`).
     pub rust_path: String,
     /// Python class name.
@@ -385,7 +383,6 @@ impl<'a> Emitter<'a> {
                 registry.insert(
                     name.to_string(),
                     Target {
-                        rust_name: name.to_string(),
                         rust_path,
                         wrapper: format!("Py{py_name}"),
                         py_name,
@@ -411,7 +408,6 @@ impl<'a> Emitter<'a> {
                         // independently addressable from the registry.
                         mono.name.clone(),
                         Target {
-                            rust_name: name.to_string(),
                             rust_path: rust_path.clone(),
                             wrapper: format!("Py{}", mono.name),
                             py_name: mono.name.clone(),
@@ -766,7 +762,6 @@ impl<'a> Emitter<'a> {
         // `Self` cannot occur in a free function, so the placeholder target
         // it resolves against is never consulted.
         let placeholder = Target {
-            rust_name: String::new(),
             rust_path: String::new(),
             py_name: String::new(),
             wrapper: String::new(),

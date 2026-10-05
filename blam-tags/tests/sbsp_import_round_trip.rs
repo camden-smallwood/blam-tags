@@ -130,26 +130,6 @@ fn placed_scene(ass: &AssFile) -> Vec<(usize, usize, Vec<[f32; 3]>)> {
     out
 }
 
-fn meshes(ass: &AssFile) -> Vec<(&Vec<blam_tags::ass::AssVertex>, &Vec<blam_tags::ass::AssTriangle>)> {
-    use blam_tags::sbsp_import::{role_of_material, MeshRole};
-    ass.objects
-        .iter()
-        .filter_map(|o| match &o.payload {
-            AssObjectPayload::Mesh { vertices, triangles }
-                if !vertices.is_empty() && !triangles.is_empty() =>
-            {
-                let role = triangles
-                    .first()
-                    .and_then(|t| ass.materials.get(t.material.max(0) as usize))
-                    .map(|m| role_of_material(&m.name))
-                    .unwrap_or(MeshRole::Render);
-                (role == MeshRole::Render).then_some((vertices, triangles))
-            }
-            _ => None,
-        })
-        .collect()
-}
-
 #[test]
 fn a_scene_survives_being_written_into_a_tag_and_read_back() {
     let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };

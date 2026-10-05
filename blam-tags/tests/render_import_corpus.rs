@@ -334,20 +334,6 @@ fn indices_against_tools_own_output() {
     let Some(kit) = common::kit("BLAM_TEST_H3EK") else { return };
     let schema = schema();
 
-    /// Every index tool wrote into this tag.
-    ///
-    /// Shipped geometry lives in a resource, so `raw indices` is not in
-    /// the tag — but each part records its own run length, and those
-    /// cover the buffer apart from the degenerate indices bridging one
-    /// part to the next. Both sides of this comparison carry that same
-    /// small overhead, so it does not favour either.
-    ///
-    /// `index count` is a signed word holding an unsigned value, so a run
-    /// over 32,767 arrives negative.
-    fn shipped_indices(tag: &TagFile) -> Option<usize> {
-        shipped_counts(tag).map(|(i, ..)| i)
-    }
-
     /// Tool's own totals: indices, vertices, meshes, parts.
     fn shipped_counts(tag: &TagFile) -> Option<(usize, usize, usize, usize)> {
         let root = tag.root();

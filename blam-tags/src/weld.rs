@@ -381,7 +381,6 @@ pub fn weld_sectioned(
     // wants.
     let mut point_of_input: Vec<u32> = vec![u32::MAX; vertices.len()];
     let mut point_positions: Vec<RealPoint3d> = Vec::new();
-    let mut kept: Vec<Vec<u32>> = Vec::new();
     for p in 0..positions.len() {
         if !alive[p] {
             continue;
@@ -391,9 +390,7 @@ pub fn weld_sectioned(
         for &i in &members[p] {
             point_of_input[i as usize] = idx;
         }
-        kept.push(std::mem::take(&mut members[p]));
     }
-    let members = kept;
 
     // ---- pass 2: vertices within a point ----------------------------
     let cos_limit = (tol.normal_degrees.to_radians()).cos();

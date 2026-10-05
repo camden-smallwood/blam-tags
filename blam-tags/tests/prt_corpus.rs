@@ -80,7 +80,7 @@ fn what_prt_do_shipped_render_models_carry() {
     // anything.
     let (mut with_prt_data, mut prt_data_bytes) = (0usize, 0usize);
     let mut examples: Vec<String> = Vec::new();
-    /// `(prt type, bytes per vertex, bytes, vertices)`
+    // `(prt type, bytes per vertex, bytes, vertices)`
     let mut ratios: Vec<(usize, f64, usize, usize)> = Vec::new();
 
     for path in common::walk(&kit.tags(), "render_model") {

@@ -1034,8 +1034,7 @@ fn check(d: &Decoded, rays: usize, report: &mut VerifyReport) {
                     report.agreed += 1;
                 } else {
                     report.wrong_surface += 1;
-                    let mut graze = false;
-                    {
+                    let graze = {
                         let m = edge_margin(
                             d,
                             a.surface as usize,
@@ -1047,8 +1046,8 @@ fn check(d: &Decoded, rays: usize, report: &mut VerifyReport) {
                         } else {
                             report.worst_solid_margin = report.worst_solid_margin.max(m);
                         }
-                        graze = m < GRAZE;
-                    }
+                        m < GRAZE
+                    };
                     // Only the non-grazing ones are worth an example: a
                     // rim clip is ambiguous by nature and tool's own
                     // trees show it too, so it would crowd out the real

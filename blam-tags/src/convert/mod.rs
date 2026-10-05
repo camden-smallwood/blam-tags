@@ -11,7 +11,6 @@ use crate::{
     TagFieldData, TagFieldMut, TagFieldPath, TagFieldType, TagFile, TagLayout, TagOptions,
     TagReferenceData, TagResourceKind, TagStruct, TagStructMut, format_group_tag, parse_group_tag,
 };
-use serde::Deserialize;
 use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -21,7 +20,7 @@ use std::path::{Path, PathBuf};
 mod companions;
 pub use companions::*;
 mod resources;
-pub use resources::*;
+use resources::*;
 
 /// A field name reduced to the key the matcher compares on.
 ///
@@ -11708,7 +11707,7 @@ mod tests {
             ) else {
                 continue;
             };
-            let Ok(mut draft) = analyze_conversion(
+            let Ok(draft) = analyze_conversion(
                 &source,
                 "haloce_mcc",
                 "halo2_mcc",
@@ -17159,7 +17158,7 @@ mod x360_cache_conversion {
         let Some(cache) = reach_x360_cache() else { return };
         let group = u32::from_be_bytes(*b"jmad");
         let cap: usize = std::env::var("JMAD_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
-        let mut score = |clip: &crate::animation::AnimationClip, out: &mut (usize, usize, usize, usize)| {
+        let score = |clip: &crate::animation::AnimationClip, out: &mut (usize, usize, usize, usize)| {
             for tracks in std::iter::once(&clip.static_tracks)
                 .chain(clip.animated_tracks.as_ref())
             {

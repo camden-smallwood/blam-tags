@@ -4546,7 +4546,7 @@ mod rename_experiment {
         ] {
             println!("\n  experiment {scope}:");
             let mut shown = 0;
-            for (label, name, referrer) in single.iter().filter(|(l, _, r)| (l != r) == cross) {
+            for (label, name, _) in single.iter().filter(|(l, _, r)| (l != r) == cross) {
                 println!("  {:>6.2} GB  {label:<26} {name}", gb_of(label));
                 shown += 1;
                 if shown == 5 {
