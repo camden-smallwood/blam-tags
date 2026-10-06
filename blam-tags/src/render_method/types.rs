@@ -701,10 +701,9 @@ impl TagBlockIndex {
 /// `definitions/halo3_mcc/render_method_template.json`):
 /// - byte 0..1 = `destination index` — D3D constant register or sampler index
 /// - byte 2    = `source index` — index into `rmt2.float_constants[]` (the
-///               source slot in the constant table this entry pulls from)
+///   source slot in the constant table this entry pulls from)
 /// - byte 3    = `type specific` — "bitmap flags or shader component mask",
-///               not used by `submit_static_ps_parameters` for the real-
-///               constant path
+///   not used by `submit_static_ps_parameters` for the real-constant path
 ///
 /// Verified against runtime dump of multiple riverworld rmt2s 2026-05-06:
 /// byte 2 increments 0,1,2,3 across routing entries (= source_index per
@@ -1326,10 +1325,8 @@ impl RenderMethodTemplate {
         // else fall through to other_platforms[0].
         let pick_block = |name: &str| -> Option<crate::api::TagBlock<'_>> {
             let top = s.field(name).and_then(|f| f.as_block());
-            if let Some(b) = top.as_ref() {
-                if b.len() > 0 {
-                    return top;
-                }
+            if top.as_ref().is_some_and(|b| !b.is_empty()) {
+                return top;
             }
             pc_platform.as_ref()
                 .and_then(|p| p.field(name))
@@ -1374,10 +1371,8 @@ fn read_constant_table_or(
     name: &str,
 ) -> Vec<String> {
     let top_block = top.field(name).and_then(|f| f.as_block());
-    if let Some(b) = top_block.as_ref() {
-        if b.len() > 0 {
-            return read_constant_table(top, name);
-        }
+    if top_block.as_ref().is_some_and(|b| !b.is_empty()) {
+        return read_constant_table(top, name);
     }
     if let Some(p) = pc_platform {
         return read_constant_table(p, name);
@@ -1612,10 +1607,10 @@ where
 {
     let mut out = Vec::with_capacity(block.len());
     for i in 0..block.len() {
-        if let Some(elem) = block.element(i) {
-            if let Ok(v) = f(&elem) {
-                out.push(v);
-            }
+        if let Some(elem) = block.element(i)
+            && let Ok(v) = f(&elem)
+        {
+            out.push(v);
         }
     }
     out
