@@ -46,10 +46,16 @@ pub struct ElementLabels {
     /// markup stripped, so the marker comes from the definitions.
     markers_by_guid: HashMap<[u8; 16], Vec<Marker>>,
     markers_by_name: HashMap<String, Vec<Marker>>,
-    /// `element_label` entries: on structs by guid (gen3) and by name, on
-    /// blocks by name (CE, H2).
+    /// `element_label` entries on structs, by guid (gen3) and by name.
     entries_by_guid: HashMap<[u8; 16], evaluate::Entry>,
     entries_by_name: HashMap<String, evaluate::Entry>,
+    /// `element_label` entries on blocks (CE, H2), by group file and block
+    /// name: Halo 2 reuses block names for different definitions across
+    /// files (its physics `materials_block` has a callback, globals' does
+    /// not).
+    entries_by_block: HashMap<(String, String), evaluate::Entry>,
+    /// Group file → its parent group's file, from `parent_tag`.
+    parent_files: HashMap<String, String>,
     /// Group file → enum name → options, for `|enum:` (Halo 2 reuses enum
     /// names across files, so a lookup tries the entry's own file first).
     enums: HashMap<String, HashMap<String, Vec<Option<String>>>>,
@@ -123,6 +129,8 @@ struct Meta {
 
 #[derive(Deserialize)]
 struct GroupNames {
+    #[serde(default)]
+    parent_tag: Option<String>,
     #[serde(default)]
     blocks: HashMap<String, BlockNames>,
     #[serde(default)]
@@ -249,6 +257,15 @@ impl ElementLabels {
             let group: GroupNames = serde_json::from_slice(&std::fs::read(&path)?)
                 .map_err(|error| ElementLabelsError::Json(path.clone(), error))?;
             let file = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+            if let Some(parent) = &group.parent_tag {
+                let bytes = parent.as_bytes();
+                if bytes.len() == 4 {
+                    let tag = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    if let Some(parent_file) = labels.group_names.get(&tag) {
+                        labels.parent_files.insert(file.clone(), parent_file.clone());
+                    }
+                }
+            }
             let enums = labels.enums.entry(file.clone()).or_default();
             for (name, options) in group.enums_flags {
                 enums.insert(name, options.options);
@@ -259,7 +276,7 @@ impl ElementLabels {
                 }
                 if let Some(entry) = block.element_label {
                     let entry = parse_entry(entry, &file, &path, &key)?;
-                    labels.entries_by_name.insert(key, entry);
+                    labels.entries_by_block.insert((file.clone(), key), entry);
                 }
             }
             for (key, structure) in group.structs {
@@ -308,7 +325,7 @@ impl ElementLabels {
         let Some(element) = element else {
             return self.bad_index(index);
         };
-        if let Some(entry) = self.entry(block, element) {
+        if let Some(entry) = self.entry(ctx, block, element) {
             let here = evaluate::Here { chain: ancestors.to_vec(), block, index, element };
             if let Some(label) = self.evaluate_entry(ctx, entry, &here) {
                 return label;
@@ -322,9 +339,9 @@ impl ElementLabels {
 
     /// The `element_label` entry for an element of `block`, if its definition
     /// has one.
-    fn entry(&self, block: TagBlock<'_>, element: TagStruct<'_>) -> Option<&evaluate::Entry> {
+    fn entry(&self, ctx: &Context, block: TagBlock<'_>, element: TagStruct<'_>) -> Option<&evaluate::Entry> {
         match self.settings.callback {
-            CallbackScope::Block => self.entries_by_name.get(block.definition().name()),
+            CallbackScope::Block => self.block_entry(ctx, block.definition().name()),
             CallbackScope::Struct => {
                 let guid = element.definition().guid();
                 (guid != [0; 16])
@@ -333,6 +350,20 @@ impl ElementLabels {
                     .or_else(|| self.entries_by_name.get(element.name()))
             }
         }
+    }
+
+    /// A block's entry, from the tag's group file or one of its parents'.
+    /// Classic block names aren't unique across files, so with the group
+    /// unknown there is none.
+    fn block_entry(&self, ctx: &Context, name: &str) -> Option<&evaluate::Entry> {
+        let mut file = ctx.group.and_then(|group| self.group_names.get(&group))?;
+        for _ in 0..16 {
+            if let Some(entry) = self.entries_by_block.get(&(file.clone(), name.to_owned())) {
+                return Some(entry);
+            }
+            file = self.parent_files.get(file)?;
+        }
+        None
     }
 
     fn enum_option(&self, file: &str, name: &str, value: i64) -> Option<String> {
@@ -351,10 +382,22 @@ impl ElementLabels {
             .unwrap_or_else(|| group.to_be_bytes().iter().map(|&b| b as char).collect::<String>().trim_end().to_owned())
     }
 
+    /// The label of element `index` of the block at `block_path` in `tag`,
+    /// with the tag's group known to the rule.
+    pub fn label_tag(&self, tag: &crate::TagFile, block_path: &str, index: i64) -> Option<String> {
+        let ctx = Context { group: Some(tag.group().tag) };
+        self.label_at_in(&ctx, tag.root(), block_path, index)
+    }
+
     /// The label of element `index` of the block at `block_path` under `root`,
     /// e.g. `"squads[2]/spawn points"`. `None` when the path doesn't reach a
     /// block.
     pub fn label_at(&self, root: TagStruct<'_>, block_path: &str, index: i64) -> Option<String> {
+        self.label_at_in(&Context::default(), root, block_path, index)
+    }
+
+    /// [`Self::label_at`] with a [`Context`].
+    pub fn label_at_in(&self, ctx: &Context, root: TagStruct<'_>, block_path: &str, index: i64) -> Option<String> {
         let mut ancestors = vec![root];
         let mut segments = block_path.split('/').peekable();
         let mut so_far = String::new();
@@ -370,7 +413,7 @@ impl ElementLabels {
             so_far.push_str(segment);
             ancestors.push(root.descend(&so_far)?);
         }
-        Some(self.label(&ancestors, block?, index))
+        Some(self.label_in(ctx, &ancestors, block?, index))
     }
 
     /// The field whose value labels `element` under the `^` rule, if any.
@@ -758,7 +801,7 @@ mod tests {
     }
 
     fn label(rules: &ElementLabels, tag: &crate::TagFile, block: &str, index: i64) -> String {
-        rules.label_at(tag.root(), block, index).unwrap_or_else(|| panic!("no block {block}"))
+        rules.label_tag(tag, block, index).unwrap_or_else(|| panic!("no block {block}"))
     }
 
     /// CE's markers come from the definitions: the tag's layout strips `^`.
@@ -799,6 +842,39 @@ mod tests {
         let rifle = classic_tag("haloce_mcc", &tags.join("weapons/sniper rifle/sniper rifle.weapon"));
         assert_eq!(label(&rules, &rifle, "triggers", 0), "primary");
         assert_eq!(label(&rules, &rifle, "item/object/functions", 0), "A out (muzzle flash)");
+    }
+
+    /// H2's label callbacks: entries are found by the tag's group (Halo 2
+    /// reuses block names across files), placements name their object only in
+    /// a scenario, zone sets read the scenario's zones, constraint edges and
+    /// rigid bodies the physics model's nodes and regions.
+    #[test]
+    fn h2_callbacks_follow_guerilla() {
+        let Some(tags) = kit_tags("BLAM_TEST_H2EK") else { return };
+        let rules = rules("halo2_mcc");
+        let delta = classic_tag("halo2_mcc", &tags.join("scenarios/solo/08b_deltacontrol/08b_deltacontrol.scenario"));
+        assert_eq!(label(&rules, &delta, "controls", 0), "s8_hunter_door_switch dcr_holo_switch");
+        assert_eq!(label(&rules, &delta, "Orders[0]/Primary area set", 0), "areas_1 (e1_scarab_canyon_wraiths)");
+        let resource = classic_tag(
+            "halo2_mcc",
+            &tags.join("scenarios/solo/08b_deltacontrol/resources/08b_deltacontrol.scenario_devices_resource"),
+        );
+        assert_eq!(label(&rules, &resource, "controls", 0), " dcr_holo_switch");
+        let mp = classic_tag("halo2_mcc", &tags.join("multiplayer/multiplayer_globals.multiplayer_globals"));
+        assert_eq!(label(&rules, &mp, "runtime[0]/general events", 1), "kill : effect player");
+        let dialogue = classic_tag("halo2_mcc", &tags.join("ai/ai_dialogue_globals.ai_dialogue_globals"));
+        assert_eq!(label(&rules, &dialogue, "patterns", 0), "death/chr_kllfoe");
+        let tram = classic_tag(
+            "halo2_mcc",
+            &tags.join("scenarios/objects/solo/spacestation/ss_tram_car/ss_tram_car.physics_model"),
+        );
+        assert_eq!(label(&rules, &tram, "node edges", 0), "*door_2:car");
+        let wall = classic_tag(
+            "halo2_mcc",
+            &tags.join("scenarios/objects/special/player_wall_solid/player_wall_solid.physics_model"),
+        );
+        assert_eq!(label(&rules, &wall, "rigid bodies", 0), "player_wall (default default)");
+        assert_eq!(label(&rules, &wall, "materials", 0), "energy");
     }
 
     /// H2: an enum prints its option name, an old_string_id its string.
@@ -1034,7 +1110,7 @@ mod tests {
     fn element_label_entries_check_out() {
         for (game, complete) in [
             ("haloce_mcc", true),
-            ("halo2_mcc", false),
+            ("halo2_mcc", true),
             ("halo3_mcc", false),
             ("halo3odst_mcc", false),
             ("haloreach_mcc", false),
