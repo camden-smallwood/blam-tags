@@ -13,11 +13,14 @@
 //! 4. otherwise `"%d. %s"` with the block's display name (CE, H2) or the
 //!    struct's short name (gen3).
 //!
-//! The per-game differences are data: `definitions/<game>/_element_labels.json`
-//! carries the settings, and the dumps carry the names step 4 prints (a block's
+//! The per-game differences are data: `definitions/<game>/_meta.json`'s
+//! `element_labels` carries the settings, and the dumps carry the names step 4 prints (a block's
 //! `display_name`, a struct's `short_name`, each written only when it differs
 //! from the key). The rules were read from each editor's code; the plan in
 //! Baboon's `todo/block-element-labels.md` lists the functions.
+
+mod evaluate;
+pub mod template;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -42,6 +45,22 @@ pub struct ElementLabels {
     /// markup stripped, so the marker comes from the definitions.
     markers_by_guid: HashMap<[u8; 16], Vec<Marker>>,
     markers_by_name: HashMap<String, Vec<Marker>>,
+    /// `element_label` entries: on structs by guid (gen3) and by name, on
+    /// blocks by name (CE, H2).
+    entries_by_guid: HashMap<[u8; 16], evaluate::Entry>,
+    entries_by_name: HashMap<String, evaluate::Entry>,
+    /// Group file → enum name → options, for `|enum:` (Halo 2 reuses enum
+    /// names across files, so a lookup tries the entry's own file first).
+    enums: HashMap<String, HashMap<String, Vec<Option<String>>>>,
+    /// Group tag → group name (the extension), from `_meta.json`.
+    group_names: HashMap<u32, String>,
+}
+
+/// What the rule knows about the tag being labelled.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Context {
+    /// The owning tag's group, for `{#group}`.
+    pub group: Option<u32>,
 }
 
 /// Where a struct definition's first `^` field sits: its position among the
@@ -92,9 +111,13 @@ enum FlagsStyle {
     Names,
 }
 
+/// `_meta.json`, for the keys this module reads.
 #[derive(Deserialize)]
-struct LabelsFile {
-    settings: Settings,
+struct Meta {
+    #[serde(default)]
+    element_labels: Option<Settings>,
+    #[serde(default)]
+    tag_index: HashMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -103,12 +126,50 @@ struct GroupNames {
     blocks: HashMap<String, BlockNames>,
     #[serde(default)]
     structs: HashMap<String, StructNames>,
+    #[serde(default)]
+    enums_flags: HashMap<String, EnumOptions>,
+}
+
+#[derive(Deserialize)]
+struct EnumOptions {
+    #[serde(default)]
+    options: Vec<Option<String>>,
 }
 
 #[derive(Deserialize)]
 struct BlockNames {
     #[serde(default)]
     display_name: Option<String>,
+    #[serde(default)]
+    element_label: Option<EntryJson>,
+}
+
+/// An `element_label` as written in a group file.
+#[derive(Deserialize)]
+struct EntryJson {
+    #[serde(default)]
+    source: String,
+    /// `null`: a callback no template expresses; see `reason`.
+    label: Option<Vec<AlternativeJson>>,
+    #[serde(default)]
+    maps: HashMap<String, MapJson>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AlternativeJson {
+    Plain(String),
+    When { when: String, format: String },
+}
+
+#[derive(Deserialize)]
+struct MapJson {
+    #[serde(default)]
+    names: Vec<Option<String>>,
+    #[serde(default)]
+    values: HashMap<String, String>,
+    #[serde(default, rename = "else")]
+    otherwise: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -119,6 +180,8 @@ struct StructNames {
     short_name: Option<String>,
     #[serde(default)]
     fields: Vec<FieldNames>,
+    #[serde(default)]
+    element_label: Option<EntryJson>,
 }
 
 #[derive(Deserialize)]
@@ -132,6 +195,8 @@ struct FieldNames {
 pub enum ElementLabelsError {
     Io(std::io::Error),
     Json(std::path::PathBuf, serde_json::Error),
+    /// An `element_label` whose template or `when` doesn't parse.
+    Template { file: std::path::PathBuf, key: String, error: template::ParseError },
 }
 
 impl std::fmt::Display for ElementLabelsError {
@@ -139,6 +204,7 @@ impl std::fmt::Display for ElementLabelsError {
         match self {
             Self::Io(error) => write!(f, "{error}"),
             Self::Json(path, error) => write!(f, "{}: {error}", path.display()),
+            Self::Template { file, key, error } => write!(f, "{} {key}: {error}", file.display()),
         }
     }
 }
@@ -151,19 +217,25 @@ impl From<std::io::Error> for ElementLabelsError {
 
 impl ElementLabels {
     /// Load one game's rules from its definitions folder
-    /// (`definitions/halo3_mcc`). A folder with no `_element_labels.json`
-    /// gets gen3's rules.
+    /// (`definitions/halo3_mcc`): the settings from `_meta.json`'s
+    /// `element_labels`, the names and markers from the group files. A game
+    /// with no settings gets gen3's rules.
     pub fn load(game_dir: impl AsRef<Path>) -> Result<Self, ElementLabelsError> {
         let game_dir = game_dir.as_ref();
-        let settings_path = game_dir.join("_element_labels.json");
-        let settings = match std::fs::read(&settings_path) {
-            Ok(bytes) => serde_json::from_slice::<LabelsFile>(&bytes)
-                .map_err(|error| ElementLabelsError::Json(settings_path.clone(), error))?
-                .settings,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Settings::default(),
+        let meta_path = game_dir.join("_meta.json");
+        let meta = match std::fs::read(&meta_path) {
+            Ok(bytes) => serde_json::from_slice::<Meta>(&bytes)
+                .map_err(|error| ElementLabelsError::Json(meta_path.clone(), error))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Meta { element_labels: None, tag_index: HashMap::new() },
             Err(error) => return Err(error.into()),
         };
-        let mut labels = ElementLabels { settings, ..ElementLabels::default() };
+        let mut labels = ElementLabels { settings: meta.element_labels.unwrap_or_default(), ..ElementLabels::default() };
+        for (group, name) in meta.tag_index {
+            let bytes = group.as_bytes();
+            if bytes.len() == 4 {
+                labels.group_names.insert(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]), name);
+            }
+        }
         for entry in std::fs::read_dir(game_dir)? {
             let path = entry?.path();
             let is_group = path.extension().is_some_and(|ext| ext == "json")
@@ -173,15 +245,31 @@ impl ElementLabels {
             }
             let group: GroupNames = serde_json::from_slice(&std::fs::read(&path)?)
                 .map_err(|error| ElementLabelsError::Json(path.clone(), error))?;
+            let file = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+            let enums = labels.enums.entry(file.clone()).or_default();
+            for (name, options) in group.enums_flags {
+                enums.insert(name, options.options);
+            }
             for (key, block) in group.blocks {
                 if let Some(display) = block.display_name {
-                    labels.block_display_names.insert(key, display);
+                    labels.block_display_names.insert(key.clone(), display);
+                }
+                if let Some(entry) = block.element_label {
+                    let entry = parse_entry(entry, &file, &path, &key)?;
+                    labels.entries_by_name.insert(key, entry);
                 }
             }
             for (key, structure) in group.structs {
                 let guid = structure.guid.as_deref().and_then(parse_guid).filter(|g| *g != [0; 16]);
                 if let (Some(guid), Some(short)) = (guid, structure.short_name) {
                     labels.struct_short_names.insert(guid, short);
+                }
+                if let Some(entry) = structure.element_label {
+                    let entry = parse_entry(entry, &file, &path, &key)?;
+                    if let Some(guid) = guid {
+                        labels.entries_by_guid.insert(guid, entry.clone());
+                    }
+                    labels.entries_by_name.insert(key.clone(), entry);
                 }
                 let marker = structure.fields.iter().enumerate().find_map(|(ordinal, field)| {
                     let name = field.name.as_deref()?;
@@ -207,14 +295,57 @@ impl ElementLabels {
     /// root) first and the struct with the block field last. They are where a
     /// block-index field looks for its target block, after the element itself.
     pub fn label(&self, ancestors: &[TagStruct<'_>], block: TagBlock<'_>, index: i64) -> String {
+        self.label_in(&Context::default(), ancestors, block, index)
+    }
+
+    /// [`Self::label`], knowing more about the tag (its group, for templates
+    /// that ask).
+    pub fn label_in(&self, ctx: &Context, ancestors: &[TagStruct<'_>], block: TagBlock<'_>, index: i64) -> String {
         let element = usize::try_from(index).ok().and_then(|i| block.element(i));
         let Some(element) = element else {
             return self.bad_index(index);
         };
-        if let Some(label) = self.marked_field_label(ancestors, element) {
+        if let Some(entry) = self.entry(block, element) {
+            let here = evaluate::Here { chain: ancestors.to_vec(), block, index, element };
+            if let Some(label) = self.evaluate_entry(ctx, entry, &here) {
+                return label;
+            }
+        }
+        if let Some(label) = self.marked_field_label(ctx, ancestors, element) {
             return label;
         }
         format!("{index}. {}", self.fallback_name(block, element))
+    }
+
+    /// The `element_label` entry for an element of `block`, if its definition
+    /// has one.
+    fn entry(&self, block: TagBlock<'_>, element: TagStruct<'_>) -> Option<&evaluate::Entry> {
+        match self.settings.callback {
+            CallbackScope::Block => self.entries_by_name.get(block.definition().name()),
+            CallbackScope::Struct => {
+                let guid = element.definition().guid();
+                (guid != [0; 16])
+                    .then(|| self.entries_by_guid.get(&guid))
+                    .flatten()
+                    .or_else(|| self.entries_by_name.get(element.name()))
+            }
+        }
+    }
+
+    fn enum_option(&self, file: &str, name: &str, value: i64) -> Option<String> {
+        let options = self
+            .enums
+            .get(file)
+            .and_then(|enums| enums.get(name))
+            .or_else(|| self.enums.values().find_map(|enums| enums.get(name)))?;
+        options.get(usize::try_from(value).ok()?)?.clone()
+    }
+
+    fn group_extension(&self, group: u32) -> String {
+        self.group_names
+            .get(&group)
+            .cloned()
+            .unwrap_or_else(|| group.to_be_bytes().iter().map(|&b| b as char).collect::<String>().trim_end().to_owned())
     }
 
     /// The label of element `index` of the block at `block_path` under `root`,
@@ -267,19 +398,19 @@ impl ElementLabels {
     }
 
     /// Step 3: the first `^` field, in flattened field order, formatted.
-    fn marked_field_label(&self, ancestors: &[TagStruct<'_>], element: TagStruct<'_>) -> Option<String> {
+    fn marked_field_label(&self, ctx: &Context, ancestors: &[TagStruct<'_>], element: TagStruct<'_>) -> Option<String> {
         let (field, holder) = self.find_marked_field(element)?;
         let mut chain = ancestors.to_vec();
         chain.push(element);
         if holder.raw().as_ptr() != element.raw().as_ptr() {
             chain.push(holder);
         }
-        Some(self.format_value(&chain, field))
+        Some(self.format_value(ctx, &chain, field))
     }
 
     /// The generic value formatter, with separator `,` and verbose off.
     /// `chain` ends with the struct holding `field`.
-    fn format_value(&self, chain: &[TagStruct<'_>], field: TagField<'_>) -> String {
+    fn format_value(&self, ctx: &Context, chain: &[TagStruct<'_>], field: TagField<'_>) -> String {
         use TagFieldType as T;
         match field.field_type() {
             T::Block => return field.as_block().map_or(0, |b| b.len()).to_string(),
@@ -291,7 +422,7 @@ impl ElementLabels {
                 return field
                     .as_resource()
                     .and_then(|resource| resource.as_struct())
-                    .map(|inner| self.marked_field_label(chain, inner).unwrap_or_default())
+                    .map(|inner| self.marked_field_label(ctx, chain, inner).unwrap_or_default())
                     .unwrap_or_else(|| "<unavailable>".to_owned());
             }
             T::ApiInterop => return "<unavailable>".to_owned(),
@@ -323,9 +454,9 @@ impl ElementLabels {
             D::ByteBlockFlags(v) => v.to_string(),
             D::WordBlockFlags(v) => (v as i16).to_string(),
             D::LongBlockFlags(v) => v.to_string(),
-            D::CharBlockIndex(v) | D::CustomCharBlockIndex(v) => self.block_index(chain, field, v as i64),
-            D::ShortBlockIndex(v) | D::CustomShortBlockIndex(v) => self.block_index(chain, field, v as i64),
-            D::LongBlockIndex(v) | D::CustomLongBlockIndex(v) => self.block_index(chain, field, v as i64),
+            D::CharBlockIndex(v) | D::CustomCharBlockIndex(v) => self.block_index(ctx, chain, field, v as i64),
+            D::ShortBlockIndex(v) | D::CustomShortBlockIndex(v) => self.block_index(ctx, chain, field, v as i64),
+            D::LongBlockIndex(v) | D::CustomLongBlockIndex(v) => self.block_index(ctx, chain, field, v as i64),
             D::Angle(v) => g6(degrees(v)),
             D::Real(v) | D::RealSlider(v) | D::RealFraction(v) => g6(v as f64),
             D::Point2d(p) => format!("{},{}", p.x, p.y),
@@ -405,12 +536,12 @@ impl ElementLabels {
 
     /// A block index takes its target element's label: the whole rule again,
     /// on the block the field points into.
-    fn block_index(&self, chain: &[TagStruct<'_>], field: TagField<'_>, index: i64) -> String {
+    fn block_index(&self, ctx: &Context, chain: &[TagStruct<'_>], field: TagField<'_>, index: i64) -> String {
         if index == -1 {
             return "NONE".to_owned();
         }
         match find_target_block(chain, field) {
-            Some((depth, block)) => self.label(&chain[..=depth], block, index),
+            Some((depth, block)) => self.label_in(ctx, &chain[..=depth], block, index),
             None => self.bad_index(index),
         }
     }
@@ -480,7 +611,7 @@ pub fn g6(value: f64) -> String {
     let scientific = format!("{:.*e}", (PRECISION - 1) as usize, value);
     let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
     let exponent: i32 = exponent.parse().unwrap_or(0);
-    if exponent < -4 || exponent >= PRECISION {
+    if !(-4..PRECISION).contains(&exponent) {
         let mantissa = trim_fraction(mantissa);
         let sign = if exponent < 0 { '-' } else { '+' };
         format!("{mantissa}e{sign}{:02}", exponent.abs())
@@ -496,6 +627,38 @@ fn trim_fraction(text: &str) -> &str {
     } else {
         text
     }
+}
+
+fn parse_entry(entry: EntryJson, file: &str, path: &Path, key: &str) -> Result<evaluate::Entry, ElementLabelsError> {
+    let fail = |error| ElementLabelsError::Template { file: path.to_owned(), key: key.to_owned(), error };
+    let alternatives = match entry.label {
+        None => None,
+        Some(list) => Some(
+            list.into_iter()
+                .map(|alternative| {
+                    Ok(match alternative {
+                        AlternativeJson::Plain(text) => evaluate::Alternative {
+                            when: None,
+                            template: template::parse_template(&text).map_err(fail)?,
+                        },
+                        AlternativeJson::When { when, format } => evaluate::Alternative {
+                            when: Some(template::parse_condition(&when).map_err(fail)?),
+                            template: template::parse_template(&format).map_err(fail)?,
+                        },
+                    })
+                })
+                .collect::<Result<Vec<_>, ElementLabelsError>>()?,
+        ),
+    };
+    let maps = entry
+        .maps
+        .into_iter()
+        .map(|(name, map)| {
+            let values = map.values.into_iter().filter_map(|(k, v)| Some((k.parse().ok()?, v))).collect();
+            (name, evaluate::LabelMap { names: map.names, values, otherwise: map.otherwise })
+        })
+        .collect();
+    Ok(evaluate::Entry { source: entry.source, alternatives, maps, file: file.to_owned() })
 }
 
 fn push_unique(markers: &mut Vec<Marker>, marker: Marker) {
@@ -652,5 +815,184 @@ mod tests {
         );
         let deaths = crate::TagFile::read(tags.join("objects/characters/default.death_program_selector")).unwrap();
         assert_eq!(label(&rules, &deaths, "special type[0]/damage type[0]/velocity", 1), "0.6");
+    }
+
+    /// A small definitions folder whose structs carry `element_label`s, and a
+    /// tag built from it with `things` and `names` filled in.
+    fn template_fixture() -> (std::path::PathBuf, crate::TagFile) {
+        use crate::fields::TagFieldData as D;
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "element-label-templates-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let game = root.join("halo3_mcc");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(
+            game.join("_meta.json"),
+            r#"{"game":"halo3_mcc","tag_index":{"labt":"label_test"},"element_labels":{"callback":"struct","fallback_name":"struct","bad_index":"BAD: %d","flags":"names"}}"#,
+        )
+        .unwrap();
+        let schema = r##"{
+          "name": "label_test", "tag": "labt", "version": 1, "flags": 0, "block": "label_test_block",
+          "blocks": {
+            "label_test_block": {"max_count": 1, "struct": "label_test_struct"},
+            "thing_block": {"max_count": 32, "struct": "thing_struct"},
+            "name_block": {"max_count": 32, "struct": "name_struct"},
+            "plain_block": {"max_count": 32, "struct": "plain_struct"}
+          },
+          "structs": {
+            "label_test_struct": {"guid": "00000000000000000000000000000001", "size": 36, "fields": [
+              {"type": "block", "name": "things", "definition": "thing_block"},
+              {"type": "block", "name": "names", "definition": "name_block"},
+              {"type": "block", "name": "plains", "definition": "plain_block"},
+              {"type": "terminator", "name": null}]},
+            "thing_struct": {"guid": "00000000000000000000000000000002", "size": 44, "fields": [
+              {"type": "string", "name": "name"},
+              {"type": "short_block_index", "name": "named", "definition": "name_block"},
+              {"type": "short_enum", "name": "type", "definition": "kind_enum"},
+              {"type": "long_flags", "name": "flags", "definition": "thing_flags"},
+              {"type": "long_integer", "name": "count"},
+              {"type": "terminator", "name": null}],
+              "element_label": {"source": "test", "label": [
+                {"when": "{flags} & 1", "format": "NOT {type|map:kinds}"},
+                {"when": "{#group} == \"labt\" && {count} > 99", "format": "big {/names[{named|index}]/text} {#1}/{#count}"},
+                "{name} ({count:03d})",
+                "{named}",
+                "#{#1}"],
+                "maps": {"kinds": {"names": ["alpha", "beta"], "else": "other"}}}},
+            "name_struct": {"guid": "00000000000000000000000000000003", "size": 32, "fields": [
+              {"type": "string", "name": "text^"},
+              {"type": "terminator", "name": null}],
+              "element_label": {"source": "test", "label": [
+                {"when": "{text} == \"quiet\"", "format": ""},
+                "<{text}>"]}},
+            "plain_struct": {"guid": "00000000000000000000000000000004", "size": 32, "fields": [
+              {"type": "string", "name": "label^"},
+              {"type": "terminator", "name": null}],
+              "element_label": {"source": "test", "label": null}}
+          },
+          "enums_flags": {
+            "kind_enum": {"options": ["a", "b", "c"]},
+            "thing_flags": {"options": ["negate", "other"]}
+          }
+        }"##;
+        std::fs::write(game.join("label_test.json"), schema).unwrap();
+        let mut tag = crate::TagFile::new(game.join("label_test.json")).unwrap();
+        let set = |tag: &mut crate::TagFile, block: &str, index: usize, field: &str, value: D| {
+            let mut root = tag.root_mut();
+            let mut block = root.field_mut(block).unwrap();
+            let mut block = block.as_block_mut().unwrap();
+            while block.len() <= index {
+                block.add_element();
+            }
+            let mut element = block.element_mut(index).unwrap();
+            element.field_mut(field).unwrap().set(value).unwrap();
+        };
+        set(&mut tag, "names", 0, "text", D::String("first".into()));
+        set(&mut tag, "names", 1, "text", D::String("quiet".into()));
+        // thing 0: flag bit 0 set → the `when`.
+        set(&mut tag, "things", 0, "flags", D::LongFlags { value: 1, names: Vec::new() });
+        set(&mut tag, "things", 0, "type", D::ShortEnum { value: 1, name: None });
+        // thing 1: a name → the plain alternative, with a zero-padded count.
+        set(&mut tag, "things", 1, "name", D::String("hello".into()));
+        set(&mut tag, "things", 1, "count", D::LongInteger(7));
+        set(&mut tag, "things", 1, "named", D::ShortBlockIndex(-1));
+        // thing 2: no name, a block index → the target element's own template.
+        set(&mut tag, "things", 2, "named", D::ShortBlockIndex(0));
+        // thing 3: nothing set and the index is −1 → the last alternative.
+        set(&mut tag, "things", 3, "named", D::ShortBlockIndex(-1));
+        // thing 4: count above 99 → the root path, only with the group known.
+        set(&mut tag, "things", 4, "count", D::LongInteger(100));
+        set(&mut tag, "things", 4, "named", D::ShortBlockIndex(0));
+        // thing 5: an out-of-range map value → the map's `else`.
+        set(&mut tag, "things", 5, "flags", D::LongFlags { value: 1, names: Vec::new() });
+        set(&mut tag, "things", 5, "type", D::ShortEnum { value: 2, name: None });
+        set(&mut tag, "plains", 0, "label", D::String("generic".into()));
+        (root, tag)
+    }
+
+    #[test]
+    fn templates_pick_the_first_alternative_that_applies() {
+        let (root, tag) = template_fixture();
+        let rules = ElementLabels::load(root.join("halo3_mcc")).unwrap();
+        let things = tag.root().field("things").unwrap().as_block().unwrap();
+        let names = tag.root().field("names").unwrap().as_block().unwrap();
+        let plains = tag.root().field("plains").unwrap().as_block().unwrap();
+        let chain = [tag.root()];
+        let label = |block, index| rules.label(&chain, block, index);
+        assert_eq!(label(things, 0), "NOT beta");
+        assert_eq!(label(things, 1), "hello (007)");
+        // A block index takes its target's label, template and all.
+        assert_eq!(label(things, 2), "<first>");
+        assert_eq!(label(things, 3), "#4");
+        assert_eq!(label(things, 5), "NOT other");
+        // `{#group}` is unset without a context, so that alternative is skipped
+        // and the block index applies; with the group it matches.
+        assert_eq!(label(things, 4), "<first>");
+        let ctx = Context { group: Some(u32::from_be_bytes(*b"labt")) };
+        assert_eq!(rules.label_in(&ctx, &chain, things, 4), "big first 5/6");
+        // An empty result is final; it does not fall through.
+        assert_eq!(label(names, 1), "");
+        assert_eq!(label(names, 0), "<first>");
+        // `label: null` defers to the generic rule.
+        assert_eq!(label(plains, 0), "generic");
+        assert_eq!(label(things, 99), "BAD: 99");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_template_that_does_not_parse_fails_the_load() {
+        let (root, _) = template_fixture();
+        let path = root.join("halo3_mcc/label_test.json");
+        let text = std::fs::read_to_string(&path).unwrap().replace("{named}", "{named|nope}");
+        std::fs::write(&path, text).unwrap();
+        let error = ElementLabels::load(root.join("halo3_mcc")).unwrap_err().to_string();
+        assert!(error.contains("thing_struct") && error.contains("nope"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One alternative at a time on `thing_struct`, to exercise each piece of
+    /// the grammar against the same tag.
+    #[test]
+    fn template_grammar_against_a_tag() {
+        let (root, tag) = template_fixture();
+        let path = root.join("halo3_mcc/label_test.json");
+        let original = std::fs::read_to_string(&path).unwrap();
+        let start = original.find(r#""element_label": {"source": "test", "label": ["#).unwrap();
+        let end = start + original[start..].find(r#""maps""#).unwrap();
+        let things = tag.root().field("things").unwrap().as_block().unwrap();
+        let chain = [tag.root()];
+        let check = |label: &str, index: i64, want: &str| {
+            let entry = format!(r#""element_label": {{"source": "test", "label": [{label}], "#);
+            std::fs::write(&path, format!("{}{entry}{}", &original[..start], &original[end..])).unwrap();
+            let rules = ElementLabels::load(root.join("halo3_mcc")).unwrap();
+            assert_eq!(rules.label(&chain, things, index), want, "{label}");
+        };
+        // A predicate: the first `names` element whose text equals this one's name.
+        check(r#""{/names[text == \"quiet\"]/text}""#, 0, "quiet");
+        // Ending at the element itself takes its label, template and all (an
+        // empty template result included).
+        check(r#""[{/names[text == \"quiet\"]}]""#, 0, "[]");
+        check(r#""[{/names[text == \"first\"]}]""#, 0, "[<first>]");
+        // No element matches: the slot is unset, so the only alternative
+        // doesn't apply and the generic rule labels it.
+        check(r#""[{/names[text == {name}]}]""#, 1, "1. thing_struct");
+        // A predicate whose bare path compares against a literal, then a sub-path.
+        check(r#""{/names[text != \"first\"]/text|noalias}""#, 0, "quiet");
+        // `any()` over a block, with bare paths relative to each element.
+        check(r#"{"when": "any(/names[*], text == \"quiet\")", "format": "has quiet"}, "no""#, 0, "has quiet");
+        check(r#"{"when": "any(/names[*], text == \"loud\")", "format": "has loud"}, "no""#, 0, "no");
+        // starts_with, a `|count`, and `|join` over another block's labels.
+        check(r#"{"when": "starts_with({name}, \"hel\")", "format": "{/names|count}: {/names|join:+}"}, "-""#, 1, "2: <first>+");
+        // An enum by name, flags by name with a separator, and arithmetic.
+        check(r#""{type|enum:kind_enum} {flags|flags:/} {count * 3 + 1}""#, 1, "a  22");
+        check(r#""{type|enum:kind_enum} {flags|flags:/}""#, 0, "b negate");
+        // `|none:` replaces a block index's NONE text and keeps the slot set;
+        // `|index` is the raw value.
+        check(r#""{named|none:nobody}/{named|index}""#, 3, "nobody/-1");
+        check(r#""{named|none:nobody}/{named|index}""#, 2, "<first>/0");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
