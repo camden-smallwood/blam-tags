@@ -67,6 +67,7 @@ pub mod io;
 pub mod error;
 pub mod fields;
 pub mod field_name;
+pub mod element_label;
 pub mod layout;
 pub mod schema;
 pub mod schema_compare;
