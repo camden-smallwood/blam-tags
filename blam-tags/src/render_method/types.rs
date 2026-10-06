@@ -74,6 +74,7 @@ pub enum GlobalSortLayer {
 pub enum GlobalRenderMethodRuntimeFlags {
     #[strum(serialize = "use VS with misc")] UseVsWithMisc = 0,
 }
+use crate::fields::TagFieldType;
 use crate::file::TagFile;
 use crate::math::ArgbColor;
 use crate::tag_function::TagFunction;
@@ -657,18 +658,6 @@ impl RenderMethodClass {
             }
         })
     }
-
-    /// How many `sted` `material name` slots this subclass's outer struct
-    /// carries: 4 for terrain (one per blend channel), 1 for the
-    /// material-bearing shaders, 0 for the rest.
-    fn material_name_count(self) -> usize {
-        match self {
-            Self::Terrain => 4,
-            Self::Shader | Self::Halogram | Self::Cortana | Self::Custom | Self::Foliage
-            | Self::Skin => 1,
-            _ => 0,
-        }
-    }
 }
 
 // =============================================================================
@@ -1041,9 +1030,9 @@ pub struct RenderMethod {
     /// matching `group_tag` — it is collision-free where the raw fourccs
     /// alias (Contrail vs Cortana).
     pub class: RenderMethodClass,
-    /// `sted` global-material name(s) from the subclass's OUTER struct:
-    /// 4 for terrain (one per blend channel 0-3), 1 for shader/halogram/
-    /// cortana/custom/foliage/skin, empty otherwise. Only populated by
+    /// `sted` global-material name(s) from the subclass's OUTER struct,
+    /// as many as it declares: 4 for terrain (one per blend channel 0-3),
+    /// up to 8 for Reach's mux, 1 for most others, empty for some. Only populated by
     /// [`Self::from_tag`] (the outer fields live above the embedded
     /// `c_render_method` and aren't reachable from `from_struct`).
     pub material_names: Vec<String>,
@@ -1054,33 +1043,9 @@ pub struct RenderMethod {
 // =============================================================================
 
 const GROUP_RM:   [u8; 4] = *b"rm  ";
-const GROUP_RMSH: [u8; 4] = *b"rmsh";
 const GROUP_RMDF: [u8; 4] = *b"rmdf";
 const GROUP_RMOP: [u8; 4] = *b"rmop";
 const GROUP_RMT2: [u8; 4] = *b"rmt2";
-
-/// Variants of `rm**` that we accept as input to [`RenderMethod::from_tag`].
-/// All embed a `render_method` struct field at the top of their layout.
-///
-/// These are the REAL group fourccs (cross-checked against the shipped
-/// tag set + `_meta.json`). The five embedded-only subclasses
-/// (Skin/Beam/LightVolume/Particle/Contrail — zero standalone files in
-/// H3/Reach/H4) are kept here for `from_tag` robustness; particle and
-/// contrail use their nominal `?rmp`/`?rmc` schema slots (a `0x3f`
-/// leading byte) rather than the previous bogus `rmp `/`rmco` stand-ins
-/// (`rmco` is not a real tag, and the old list aliased contrail onto a
-/// nonexistent group while `contrail_system` stamped it as `rmct` =
-/// cortana). Standalone files of these never exist; the container
-/// walkers build them via `from_struct` and set `class` directly.
-const RENDER_METHOD_GROUPS: &[[u8; 4]] = &[
-    GROUP_RM,
-    GROUP_RMSH,                     // rmsh shader
-    *b"rmtr", *b"rmw ", *b"rmfl",   // terrain, water, foliage
-    *b"rmd ", *b"rmhg", *b"rmsk",   // decal, halogram, skin
-    *b"rmct", *b"rmcs",             // cortana, custom
-    *b"rmb ", *b"rmlv",             // beam, light_volume (embedded-only)
-    *b"\x3frmp", *b"\x3frmc",       // particle, contrail — nominal ?rmp/?rmc
-];
 
 fn check_group(tag: &TagFile, allowed: &[[u8; 4]]) -> Result<(), RenderMethodError> {
     let actual = tag.group().tag.to_be_bytes();
@@ -1093,19 +1058,45 @@ fn check_group(tag: &TagFile, allowed: &[[u8; 4]]) -> Result<(), RenderMethodErr
 
 // ---- RenderMethod ----
 
+/// The `c_render_method` a subclass's root inherits: the struct reached by
+/// following first fields that are structs until one is named
+/// "render_method". `None` when the chain ends first.
+fn inherited_render_method(root: TagStruct<'_>) -> Option<TagStruct<'_>> {
+    let mut current = root;
+    loop {
+        let first = current.fields().next()?;
+        if first.field_type() != TagFieldType::Struct {
+            return None;
+        }
+        let name = first.clean_name();
+        let next = current.descend(&name)?;
+        if name == "render_method" {
+            return Some(next);
+        }
+        current = next;
+    }
+}
+
 impl RenderMethod {
-    /// Parse an `rm**` tag (or its base `rm  `). Subclass tags (rmsh,
-    /// rmtr, ...) embed the `c_render_method` portion as a nested
-    /// struct field named "render_method"; we descend into it before
-    /// reading.
+    /// Parse the base `rm  ` tag or any group that inherits it. A child
+    /// group embeds its parent's struct as the first field of its root
+    /// (and a grandchild its parent's, which embeds `c_render_method` in
+    /// turn), so every `rm**` subclass (rmsh, rmtr, ODST's rmss and rmbk,
+    /// Reach's rmgl and rmmx, H4's rmwf, ...) reaches a struct named
+    /// "render_method" by following first fields. That is the test, not a
+    /// list of groups, which would miss each new subclass a game adds.
     pub fn from_tag(tag: &TagFile) -> Result<Self, RenderMethodError> {
-        check_group(tag, RENDER_METHOD_GROUPS)?;
         let group_tag = tag.group().tag;
         let root = tag.root();
-        // Subclasses (rmsh etc.) wrap c_render_method as a struct field.
-        let rm = root
-            .descend("render_method")
-            .unwrap_or(root);
+        let rm = if group_tag.to_be_bytes() == GROUP_RM {
+            Some(root)
+        } else {
+            inherited_render_method(root)
+        }
+        .ok_or(RenderMethodError::WrongGroup {
+            expected: GROUP_RM,
+            actual: group_tag.to_be_bytes(),
+        })?;
         let mut out = Self::from_struct(&rm)?;
         out.group_tag = group_tag;
         out.class = RenderMethodClass::from_group_tag(group_tag.to_be_bytes())
@@ -1113,20 +1104,17 @@ impl RenderMethod {
         // Read the subclass's OUTER `sted` material name(s) — they live
         // on `root` (the subclass struct), siblings of the embedded
         // `render_method` field, so they're only reachable here (not in
-        // `from_struct`). Terrain carries 4 (one per blend channel),
-        // the material-bearing shaders 1; others none. Field names are
-        // stored clean (no `#doc` suffix), verified against the H3 tags.
-        let count = out.class.material_name_count();
-        if count == 1 {
-            if let Some(name) = root.read_string_id("material name") {
-                out.material_names.push(name);
-            }
-        } else if count == 4 {
-            for i in 0..4 {
-                let name = root
-                    .read_string_id(&format!("material name {i}"))
-                    .unwrap_or_default();
-                out.material_names.push(name);
+        // `from_struct`). Each subclass declares its own: terrain one per
+        // blend channel (`material name 0`-`3`), Reach's mux up to 8,
+        // most others one `material name`, some none.
+        if group_tag.to_be_bytes() != GROUP_RM {
+            for field in root.fields() {
+                let name = field.clean_name();
+                if field.field_type() == TagFieldType::StringId
+                    && (name == "material name" || name.starts_with("material name "))
+                {
+                    out.material_names.push(root.read_string_id(&name).unwrap_or_default());
+                }
             }
         }
         Ok(out)
