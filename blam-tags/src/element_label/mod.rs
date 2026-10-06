@@ -19,6 +19,7 @@
 //! from the key). The rules were read from each editor's code; the plan in
 //! Baboon's `todo/block-element-labels.md` lists the functions.
 
+pub mod check;
 mod evaluate;
 pub mod template;
 
@@ -153,6 +154,8 @@ struct EntryJson {
     label: Option<Vec<AlternativeJson>>,
     #[serde(default)]
     maps: HashMap<String, MapJson>,
+    #[serde(default)]
+    max_length: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -658,7 +661,13 @@ fn parse_entry(entry: EntryJson, file: &str, path: &Path, key: &str) -> Result<e
             (name, evaluate::LabelMap { names: map.names, values, otherwise: map.otherwise })
         })
         .collect();
-    Ok(evaluate::Entry { source: entry.source, alternatives, maps, file: file.to_owned() })
+    Ok(evaluate::Entry {
+        source: entry.source,
+        alternatives,
+        maps,
+        max_length: entry.max_length,
+        file: file.to_owned(),
+    })
 }
 
 fn push_unique(markers: &mut Vec<Marker>, marker: Marker) {
@@ -767,6 +776,29 @@ mod tests {
         assert_eq!(label(&rules, &a50, "object names", 9999), "BAD");
         let model = classic_tag("haloce_mcc", &tags.join("weapons/sniper rifle/sniper rifle.gbxmodel"));
         assert_eq!(label(&rules, &model, "shaders", 0), "sniper rifle metal");
+    }
+
+    /// CE's label callbacks, through their `element_label` entries: a table
+    /// (the unit-seat animation the plan opened with), a placement's object
+    /// name and palette file, a squad under its encounter's platoon, an AI
+    /// command, a pitch range, a weapon trigger.
+    #[test]
+    fn ce_callbacks_follow_guerilla() {
+        let Some(tags) = kit_tags("BLAM_TEST_HCEEK") else { return };
+        let rules = rules("haloce_mcc");
+        let animations = classic_tag("haloce_mcc", &tags.join("weapons/flamethrower/fp/fp.model_animations"));
+        assert_eq!(label(&rules, &animations, "UNITS[0]/animations", 0), "airborne-dead");
+        let a50 = classic_tag("haloce_mcc", &tags.join("levels/a50/a50_cinema.scenario"));
+        assert_eq!(label(&rules, &a50, "scenery", 0), "marine1_plasma plasma_rifle");
+        let d40 = classic_tag("haloce_mcc", &tags.join("levels/d40/d40.scenario"));
+        assert_eq!(label(&rules, &d40, "encounters[0]/squads", 2), "(def)carriers");
+        assert_eq!(label(&rules, &d40, "command lists[0]/commands", 0), " 0: pause 0.1");
+        assert_eq!(label(&rules, &d40, "command lists[2]/commands", 1), " 1: move forwards for 2.0 sec");
+        let engine = classic_tag("haloce_mcc", &tags.join("sound/sfx/vehicles/warthog_7_engine.sound"));
+        assert_eq!(label(&rules, &engine, "pitch ranges", 0), "porsche_med:1.40 to 1.75");
+        let rifle = classic_tag("haloce_mcc", &tags.join("weapons/sniper rifle/sniper rifle.weapon"));
+        assert_eq!(label(&rules, &rifle, "triggers", 0), "primary");
+        assert_eq!(label(&rules, &rifle, "item/object/functions", 0), "A out (muzzle flash)");
     }
 
     /// H2: an enum prints its option name, an old_string_id its string.
@@ -993,6 +1025,44 @@ mod tests {
         // `|index` is the raw value.
         check(r#""{named|none:nobody}/{named|index}""#, 3, "nobody/-1");
         check(r#""{named|none:nobody}/{named|index}""#, 2, "<first>/0");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every game's entries parse and name real fields; the games whose
+    /// entries are written have one for every label callback.
+    #[test]
+    fn element_label_entries_check_out() {
+        for (game, complete) in [
+            ("haloce_mcc", true),
+            ("halo2_mcc", false),
+            ("halo3_mcc", false),
+            ("halo3odst_mcc", false),
+            ("haloreach_mcc", false),
+            ("halo4_mcc", false),
+            ("halo2amp_mcc", false),
+        ] {
+            let problems = check::check(format!("../definitions/{game}"), complete).unwrap();
+            assert!(problems.is_empty(), "{game}:\n{}", problems.join("\n"));
+        }
+    }
+
+    /// The checks disagree with a broken entry: a misspelt field, a missing
+    /// map, and a callback with no entry are each reported.
+    #[test]
+    fn element_label_checks_catch_mistakes() {
+        let (root, _) = template_fixture();
+        let path = root.join("halo3_mcc/label_test.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("{name} ({count:03d})", "{nmae} ({count:03d})")
+            .replace("{type|map:kinds}", "{type|map:sorts}")
+            .replace(r#""plain_struct": {"#, r#""plain_struct": {"element_label_callback": "test 0x1", "#)
+            .replace(r#""element_label": {"source": "test", "label": null}"#, r#""unused": 0"#);
+        std::fs::write(&path, text).unwrap();
+        let problems = check::check(root.join("halo3_mcc"), true).unwrap().join("\n");
+        assert!(problems.contains("no field `nmae`"), "{problems}");
+        assert!(problems.contains("no map `sorts`"), "{problems}");
+        assert!(problems.contains("plain_struct: has a label callback but no element_label"), "{problems}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

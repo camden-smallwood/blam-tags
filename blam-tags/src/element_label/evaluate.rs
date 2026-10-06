@@ -19,6 +19,9 @@ pub(super) struct Entry {
     /// labelled by the generic rule.
     pub alternatives: Option<Vec<Alternative>>,
     pub maps: HashMap<String, LabelMap>,
+    /// The editor formats into a buffer this many characters long (CE's
+    /// unicode string list: 31).
+    pub max_length: Option<usize>,
     /// The group file the entry sits in, for `|enum:` names (scoped per file
     /// in Halo 2).
     pub file: String,
@@ -79,7 +82,13 @@ impl ElementLabels {
                 None => self.all_slots_set(ctx, entry, here, &alternative.template),
             };
             if applies {
-                return Some(self.render_template(ctx, entry, here, &alternative.template));
+                let mut text = self.render_template(ctx, entry, here, &alternative.template);
+                if let Some(max) = entry.max_length
+                    && let Some((cut, _)) = text.char_indices().nth(max)
+                {
+                    text.truncate(cut);
+                }
+                return Some(text);
             }
         }
         None
@@ -127,7 +136,8 @@ impl ElementLabels {
                     Hash::Index => Val::Number(here.index as f64),
                     Hash::Index1 => Val::Number(here.index as f64 + 1.0),
                     Hash::Count => Val::Number(count),
-                    Hash::Fraction => Val::Number(if count > 1.0 { here.index as f64 / (count - 1.0) } else { 0.0 }),
+                    // CE's look function: a one-element block is at 1.0.
+                    Hash::Fraction => Val::Number(if count > 1.0 { here.index as f64 / (count - 1.0) } else { 1.0 }),
                     Hash::Block => Val::Text(here.block.definition().name().to_owned()),
                     Hash::Group => match ctx.group {
                         Some(group) => Val::Text(group.to_be_bytes().iter().map(|&b| b as char).collect()),
@@ -211,7 +221,15 @@ impl ElementLabels {
         let len = match (&block, field.as_array()) {
             (Some(block), _) => block.len(),
             (None, Some(array)) => array.len(),
-            (None, None) => return,
+            (None, None) => {
+                // `{bounds[0]}`: one component of a multi-value field.
+                if let (true, Select::Literal(i)) = (last, select)
+                    && let Some(value) = field.value().and_then(|v| component(&v, *i))
+                {
+                    out.push(Val::Number(value));
+                }
+                return;
+            }
         };
         let element = |index: usize| match (&block, field.as_array()) {
             (Some(block), _) => block.element(index),
@@ -434,7 +452,8 @@ impl ElementLabels {
                         let Some(bytes) = field.as_data() else { return String::new() };
                         return if *filter == Filter::Text {
                             let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                            String::from_utf8_lossy(&bytes[..end]).into_owned()
+                            // The editors print the bytes as they are.
+                            bytes[..end].iter().map(|&b| b as char).collect()
                         } else {
                             let units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&u| u != 0).collect();
                             String::from_utf16_lossy(&units)
@@ -495,6 +514,34 @@ impl ElementLabels {
         }
         text
     }
+}
+
+/// Component `i` of a multi-value field: bounds (lower, upper), points and
+/// vectors (x/i, y/j, z/k, w), planes, colors and euler angles, in storage
+/// order.
+fn component(value: &TagFieldData, i: i64) -> Option<f64> {
+    use TagFieldData as D;
+    let parts: Vec<f64> = match value {
+        D::Point2d(p) => vec![p.x as f64, p.y as f64],
+        D::Rectangle2d(r) => vec![r.top as f64, r.left as f64, r.bottom as f64, r.right as f64],
+        D::ShortIntegerBounds(b) => vec![b.lower as f64, b.upper as f64],
+        D::AngleBounds(b) | D::RealBounds(b) | D::FractionBounds(b) => vec![b.lower as f64, b.upper as f64],
+        D::RealPoint2d(p) => vec![p.x as f64, p.y as f64],
+        D::RealPoint3d(p) => vec![p.x as f64, p.y as f64, p.z as f64],
+        D::RealVector2d(v) => vec![v.i as f64, v.j as f64],
+        D::RealVector3d(v) => vec![v.i as f64, v.j as f64, v.k as f64],
+        D::RealQuaternion(q) => vec![q.i as f64, q.j as f64, q.k as f64, q.w as f64],
+        D::RealEulerAngles2d(e) => vec![e.yaw as f64, e.pitch as f64],
+        D::RealEulerAngles3d(e) => vec![e.yaw as f64, e.pitch as f64, e.roll as f64],
+        D::RealPlane2d(p) => vec![p.i as f64, p.j as f64, p.d as f64],
+        D::RealPlane3d(p) => vec![p.i as f64, p.j as f64, p.k as f64, p.d as f64],
+        D::RealRgbColor(c) => vec![c.red as f64, c.green as f64, c.blue as f64],
+        D::RealArgbColor(c) => vec![c.alpha as f64, c.red as f64, c.green as f64, c.blue as f64],
+        D::RealHsvColor(c) => vec![c.hue as f64, c.saturation as f64, c.value as f64],
+        D::RealAhsvColor(c) => vec![c.alpha as f64, c.hue as f64, c.saturation as f64, c.value as f64],
+        _ => return None,
+    };
+    parts.get(usize::try_from(i).ok()?).copied()
 }
 
 fn block_index_value(value: &TagFieldData) -> Option<i64> {
