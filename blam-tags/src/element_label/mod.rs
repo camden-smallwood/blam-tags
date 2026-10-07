@@ -1206,6 +1206,39 @@ mod tests {
         assert_eq!(label(&rules, &menu, "cubemaps", 1), "cubemap   1 : reference 3");
     }
 
+    /// Halo 4's label callbacks. Sound RTPCs read the owning object's
+    /// attachments; rewards do arithmetic on two fields; a damage transfer
+    /// whose section is out of range prints no name, as tag_test does.
+    #[test]
+    fn halo4_callbacks_follow_tag_test() {
+        let Some(tags) = kit_tags("BLAM_TEST_H4EK") else { return };
+        let rules = rules("halo4_mcc");
+        let read = |path: &str| crate::TagFile::read(tags.join(path)).unwrap();
+        let jet_pack = read("objects/equipment/storm_jet_pack/storm_jet_pack.equipment");
+        assert_eq!(label(&rules, &jet_pack, "Sound RTPCs", 0), "jetpack_loop -> equipment_energy_burned");
+        let smg = read("objects/weapons/rifle/storm_forerunner_smg/storm_forerunner_smg.weapon");
+        assert_eq!(label(&rules, &smg, "Sound RTPCs", 0), "No attachment - uses main body");
+        let scorpion = read("objects/vehicles/human/storm_scorpion/storm_scorpion.vehicle");
+        assert_eq!(label(&rules, &scorpion, "Sound Sweeteners", 0), "engine_audio -> ");
+        let results = read("globals/game_results.game_completion_rewards_globals");
+        assert_eq!(label(&rules, &results, "firefight[0]/easy matchmaking", 1), "62.0 xp per min +151% win/+0% place");
+        let sacrifice = read("cinematics/cin_m091b_sacrifice/cin_m091b_sacrifice_000.cinematic_scene");
+        assert_eq!(label(&rules, &sacrifice, "shots[0]/screen effects", 0), "0. cinematic_fade (1 - 155)");
+        let kiss = read("cinematics/cin_m093_midnightkiss/cin_m093_midnightkiss_010.cinematic_scene_data");
+        assert_eq!(label(&rules, &kiss, "shots[0]/dialogue", 0), "0. c_m93_00100");
+        let missile = read("objects/temp/jacben/cruise_missile_model.model");
+        assert_eq!(
+            label(&rules, &missile, "damage info/damage sections[0]/instant responses[0]/response damage transfers", 0),
+            "0.75 ceil: -> ",
+        );
+        let enlistment = read("globals/player_enlistment_globals.player_enlistment_globals_definition");
+        assert_eq!(label(&rules, &enlistment, "enlistments[0]/grades", 1), "11730 xp: wetwork_grade_1");
+        let laser = read("objects/weapons/pistol/storm_target_laser/storm_target_laser.weapon");
+        assert_eq!(label(&rules, &laser, "item/object/function switches[0]/switched functions", 1), "0.50 - 1.00 : primary_charged");
+        let incidents = read("globals/game_incident.incident_globals_definition");
+        assert_eq!(label(&rules, &incidents, "incidents[0]/response", 0), " player_kill_player challenges");
+    }
+
     /// A small definitions folder whose structs carry `element_label`s, and a
     /// tag built from it with `things` and `names` filled in.
     fn template_fixture() -> (std::path::PathBuf, crate::TagFile) {
@@ -1400,7 +1433,7 @@ mod tests {
             ("halo3_mcc", true),
             ("halo3odst_mcc", true),
             ("haloreach_mcc", true),
-            ("halo4_mcc", false),
+            ("halo4_mcc", true),
             ("halo2amp_mcc", false),
         ] {
             let problems = check::check(format!("../definitions/{game}"), complete).unwrap();
