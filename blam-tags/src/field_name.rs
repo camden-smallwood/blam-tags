@@ -90,9 +90,23 @@ pub struct FieldNameInfo<'a> {
 
 impl<'a> FieldNameInfo<'a> {
     /// The name to display in a grid/tree: the `&` override if present, else the
-    /// clean name.
-    pub fn display(&self) -> &str {
-        self.display_name.unwrap_or(&self.clean_name)
+    /// clean name as it was written. Foundation turns `/` into `\` only in the
+    /// name a field is addressed by, so a path can't split on it, and shows
+    /// `left/right bleed`; the definitions have no name with a `\` of its own.
+    pub fn display(&self) -> Cow<'_, str> {
+        match self.display_name {
+            Some(display) => Cow::Borrowed(display),
+            None if self.clean_name.contains('\\') => Cow::Owned(self.clean_name.replace('\\', "/")),
+            None => Cow::Borrowed(&self.clean_name),
+        }
+    }
+
+    /// The `[…]` range hint as it is shown: closed, when the name left its `[`
+    /// open (Halo 3's and Reach's `left/right bleed:[0 = no bleed, 1 = swap
+    /// left/right, 0.5 = mono` does).
+    pub fn range_text(&self) -> Option<Cow<'a, str>> {
+        let range = self.range?;
+        Some(if range.ends_with(']') { Cow::Borrowed(range) } else { Cow::Owned(format!("{range}]")) })
     }
 }
 
@@ -195,10 +209,14 @@ fn clean_name_cow(raw: &str) -> Cow<'_, str> {
 
 /// The `[…]` range hint including its brackets, if the name carries a
 /// well-formed one. Uses the first `[` and its matching-position `]`.
+/// The `[…]` range hint in `raw`, brackets and all. A `[` never closed runs to
+/// the end: it is still a range, written without its `]`, not units.
 fn range_hint(raw: &str) -> Option<&str> {
     let open = raw.find('[')?;
-    let close = raw[open..].find(']')? + open;
-    (close > open).then(|| &raw[open..=close])
+    match raw[open..].find(']') {
+        Some(close) => Some(&raw[open..=open + close]),
+        None => non_empty(raw[open..].trim_end()),
+    }
 }
 
 #[cfg(test)]
@@ -207,6 +225,22 @@ mod tests {
 
     fn clean(raw: &str) -> String {
         clean_field_name(raw).into_owned()
+    }
+
+    /// Halo 3's and Reach's `left/right bleed` never closes its range: it is
+    /// still the range, not units, and shows closed; its name shows with `/`.
+    #[test]
+    fn an_unclosed_range_runs_to_the_end_and_shows_closed() {
+        let info = parse_field_name("left/right bleed:[0 = no bleed, 1 = swap left/right, 0.5 = mono");
+        assert_eq!(info.clean_name, "left\\right bleed");
+        assert_eq!(info.display(), "left/right bleed");
+        assert_eq!(info.units, None);
+        assert_eq!(info.range, Some("[0 = no bleed, 1 = swap left/right, 0.5 = mono"));
+        assert_eq!(info.range_text().as_deref(), Some("[0 = no bleed, 1 = swap left/right, 0.5 = mono]"));
+        // A closed one is left as it is, and a shipped tag's stripped name
+        // displays the same.
+        assert_eq!(parse_field_name("ambient color:[0,255]").range_text().as_deref(), Some("[0,255]"));
+        assert_eq!(parse_field_name("left\\right bleed").display(), "left/right bleed");
     }
 
     #[test]
