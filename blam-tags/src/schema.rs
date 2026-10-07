@@ -1358,7 +1358,16 @@ fn build_layout_from_schema(
     // Everything above builds a layout that is *correct*. This makes it the one
     // the engine would have written: the tables re-ordered by the walk from the
     // root block, and the identifier a freshly-authored layout carries.
-    reemit_in_engine_order(&mut result);
+    //
+    // Not for a classic game. A classic tag has no `blay` for the order to
+    // matter to, and the re-emit writes every zero-width field as `custom` —
+    // which on Halo 2 includes `useless_pad`, a field the V1–V3 (`ambl`,
+    // `LAMB`, `MLAB`) forms store at its real length. Without it the classic
+    // reader read those tags 40 or 96 bytes early: `ai/all.style` took a flags
+    // word for a block count and ran off the end of the file.
+    if !is_classic_game(defs_dir) {
+        reemit_in_engine_order(&mut result);
+    }
     result.version = persist_layout_version(defs_dir);
     result.root_data_size = u32::MAX;
     result.guid = new_layout_guid();
@@ -1379,6 +1388,14 @@ fn build_layout_from_schema(
 /// this importer emitted for every group before, every engine from Halo 3 on
 /// reads it, and the two differ only in whether `stv4`'s per-struct version
 /// field is present.
+/// Whether `defs_dir` holds a classic game's definitions (Halo CE or Halo 2),
+/// whose tags are read and written without a `blay`.
+fn is_classic_game(defs_dir: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(defs_dir.join("_meta.json")) else { return false };
+    let Ok(meta): Result<serde_json::Value, _> = serde_json::from_slice(&bytes) else { return false };
+    matches!(meta.get("game").and_then(|value| value.as_str()), Some("haloce_mcc") | Some("halo2_mcc"))
+}
+
 fn persist_layout_version(defs_dir: &Path) -> u32 {
     let Ok(bytes) = std::fs::read(defs_dir.join("_meta.json")) else { return 3 };
     let Ok(meta): Result<serde_json::Value, _> = serde_json::from_slice(&bytes) else { return 3 };
@@ -2417,5 +2434,41 @@ mod tests {
             .find(|s| layout.get_string(s.name_offset) == Some("render_method_postprocess_block"))
             .unwrap();
         assert_eq!(postprocess.size, 172);
+    }
+
+    /// A Halo 2 layout keeps its `useless_pad` fields. The `MLAB` and older
+    /// forms store them at their real length, so a layout that wrote them as
+    /// zero-width `custom` fields put every later field of those tags in the
+    /// wrong place: `style`'s flags were read as block counts, and 18 kit
+    /// tags failed to read while hundreds more read wrong without an error.
+    #[test]
+    fn halo2_layouts_keep_useless_pad() {
+        let layout = TagLayout::from_json("../definitions/halo2_mcc/style.json").unwrap();
+        let pads: Vec<u32> = layout
+            .fields
+            .iter()
+            .filter(|f| f.field_type == TagFieldType::UselessPad)
+            .map(|f| f.definition)
+            .collect();
+        assert_eq!(pads, [24, 12, 60]);
+
+        let Some(kit) = std::env::var_os("BLAM_TEST_H2EK").map(std::path::PathBuf::from) else {
+            eprintln!("skipped the kit half: no BLAM_TEST_H2EK");
+            return;
+        };
+        let read = |name: &str| {
+            let bytes = std::fs::read(kit.join("tags/ai").join(name)).unwrap();
+            crate::classic::read_classic_tag_file(&bytes, layout.clone())
+        };
+        // Ran off the end of the file: `Style control` was read as the
+        // `Special movement` count.
+        read("all.style").unwrap();
+        // Read without an error, and `Behaviors1` came back 0.
+        let turret = read("integrated_turret.style").unwrap();
+        let behaviors = turret.root().field("Behaviors1").and_then(|f| f.value());
+        assert!(
+            matches!(behaviors, Some(crate::TagFieldData::LongFlags { value: 0x1A00_60BE, .. })),
+            "{behaviors:?}"
+        );
     }
 }
