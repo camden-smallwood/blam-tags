@@ -1204,6 +1204,9 @@ mod tests {
         assert_eq!(label(&rules, &bonus, "squads[0]/spawn points", 0), "crew: driver");
         let menu = read("levels/ui/mainmenu/mainmenu.scenario");
         assert_eq!(label(&rules, &menu, "cubemaps", 1), "cubemap   1 : reference 3");
+        // Source tags leave the packed graph index at -1, so no graph is found.
+        let jorge = read("objects/characters/spartan_jorge/spartan_jorge.model_animation_graph");
+        assert_eq!(label(&rules, &jorge, "content/modes[2]/weapon class[0]/ranged actions[0]/animations", 0), "<invalid animation>");
     }
 
     /// Halo 4's label callbacks. Sound RTPCs read the owning object's
@@ -1237,6 +1240,8 @@ mod tests {
         assert_eq!(label(&rules, &laser, "item/object/function switches[0]/switched functions", 1), "0.50 - 1.00 : primary_charged");
         let incidents = read("globals/game_incident.incident_globals_definition");
         assert_eq!(label(&rules, &incidents, "incidents[0]/response", 0), " player_kill_player challenges");
+        let pawn = read("objects/characters/storm_pawn/storm_pawn.model_animation_graph");
+        assert_eq!(label(&rules, &pawn, "content/modes[2]/weapon class[0]/ranged actions[0]/animations", 0), "<invalid animation>");
     }
 
     /// A small definitions folder whose structs carry `element_label`s, and a
