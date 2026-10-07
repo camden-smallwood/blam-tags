@@ -1227,7 +1227,7 @@ mod tests {
             ("haloce_mcc", true),
             ("halo2_mcc", true),
             ("halo3_mcc", true),
-            ("halo3odst_mcc", false),
+            ("halo3odst_mcc", true),
             ("haloreach_mcc", false),
             ("halo4_mcc", false),
             ("halo2amp_mcc", false),

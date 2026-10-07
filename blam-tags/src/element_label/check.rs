@@ -60,6 +60,11 @@ impl Schema {
                                 .as_array()
                                 .into_iter()
                                 .flatten()
+                                // A tag's layout carries an explanation as an unnamed,
+                                // zero-width field, so no path can name one; Halo 3 ODST's
+                                // scenario has an explanation and a block both called
+                                // `campaign players`.
+                                .filter(|f| f["type"] != "explanation")
                                 .filter_map(|f| {
                                     let name = f["name"].as_str()?;
                                     Some((
