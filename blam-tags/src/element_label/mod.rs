@@ -1166,6 +1166,46 @@ mod tests {
         assert_eq!(label(&rules, &deaths, "special type[0]/damage type[0]/velocity", 1), "0.6");
     }
 
+    /// Reach's label callbacks. Remap tables index the owning list's weapons or
+    /// vehicles; damage transfers and chud placements build their text from
+    /// optional pieces; a negative CRC prints its 32-bit pattern.
+    #[test]
+    fn reach_callbacks_follow_managedblam() {
+        let Some(tags) = kit_tags("BLAM_TEST_HREK") else { return };
+        let rules = rules("haloreach_mcc");
+        let read = |path: &str| crate::TagFile::read(tags.join(path)).unwrap();
+        let objects = read("multiplayer/globals.multiplayer_object_type_list");
+        assert_eq!(label(&rules, &objects, "weapon remapping[0]/remap table", 0), "plasma_pistol -> magnum");
+        assert_eq!(label(&rules, &objects, "weapon remapping[0]/remap table", 2), "energy_sword -> REMOVE");
+        assert_eq!(label(&rules, &objects, "vehicle remapping[0]/remap table", 0), "warthog -> mongoose");
+        let bracers = read("objects/weapons/melee/skirmisher_bracers/skirmisher_bracers.model");
+        assert_eq!(label(&rules, &bracers, "damage info/damage sections[1]/section damage transfers", 0), "0.50 pts: -> parent");
+        let warthog = read("objects/vehicles/human/warthog/warthog.model");
+        assert_eq!(
+            label(&rules, &warthog, "damage info/damage sections[0]/instant responses[0]/response damage transfers", 0),
+            "0.75 ceil: -> hull_front",
+        );
+        let spartans = read("objects/characters/spartans/spartans.model");
+        assert_eq!(label(&rules, &spartans, "damage info/damage sections[0]/section health transfers", 0), "100.00%: -> head");
+        let rifle = read("ui/chud/assault_rifle.chud_definition");
+        assert_eq!(label(&rules, &rifle, "widget collections[1]/base/state data/state data", 0), "A:(weapon is right hand) H:(zoomed)");
+        assert_eq!(
+            label(&rules, &rifle, "widget collections[0]/bitmap widgets[0]/base/placement data/placement data", 1),
+            "crosshairhalfscreen{720p halfscreen}",
+        );
+        let forge = read("levels/multi/forge_halo/forge_halo.scenario");
+        assert_eq!(label(&rules, &forge, "map variant palettes compatibility[0]/crcs", 1), "0xDC4DBFF6 1.1246.0.0");
+        let vehicle = read("objects/vehicles/human/warthog/warthog.vehicle");
+        assert_eq!(
+            label(&rules, &vehicle, "physics types/type-human_jeep[0]/engine/load and cruise sound", 0),
+            "prototype_load_left -> abs_throttle",
+        );
+        let bonus = read("levels/solo/m70_bonus/m70_bonus.scenario");
+        assert_eq!(label(&rules, &bonus, "squads[0]/spawn points", 0), "crew: driver");
+        let menu = read("levels/ui/mainmenu/mainmenu.scenario");
+        assert_eq!(label(&rules, &menu, "cubemaps", 1), "cubemap   1 : reference 3");
+    }
+
     /// A small definitions folder whose structs carry `element_label`s, and a
     /// tag built from it with `things` and `names` filled in.
     fn template_fixture() -> (std::path::PathBuf, crate::TagFile) {
@@ -1359,7 +1399,7 @@ mod tests {
             ("halo2_mcc", true),
             ("halo3_mcc", true),
             ("halo3odst_mcc", true),
-            ("haloreach_mcc", false),
+            ("haloreach_mcc", true),
             ("halo4_mcc", false),
             ("halo2amp_mcc", false),
         ] {

@@ -640,6 +640,11 @@ fn find_field<'a>(holder: TagStruct<'a>, name: &str) -> Option<TagField<'a>> {
 /// One printf conversion (`.2f`, `04x`, `+2.0f`, `3d`, `3`), or `mb` (a byte
 /// count as `%.2f` megabytes). With no format, an integral value prints as
 /// an integer and any other as `%.6g`.
+fn as_c_unsigned(value: f64) -> u64 {
+    let value = value as i64;
+    if (i64::from(i32::MIN)..0).contains(&value) { u64::from(value as i32 as u32) } else { value as u64 }
+}
+
 pub(super) fn printf_number(format: Option<&str>, value: f64) -> String {
     let Some(spec) = format else {
         return if value.fract() == 0.0 && value.abs() < 1e15 { format!("{}", value as i64) } else { super::g6(value) };
@@ -677,8 +682,10 @@ pub(super) fn printf_number(format: Option<&str>, value: f64) -> String {
     let conversion = chars.next().unwrap_or(if value.fract() == 0.0 { 'd' } else { 'g' });
     let mut body = match conversion {
         'd' | 'i' => format!("{}", value as i64),
-        'x' => format!("{:x}", value as i64),
-        'X' => format!("{:X}", value as i64),
+        // `%x` takes an unsigned int: a negative 32-bit value prints as its
+        // 32-bit pattern (Reach's palette CRCs), not sign-extended to 64.
+        'x' => format!("{:x}", as_c_unsigned(value)),
+        'X' => format!("{:X}", as_c_unsigned(value)),
         'f' | 'F' => format!("{:.*}", precision.unwrap_or(6), value),
         'e' => format!("{:.*e}", precision.unwrap_or(6), value),
         _ => super::g6(value),
@@ -709,6 +716,8 @@ mod tests {
     #[test]
     fn printf_matches_c() {
         assert_eq!(printf_number(Some("04x"), 255.0), "00ff");
+        // A negative int prints its 32-bit pattern, as C's `%X` does.
+        assert_eq!(printf_number(Some("08X"), -598884362.0), "DC4DBFF6");
         assert_eq!(printf_number(Some(".2f"), 1.005), format!("{:.2}", 1.005));
         assert_eq!(printf_number(Some("3.1f"), 2.25), "2.2");
         assert_eq!(printf_number(Some("+2.0f"), 50.0), "+50");
