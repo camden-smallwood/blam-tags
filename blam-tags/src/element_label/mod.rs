@@ -1434,7 +1434,7 @@ mod tests {
             ("halo3odst_mcc", true),
             ("haloreach_mcc", true),
             ("halo4_mcc", true),
-            ("halo2amp_mcc", false),
+            ("halo2amp_mcc", true),
         ] {
             let problems = check::check(format!("../definitions/{game}"), complete).unwrap();
             if let Err(error) = ElementLabels::load(format!("../definitions/{game}")) {
