@@ -843,12 +843,20 @@ impl<'a> TagField<'a> {
     }
 
     /// Decode the field as a [`crate::TagFunction`] (`mapping_function`
-    /// data blob). The schema declares these as `data` fields with a
-    /// 32-byte header + variable per-type compact data; this helper
-    /// reads the bytes via [`Self::as_data`] and parses them. Returns
-    /// `None` if the field isn't a `data` field, the bytes don't
-    /// belong to a function blob, or parsing fails.
+    /// data blob). The schema declares these as `data` fields of the
+    /// `function_definition_data` definition, holding a 32-byte header +
+    /// variable per-type compact data. Returns `None` for any other field —
+    /// whatever its bytes: a bitmap's pixels can parse as a function — and
+    /// when the bytes don't parse.
+    ///
+    /// The definition is what the editors go by. Foundation draws a function
+    /// editor for the `fned` custom field, and in every game's definitions
+    /// that field is followed by the `mapping_function` struct holding the
+    /// only `function_definition_data` fields there are.
     pub fn as_function(&self) -> Option<crate::TagFunction> {
+        if !self.is_function_data() {
+            return None;
+        }
         let bytes = self.as_data()?;
         crate::TagFunction::parse(bytes).ok()
     }
@@ -2579,6 +2587,27 @@ mod set_type_tests {
             .expect("render depth bias")
             .set(TagFieldData::Data(vec![1, 2, 3]));
         assert!(matches!(result, Err(TagSetError::TypeMismatch { .. })), "{result:?}");
+    }
+
+    /// A field is a function when its definition says so, not when its bytes
+    /// happen to parse as one: a Halo 3 bitmap's processed pixels can.
+    #[test]
+    fn only_function_data_reads_as_a_function() {
+        let halo3 = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../definitions/halo3_mcc");
+        let function = crate::default_function_definition_bytes(crate::io::Endian::Le);
+        let mut bitmap = TagFile::new(halo3.join("bitmap.json")).unwrap();
+        let mut root = bitmap.root_mut();
+        root.field_path_mut("processed pixel data").unwrap().set(TagFieldData::Data(function.clone())).unwrap();
+        let pixels = bitmap.root().field_path("processed pixel data").unwrap();
+        assert!(!pixels.is_function_data());
+        assert!(pixels.as_function().is_none(), "pixels that parse as a function read as one");
+
+        let mut widget = TagFile::new(halo3.join("gui_widget_color_animation_definition.json")).unwrap();
+        let mut root = widget.root_mut();
+        root.field_path_mut("default function/data").unwrap().set(TagFieldData::Data(function)).unwrap();
+        let data = widget.root().field_path("default function/data").unwrap();
+        assert!(data.is_function_data());
+        assert!(data.as_function().is_some());
     }
 
     #[test]
