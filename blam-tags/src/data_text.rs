@@ -9,8 +9,7 @@
 //!
 //! A tag's own layout names a data field's definition but keeps none of it,
 //! so the flags and maximum size come from the definitions:
-//! `definitions/<game>/<group>.json`'s `datas`. Halo 2's dump recorded no
-//! flags, so none of its data fields is text.
+//! `definitions/<game>/<group>.json`'s `datas`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -186,7 +185,8 @@ mod tests {
     }
 
     /// The text definitions are the ones the editors show as text, in a gen3
-    /// game and in Halo CE; function data, vertex buffers and the like aren't.
+    /// game, Halo CE and Halo 2; function data, vertex buffers, sound samples
+    /// and the like aren't.
     #[test]
     fn text_comes_from_the_definitions_flags() {
         let halo3 = definitions("halo3_mcc");
@@ -201,7 +201,10 @@ mod tests {
         }
         let halo1 = definitions("haloce_mcc");
         assert!(halo1.get("hs_source_data_definition").unwrap().is_text());
-        assert!(!definitions("halo2_mcc").get("hs_source_data_definition").is_some_and(DataDefinitionInfo::is_text));
+        let halo2 = definitions("halo2_mcc");
+        assert!(halo2.get("hs_source_data_definition").unwrap().is_text());
+        assert!(halo2.get("shader_text_definition").unwrap().is_text());
+        assert!(!halo2.get("sound_samples").unwrap().is_text());
     }
 
     const TEXT: DataDefinitionInfo = DataDefinitionInfo { flags: DATA_IS_TEXT, max_size: 16 };
