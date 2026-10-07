@@ -77,6 +77,7 @@ pub mod collision_verify;
 pub mod prt;
 pub mod convert;
 pub mod data;
+pub mod data_text;
 pub mod path;
 pub mod field_path;
 pub mod stream;
