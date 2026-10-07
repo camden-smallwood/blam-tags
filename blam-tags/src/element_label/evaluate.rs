@@ -34,7 +34,23 @@ pub(super) struct Alternative {
     /// `{"join": sep, "parts": [...]}`: the parts that come out non-empty,
     /// joined by `sep`, in place of `template`. Halo 3's chud widget states
     /// join one field's set flags with ` OR ` and the fields with ` AND `.
-    pub join: Option<(String, Vec<Template>)>,
+    pub join: Option<Join>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Join {
+    pub separator: String,
+    /// Text before the joined parts (Reach's damage transfers: `"50.00%: -> "`).
+    pub prefix: Option<Template>,
+    pub parts: Vec<Part>,
+}
+
+/// One piece of a join: a template, or alternatives of its own (the first that
+/// applies, else nothing), for a piece that appears only under a condition.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum Part {
+    Text(Template),
+    Choice(Vec<Alternative>),
 }
 
 /// A hand-entered table: `names[value]`, else `values[value]`, else `else`.
@@ -80,28 +96,42 @@ enum Val<'a> {
 impl ElementLabels {
     /// The entry's text for `here`, or `None` when no alternative applies.
     pub(super) fn evaluate_entry(&self, ctx: &Context, entry: &Entry, here: &Here<'_>) -> Option<String> {
-        for alternative in entry.alternatives.as_ref()? {
+        let mut text = self.first_that_applies(ctx, entry, here, entry.alternatives.as_ref()?)?;
+        if let Some(max) = entry.max_length
+            && let Some((cut, _)) = text.char_indices().nth(max)
+        {
+            text.truncate(cut);
+        }
+        Some(text)
+    }
+
+    fn first_that_applies(&self, ctx: &Context, entry: &Entry, here: &Here<'_>, alternatives: &[Alternative]) -> Option<String> {
+        for alternative in alternatives {
             let applies = match (&alternative.when, &alternative.join) {
                 (Some(cond), _) => self.holds(ctx, entry, here, &self.element_base(here), cond),
                 (None, Some(_)) => true,
                 (None, None) => self.all_slots_set(ctx, entry, here, &alternative.template),
             };
             if applies {
-                let mut text = match &alternative.join {
-                    Some((separator, parts)) => parts
-                        .iter()
-                        .map(|part| self.render_template(ctx, entry, here, part))
-                        .filter(|part| !part.is_empty())
-                        .collect::<Vec<_>>()
-                        .join(separator),
+                return Some(match &alternative.join {
+                    Some(join) => {
+                        let parts = join
+                            .parts
+                            .iter()
+                            .map(|part| match part {
+                                Part::Text(template) => self.render_template(ctx, entry, here, template),
+                                Part::Choice(choices) => self.first_that_applies(ctx, entry, here, choices).unwrap_or_default(),
+                            })
+                            .filter(|part| !part.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(&join.separator);
+                        match &join.prefix {
+                            Some(prefix) => self.render_template(ctx, entry, here, prefix) + &parts,
+                            None => parts,
+                        }
+                    }
                     None => self.render_template(ctx, entry, here, &alternative.template),
-                };
-                if let Some(max) = entry.max_length
-                    && let Some((cut, _)) = text.char_indices().nth(max)
-                {
-                    text.truncate(cut);
-                }
-                return Some(text);
+                });
             }
         }
         None

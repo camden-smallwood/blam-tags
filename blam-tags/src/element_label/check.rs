@@ -268,6 +268,29 @@ impl Checker<'_> {
     }
 }
 
+/// Check one alternative: its `when`, its `format`, and a join's prefix and
+/// parts (a part may hold alternatives of its own).
+fn check_alternative(checker: &mut Checker<'_>, alternative: &Value, group_files: &HashMap<String, String>) {
+    match alternative {
+        Value::String(text) => checker.template(text),
+        other => {
+            checker.root_file = other["when"].as_str().and_then(|when| guarded_group(when, group_files));
+            if let Some(when) = other["when"].as_str() {
+                checker.condition(when);
+            }
+            for template in ["format", "prefix"].iter().filter_map(|key| other[*key].as_str()) {
+                checker.template(template);
+            }
+            for part in other["parts"].as_array().into_iter().flatten() {
+                match part {
+                    Value::Array(choices) => choices.iter().for_each(|choice| check_alternative(checker, choice, group_files)),
+                    part => check_alternative(checker, part, group_files),
+                }
+            }
+        }
+    }
+}
+
 /// The group file a `when` limits its alternative to with `{#group} == "tag"`.
 fn guarded_group(when: &str, group_files: &HashMap<String, String>) -> Option<String> {
     let start = when.find(r#"{#group} == ""#)? + r#"{#group} == ""#.len();
@@ -336,21 +359,7 @@ pub fn check(game_dir: impl AsRef<Path>, require_coverage: bool) -> Result<Vec<S
                 problems: &mut problems,
             };
             for alternative in label["label"].as_array().into_iter().flatten() {
-                match alternative {
-                    Value::String(text) => checker.template(text),
-                    other => {
-                        checker.root_file = other["when"].as_str().and_then(|when| guarded_group(when, &group_files));
-                        if let Some(when) = other["when"].as_str() {
-                            checker.condition(when);
-                        }
-                        if let Some(format) = other["format"].as_str() {
-                            checker.template(format);
-                        }
-                        for part in other["parts"].as_array().into_iter().flatten().filter_map(Value::as_str) {
-                            checker.template(part);
-                        }
-                    }
-                }
+                check_alternative(&mut checker, alternative, &group_files);
             }
         };
         if let Some(blocks) = value["blocks"].as_object() {

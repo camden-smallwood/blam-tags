@@ -64,6 +64,14 @@ pub struct ElementLabels {
     /// Maps every entry of the game can name, from `_meta.json`'s
     /// `element_labels.maps`: an entry's own maps come first.
     shared_maps: HashMap<String, evaluate::LabelMap>,
+    /// Every struct guid the definitions know (gen3). A tag whose struct isn't
+    /// among them was saved with an older layout, which the editors upgrade
+    /// on load; see [`Self::upgraded_struct`].
+    known_struct_guids: std::collections::HashSet<[u8; 16]>,
+    /// (group file, block) → the block's struct in the definitions.
+    block_structs: HashMap<(String, String), String>,
+    /// Struct key → short name, where they differ (gen3).
+    struct_short_names_by_name: HashMap<String, String>,
 }
 
 /// What the rule knows about the tag being labelled.
@@ -164,6 +172,8 @@ struct EnumOptions {
 struct BlockNames {
     #[serde(default)]
     display_name: Option<String>,
+    #[serde(default, rename = "struct")]
+    structure: Option<String>,
     #[serde(default)]
     element_label: Option<EntryRef>,
 }
@@ -199,8 +209,18 @@ enum AlternativeJson {
         #[serde(default)]
         when: Option<String>,
         join: String,
-        parts: Vec<String>,
+        #[serde(default)]
+        prefix: Option<String>,
+        parts: Vec<PartJson>,
     },
+}
+
+/// A join's part: a template, or a list of alternatives.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PartJson {
+    Text(String),
+    Choice(Vec<AlternativeJson>),
 }
 
 #[derive(Deserialize)]
@@ -331,6 +351,9 @@ impl ElementLabels {
                 enums.insert(name, options.options);
             }
             for (key, block) in group.blocks {
+                if let Some(structure) = block.structure {
+                    labels.block_structs.insert((file.clone(), key.clone()), structure);
+                }
                 if let Some(display) = block.display_name {
                     labels.block_display_names.insert(key.clone(), display);
                 }
@@ -341,8 +364,14 @@ impl ElementLabels {
             }
             for (key, structure) in group.structs {
                 let guid = structure.guid.as_deref().and_then(parse_guid).filter(|g| *g != [0; 16]);
-                if let (Some(guid), Some(short)) = (guid, structure.short_name) {
-                    labels.struct_short_names.insert(guid, short);
+                if let Some(guid) = guid {
+                    labels.known_struct_guids.insert(guid);
+                }
+                if let Some(short) = structure.short_name {
+                    if let Some(guid) = guid {
+                        labels.struct_short_names.insert(guid, short.clone());
+                    }
+                    labels.struct_short_names_by_name.insert(key.clone(), short);
                 }
                 if let Some(entry) = structure.element_label {
                     let entry = resolve(entry, &file, &path, &key)?;
@@ -391,8 +420,13 @@ impl ElementLabels {
                 return label;
             }
         }
-        if let Some(label) = self.marked_field_label(ctx, ancestors, element) {
+        let upgraded = self.upgraded_struct(ctx, block, element);
+        if let Some(label) = self.marked_field_label(ctx, ancestors, element, upgraded) {
             return label;
+        }
+        if let Some(current) = upgraded {
+            let name = self.struct_short_names_by_name.get(current).map_or(current, String::as_str);
+            return format!("{index}. {name}");
         }
         format!("{index}. {}", self.fallback_name(block, element))
     }
@@ -402,14 +436,38 @@ impl ElementLabels {
     fn entry(&self, ctx: &Context, block: TagBlock<'_>, element: TagStruct<'_>) -> Option<&evaluate::Entry> {
         match self.settings.callback {
             CallbackScope::Block => self.block_entry(ctx, block.definition().name()),
-            CallbackScope::Struct => {
-                let guid = element.definition().guid();
-                (guid != [0; 16])
-                    .then(|| self.entries_by_guid.get(&guid))
-                    .flatten()
-                    .or_else(|| self.entries_by_name.get(element.name()))
-            }
+            CallbackScope::Struct => match self.upgraded_struct(ctx, block, element) {
+                Some(current) => self.entries_by_name.get(current),
+                None => {
+                    let guid = element.definition().guid();
+                    (guid != [0; 16])
+                        .then(|| self.entries_by_guid.get(&guid))
+                        .flatten()
+                        .or_else(|| self.entries_by_name.get(element.name()))
+                }
+            },
         }
+    }
+
+    /// The definitions' current struct for `block`, when `element` was saved
+    /// with a layout the definitions don't know (an H3-era tag in ODST's kit,
+    /// say). The editors upgrade such a tag to the current definition when
+    /// they load it, so its label is the current struct's: its callback, its
+    /// `^` field (matched by name, since an older layout orders fields
+    /// differently) and its name. Needs the tag's group to find the block.
+    fn upgraded_struct(&self, ctx: &Context, block: TagBlock<'_>, element: TagStruct<'_>) -> Option<&str> {
+        if self.known_struct_guids.is_empty() || self.known_struct_guids.contains(&element.definition().guid()) {
+            return None;
+        }
+        let name = block.definition().name();
+        let mut file = ctx.group.and_then(|group| self.group_names.get(&group))?;
+        for _ in 0..16 {
+            if let Some(structure) = self.block_structs.get(&(file.clone(), name.to_owned())) {
+                return Some(structure.as_str());
+            }
+            file = self.parent_files.get(file)?;
+        }
+        None
     }
 
     /// A block's entry, from the tag's group file or one of its parents'.
@@ -504,8 +562,17 @@ impl ElementLabels {
     }
 
     /// Step 3: the first `^` field, in flattened field order, formatted.
-    fn marked_field_label(&self, ctx: &Context, ancestors: &[TagStruct<'_>], element: TagStruct<'_>) -> Option<String> {
-        let (field, holder) = self.find_marked_field(element)?;
+    fn marked_field_label(
+        &self,
+        ctx: &Context,
+        ancestors: &[TagStruct<'_>],
+        element: TagStruct<'_>,
+        upgraded: Option<&str>,
+    ) -> Option<String> {
+        let (field, holder) = match upgraded {
+            Some(current) => self.find_field_named(element, &self.markers_by_name.get(current)?.first()?.clean_name)?,
+            None => self.find_marked_field(element)?,
+        };
         let mut chain = ancestors.to_vec();
         chain.push(element);
         if holder.raw().as_ptr() != element.raw().as_ptr() {
@@ -528,7 +595,7 @@ impl ElementLabels {
                 return field
                     .as_resource()
                     .and_then(|resource| resource.as_struct())
-                    .map(|inner| self.marked_field_label(ctx, chain, inner).unwrap_or_default())
+                    .map(|inner| self.marked_field_label(ctx, chain, inner, None).unwrap_or_default())
                     .unwrap_or_else(|| "<unavailable>".to_owned());
             }
             T::ApiInterop => return "<unavailable>".to_owned(),
@@ -613,6 +680,24 @@ impl ElementLabels {
                 _ => None,
             };
             if let Some(found) = inner.and_then(|inner| self.find_marked_field(inner)) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// The first field named `name` in the flattened walk.
+    fn find_field_named<'a>(&self, holder: TagStruct<'a>, name: &str) -> Option<(TagField<'a>, TagStruct<'a>)> {
+        for field in holder.fields_all() {
+            if field.clean_name() == name {
+                return Some((field, holder));
+            }
+            let inner = match field.field_type() {
+                TagFieldType::Struct => field.as_struct(),
+                TagFieldType::Array => field.as_array().and_then(|array| array.element(0)),
+                _ => None,
+            };
+            if let Some(found) = inner.and_then(|inner| self.find_field_named(inner, name)) {
                 return Some(found);
             }
         }
@@ -740,34 +825,7 @@ fn parse_entry(entry: EntryJson, file: &str, path: &Path, key: &str) -> Result<e
     let alternatives = match entry.label {
         None => None,
         Some(list) => Some(
-            list.into_iter()
-                .map(|alternative| {
-                    Ok(match alternative {
-                        AlternativeJson::Plain(text) => evaluate::Alternative {
-                            when: None,
-                            template: template::parse_template(&text).map_err(fail)?,
-                            join: None,
-                        },
-                        AlternativeJson::When { when, format } => evaluate::Alternative {
-                            when: Some(template::parse_condition(&when).map_err(fail)?),
-                            template: template::parse_template(&format).map_err(fail)?,
-                            join: None,
-                        },
-                        AlternativeJson::Join { when, join, parts } => evaluate::Alternative {
-                            when: when.map(|when| template::parse_condition(&when)).transpose().map_err(fail)?,
-                            template: template::parse_template("").map_err(fail)?,
-                            join: Some((
-                                join,
-                                parts
-                                    .iter()
-                                    .map(|part| template::parse_template(part))
-                                    .collect::<Result<_, _>>()
-                                    .map_err(fail)?,
-                            )),
-                        },
-                    })
-                })
-                .collect::<Result<Vec<_>, ElementLabelsError>>()?,
+            list.into_iter().map(|alternative| parse_alternative(alternative, &fail)).collect::<Result<Vec<_>, _>>()?,
         ),
     };
     let maps = entry.maps.into_iter().map(|(name, map)| (name, parse_map(map))).collect();
@@ -777,6 +835,43 @@ fn parse_entry(entry: EntryJson, file: &str, path: &Path, key: &str) -> Result<e
         maps,
         max_length: entry.max_length,
         file: file.to_owned(),
+    })
+}
+
+fn parse_alternative(
+    alternative: AlternativeJson,
+    fail: &impl Fn(template::ParseError) -> ElementLabelsError,
+) -> Result<evaluate::Alternative, ElementLabelsError> {
+    Ok(match alternative {
+        AlternativeJson::Plain(text) => evaluate::Alternative {
+            when: None,
+            template: template::parse_template(&text).map_err(fail)?,
+            join: None,
+        },
+        AlternativeJson::When { when, format } => evaluate::Alternative {
+            when: Some(template::parse_condition(&when).map_err(fail)?),
+            template: template::parse_template(&format).map_err(fail)?,
+            join: None,
+        },
+        AlternativeJson::Join { when, join, prefix, parts } => evaluate::Alternative {
+            when: when.map(|when| template::parse_condition(&when)).transpose().map_err(fail)?,
+            template: template::parse_template("").map_err(fail)?,
+            join: Some(evaluate::Join {
+                separator: join,
+                prefix: prefix.map(|prefix| template::parse_template(&prefix)).transpose().map_err(fail)?,
+                parts: parts
+                    .into_iter()
+                    .map(|part| {
+                        Ok(match part {
+                            PartJson::Text(text) => evaluate::Part::Text(template::parse_template(&text).map_err(fail)?),
+                            PartJson::Choice(choices) => evaluate::Part::Choice(
+                                choices.into_iter().map(|choice| parse_alternative(choice, fail)).collect::<Result<_, _>>()?,
+                            ),
+                        })
+                    })
+                    .collect::<Result<_, ElementLabelsError>>()?,
+            }),
+        },
     })
 }
 
@@ -1017,6 +1112,40 @@ mod tests {
         assert_eq!(label(&rules, &finished, "shots[1]/object functions[0]/keyframes", 1), "Frame 223 (Disable)");
         let physics = read("objects/vehicles/warthog/warthog.physics_model");
         assert_eq!(label(&rules, &physics, "node edges", 0), "*hull:bumper");
+        // Saved with an older layout: labelled as the current struct.
+        let bugger = read("objects/characters/bugger/bugger.collision_model");
+        assert_eq!(
+            label(&rules, &bugger, "regions[0]/permutations[0]/bsps[0]/bsp/bsp3d nodes", 0),
+            "0. bsp3d_nodes_block_struct",
+        );
+    }
+
+    /// ODST's label callbacks. GUI widgets print their name or, without one,
+    /// their block's; chud states add the PDA bit; spawn points take their
+    /// squad's cell label (empty here, as in Guerilla). A tag saved with an
+    /// older layout is labelled by the current struct, the way the editor
+    /// upgrades it on load: `120_halo`'s squads are H3-era `squads_struct`.
+    #[test]
+    fn odst_callbacks_follow_guerilla() {
+        let Some(tags) = kit_tags("BLAM_TEST_H3ODSTEK") else { return };
+        let rules = rules("halo3odst_mcc");
+        let read = |path: &str| crate::TagFile::read(tags.join(path)).unwrap();
+        let menu = read("ui/halox/start_menu/start_menu.gui_screen_widget_definition");
+        assert_eq!(label(&rules, &menu, "groups[0]/bitmaps", 0), "0. background_bitmap");
+        let skin = read("ui/halox/start_menu/sidebar_list.gui_skin_definition");
+        assert_eq!(label(&rules, &skin, "bitmap blocks", 0), "0. [bitmap_widget_block]");
+        let rifle = read("ui/chud/assault_rifle.chud_definition");
+        assert_eq!(label(&rules, &rifle, "widget collections[0]/base/state data", 0), "spartan AND 720p fullscreen AND pda active");
+        let progression = read("globals/game_progression.game_progression");
+        assert_eq!(label(&rules, &progression, "profile variables/profile boolean", 1), "gp_arg_slot_01->gp_arg_slot_30");
+        let shared = read("levels/shared/cache/h100_for_shared.scenario");
+        assert_eq!(label(&rules, &shared, "squads[0]/spawn points", 0), ": phantom");
+        let halo = read("levels/solo/120_halo/120_halo.scenario");
+        assert_eq!(label(&rules, &halo, "squads", 0), "343_spark");
+        let survival = read("firefight/survival_mode_globals.survival_mode_globals");
+        assert_eq!(label(&rules, &survival, "game events", 0), "survival_welcome : all");
+        let epilogue = read("levels/solo/130_epilogue/130_epilogue.scenario");
+        assert_eq!(label(&rules, &epilogue, "player starting profile", 0), "player starting profile_0 : unknown : initial campaign");
     }
 
     /// Reach: a long block index recurses, several set flags join with `,`,
@@ -1216,6 +1345,8 @@ mod tests {
         // `join`: the parts that come out non-empty, joined.
         check(r#"{"join": " AND ", "parts": ["{flags|flags: OR }", "{name}", "{type|enum:kind_enum}"]}"#, 0, "negate AND b");
         check(r#"{"join": " AND ", "parts": ["{flags|flags: OR }", "{name}"]}"#, 3, "");
+        // A prefix, and parts that are alternatives of their own.
+        check(r#"{"join": " AND ", "prefix": "{count}: ", "parts": [[{"when": "{flags} & 1", "format": "on"}], [{"when": "{flags} & 2", "format": "two"}], "{type|enum:kind_enum}"]}"#, 0, "0: on AND b");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1233,6 +1364,9 @@ mod tests {
             ("halo2amp_mcc", false),
         ] {
             let problems = check::check(format!("../definitions/{game}"), complete).unwrap();
+            if let Err(error) = ElementLabels::load(format!("../definitions/{game}")) {
+                panic!("{game}: {error}");
+            }
             assert!(problems.is_empty(), "{game}:\n{}", problems.join("\n"));
         }
     }
