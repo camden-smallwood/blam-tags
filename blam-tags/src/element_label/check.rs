@@ -115,6 +115,7 @@ struct Checker<'a> {
     key: String,
     element_struct: String,
     maps: Vec<String>,
+    used_maps: &'a mut std::collections::HashSet<String>,
     problems: &'a mut Vec<String>,
 }
 
@@ -150,6 +151,9 @@ impl Checker<'_> {
         for filter in &slot.filters {
             match filter {
                 Filter::Map(name) if !self.maps.contains(name) => self.problem(format!("no map `{name}`")),
+                Filter::Map(name) => {
+                    self.used_maps.insert(name.clone());
+                }
                 Filter::Enum(name) if !self.schema.enums.contains(name) => self.problem(format!("no enum `{name}`")),
                 _ => {}
             }
@@ -256,24 +260,60 @@ impl Checker<'_> {
 }
 
 /// Problems with a game's `element_label` entries: templates or `when`s that
-/// don't parse, paths that name no field, maps or enums that don't exist, and
-/// (with `require_coverage`) definitions marked `element_label_callback` that
-/// have no entry.
+/// don't parse, paths that name no field, maps, enums or shared entries that
+/// don't exist, shared maps and entries nothing uses, and (with
+/// `require_coverage`) definitions marked `element_label_callback` that have
+/// no entry. A shared entry is checked against every struct that names it.
 pub fn check(game_dir: impl AsRef<Path>, require_coverage: bool) -> Result<Vec<String>, ElementLabelsError> {
-    let (schema, raw) = Schema::load(game_dir.as_ref())?;
+    let game_dir = game_dir.as_ref();
+    let (schema, raw) = Schema::load(game_dir)?;
+    let meta_path = game_dir.join("_meta.json");
+    let meta: Value = match std::fs::read(&meta_path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| ElementLabelsError::Json(meta_path.clone(), error))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Value::Null,
+        Err(error) => return Err(error.into()),
+    };
+    let shared_maps: Vec<String> =
+        meta["element_labels"]["maps"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
+    let shared_entries = meta["element_labels"]["entries"].as_object().cloned().unwrap_or_default();
+    let mut used_maps = std::collections::HashSet::new();
+    let mut used_entries = std::collections::HashSet::new();
     let mut problems = Vec::new();
     for (file, value) in &raw {
         let mut visit = |key: &str, entry: &Value, element_struct: Option<String>| {
-            let label = &entry["element_label"];
+            let mut label = &entry["element_label"];
             if label.is_null() {
                 if require_coverage && entry.get("element_label_callback").is_some() {
                     problems.push(format!("{file}/{key}: has a label callback but no element_label"));
                 }
                 return;
             }
+            if let Some(name) = label.as_str() {
+                used_entries.insert(name.to_owned());
+                match shared_entries.get(name) {
+                    Some(shared) => label = shared,
+                    None => {
+                        problems.push(format!("{file}/{key}: no shared element_label entry `{name}`"));
+                        return;
+                    }
+                }
+            }
             let Some(element_struct) = element_struct else { return };
-            let maps = label["maps"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
-            let mut checker = Checker { schema: &schema, file, key: key.to_owned(), element_struct, maps, problems: &mut problems };
+            let mut maps: Vec<String> = label["maps"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
+            for name in &shared_maps {
+                if !maps.contains(name) {
+                    maps.push(name.clone());
+                }
+            }
+            let mut checker = Checker {
+                schema: &schema,
+                file,
+                key: key.to_owned(),
+                element_struct,
+                maps,
+                used_maps: &mut used_maps,
+                problems: &mut problems,
+            };
             for alternative in label["label"].as_array().into_iter().flatten() {
                 match alternative {
                     Value::String(text) => checker.template(text),
@@ -298,6 +338,12 @@ pub fn check(game_dir: impl AsRef<Path>, require_coverage: bool) -> Result<Vec<S
                 visit(key, structure, Some(key.clone()));
             }
         }
+    }
+    for name in shared_maps.iter().filter(|name| !used_maps.contains(*name)) {
+        problems.push(format!("_meta: shared map `{name}` is used by no entry"));
+    }
+    for name in shared_entries.keys().filter(|name| !used_entries.contains(*name)) {
+        problems.push(format!("_meta: shared entry `{name}` is named by no definition"));
     }
     Ok(problems)
 }

@@ -483,7 +483,8 @@ impl ElementLabels {
             match filter {
                 Filter::Map(name) => {
                     let Some(n) = number(value) else { return String::new() };
-                    return entry.maps.get(name).and_then(|map| map.get(n as i64)).unwrap_or_default().to_owned();
+                    let map = entry.maps.get(name).or_else(|| self.shared_maps.get(name));
+                    return map.and_then(|map| map.get(n as i64)).unwrap_or_default().to_owned();
                 }
                 Filter::Enum(name) => {
                     let Some(n) = number(value) else { return String::new() };

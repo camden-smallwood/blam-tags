@@ -61,6 +61,9 @@ pub struct ElementLabels {
     enums: HashMap<String, HashMap<String, Vec<Option<String>>>>,
     /// Group tag → group name (the extension), from `_meta.json`.
     group_names: HashMap<u32, String>,
+    /// Maps every entry of the game can name, from `_meta.json`'s
+    /// `element_labels.maps`: an entry's own maps come first.
+    shared_maps: HashMap<String, evaluate::LabelMap>,
 }
 
 /// What the rule knows about the tag being labelled.
@@ -122,9 +125,21 @@ enum FlagsStyle {
 #[derive(Deserialize)]
 struct Meta {
     #[serde(default)]
-    element_labels: Option<Settings>,
+    element_labels: Option<serde_json::Value>,
     #[serde(default)]
     tag_index: HashMap<String, String>,
+}
+
+/// What `_meta.json`'s `element_labels` shares across the game's group files,
+/// so a table or a whole entry that several definitions use is written once:
+/// `maps` any entry's `|map:` can name, and `entries` a struct or block can
+/// name in place of writing its own (`"element_label": "character_style"`).
+#[derive(Deserialize, Default)]
+struct Shared {
+    #[serde(default)]
+    maps: HashMap<String, MapJson>,
+    #[serde(default)]
+    entries: HashMap<String, EntryJson>,
 }
 
 #[derive(Deserialize)]
@@ -150,7 +165,16 @@ struct BlockNames {
     #[serde(default)]
     display_name: Option<String>,
     #[serde(default)]
-    element_label: Option<EntryJson>,
+    element_label: Option<EntryRef>,
+}
+
+/// A definition's `element_label`: its own entry, or the name of one in
+/// `_meta.json`'s `element_labels.entries`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EntryRef {
+    Named(String),
+    Own(EntryJson),
 }
 
 /// An `element_label` as written in a group file.
@@ -192,7 +216,7 @@ struct StructNames {
     #[serde(default)]
     fields: Vec<FieldNames>,
     #[serde(default)]
-    element_label: Option<EntryJson>,
+    element_label: Option<EntryRef>,
 }
 
 #[derive(Deserialize)]
@@ -208,6 +232,8 @@ pub enum ElementLabelsError {
     Json(std::path::PathBuf, serde_json::Error),
     /// An `element_label` whose template or `when` doesn't parse.
     Template { file: std::path::PathBuf, key: String, error: template::ParseError },
+    /// An `element_label` naming a shared entry `_meta.json` doesn't have.
+    UnknownEntry { file: std::path::PathBuf, key: String, name: String },
 }
 
 impl std::fmt::Display for ElementLabelsError {
@@ -216,6 +242,9 @@ impl std::fmt::Display for ElementLabelsError {
             Self::Io(error) => write!(f, "{error}"),
             Self::Json(path, error) => write!(f, "{}: {error}", path.display()),
             Self::Template { file, key, error } => write!(f, "{} {key}: {error}", file.display()),
+            Self::UnknownEntry { file, key, name } => {
+                write!(f, "{} {key}: no shared element_label entry `{name}`", file.display())
+            }
         }
     }
 }
@@ -240,7 +269,32 @@ impl ElementLabels {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Meta { element_labels: None, tag_index: HashMap::new() },
             Err(error) => return Err(error.into()),
         };
-        let mut labels = ElementLabels { settings: meta.element_labels.unwrap_or_default(), ..ElementLabels::default() };
+        let json = |error| ElementLabelsError::Json(meta_path.clone(), error);
+        let (settings, shared) = match meta.element_labels {
+            Some(value) => (
+                serde_json::from_value::<Settings>(value.clone()).map_err(json)?,
+                serde_json::from_value::<Shared>(value).map_err(json)?,
+            ),
+            None => (Settings::default(), Shared::default()),
+        };
+        let mut labels = ElementLabels {
+            settings,
+            shared_maps: shared.maps.into_iter().map(|(name, map)| (name, parse_map(map))).collect(),
+            ..ElementLabels::default()
+        };
+        // Parsed once; each definition that names one gets a copy scoped to its
+        // own file (for `|enum:`).
+        let mut shared_entries = HashMap::new();
+        for (name, entry) in shared.entries {
+            shared_entries.insert(name.clone(), parse_entry(entry, "", &meta_path, &name)?);
+        }
+        let resolve = |entry: EntryRef, file: &str, path: &Path, key: &str| match entry {
+            EntryRef::Own(entry) => parse_entry(entry, file, path, key),
+            EntryRef::Named(name) => match shared_entries.get(&name) {
+                Some(entry) => Ok(evaluate::Entry { file: file.to_owned(), ..entry.clone() }),
+                None => Err(ElementLabelsError::UnknownEntry { file: path.to_owned(), key: key.to_owned(), name }),
+            },
+        };
         for (group, name) in meta.tag_index {
             let bytes = group.as_bytes();
             if bytes.len() == 4 {
@@ -275,7 +329,7 @@ impl ElementLabels {
                     labels.block_display_names.insert(key.clone(), display);
                 }
                 if let Some(entry) = block.element_label {
-                    let entry = parse_entry(entry, &file, &path, &key)?;
+                    let entry = resolve(entry, &file, &path, &key)?;
                     labels.entries_by_block.insert((file.clone(), key), entry);
                 }
             }
@@ -285,7 +339,7 @@ impl ElementLabels {
                     labels.struct_short_names.insert(guid, short);
                 }
                 if let Some(entry) = structure.element_label {
-                    let entry = parse_entry(entry, &file, &path, &key)?;
+                    let entry = resolve(entry, &file, &path, &key)?;
                     if let Some(guid) = guid {
                         labels.entries_by_guid.insert(guid, entry.clone());
                     }
@@ -696,14 +750,7 @@ fn parse_entry(entry: EntryJson, file: &str, path: &Path, key: &str) -> Result<e
                 .collect::<Result<Vec<_>, ElementLabelsError>>()?,
         ),
     };
-    let maps = entry
-        .maps
-        .into_iter()
-        .map(|(name, map)| {
-            let values = map.values.into_iter().filter_map(|(k, v)| Some((k.parse().ok()?, v))).collect();
-            (name, evaluate::LabelMap { names: map.names, values, otherwise: map.otherwise })
-        })
-        .collect();
+    let maps = entry.maps.into_iter().map(|(name, map)| (name, parse_map(map))).collect();
     Ok(evaluate::Entry {
         source: entry.source,
         alternatives,
@@ -711,6 +758,11 @@ fn parse_entry(entry: EntryJson, file: &str, path: &Path, key: &str) -> Result<e
         max_length: entry.max_length,
         file: file.to_owned(),
     })
+}
+
+fn parse_map(map: MapJson) -> evaluate::LabelMap {
+    let values = map.values.into_iter().filter_map(|(k, v)| Some((k.parse().ok()?, v))).collect();
+    evaluate::LabelMap { names: map.names, values, otherwise: map.otherwise }
 }
 
 fn push_unique(markers: &mut Vec<Marker>, marker: Marker) {
@@ -1139,6 +1191,82 @@ mod tests {
         assert!(problems.contains("no field `nmae`"), "{problems}");
         assert!(problems.contains("no map `sorts`"), "{problems}");
         assert!(problems.contains("plain_struct: has a label callback but no element_label"), "{problems}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Rewrite the fixture so `name_struct` names a shared entry and
+    /// `thing_struct` a shared map, both from `_meta.json`.
+    fn share_in_fixture(root: &Path, entries: &str, maps: &str, name_struct_label: &str) {
+        let meta = root.join("halo3_mcc/_meta.json");
+        let text = std::fs::read_to_string(&meta)
+            .unwrap()
+            .replace(r#""flags":"names"}"#, &format!(r#""flags":"names","entries":{{{entries}}},"maps":{{{maps}}}}}"#));
+        std::fs::write(&meta, text).unwrap();
+        let path = root.join("halo3_mcc/label_test.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("{type|map:kinds}", "{type|map:shared_kinds}")
+            .replace(
+                r#""element_label": {"source": "test", "label": [
+                {"when": "{text} == \"quiet\"", "format": ""},
+                "<{text}>"]}"#,
+                &format!(r#""element_label": {name_struct_label}"#),
+            );
+        std::fs::write(&path, text).unwrap();
+    }
+
+    /// A definition can name an entry from `_meta.json` instead of writing its
+    /// own, and `|map:` falls back to `_meta.json`'s maps.
+    #[test]
+    fn shared_entries_and_maps_are_used_by_name() {
+        let (root, tag) = template_fixture();
+        share_in_fixture(
+            &root,
+            r#""quoted": {"source": "test", "label": ["[{text}]"]}"#,
+            r#""shared_kinds": {"names": ["x", "y"]}"#,
+            r#""quoted""#,
+        );
+        let rules = ElementLabels::load(root.join("halo3_mcc")).unwrap();
+        let things = tag.root().field("things").unwrap().as_block().unwrap();
+        let names = tag.root().field("names").unwrap().as_block().unwrap();
+        let chain = [tag.root()];
+        assert_eq!(rules.label(&chain, names, 0), "[first]");
+        assert_eq!(rules.label(&chain, names, 1), "[quiet]");
+        assert_eq!(rules.label(&chain, things, 0), "NOT y");
+        assert!(check::check(root.join("halo3_mcc"), false).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A name with no shared entry fails the load; `check` reports it, a shared
+    /// entry checked against a struct it doesn't fit, and shared entries and
+    /// maps that nothing uses.
+    #[test]
+    fn shared_entry_mistakes_are_caught() {
+        let (root, _) = template_fixture();
+        share_in_fixture(
+            &root,
+            r#""quoted": {"source": "test", "label": ["[{text}]"]}, "orphan": {"source": "test", "label": ["x"]}"#,
+            r#""shared_kinds": {"names": ["x", "y"]}, "unused_map": {"names": ["z"]}"#,
+            r#""missing""#,
+        );
+        let error = ElementLabels::load(root.join("halo3_mcc")).unwrap_err().to_string();
+        assert!(error.contains("name_struct") && error.contains("missing"), "{error}");
+        let path = root.join("halo3_mcc/label_test.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace(r#""element_label": "missing""#, r#""element_label": "quoted""#)
+            .replace(r#""element_label": {"source": "test", "label": null}"#, r#""element_label": "quoted""#);
+        std::fs::write(&path, text).unwrap();
+        ElementLabels::load(root.join("halo3_mcc")).unwrap();
+        let problems = check::check(root.join("halo3_mcc"), false).unwrap().join("\n");
+        assert!(problems.contains("plain_struct: no field `text` in plain_struct"), "{problems}");
+        assert!(problems.contains("shared entry `orphan` is named by no definition"), "{problems}");
+        assert!(problems.contains("shared map `unused_map` is used by no entry"), "{problems}");
+        assert!(!problems.contains("`quoted`") && !problems.contains("`shared_kinds`"), "{problems}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace(r#""element_label": "quoted"}"#, r#""element_label": "gone"}"#)).unwrap();
+        let problems = check::check(root.join("halo3_mcc"), false).unwrap().join("\n");
+        assert!(problems.contains("no shared element_label entry `gone`"), "{problems}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
