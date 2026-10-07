@@ -31,6 +31,10 @@ pub(super) struct Entry {
 pub(super) struct Alternative {
     pub when: Option<Cond>,
     pub template: Template,
+    /// `{"join": sep, "parts": [...]}`: the parts that come out non-empty,
+    /// joined by `sep`, in place of `template`. Halo 3's chud widget states
+    /// join one field's set flags with ` OR ` and the fields with ` AND `.
+    pub join: Option<(String, Vec<Template>)>,
 }
 
 /// A hand-entered table: `names[value]`, else `values[value]`, else `else`.
@@ -77,12 +81,21 @@ impl ElementLabels {
     /// The entry's text for `here`, or `None` when no alternative applies.
     pub(super) fn evaluate_entry(&self, ctx: &Context, entry: &Entry, here: &Here<'_>) -> Option<String> {
         for alternative in entry.alternatives.as_ref()? {
-            let applies = match &alternative.when {
-                Some(cond) => self.holds(ctx, entry, here, &self.element_base(here), cond),
-                None => self.all_slots_set(ctx, entry, here, &alternative.template),
+            let applies = match (&alternative.when, &alternative.join) {
+                (Some(cond), _) => self.holds(ctx, entry, here, &self.element_base(here), cond),
+                (None, Some(_)) => true,
+                (None, None) => self.all_slots_set(ctx, entry, here, &alternative.template),
             };
             if applies {
-                let mut text = self.render_template(ctx, entry, here, &alternative.template);
+                let mut text = match &alternative.join {
+                    Some((separator, parts)) => parts
+                        .iter()
+                        .map(|part| self.render_template(ctx, entry, here, part))
+                        .filter(|part| !part.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(separator),
+                    None => self.render_template(ctx, entry, here, &alternative.template),
+                };
                 if let Some(max) = entry.max_length
                     && let Some((cut, _)) = text.char_indices().nth(max)
                 {

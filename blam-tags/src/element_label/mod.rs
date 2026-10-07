@@ -195,6 +195,12 @@ struct EntryJson {
 enum AlternativeJson {
     Plain(String),
     When { when: String, format: String },
+    Join {
+        #[serde(default)]
+        when: Option<String>,
+        join: String,
+        parts: Vec<String>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -740,10 +746,24 @@ fn parse_entry(entry: EntryJson, file: &str, path: &Path, key: &str) -> Result<e
                         AlternativeJson::Plain(text) => evaluate::Alternative {
                             when: None,
                             template: template::parse_template(&text).map_err(fail)?,
+                            join: None,
                         },
                         AlternativeJson::When { when, format } => evaluate::Alternative {
                             when: Some(template::parse_condition(&when).map_err(fail)?),
                             template: template::parse_template(&format).map_err(fail)?,
+                            join: None,
+                        },
+                        AlternativeJson::Join { when, join, parts } => evaluate::Alternative {
+                            when: when.map(|when| template::parse_condition(&when)).transpose().map_err(fail)?,
+                            template: template::parse_template("").map_err(fail)?,
+                            join: Some((
+                                join,
+                                parts
+                                    .iter()
+                                    .map(|part| template::parse_template(part))
+                                    .collect::<Result<_, _>>()
+                                    .map_err(fail)?,
+                            )),
                         },
                     })
                 })
@@ -959,6 +979,46 @@ mod tests {
         assert_eq!(label(&rules, &jungle, "zone set pvs", 9999), "BAD: 9999");
     }
 
+    /// H3's label callbacks, through their `element_label` entries. Each value
+    /// is what the decompiled callback prints for that element: a reference
+    /// frame names its placement only when one matches the object id
+    /// (`[invalid]` otherwise), placements name their object only in a
+    /// scenario, chud states join a field's flags with ` OR ` and the fields
+    /// with ` AND `, and a pitch range alone in its block is "always played".
+    #[test]
+    fn h3_callbacks_follow_guerilla() {
+        let Some(tags) = kit_tags("BLAM_TEST_H3EK") else { return };
+        let rules = rules("halo3_mcc");
+        let read = |path: &str| crate::TagFile::read(tags.join(path)).unwrap();
+        let halo = read("levels/solo/120_halo/120_halo.scenario");
+        assert_eq!(label(&rules, &halo, "reference frames", 0), "[invalid]:1");
+        assert_eq!(label(&rules, &halo, "reference frames", 2), "trench_frigate:1");
+        assert_eq!(label(&rules, &halo, "machines", 0), "120_halo_large_door01 forerunner_door_grand");
+        assert_eq!(label(&rules, &halo, "controls", 0), "120_halo_large_door02_ctrl_a NONE");
+        assert_eq!(label(&rules, &halo, "ai objectives[0]/tasks[0]/areas", 0), "areas_0 (control_room)");
+        let devices = read("levels/ui/mainmenu/resources/mainmenu.scenario_devices_resource");
+        assert_eq!(label(&rules, &devices, "machines", 0), " storm_main_menu");
+        let rifle = read("ui/chud/assault_rifle.chud_definition");
+        assert_eq!(
+            label(&rules, &rifle, "widget collections[0]/base/state data", 0),
+            "spartan AND 720p fullscreen OR 480p fullscreen OR 480i fullscreen",
+        );
+        assert_eq!(label(&rules, &rifle, "widget collections[2]/base/state data", 0), "unzoomed");
+        let mp = read("multiplayer/multiplayer_globals.multiplayer_globals");
+        assert_eq!(label(&rules, &mp, "runtime[0]/general events", 1), "kill : effect player");
+        let warthog = read("sound/vehicles/warthog/new_warthog_right/track1/loop.sound");
+        assert_eq!(label(&rules, &warthog, "pitch ranges", 0), "hi:868 to 1400");
+        let flyby = read("sound/weapons/spike_rifle/spike_flyby.sound");
+        assert_eq!(label(&rules, &flyby, "pitch ranges", 0), "always played");
+        let knock = read("cinematics/ubercam_exports/130ld_legendary/130ld01_knock_knock.cinematic_scene");
+        assert_eq!(label(&rules, &knock, "shots[0]/object functions[0]/keyframes", 0), "Frame   0");
+        assert_eq!(label(&rules, &knock, "shots[0]/object functions", 0), "0. cin_matte_painting (planet_glow)");
+        let finished = read("cinematics/ubercam_exports/130lc_epilogue/130lc03_its_finished.cinematic_scene");
+        assert_eq!(label(&rules, &finished, "shots[1]/object functions[0]/keyframes", 1), "Frame 223 (Disable)");
+        let physics = read("objects/vehicles/warthog/warthog.physics_model");
+        assert_eq!(label(&rules, &physics, "node edges", 0), "*hull:bumper");
+    }
+
     /// Reach: a long block index recurses, several set flags join with `,`,
     /// and a real prints as `%.6g`.
     #[test]
@@ -1153,6 +1213,9 @@ mod tests {
         // `|index` is the raw value.
         check(r#""{named|none:nobody}/{named|index}""#, 3, "nobody/-1");
         check(r#""{named|none:nobody}/{named|index}""#, 2, "<first>/0");
+        // `join`: the parts that come out non-empty, joined.
+        check(r#"{"join": " AND ", "parts": ["{flags|flags: OR }", "{name}", "{type|enum:kind_enum}"]}"#, 0, "negate AND b");
+        check(r#"{"join": " AND ", "parts": ["{flags|flags: OR }", "{name}"]}"#, 3, "");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1163,7 +1226,7 @@ mod tests {
         for (game, complete) in [
             ("haloce_mcc", true),
             ("halo2_mcc", true),
-            ("halo3_mcc", false),
+            ("halo3_mcc", true),
             ("halo3odst_mcc", false),
             ("haloreach_mcc", false),
             ("halo4_mcc", false),
@@ -1184,12 +1247,15 @@ mod tests {
             .unwrap()
             .replace("{name} ({count:03d})", "{nmae} ({count:03d})")
             .replace("{type|map:kinds}", "{type|map:sorts}")
+            .replace("big {/names[", "big {/nmaes[")
             .replace(r#""plain_struct": {"#, r#""plain_struct": {"element_label_callback": "test 0x1", "#)
             .replace(r#""element_label": {"source": "test", "label": null}"#, r#""unused": 0"#);
         std::fs::write(&path, text).unwrap();
         let problems = check::check(root.join("halo3_mcc"), true).unwrap().join("\n");
         assert!(problems.contains("no field `nmae`"), "{problems}");
         assert!(problems.contains("no map `sorts`"), "{problems}");
+        // A root path under a `{#group} ==` guard is checked against that group's root.
+        assert!(problems.contains("no field `nmaes` in label_test_struct"), "{problems}");
         assert!(problems.contains("plain_struct: has a label callback but no element_label"), "{problems}");
         let _ = std::fs::remove_dir_all(&root);
     }

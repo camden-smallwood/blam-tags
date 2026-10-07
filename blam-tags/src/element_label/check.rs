@@ -115,6 +115,10 @@ struct Checker<'a> {
     key: String,
     element_struct: String,
     maps: Vec<String>,
+    /// The group file a root path starts in: the alternative's `{#group} ==`
+    /// guard when it has one (a scenario-object block in a resource file
+    /// reads the owning scenario's root), else the entry's own file.
+    root_file: Option<String>,
     used_maps: &'a mut std::collections::HashSet<String>,
     problems: &'a mut Vec<String>,
 }
@@ -207,7 +211,7 @@ impl Checker<'_> {
     fn path(&mut self, path: &TPath, base: &str) -> Reached {
         let mut current = match path.start {
             PathStart::Element => base.to_owned(),
-            PathStart::Root => match self.schema.groups.get(self.file).and_then(|g| g.root_struct.clone()) {
+            PathStart::Root => match self.schema.groups.get(self.root_file.as_deref().unwrap_or(self.file)).and_then(|g| g.root_struct.clone()) {
                 Some(root) => root,
                 None => return Reached::Unknown,
             },
@@ -259,6 +263,13 @@ impl Checker<'_> {
     }
 }
 
+/// The group file a `when` limits its alternative to with `{#group} == "tag"`.
+fn guarded_group(when: &str, group_files: &HashMap<String, String>) -> Option<String> {
+    let start = when.find(r#"{#group} == ""#)? + r#"{#group} == ""#.len();
+    let tag = when[start..].split('"').next()?;
+    group_files.get(&format!("{tag:<4}")).cloned()
+}
+
 /// Problems with a game's `element_label` entries: templates or `when`s that
 /// don't parse, paths that name no field, maps, enums or shared entries that
 /// don't exist, shared maps and entries nothing uses, and (with
@@ -276,6 +287,10 @@ pub fn check(game_dir: impl AsRef<Path>, require_coverage: bool) -> Result<Vec<S
     let shared_maps: Vec<String> =
         meta["element_labels"]["maps"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
     let shared_entries = meta["element_labels"]["entries"].as_object().cloned().unwrap_or_default();
+    let group_files: HashMap<String, String> = meta["tag_index"]
+        .as_object()
+        .map(|index| index.iter().filter_map(|(tag, file)| Some((tag.clone(), file.as_str()?.to_owned()))).collect())
+        .unwrap_or_default();
     let mut used_maps = std::collections::HashSet::new();
     let mut used_entries = std::collections::HashSet::new();
     let mut problems = Vec::new();
@@ -311,6 +326,7 @@ pub fn check(game_dir: impl AsRef<Path>, require_coverage: bool) -> Result<Vec<S
                 key: key.to_owned(),
                 element_struct,
                 maps,
+                root_file: None,
                 used_maps: &mut used_maps,
                 problems: &mut problems,
             };
@@ -318,11 +334,15 @@ pub fn check(game_dir: impl AsRef<Path>, require_coverage: bool) -> Result<Vec<S
                 match alternative {
                     Value::String(text) => checker.template(text),
                     other => {
+                        checker.root_file = other["when"].as_str().and_then(|when| guarded_group(when, &group_files));
                         if let Some(when) = other["when"].as_str() {
                             checker.condition(when);
                         }
                         if let Some(format) = other["format"].as_str() {
                             checker.template(format);
+                        }
+                        for part in other["parts"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                            checker.template(part);
                         }
                     }
                 }
