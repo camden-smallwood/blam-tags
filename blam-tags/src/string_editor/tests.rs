@@ -185,6 +185,9 @@ fn sweep_kit_values() {
                 let count = counts.entry(format!("{editor} ({})", crate::fields::format_group_tag(tag.group().tag).trim())).or_default();
                 if menu.picks().is_empty() {
                     count.empty_menu += 1;
+                    if count.samples.len() < 4 {
+                        count.samples.push(format!("(empty) {rel} {path} = {value:?}"));
+                    }
                 } else if menu.accepts(&value) {
                     count.accepted += 1;
                 } else {
@@ -200,7 +203,7 @@ fn sweep_kit_values() {
     for (editor, count) in &counts {
         eprintln!("  {editor:40} {:6} / {:5} / {:5}", count.accepted, count.rejected, count.empty_menu);
         for sample in &count.samples {
-            eprintln!("      rejected: {sample}");
+            eprintln!("      {sample}");
         }
     }
 }
@@ -234,4 +237,22 @@ fn print_menu() {
     eprintln!("editor {editor}, group {}", crate::fields::format_group_tag(tag.group().tag));
     show(&menu.items, 0);
     if let Some(note) = &menu.note { eprintln!("(note) {note}"); }
+}
+
+/// Foundation groups marker names by their `_` parts: a name alone in its
+/// group is an item, a group is a submenu named by its shared parts, a name
+/// that is exactly that prefix comes first in it, and a prefix every name
+/// shares is skipped.
+#[test]
+fn marker_names_group_by_their_parts() {
+    let split = |names: &[&str]| -> Vec<Vec<String>> { names.iter().map(|name| name.split('_').map(str::to_owned).collect()).collect() };
+    let menu = build::marker_hierarchy(&split(&["body", "primary", "primary_ejection", "primary_trigger", "secondary_trigger"]), 0);
+    assert_eq!(menu, vec![
+        MenuItem::item("body"),
+        MenuItem::submenu("primary", vec![MenuItem::item("primary"), MenuItem::item("primary_ejection"), MenuItem::item("primary_trigger")]),
+        MenuItem::item("secondary_trigger"),
+    ]);
+    // Everything shares `left_hand`: that level is skipped, not a submenu.
+    let menu = build::marker_hierarchy(&split(&["left_hand_a", "left_hand_b"]), 0);
+    assert_eq!(menu, vec![MenuItem::item("left_hand_a"), MenuItem::item("left_hand_b")]);
 }

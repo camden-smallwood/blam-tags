@@ -37,6 +37,8 @@ pub(crate) enum Builder {
     /// Foundation's object function panel on an animation graph; see
     /// [`ObjectFunctionPanel`].
     ObjectFunctionPanel(ObjectFunctionPanel),
+    /// Foundation's marker name panel; see [`MarkerNames`].
+    MarkerNames(MarkerNames),
     /// An editor whose list depends on something Baboon can't know yet;
     /// accepts anything, as an empty menu does.
     Unavailable {
@@ -471,15 +473,16 @@ pub(crate) struct ObjectFunction {
     /// The tag's own functions: blocks of its object struct.
     #[serde(default)]
     own: Vec<Level>,
-    /// Object type (group name) → its type chain, root type first
-    /// (`biped` → `object`, `motor`, `unit`, `biped`).
-    types: HashMap<String, Vec<String>>,
-    /// When the tag's group isn't one of `types`, list the chain of its
-    /// group and ancestors instead (Halo 2, Halo 3).
+    /// The object groups (by name) whose tags get the per-type lists: the
+    /// engine's object types, not the abstract `object`, `unit`, `item` or
+    /// `device`.
+    object_types: Vec<String>,
+    /// A level's submenu title where the engine's differs from the group's
+    /// name (Halo 3's `device_terminal` is "terminal").
     #[serde(default)]
-    chain_from_groups: bool,
-    /// Type → its fixed function names; each is a submenu named after the
-    /// type.
+    titles: HashMap<String, String>,
+    /// Group name → its fixed function names. The tag's group and its
+    /// ancestors, root first, each give a submenu when they have a list.
     lists: HashMap<String, Vec<String>>,
     /// Further submenus for some object types.
     #[serde(default)]
@@ -511,17 +514,14 @@ impl ObjectFunction {
                 items.push(MenuItem::submenu(title, own));
             }
         }
-        let chain: Option<Vec<String>> = match self.types.get(group_name) {
-            Some(chain) => Some(chain.clone()),
-            None if self.chain_from_groups && is_object => Some(
-                editors.group_chain(group).iter().rev().filter_map(|tag| editors.group_name(*tag).map(str::to_owned)).collect(),
-            ),
-            None => None,
-        };
-        let Some(chain) = chain else { return Menu { items, ..Default::default() } };
-        for level in &chain {
+        if !self.object_types.iter().any(|name| name == group_name) {
+            return Menu { items, ..Default::default() };
+        }
+        let chain: Vec<&str> = editors.group_chain(group).iter().rev().filter_map(|tag| editors.group_name(*tag)).collect();
+        for level in chain {
             if let Some(names) = self.lists.get(level).filter(|names| !names.is_empty()) {
-                items.push(MenuItem::submenu(level.clone(), names.iter().map(MenuItem::item).collect()));
+                let title = self.titles.get(level).map(String::as_str).unwrap_or(level);
+                items.push(MenuItem::submenu(title, names.iter().map(MenuItem::item).collect()));
             }
         }
         for extra in &self.extra {
@@ -980,6 +980,239 @@ impl ObjectFunctionPanel {
     }
 }
 
+/// Foundation's marker name panel (`amkr`): the marker names of a render
+/// model, grouped into submenus by their `_`-separated parts. Which render
+/// model comes from the first of `providers` that applies to the tag and
+/// field, as `MarkerNameMenuPanelItemCache` lists them.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct MarkerNames {
+    providers: Vec<MarkerProvider>,
+    /// From a model, object or render model to its markers.
+    model: String,
+    render_model: String,
+    markers: String,
+    marker_label: String,
+    /// The disabled entry when no render model is found.
+    empty: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct MarkerProvider {
+    /// The tag's group, or one it descends from (by name); any when absent.
+    #[serde(default)]
+    group: Option<String>,
+    /// The edited field's path without indices must end with this.
+    #[serde(default)]
+    field: Option<String>,
+    from: MarkerSource,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MarkerSource {
+    /// The edited tag itself.
+    Itself,
+    /// A reference field of the edited tag (or its parent group's struct).
+    Reference(String),
+    /// From the struct holding the edited field: `..` climbs out of a
+    /// struct or element, `{"index": f, "block": b}` follows a block index
+    /// into the root's block `b`, `{"index": f, "palettes": {...}}` into
+    /// the palette of the placement block it sits in; the last step names
+    /// the reference.
+    Relative(Vec<RelativeStep>),
+    /// The tag of this group at the edited tag's own path.
+    SamePath(String),
+    /// A fixed list, no model.
+    List(Vec<String>),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum RelativeStep {
+    Name(String),
+    Index {
+        index: String,
+        #[serde(default)]
+        block: Option<String>,
+        #[serde(default)]
+        palettes: HashMap<String, String>,
+    },
+}
+
+/// A field path with its indices and ordinals taken out, as clean names.
+fn bare_path(path: &str) -> Vec<String> {
+    path.split('/').map(|segment| crate::field_name::clean_field_name(segment.split(['[', '#']).next().unwrap_or(segment)).into_owned()).collect()
+}
+
+fn block_index(field: crate::TagField<'_>) -> Option<i64> {
+    match field.value()? {
+        TagFieldData::CharBlockIndex(i) => Some(i as i64),
+        TagFieldData::ShortBlockIndex(i) => Some(i as i64),
+        TagFieldData::LongBlockIndex(i) => Some(i as i64),
+        _ => None,
+    }
+}
+
+impl MarkerNames {
+    fn applies(&self, editors: &StringEditors, provider: &MarkerProvider, ctx: &Context<'_>) -> bool {
+        if let Some(group) = &provider.group {
+            let Some(wanted) = editors.group_tag(group) else { return false };
+            if !editors.group_chain(ctx.tag.group().tag).contains(&wanted) {
+                return false;
+            }
+        }
+        match &provider.field {
+            Some(field) => {
+                let path = bare_path(ctx.field_path);
+                let wanted = bare_path(field);
+                path.len() >= wanted.len() && path[path.len() - wanted.len()..] == wanted[..]
+            }
+            None => true,
+        }
+    }
+
+    /// The tag the provider names, or the fixed list it gives.
+    fn source(&self, editors: &StringEditors, from: &MarkerSource, ctx: &Context<'_>, source: &dyn TagSource) -> Result<Option<Held>, Vec<String>> {
+        let root = ctx.tag.root();
+        Ok(match from {
+            MarkerSource::Itself => Some(Held::Edited),
+            MarkerSource::Reference(field) => inherited(root, field).and_then(|field| source.tag_of(field)).map(Held::Loaded),
+            MarkerSource::SamePath(group) => editors.group_tag(group).and_then(|group| source.tag(group, ctx.tag_path)).map(Held::Loaded),
+            MarkerSource::List(items) => return Err(items.clone()),
+            MarkerSource::Relative(steps) => (|| {
+                let segments: Vec<&str> = ctx.field_path.split('/').collect();
+                let mut at: Vec<&str> = segments[..segments.len().saturating_sub(1)].to_vec();
+                let mut element = None;
+                let (last, walk) = steps.split_last()?;
+                for step in walk {
+                    match step {
+                        RelativeStep::Name(name) if name == ".." => {
+                            at.pop()?;
+                        }
+                        RelativeStep::Name(_) => return None,
+                        RelativeStep::Index { index, block, palettes } => {
+                            let holder = if at.is_empty() { root } else { root.descend(&at.join("/"))? };
+                            let i = block_index(holder.field(index)?)?;
+                            if i < 0 {
+                                return None;
+                            }
+                            let block = match block {
+                                Some(block) => block.clone(),
+                                None => {
+                                    let placement = at.iter().rev().find_map(|segment| {
+                                        let name = crate::field_name::clean_field_name(segment.split(['[', '#']).next().unwrap_or(segment)).into_owned();
+                                        palettes.iter().find(|(placement, _)| crate::field_name::clean_field_name(placement) == name).map(|(_, palette)| palette.clone())
+                                    })?;
+                                    placement
+                                }
+                            };
+                            element = Some(format!("{block}[{i}]"));
+                            at.clear();
+                        }
+                    }
+                }
+                let RelativeStep::Name(reference) = last else { return None };
+                let holder = match (&element, at.is_empty()) {
+                    (Some(element), _) => root.descend(element)?,
+                    (None, true) => root,
+                    (None, false) => root.descend(&at.join("/"))?,
+                };
+                source.tag_of(holder.field(reference)?)
+            })()
+            .map(Held::Loaded),
+        })
+    }
+
+    /// The render model a model, an object or a render model leads to.
+    fn render_model(&self, editors: &StringEditors, held: Held, ctx: &Context<'_>, source: &dyn TagSource) -> Option<Held> {
+        let mut held = held;
+        for _ in 0..3 {
+            let group = match &held {
+                Held::Edited => ctx.tag.group().tag,
+                Held::Loaded(tag) => tag.group().tag,
+            };
+            let chain = editors.group_chain(group);
+            let next = if chain.contains(&u32::from_be_bytes(*b"mode")) {
+                return Some(held);
+            } else if chain.contains(&u32::from_be_bytes(*b"hlmt")) {
+                &self.render_model
+            } else if chain.contains(&u32::from_be_bytes(*b"obje")) {
+                &self.model
+            } else {
+                return None;
+            };
+            let tag = source.tag_of(inherited(held.root(ctx), next)?)?;
+            held = Held::Loaded(tag);
+        }
+        None
+    }
+
+    fn build(&self, editors: &StringEditors, ctx: &Context<'_>, source: &dyn TagSource) -> Menu {
+        let empty = || Menu { note: Some(self.empty.clone()), ..Default::default() };
+        let Some(provider) = self.providers.iter().find(|provider| self.applies(editors, provider, ctx)) else { return empty() };
+        let held = match self.source(editors, &provider.from, ctx, source) {
+            Err(list) => return Menu { items: list.into_iter().map(MenuItem::item).collect(), ..Default::default() },
+            Ok(Some(held)) => held,
+            Ok(None) => return empty(),
+        };
+        let Some(model) = self.render_model(editors, held, ctx, source) else { return empty() };
+        let Some(block) = inherited(model.root(ctx), &self.markers).and_then(|field| field.as_block()) else { return empty() };
+        let mut names: Vec<String> = Vec::new();
+        for element in block.iter() {
+            if let Some(name) = element.field(&self.marker_label).and_then(|field| field.text()) {
+                if !names.iter().any(|known| known.eq_ignore_ascii_case(&name)) {
+                    names.push(name);
+                }
+            }
+        }
+        names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| b.cmp(a)));
+        let split: Vec<Vec<String>> = names.iter().map(|name| name.split('_').map(str::to_owned).collect()).collect();
+        let items = marker_hierarchy(&split, 0);
+        if items.is_empty() { empty() } else { Menu { items, ..Default::default() } }
+    }
+}
+
+/// Foundation's `InitMenuHierarchyByName`: names split on `_`, grouped by
+/// their parts from `depth` on; a group of one is an item, a larger one a
+/// submenu named by the parts its members share, which lists first a member
+/// that is exactly that prefix.
+pub(super) fn marker_hierarchy(ids: &[Vec<String>], depth: usize) -> Vec<MenuItem> {
+    let ids: Vec<&Vec<String>> = ids.iter().filter(|id| id.len() > depth).collect();
+    if ids.len() <= 1 {
+        return ids.first().map(|id| vec![MenuItem::item(id.join("_"))]).unwrap_or_default();
+    }
+    let mut max_depth = depth;
+    let groups = loop {
+        let mut groups: Vec<(String, Vec<Vec<String>>)> = Vec::new();
+        for id in &ids {
+            let key = id.get(max_depth).cloned().unwrap_or_default();
+            match groups.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, members)) => members.push((*id).clone()),
+                None => groups.push((key, vec![(*id).clone()])),
+            }
+        }
+        max_depth += 1;
+        if groups.len() != 1 || max_depth > 64 {
+            break groups;
+        }
+    };
+    let mut items = Vec::new();
+    for (_, members) in groups {
+        let first = &members[0];
+        if members.len() == 1 {
+            items.push(MenuItem::item(first.join("_")));
+            continue;
+        }
+        let mut children = marker_hierarchy(&members, max_depth);
+        if first.len() == max_depth {
+            children.insert(0, MenuItem::item(first.join("_")));
+        }
+        let prefix = first[..max_depth.min(first.len())].join("_");
+        items.push(MenuItem::submenu(prefix, children));
+    }
+    items
+}
+
 /// The element of `block` the edited field sits in.
 fn enclosing<'a>(ctx: &Context<'a>, block: &str) -> Option<TagStruct<'a>> {
     let segments: Vec<&str> = ctx.field_path.split('/').collect();
@@ -1035,6 +1268,7 @@ pub(crate) fn build(editors: &StringEditors, builder: &Builder, ctx: &Context<'_
         Builder::Choice(spec) => spec.build(editors, ctx, source),
         Builder::ObjectVariant(spec) => spec.build(editors, ctx, source),
         Builder::ObjectFunctionPanel(spec) => spec.build(editors, ctx, source),
+        Builder::MarkerNames(spec) => spec.build(editors, ctx, source),
         Builder::Unavailable { .. } => Menu::default(),
     }
 }
