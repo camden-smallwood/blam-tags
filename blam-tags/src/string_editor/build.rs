@@ -870,7 +870,9 @@ impl Choice {
 /// entry references the object; the object's model holds the variants.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ObjectVariant {
-    /// Placement block (as named in the field's path) → its palette block.
+    /// Placement block (as named in the field's path) → its palette block;
+    /// `_meta.json`'s `placement_palettes` when not given.
+    #[serde(default)]
     palettes: HashMap<String, String>,
     /// The placement's palette index field, and the palette entry's
     /// reference.
@@ -888,7 +890,8 @@ impl ObjectVariant {
         let found = (1..segments.len()).rev().find_map(|end| {
             let segment = segments[end - 1];
             let name = crate::field_name::clean_field_name(segment.split(['[', '#']).next().unwrap_or(segment)).into_owned();
-            let palette = self.palettes.iter().find(|(block, _)| crate::field_name::clean_field_name(block) == name)?.1;
+            let palettes = if self.palettes.is_empty() { &editors.placement_palettes } else { &self.palettes };
+            let palette = palettes.iter().find(|(block, _)| crate::field_name::clean_field_name(block) == name)?.1;
             segment.contains('[').then(|| (segments[..end].join("/"), palette.clone()))
         });
         let Some((placement, palette)) = found else { return Menu::default() };
@@ -1099,6 +1102,7 @@ impl MarkerNames {
                             let block = match block {
                                 Some(block) => block.clone(),
                                 None => {
+                                    let palettes = if palettes.is_empty() { &editors.placement_palettes } else { palettes };
                                     let placement = at.iter().rev().find_map(|segment| {
                                         let name = crate::field_name::clean_field_name(segment.split(['[', '#']).next().unwrap_or(segment)).into_owned();
                                         palettes.iter().find(|(placement, _)| crate::field_name::clean_field_name(placement) == name).map(|(_, palette)| palette.clone())

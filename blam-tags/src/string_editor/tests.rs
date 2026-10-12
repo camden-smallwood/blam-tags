@@ -256,3 +256,27 @@ fn marker_names_group_by_their_parts() {
     let menu = build::marker_hierarchy(&split(&["left_hand_a", "left_hand_b"]), 0);
     assert_eq!(menu, vec![MenuItem::item("left_hand_a"), MenuItem::item("left_hand_b")]);
 }
+
+/// `like` takes another editor's spec with some keys replaced; `null`
+/// clears one. A `like` naming no editor fails the load.
+#[test]
+fn like_borrows_another_editors_spec() {
+    let dir = std::env::temp_dir().join(format!("string_editor_like_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("_meta.json"), r#"{"string_editors": {
+        "base": {"caption": "Base", "builder": "list", "items": ["a", "b"]},
+        "same": {"like": "base", "caption": null},
+        "other": {"like": "base", "items": ["c"]}}}"#).unwrap();
+    let editors = StringEditors::load(&dir).unwrap();
+    assert_eq!(editors.caption("base"), "Base");
+    assert_eq!(editors.caption("same"), "Select String", "null clears the caption");
+    let source = KitTags::new(dir.clone(), "halo3_mcc");
+    let tag = TagFile::new("../definitions/halo3_mcc/model.json").unwrap();
+    let ctx = Context { tag: &tag, tag_path: "", field_path: "" };
+    assert_eq!(editors.menu("same", &ctx, &source).picks(), vec!["a", "b"]);
+    assert_eq!(editors.menu("other", &ctx, &source).picks(), vec!["c"]);
+    std::fs::write(dir.join("_meta.json"), r#"{"string_editors": {"lost": {"like": "nothing"}}}"#).unwrap();
+    let error = StringEditors::load(&dir).unwrap_err();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(matches!(error, StringEditorsError::BadLike { ref editor, .. } if editor == "lost"), "{error}");
+}

@@ -124,6 +124,8 @@ pub struct StringEditors {
     /// Group name (the extension) → group tag, and back.
     groups_by_name: HashMap<String, u32>,
     group_names: HashMap<u32, String>,
+    /// From `_meta.json`'s `placement_palettes`.
+    pub(crate) placement_palettes: HashMap<String, String>,
 }
 
 /// A field with an editor: its clean name, and which of its struct's fields
@@ -141,6 +143,8 @@ struct FieldEditor {
 pub enum StringEditorsError {
     Io(std::io::Error),
     Json(std::path::PathBuf, serde_json::Error),
+    /// A spec whose `like` names no spec (or loops).
+    BadLike { file: std::path::PathBuf, editor: String },
     /// A field naming an editor `_meta.json` doesn't describe.
     UnknownEditor { file: std::path::PathBuf, field: String, editor: String },
 }
@@ -150,6 +154,7 @@ impl std::fmt::Display for StringEditorsError {
         match self {
             Self::Io(error) => write!(f, "{error}"),
             Self::Json(path, error) => write!(f, "{}: {error}", path.display()),
+            Self::BadLike { file, editor } => write!(f, "{}: string editor `{editor}` is `like` one that isn't there", file.display()),
             Self::UnknownEditor { file, field, editor } =>
                 write!(f, "{}: field `{field}` names string editor `{editor}`, which _meta.json doesn't describe", file.display()),
         }
@@ -164,10 +169,16 @@ impl From<std::io::Error> for StringEditorsError {
 
 #[derive(Deserialize)]
 struct Meta {
+    /// Editor name → its spec, which may be `{"like": "<editor>", ...}`:
+    /// that editor's spec with these keys replacing its own.
     #[serde(default)]
-    string_editors: HashMap<String, Spec>,
+    string_editors: serde_json::Map<String, serde_json::Value>,
     #[serde(default)]
     tag_index: HashMap<String, String>,
+    /// Scenario placement block → its palette block, for the editors that
+    /// follow a placement's `type` (object variants, connection markers).
+    #[serde(default)]
+    placement_palettes: HashMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -211,6 +222,22 @@ pub(crate) struct Spec {
 
 fn validates() -> bool { true }
 
+/// A spec with its `like` resolved: the named spec's keys, then its own.
+fn resolve_like(specs: &serde_json::Map<String, serde_json::Value>, value: &serde_json::Value, depth: usize) -> Option<serde_json::Value> {
+    let object = value.as_object()?;
+    let Some(like) = object.get("like") else { return Some(value.clone()) };
+    if depth > 8 {
+        return None;
+    }
+    let mut merged = resolve_like(specs, specs.get(like.as_str()?)?, depth + 1)?.as_object()?.clone();
+    for (key, value) in object {
+        if key != "like" {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    Some(serde_json::Value::Object(merged))
+}
+
 fn parse_guid(text: &str) -> Option<[u8; 16]> {
     let text = text.trim();
     if text.len() != 32 {
@@ -233,10 +260,16 @@ impl StringEditors {
         let meta_path = game_dir.join("_meta.json");
         let meta: Meta = match std::fs::read(&meta_path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| StringEditorsError::Json(meta_path.clone(), error))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Meta { string_editors: HashMap::new(), tag_index: HashMap::new() },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Meta { string_editors: Default::default(), tag_index: HashMap::new(), placement_palettes: HashMap::new() },
             Err(error) => return Err(error.into()),
         };
-        let mut editors = StringEditors { specs: meta.string_editors, ..Default::default() };
+        let mut specs = HashMap::new();
+        for (name, value) in &meta.string_editors {
+            let merged = resolve_like(&meta.string_editors, value, 0).ok_or_else(|| StringEditorsError::BadLike { file: meta_path.clone(), editor: name.clone() })?;
+            let spec: Spec = serde_json::from_value(merged).map_err(|error| StringEditorsError::Json(meta_path.clone(), error))?;
+            specs.insert(name.clone(), spec);
+        }
+        let mut editors = StringEditors { specs, placement_palettes: meta.placement_palettes, ..Default::default() };
         for (tag, name) in &meta.tag_index {
             if let Some(tag) = crate::fields::parse_group_tag(tag) {
                 editors.groups_by_name.insert(name.clone(), tag);
