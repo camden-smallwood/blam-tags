@@ -266,6 +266,18 @@ reason = "the path handles take field paths as strings"
 strategy = "skip"
 reason = "field-name markup parsing; names reach Python already cleaned"
 
+[module.data_text]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.element_label]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
+[module.string_editor]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
 [module.typed_enums]
 strategy = "skip"
 reason = "Rust typing helpers over schema enums; Python sets enums by name"

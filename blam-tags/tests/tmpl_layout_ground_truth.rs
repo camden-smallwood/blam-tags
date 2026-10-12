@@ -175,10 +175,11 @@ fn h3ek_ships_particles_at_several_root_sizes_and_the_dump_matches_one() {
 /// size. `fold_template_bases` folds a template's inherited base into the struct
 /// that carries it, turning those bytes into real fields; once folded the hole
 /// names its template but is zero bytes wide, because nothing anonymous is left.
-/// Halo 3 is the one case here that stays unfolded — it dumps the shader fields
-/// straight into the struct, so its `?rmp` hole is a genuine 64-byte range —
-/// while Reach folds the same `?rmp` down to a named, zero-width marker. The
-/// identity is the durable fact across both; the width is a fold artifact.
+/// Halo 3 and Reach stay unfolded — their dumps carry the shader fields in the
+/// struct after the template (Reach's since the `d3871e2` repair dump), so the
+/// `?rmp` hole is a genuine range: 64 bytes in Halo 3, 100 in Reach — and Reach's
+/// particle built from them is still the 496 bytes its kit ships. The identity
+/// is the durable fact; the width depends on whether the dump inlined the base.
 #[test]
 fn a_tmpl_hole_records_which_template_fills_it() {
     let holes = |game: &str, group: &str| {
@@ -193,12 +194,16 @@ fn a_tmpl_hole_records_which_template_fills_it() {
     };
 
     assert_eq!(holes("halo3_mcc", "particle"), vec![("?rmp".to_owned(), 64)]);
-    assert_eq!(holes("haloreach_mcc", "particle"), vec![("?rmp".to_owned(), 0)]);
+    assert_eq!(holes("haloreach_mcc", "particle"), vec![("?rmp".to_owned(), 100)]);
+    // The unfolded hole is the right width: a new Reach particle is the size
+    // HREK's particles are (`a_shipped_reach_particle_keeps_its_render_method_in_an_unnamed_slot`).
+    let reach = blam_tags::TagFile::new(definitions().join("haloreach_mcc/particle.json")).unwrap();
+    assert_eq!(reach.root().definition().size(), 496);
     // Each fx group has its own render-method template, so the identity really
     // does distinguish them rather than being one constant wearing three hats —
-    // and it survives the fold that zeroes the width.
-    assert_eq!(holes("haloreach_mcc", "beam_system"), vec![("rmb".to_owned(), 0)]);
-    assert_eq!(holes("haloreach_mcc", "decal_system"), vec![("rmd".to_owned(), 0)]);
+    // and it holds whatever the width.
+    assert_eq!(holes("haloreach_mcc", "beam_system"), vec![("rmb".to_owned(), 100)]);
+    assert_eq!(holes("haloreach_mcc", "decal_system"), vec![("rmd".to_owned(), 100)]);
 }
 
 /// A zero-width template hole is still recorded.

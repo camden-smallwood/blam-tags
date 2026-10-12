@@ -337,25 +337,17 @@ fn every_group_builds_a_layout_and_a_new_tag() {
 
 /// Structs whose fields do not add up to their declared size:
 /// `(struct, declared, sum of its fields)`. Every one holds a `tmpl` custom —
-/// a template whose inherited fields (a render method: 64 bytes in ODST, 100
-/// in Reach and Halo 4) are described by another group, which the engine
-/// inlines when it builds the layout (`schema::fold_template_bases` and the
-/// expansion in `build_layout_from_schema`). Halo 3 and Campaign Evolved
-/// inline those fields in the dump itself. Anything new here is a dump the
-/// engine has not been taught about. A data gap, not an engine failure.
+/// a template whose inherited fields (a render method: 100 bytes in Halo 4
+/// and H2AMP) are described by another group, which the engine inlines when
+/// it builds the layout (`schema::fold_template_bases` and the expansion in
+/// `build_layout_from_schema`). Halo 3, ODST, Reach and Campaign Evolved
+/// size the struct after the template with those fields in the dump itself
+/// (ODST's and Reach's since the repair dumps of `715e3c8`/`d3871e2`).
+/// Anything new here is a dump the engine has not been taught about. A data
+/// gap, not an engine failure.
 const TEMPLATE_HOLES: &[(&str, u64, u64)] = &[
     ("halo2amp_mcc/particle_struct_definition", 568, 468),
-    ("halo3odst_mcc/beam_definition_block", 500, 436),
-    ("halo3odst_mcc/contrail_definition_block", 600, 536),
-    ("halo3odst_mcc/decal_definition_block", 116, 52),
-    ("halo3odst_mcc/light_volume_definition_block", 360, 296),
-    ("halo3odst_mcc/particle_struct_definition", 404, 340),
     ("halo4_mcc/particle_struct_definition", 568, 468),
-    ("haloreach_mcc/beam_definition_block", 548, 448),
-    ("haloreach_mcc/contrail_definition_block", 640, 540),
-    ("haloreach_mcc/decal_definition_block", 152, 52),
-    ("haloreach_mcc/light_volume_definition_block", 436, 336),
-    ("haloreach_mcc/particle_struct_definition", 496, 396),
 ];
 
 /// The engine's name for a JSON field type: the dump's snake case with
