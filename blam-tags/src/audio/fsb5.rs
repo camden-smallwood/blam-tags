@@ -363,11 +363,10 @@ impl Fsb5 {
 
 /// Normalize a tag reference to the `.fsb.info` manifest key.
 pub fn tag_ref_to_info_path(sound_rel: &str) -> String {
-    let norm = sound_rel.replace('/', "\\");
-    let mut p = if norm.to_ascii_lowercase().starts_with("data\\") {
-        norm
+    let mut p = if sound_rel.to_ascii_lowercase().starts_with("data\\") {
+        sound_rel.to_owned()
     } else {
-        format!("data\\{norm}")
+        format!("data\\{sound_rel}")
     };
     if !p.to_ascii_lowercase().ends_with(".aif") {
         p.push_str(".aif");
@@ -376,7 +375,7 @@ pub fn tag_ref_to_info_path(sound_rel: &str) -> String {
 }
 
 pub fn sound_leaf_name(rel: &str) -> String {
-    rel.rsplit(['\\', '/'])
+    rel.rsplit('\\')
         .next()
         .unwrap_or(rel)
         .to_string()

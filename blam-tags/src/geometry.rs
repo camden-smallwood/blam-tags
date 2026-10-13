@@ -233,14 +233,14 @@ pub fn strip_to_list_u32(strip: &[u32]) -> Vec<(u32, u32, u32)> {
     out
 }
 
-/// A tag reference's name: the last segment of its path (either separator).
+/// A tag reference's name: the last segment of its `\\`-separated path.
 /// `None` when that is empty — a null reference, or a path ending in a
 /// separator.
 ///
 /// Not `Path::file_stem`: a reference path carries no extension, so a stem
 /// would cut a tag named `probe. multipurpose` down to `probe`.
 pub(crate) fn tag_path_basename(path: &str) -> Option<&str> {
-    path.rsplit(['\\', '/']).next().filter(|name| !name.is_empty())
+    path.rsplit('\\').next().filter(|name| !name.is_empty())
 }
 
 //================================================================================
@@ -409,7 +409,6 @@ mod tests {
     #[test]
     fn a_tag_name_keeps_its_dots() {
         assert_eq!(tag_path_basename("shaders\\metal\\plate"), Some("plate"));
-        assert_eq!(tag_path_basename("shaders/metal/plate"), Some("plate"));
         // Shipped CE tags: the dot is part of the name, not an extension.
         assert_eq!(tag_path_basename("bitmaps\\probe. multipurpose"), Some("probe. multipurpose"));
         assert_eq!(tag_path_basename("sound\\stand_sword_melee.mov"), Some("stand_sword_melee.mov"));

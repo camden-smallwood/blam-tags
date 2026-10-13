@@ -521,6 +521,9 @@ pub struct GameTagIndex {
 
 #[derive(Default)]
 pub struct NativeTemplateIndex {
+    /// The kit `tags` folder the index was built from; tag paths resolve
+    /// against it.
+    tags_root: PathBuf,
     by_group: HashMap<u32, Vec<PathBuf>>,
     cached: RefCell<HashMap<u32, Option<(Vec<u8>, PathBuf)>>>,
     /// What each `.material_shader` in the kit declares its inputs to be, keyed
@@ -537,7 +540,7 @@ impl NativeTemplateIndex {
         for (group_tag, group_name) in &groups.by_tag {
             by_extension.insert(group_name.to_ascii_lowercase(), *group_tag);
         }
-        let mut result = Self::default();
+        let mut result = Self { tags_root: tags_root.to_path_buf(), ..Self::default() };
         for item in walk_files(tags_root) {
             let Some(extension) = item.extension().and_then(|value| value.to_str()) else {
                 continue;
@@ -3066,19 +3069,13 @@ fn material_shader_parameters(
         return cached.clone();
     }
     let group = parse_group_tag("mats").unwrap_or(u32::from_be_bytes(*b"mats"));
-    let wanted =
-        format!("{}.material_shader", tag_path.replace('\\', "/")).to_ascii_lowercase();
+    let wanted = crate::paths::resolve_tag_path(&templates.tags_root, tag_path, "material_shader");
     let found: Vec<DeclaredParameter> = templates
         .by_group
         .get(&group)
         .into_iter()
         .flatten()
-        .find(|path| {
-            path.to_string_lossy()
-                .replace('\\', "/")
-                .to_ascii_lowercase()
-                .ends_with(&wanted)
-        })
+        .find(|path| path.as_os_str().eq_ignore_ascii_case(wanted.as_os_str()))
         .and_then(|path| {
             read_tag_for_conversion(path, Some(target_game), Some(definitions_root), group).ok()
         })
@@ -13111,15 +13108,22 @@ mod chain_sweep {
     /// that looks like scratch to the back. Ties break alphabetically so a run is
     /// still repeatable.
     fn stock_rank(path: &Path) -> (u8, String) {
-        let text = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
-        let scratch = ["digsite", "/test", "test/", "temp", "scratch", "_old", "unused"]
+        let text = path.to_string_lossy().to_ascii_lowercase();
+        let names: Vec<String> = path
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().to_ascii_lowercase())
+            .collect();
+        let folders = &names[..names.len().saturating_sub(1)];
+        let scratch = ["digsite", "temp", "scratch", "_old", "unused"]
             .iter()
-            .any(|needle| text.contains(needle));
+            .any(|needle| text.contains(needle))
+            || names.iter().any(|name| name.starts_with("test"))
+            || folders.iter().any(|folder| folder.ends_with("test"));
         let tier = if scratch {
             3
-        } else if text.contains("/objects/") {
+        } else if folders.iter().any(|folder| folder == "objects") {
             0
-        } else if text.contains("/levels/") {
+        } else if folders.iter().any(|folder| folder == "levels") {
             1
         } else {
             2
@@ -14057,7 +14061,7 @@ mod x360_cache_conversion {
             .filter(|entry| entry.group_tag == u32::from_be_bytes(*b"jmad"))
             .filter_map(|entry| {
                 let path =
-                    reach.join(format!("{}.model_animation_graph", entry.name.replace('\\', "/")));
+                    crate::paths::resolve_tag_path(&reach, &entry.name, "model_animation_graph");
                 std::fs::metadata(&path)
                     .and_then(|meta| meta.modified())
                     .map(|when| when < cutoff)
@@ -14222,7 +14226,7 @@ mod x360_cache_conversion {
             let Some(extension) = crate::paths::group_tag_to_extension(entry.group_tag) else {
                 continue;
             };
-            let path = reach.join(format!("{}.{extension}", entry.name.replace('\\', "/")));
+            let path = crate::paths::resolve_tag_path(&reach, &entry.name, extension);
             // An imported tag is this converter's own output; only one the kit
             // shipped says anything about how a GUID should read.
             if std::fs::metadata(&path)
@@ -14330,7 +14334,7 @@ mod x360_cache_conversion {
             .iter_tags()
             .filter(|entry| entry.group_tag == u32::from_be_bytes(*b"bitm"))
             .filter_map(|entry| {
-                let path = reach.join(format!("{}.bitmap", entry.name.replace('\\', "/")));
+                let path = crate::paths::resolve_tag_path(&reach, &entry.name, "bitmap");
                 std::fs::metadata(&path)
                     .and_then(|meta| meta.modified())
                     .map(|when| when < cutoff)
@@ -15716,11 +15720,7 @@ mod x360_cache_conversion {
                 Some(&templates),
             ) {
                 Ok(draft) => {
-                    let path = out.join(format!(
-                        "{}.{}",
-                        name.replace('\\', "/"),
-                        draft.target_extension
-                    ));
+                    let path = crate::paths::resolve_tag_path(&out, &name, &draft.target_extension);
                     if let Some(parent) = path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
@@ -15785,7 +15785,7 @@ mod x360_cache_conversion {
             Ok(t) => t,
             Err(e) => { eprintln!("could not read source: {e}"); return; }
         };
-        let kit_path = reach.join(format!("{}.{ext}", name.replace('\\', "/")));
+        let kit_path = crate::paths::resolve_tag_path(&reach, &name, &ext);
         let stock = match TagFile::read(&kit_path) {
             Ok(t) => t,
             Err(e) => { eprintln!("could not read {}: {e}", kit_path.display()); return; }
@@ -15921,8 +15921,8 @@ mod x360_cache_conversion {
         let cutoff = std::time::SystemTime::UNIX_EPOCH
             + std::time::Duration::from_secs(1_577_836_800); // 2020-01-01
         for entry in cache.iter_tags().filter(|e| e.group_tag == group) {
-            let relative = format!("{}.{ext}", entry.name.replace('\\', "/"));
-            let path = reach.join(&relative);
+            let relative = format!("{}.{ext}", entry.name);
+            let path = crate::paths::resolve_tag_path(&reach, &entry.name, &ext);
             let Ok(meta) = std::fs::metadata(&path) else { continue };
             let stock = meta.modified().map(|m| m < cutoff).unwrap_or(false);
             eprintln!("{}	{relative}", if stock { "STOCK  " } else { "touched" });
@@ -16160,7 +16160,7 @@ mod x360_cache_conversion {
             .iter_tags()
             .filter(|e| e.group_tag == group)
             .filter_map(|e| {
-                let path = reach.join(format!("{}.{ext}", e.name.replace('\\', "/")));
+                let path = crate::paths::resolve_tag_path(&reach, &e.name, &ext);
                 let stock = std::fs::metadata(&path)
                     .and_then(|m| m.modified())
                     .map(|m| m < cutoff)
@@ -16270,7 +16270,7 @@ mod x360_cache_conversion {
             .iter_tags()
             .filter(|e| e.group_tag == group)
             .filter_map(|e| {
-                let path = reach.join(format!("{}.bitmap", e.name.replace('\\', "/")));
+                let path = crate::paths::resolve_tag_path(&reach, &e.name, "bitmap");
                 std::fs::metadata(&path)
                     .and_then(|m| m.modified())
                     .map(|m| m < cutoff)
@@ -16543,7 +16543,7 @@ mod x360_cache_conversion {
         let name = std::env::var("DIFF_NAME").unwrap_or_default();
         let Some(entry) = cache.find_tag(u32::from_be_bytes(*b"bitm"), &name) else { return };
         let Ok(source) = cache.read_tag(entry) else { return };
-        let Ok(stock) = TagFile::read(&reach.join(format!("{}.bitmap", name.replace('\\', "/"))))
+        let Ok(stock) = TagFile::read(&crate::paths::resolve_tag_path(&reach, &name, "bitmap"))
         else { return };
         let root = source.root();
         let Some(elem) = root
@@ -16994,7 +16994,7 @@ mod x360_cache_conversion {
             .iter_tags()
             .filter(|e| e.group_tag == group)
             .filter_map(|e| {
-                let path = reach.join(format!("{}.model_animation_graph", e.name.replace('\\', "/")));
+                let path = crate::paths::resolve_tag_path(&reach, &e.name, "model_animation_graph");
                 std::fs::metadata(&path)
                     .and_then(|m| m.modified())
                     .map(|w| w < cutoff)
@@ -17281,7 +17281,7 @@ mod x360_cache_conversion {
             .iter_tags()
             .filter(|e| e.group_tag == group)
             .filter_map(|e| {
-                let path = reach.join(format!("{}.model_animation_graph", e.name.replace('\\', "/")));
+                let path = crate::paths::resolve_tag_path(&reach, &e.name, "model_animation_graph");
                 std::fs::metadata(&path)
                     .and_then(|m| m.modified())
                     .map(|w| w < cutoff)
@@ -17515,7 +17515,7 @@ mod x360_cache_conversion {
             .filter(|e| e.group_tag == u32::from_be_bytes(*b"jmad"))
             .find(|e| e.name.contains(&want))
         else { return };
-        let path = reach.join(format!("{}.model_animation_graph", entry.name.replace('\\', "/")));
+        let path = crate::paths::resolve_tag_path(&reach, &entry.name, "model_animation_graph");
         let (Ok(source), Ok(kit)) = (cache.read_tag(entry), TagFile::read(&path)) else { return };
         let ours: Vec<(i32, i16, i8)> = {
             let mut out = Vec::new();
@@ -17587,7 +17587,7 @@ mod x360_cache_conversion {
             .iter_tags()
             .filter(|e| e.group_tag == u32::from_be_bytes(*b"sbsp"))
             .filter_map(|e| {
-                let path = reach.join(format!("{}.scenario_structure_bsp", e.name.replace('\\', "/")));
+                let path = crate::paths::resolve_tag_path(&reach, &e.name, "scenario_structure_bsp");
                 std::fs::metadata(&path)
                     .and_then(|m| m.modified())
                     .map(|w| w < cutoff)
@@ -17853,7 +17853,7 @@ mod x360_cache_conversion {
             .find(|e| e.group_tag == u32::from_be_bytes(*b"sbsp") && e.name == name)
         else { eprintln!("no such bsp"); return };
         let Ok(source) = cache.read_tag(entry) else { return };
-        let kit_path = reach.join(format!("{}.scenario_structure_bsp", name.replace('\\', "/")));
+        let kit_path = crate::paths::resolve_tag_path(&reach, &name, "scenario_structure_bsp");
         let Ok(kit) = TagFile::read(&kit_path) else { eprintln!("no kit copy"); return };
         let Ok(draft) = analyze_conversion_with_templates(
             &source, "haloreach_mcc", "haloreach_mcc", &definitions, Some(&templates),
@@ -18143,7 +18143,7 @@ mod x360_cache_conversion {
         ) {
             report("CONVERTED", &draft.tag);
         }
-        let path = reach.join(format!("{}.scenario_structure_bsp", name.replace('\\', "/")));
+        let path = crate::paths::resolve_tag_path(&reach, &name, "scenario_structure_bsp");
         if let Ok(kit) = TagFile::read(&path) {
             report("KIT", &kit);
         }
@@ -18230,7 +18230,7 @@ mod x360_cache_conversion {
             if let Some((group, target)) = value.read_tag_ref_with_group(&name) {
                 if target.is_empty() { continue }
                 let extension = crate::paths::group_tag_to_extension(group).unwrap_or("");
-                let file = reach.join(format!("{}.{extension}", target.replace('\\', "/")));
+                let file = crate::paths::resolve_tag_path(&reach, &target, extension);
                 out.push((here, format!("{target}.{extension}"), file.is_file()));
                 continue;
             }

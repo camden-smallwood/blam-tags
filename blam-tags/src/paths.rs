@@ -63,6 +63,17 @@ pub fn resolve_tag_path(tags_root: &Path, rel: &str, ext: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// The tag path for a path relative to a `tags` folder: its components
+/// joined with `\\`, the separator Halo tag paths use on every host. The
+/// inverse of [`resolve_tag_path`]; a file's extension is kept, so strip it
+/// first when the result should name the tag rather than its file.
+pub fn relative_tag_path(rel: &Path) -> String {
+    rel.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("\\")
+}
+
 /// Map a tag group FOURCC (big-endian u32 such as `rmtr`) to the
 /// matching on-disk file extension. Returns `None` for unknown
 /// groups — caller falls back to a sensible default (typically
@@ -488,4 +499,20 @@ pub fn group_tag_to_extension(group: u32) -> Option<&'static str> {
         b"rmp " => "shader_particle",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tag_paths_and_disk_paths_convert_both_ways() {
+        let root = Path::new("kit").join("tags");
+        let file = resolve_tag_path(&root, "objects\\props\\crate", "scenery");
+        assert_eq!(file, root.join("objects").join("props").join("crate.scenery"));
+        let rel = file.strip_prefix(&root).unwrap().with_extension("");
+        assert_eq!(relative_tag_path(&rel), "objects\\props\\crate");
+        // A dot in a name is part of it.
+        assert_eq!(relative_tag_path(Path::new("bitmaps/probe. multipurpose")), "bitmaps\\probe. multipurpose");
+    }
 }

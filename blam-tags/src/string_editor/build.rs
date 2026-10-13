@@ -510,7 +510,7 @@ impl ObjectFunction {
         if self.own_functions && is_object {
             let own: Vec<MenuItem> = self.own.iter().flat_map(|level| level.items(ctx.tag.root(), source, Sort::None)).collect();
             if !own.is_empty() {
-                let title = ctx.tag_path.rsplit(['\\', '/']).next().unwrap_or(ctx.tag_path);
+                let title = ctx.tag_path.rsplit('\\').next().unwrap_or(ctx.tag_path);
                 items.push(MenuItem::submenu(title, own));
             }
         }

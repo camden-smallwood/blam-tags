@@ -428,7 +428,7 @@ fn canonical_template_path(template_path: &str, rmsh_options: &[i16], category_c
     // before that stays as the directory portion. The engine constructs
     // the name as `<dir>\_{joined}.render_method_template`, but our
     // `template_path` here is just `<dir>\_{joined}` (no extension).
-    let last_slash = template_path.rfind(['\\', '/'])?;
+    let last_slash = template_path.rfind('\\')?;
     let dir = &template_path[..last_slash];
     let name_start = template_path.get(last_slash + 1..)?;
     // The name should start with `_`. If not, this isn't a canonical

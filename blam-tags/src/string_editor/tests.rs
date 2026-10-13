@@ -83,7 +83,7 @@ impl KitTags {
 
 impl TagSource for KitTags {
     fn tag(&self, group: u32, path: &str) -> Option<Arc<TagFile>> {
-        let file = self.tags.join(format!("{}.{}", path.replace('\\', "/"), self.names.get(&group)?));
+        let file = crate::paths::resolve_tag_path(&self.tags, path, self.names.get(&group)?);
         self.read(&file)
     }
 }
@@ -169,7 +169,7 @@ fn sweep_kit_values() {
     for (_, files) in by_group {
         for file in files {
             let Some(tag) = kit.read(&file) else { continue };
-            let rel = file.strip_prefix(&tags).unwrap().with_extension("").to_string_lossy().replace('/', "\\");
+            let rel = crate::paths::relative_tag_path(&file.strip_prefix(&tags).unwrap().with_extension(""));
             for (path, editor) in editor_fields(&editors, tag.root()) {
                 let Some(field) = tag.root().field_path(&path) else { continue };
                 let value = match field.value() {
@@ -221,7 +221,7 @@ fn print_menu() {
     let editors = StringEditors::load(format!("../definitions/{game}")).unwrap();
     let kit = KitTags::new(tags.clone(), game);
     let tag = kit.read(&file).unwrap();
-    let rel = file.strip_prefix(&tags).unwrap().with_extension("").to_string_lossy().replace('/', "\\");
+    let rel = crate::paths::relative_tag_path(&file.strip_prefix(&tags).unwrap().with_extension(""));
     let Some(editor) = editors.editor_at(tag.root(), path) else {
         let (holder, ordinal) = holder_of(tag.root(), path).expect("the field");
         let guid: String = holder.definition().guid().iter().map(|b| format!("{b:02x}")).collect();
