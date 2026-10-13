@@ -260,6 +260,25 @@ impl<'a> TagFieldDefinition<'a> {
         })
     }
 
+    /// For a block-flags field, the block definition whose elements its bits
+    /// stand for: bit `n` is element `n`. Its `definition` holds the block's
+    /// layout index, as a block index's does. `None` for other field types.
+    pub fn block_flags_target(&self) -> Option<TagBlockDefinition<'a>> {
+        let record = &self.layout.fields[self.field_index];
+        if !matches!(
+            record.field_type,
+            TagFieldType::ByteBlockFlags
+                | TagFieldType::WordBlockFlags
+                | TagFieldType::LongBlockFlags
+        ) {
+            return None;
+        }
+        Some(TagBlockDefinition {
+            layout: self.layout,
+            block_layout_index: record.definition as usize,
+        })
+    }
+
     /// If this is an `Array` field, return the array definition.
     pub fn as_array(&self) -> Option<TagArrayDefinition<'a>> {
         let record = &self.layout.fields[self.field_index];
