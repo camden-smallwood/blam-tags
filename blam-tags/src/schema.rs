@@ -378,6 +378,12 @@ pub struct TagGroupMeta {
 }
 
 impl TagLayout {
+    /// Import a self-contained JSON schema held in memory. Unlike file import,
+    /// all referenced definitions must be present; no parent files are loaded.
+    pub fn from_json_value(value: serde_json::Value) -> Result<Self, TagSchemaError> {
+        build_layout_from_schema(serde_json::from_value(value)?, Path::new(""))
+    }
+
     /// Build a TagLayout from a JSON schema file (per-group output of
     /// `halo3_dump_tag_definitions_json.py`). The result matches
     /// what `TagLayout::read` would produce from an equivalent blay
