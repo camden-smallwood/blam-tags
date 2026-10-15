@@ -69,6 +69,7 @@ pub mod fields;
 pub mod field_name;
 pub mod element_label;
 pub mod string_editor;
+pub mod string_list;
 pub mod layout;
 pub mod schema;
 pub mod schema_compare;

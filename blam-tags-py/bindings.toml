@@ -278,6 +278,10 @@ reason = "not bound yet (parity gap; see parity.toml)"
 strategy = "skip"
 reason = "not bound yet (parity gap; see parity.toml)"
 
+[module.string_list]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
 [module.typed_enums]
 strategy = "skip"
 reason = "Rust typing helpers over schema enums; Python sets enums by name"
