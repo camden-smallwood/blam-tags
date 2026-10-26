@@ -1,7 +1,8 @@
 //! String list tags as a list of strings: Halo 2 on's
 //! `multilingual_unicode_string_list` (string ids, one text per language, all
 //! the text in one UTF-8 blob) and Halo CE's `unicode_string_list` (one UTF-16
-//! text per element). Read from a tag, edited, and written back whole.
+//! text per element), and CE HUD messages (names, UTF-16 runs and runtime
+//! prompt elements). Read from a tag, edited, and written back whole.
 //!
 //! The text blob is rebuilt the way every tool from Halo 2 on writes it
 //! (`import_text.cpp`): each string's languages in order, each text followed
@@ -10,7 +11,9 @@
 //! was. A language with no text has offset -1, as the tools write it; the
 //! tools never store an empty text.
 
+mod hud;
 mod markup;
+pub use hud::{HUD_GROUP, HUD_TOKENS, parse_hud_messages_file, hud_messages_file, validate_hud_name};
 mod syntax;
 #[cfg(test)]
 mod tests;
@@ -38,7 +41,7 @@ const MULTILINGUAL_MAX_UNITS: usize = 1023;
 const CLASSIC_MAX_UNITS: usize = 16383;
 
 pub fn is_string_list_group(group_tag: u32) -> bool {
-    group_tag == MULTILINGUAL_GROUP || group_tag == CLASSIC_GROUP
+    group_tag == MULTILINGUAL_GROUP || group_tag == CLASSIC_GROUP || group_tag == HUD_GROUP
 }
 
 /// How a string list keeps its text.
@@ -48,6 +51,8 @@ pub enum Storage {
     Multilingual,
     /// One UTF-16 text per element, no ids, one language.
     Classic,
+    /// Named CE HUD messages, UTF-16 text runs and runtime prompt elements.
+    HudMessages,
 }
 
 /// One language column.
@@ -61,9 +66,11 @@ pub struct Language {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StringEntry {
-    /// `None` for Halo CE.
+    /// A string ID, a HUD message name, or `None` for CE Unicode lists.
     pub id: Option<String>,
-    /// One per language; `None` where a language has no text.
+    /// One per language; `None` where a language has no text. HUD text uses
+    /// `%token` for runtime elements, `%%` for literal percent, and `%{token}`
+    /// when adjoining literal text would otherwise change the token identity.
     pub texts: Vec<Option<String>>,
 }
 
@@ -82,6 +89,16 @@ pub struct StringList {
     pub pairs: Vec<(String, String)>,
 }
 
+impl Storage {
+    pub fn has_ids(self) -> bool { self != Self::Classic }
+    pub fn identity_label(self) -> &'static str { if self == Self::HudMessages { "Name" } else { "String ID" } }
+    pub fn text_label(self) -> &'static str { if self == Self::HudMessages { "Text" } else { "String Text" } }
+    pub fn text_extension(self) -> &'static str { if self == Self::HudMessages { "hmt" } else { "txt" } }
+    pub fn rows_block(self) -> &'static str { if self == Self::HudMessages { "messages" } else { "string references" } }
+    /// Apply only this storage's additional notation to a game's syntax.
+    pub fn text_syntax(self, syntax: TextSyntax) -> TextSyntax { syntax.with_hud_messages(self == Self::HudMessages) }
+}
+
 impl StringList {
     /// Whether the pairs hold a binding's (component, property), as the game
     /// looks it up.
@@ -95,6 +112,7 @@ impl StringList {
         match self.storage {
             Storage::Multilingual => MULTILINGUAL_MAX_UNITS,
             Storage::Classic => CLASSIC_MAX_UNITS,
+            Storage::HudMessages => 32767,
         }
     }
 
@@ -102,7 +120,7 @@ impl StringList {
     pub fn new_entry(&self) -> StringEntry {
         let id = match self.storage {
             Storage::Classic => None,
-            Storage::Multilingual => {
+            Storage::Multilingual | Storage::HudMessages => {
                 let taken = |id: &str| self.entries.iter().any(|entry| entry.id.as_deref() == Some(id));
                 let id = std::iter::once("new_string".to_owned())
                     .chain((1..).map(|n| format!("new_string_{n}")))
@@ -117,6 +135,7 @@ impl StringList {
 
 /// Read `tag`'s strings, or `None` if it is not a string list this reads.
 pub fn read_string_list(tag: &TagFile) -> Option<StringList> {
+    if tag.group().tag == HUD_GROUP { return hud::read(tag).ok(); }
     let root = tag.root();
     let block = root.field_path(REFERENCES_BLOCK)?.as_block()?;
     if let Some(data) = root.field_path(TEXT_DATA) {
@@ -272,6 +291,7 @@ fn encode_utf16_text(text: &str) -> Vec<u8> {
 /// Write `list` into `tag`: the elements, their ids and offsets, and the
 /// text blob rebuilt in the tools' order.
 pub fn write_string_list(tag: &mut TagFile, list: &StringList) -> Result<(), String> {
+    if list.storage == Storage::HudMessages { return hud::write(tag, list); }
     let mut root = tag.root_mut();
     let blob = {
         let mut field = root
@@ -285,6 +305,7 @@ pub fn write_string_list(tag: &mut TagFile, list: &StringList) -> Result<(), Str
             block.add_element();
         }
         match list.storage {
+            Storage::HudMessages => unreachable!("handled above"),
             Storage::Classic => {
                 for (index, entry) in list.entries.iter().enumerate() {
                     let mut element = block.element_mut(index).ok_or("string reference out of range")?;
