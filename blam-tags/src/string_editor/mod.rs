@@ -17,6 +17,8 @@
 //! editor, per game, is in Baboon's `todo/string-editors.md`.
 
 mod build;
+mod string_reference;
+pub use string_reference::{StringReferenceEntry, StringReferenceList, StringReferenceSource, StringReferenceValidation};
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -352,6 +354,21 @@ impl StringEditors {
     pub fn unavailable_reason(&self, editor: &str) -> Option<&str> {
         match &self.specs.get(editor)?.builder {
             build::Builder::Unavailable { reason } => Some(reason.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Whether this editor resolves IDs in a localized string list. These
+    /// have stricter lookup state than Foundation's permissive name menus.
+    pub fn is_string_reference(&self, editor: &str) -> bool {
+        matches!(self.specs.get(editor).map(|spec| &spec.builder), Some(build::Builder::StringList(_)))
+    }
+
+    /// Resolve the string list and preview text without UI or filesystem policy.
+    /// The caller supplies a TagSource, and decides when to refresh it.
+    pub fn string_references(&self, editor: &str, ctx: &Context<'_>, source: &dyn TagSource) -> Option<StringReferenceList> {
+        match &self.specs.get(editor)?.builder {
+            build::Builder::StringList(spec) => Some(build::string_references(self, spec, ctx, source)),
             _ => None,
         }
     }
