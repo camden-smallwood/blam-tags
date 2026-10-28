@@ -199,13 +199,19 @@ impl TextSyntax {
     }
 
     /// The runtime element at the start of `text` (what follows a `%`) in
-    /// shown text: `{name}`, `{code}` or a name. Its code and length.
+    /// shown text: `{name}`, `{code}` or a name. Its code and length. A code
+    /// past the game's names is not one: the game reads the custom slots
+    /// past their end for it.
     fn hud_element_at(&self, text: &str) -> Option<(u8, usize)> {
         if let Some(inner) = text.strip_prefix('{') {
             let end = inner.find('}')?;
             let code = match self.hud_tokens.iter().position(|name| name.eq_ignore_ascii_case(&inner[..end])) {
                 Some(code) => u8::try_from(code).ok()?,
-                None => return super::hud::coded_element(text),
+                None => {
+                    let (code, len) = super::hud::coded_element(text)?;
+                    let known = self.hud_tokens.is_empty() || usize::from(code) < self.hud_tokens.len();
+                    return known.then_some((code, len));
+                }
             };
             return Some((code, end + 2));
         }

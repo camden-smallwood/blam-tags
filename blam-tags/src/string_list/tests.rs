@@ -847,7 +847,8 @@ fn hud_elements_without_a_name_keep_their_code() {
     let list = read_string_list(&tag).unwrap();
     assert_eq!(list.entries[0].texts[0].as_deref(), Some("%{99}"));
     assert_eq!(format_shown("%{99}", &hud_syntax()), "%{99}");
-    assert_eq!(hud_text("%{99}"), "%{99}");
+    assert!(parse_shown("%{99}", &hud_syntax()).is_err(), "the game reads past its custom slots for an unnamed code");
+    assert_eq!(hud_text("%{39}"), "%{39}");
     let mut rewritten = reopen_hud(&tag);
     write_string_list(&mut rewritten, &list).unwrap();
     assert_eq!(read_string_list(&reopen_hud(&rewritten)).unwrap(), list);
