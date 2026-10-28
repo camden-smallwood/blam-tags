@@ -21,6 +21,8 @@ use crate::{TagFile, TagStruct};
 pub(crate) enum Builder {
     /// Names from blocks of a tag; see [`Names`].
     Names(Names),
+    /// IDs and localized previews from a referenced Unicode string list.
+    StringList(StringListSpec),
     /// A fixed menu.
     List { items: Vec<ListItem> },
     ObjectFunction(ObjectFunction),
@@ -76,6 +78,9 @@ pub(crate) enum Step {
     Named(String),
     /// A tag at a fixed path.
     Tag { tag: String, group: String },
+    /// A reference shared by every element of a block (e.g. HUD skins).
+    /// Different or missing targets need context and must not be guessed.
+    BlockRef { block: String, #[serde(rename = "ref")] field: String },
     /// The tag a reference field of the current tag points at.
     Ref {
         #[serde(rename = "ref")]
@@ -110,6 +115,11 @@ fn follow(editors: &StringEditors, steps: &[Step], ctx: &Context<'_>, source: &d
             Step::Named(_) => return None,
             Step::Tag { tag, group } => Held::Loaded(source.tag(editors.group_tag(group)?, tag)?),
             Step::Element { element, field } => Held::Loaded(source.tag_of(enclosing(ctx, element)?.field(field)?)?),
+            Step::BlockRef { block, field } => {
+                let root = current.as_ref().map(|held| held.root(ctx)).unwrap_or_else(|| ctx.tag.root());
+                let (group,path) = shared_block_reference(root,block,field).ok()?;
+                Held::Loaded(source.tag(group,&path)?)
+            }
             Step::Ref { field } => {
                 let root = current.as_ref().map(|held| held.root(ctx)).unwrap_or_else(|| ctx.tag.root());
                 let (group, path) = inherited(root, field)?.read_ref()?;
@@ -118,6 +128,26 @@ fn follow(editors: &StringEditors, steps: &[Step], ctx: &Context<'_>, source: &d
         });
     }
     current
+}
+
+/// Resolve a reference repeated by every block element without choosing an
+/// arbitrary active player/HUD skin. Keep the original spelling for navigation.
+fn shared_block_reference(root: TagStruct<'_>, path: &str, field: &str) -> Result<(u32,String),String> {
+    let block = inherited(root,path).and_then(|field|field.as_block())
+        .ok_or_else(||format!("Source block '{path}' is unavailable."))?;
+    let mut target:Option<(u32,String)> = None;
+    for element in block.iter() {
+        let reference = element.field_path(field).and_then(|field|field.read_ref())
+            .filter(|(_, path)| !path.trim_end_matches('\0').is_empty())
+            .ok_or_else(||format!("A source '{path}' entry has no '{field}' reference."))?;
+        if let Some((group,ref existing)) = target {
+            let normalize = |path:&str| path.trim_end_matches('\0').replace('/',"\\").to_ascii_lowercase();
+            if group != reference.0 || normalize(existing) != normalize(&reference.1) {
+                return Err(format!("Source '{path}' entries reference different string lists; a HUD-skin context is required."));
+            }
+        } else { target=Some(reference); }
+    }
+    target.ok_or_else(||format!("Source block '{path}' is empty."))
 }
 
 /// A tag a builder reads: the edited one, or one the source loaded.
@@ -1247,6 +1277,7 @@ impl Builder {
     pub(crate) fn fixed_sources(&self) -> Vec<(u32, String)> {
         let steps: &[Step] = match self {
             Builder::Names(names) => &names.source,
+            Builder::StringList(spec) => &spec.source,
             Builder::Incident(incident) => &incident.definitions.source,
             _ => &[],
         };
@@ -1264,6 +1295,10 @@ impl Builder {
 pub(crate) fn build(editors: &StringEditors, builder: &Builder, ctx: &Context<'_>, source: &dyn TagSource) -> Menu {
     match builder {
         Builder::Names(names) => names.build(editors, ctx, source),
+        Builder::StringList(spec) => {
+            let list = string_references(editors, spec, ctx, source);
+            Menu { items: list.entries.iter().map(|entry| MenuItem::item(&entry.id)).collect(), note: list.unavailable, ..Default::default() }
+        },
         Builder::List { items } => Menu { items: list_items(items), ..Default::default() },
         Builder::ObjectFunction(spec) => spec.build(editors, ctx, source),
         Builder::AiActivities(spec) => spec.build(editors, ctx, source),
@@ -1275,4 +1310,61 @@ pub(crate) fn build(editors: &StringEditors, builder: &Builder, ctx: &Context<'_
         Builder::MarkerNames(spec) => spec.build(editors, ctx, source),
         Builder::Unavailable { .. } => Menu::default(),
     }
+}
+
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct StringListSpec {
+    source: Vec<Step>,
+    #[serde(default = "english_language")]
+    language: String,
+}
+fn english_language() -> String { "English".to_owned() }
+
+pub(crate) fn string_references(editors: &StringEditors, spec: &StringListSpec, ctx: &Context<'_>, source: &dyn TagSource) -> super::StringReferenceList {
+    use super::{StringReferenceEntry, StringReferenceList, StringReferenceSource};
+    let mut result = StringReferenceList::unavailable("No string-list source was resolved.");
+    let mut current = None;
+    for (step_index, step) in spec.source.iter().enumerate() {
+        let target = match step {
+            Step::Named(name) if name == "globals" => Some((u32::from_be_bytes(*b"matg"), "globals\\globals".to_owned())),
+            Step::Tag { tag, group } => editors.group_tag(group).map(|group| (group, tag.clone())),
+            Step::BlockRef { block, field } => {
+                let root = current.as_ref().map(|held: &Held| held.root(ctx)).unwrap_or_else(|| ctx.tag.root());
+                match shared_block_reference(root,block,field) {
+                    Ok(target) => Some(target),
+                    Err(error) => {result.unavailable=Some(error);result.source=None;return result;}
+                }
+            }
+            Step::Ref { field } => {
+                let root = current.as_ref().map(|held: &Held| held.root(ctx)).unwrap_or_else(|| ctx.tag.root());
+                let target = inherited(root, field).and_then(|field| field.read_ref());
+                if target.is_none() { result.unavailable = Some(format!("Source reference '{field}' is empty or unavailable.")); return result; }
+                target
+            }
+            Step::Named(name) if name == "self" => { current = Some(Held::Edited); continue; }
+            _ => { result.unavailable = Some("This string-list source rule is not supported.".to_owned()); return result; }
+        };
+        let Some((group_tag, path)) = target else { result.unavailable = Some("The source rule names an unknown tag group.".to_owned()); return result; };
+        let path = path.trim_end_matches('\0').to_owned();
+        // Only the final reference is an Open destination; never expose an
+        // intermediate globals tag as though it were the string-list source.
+        result.source = None;
+        let last = step_index + 1 == spec.source.len();
+        if last { result.source = Some(StringReferenceSource { group_tag, path:path.clone() }); }
+        let Some(tag) = source.tag(group_tag, &path) else { result.unavailable = Some(format!("Could not load source tag '{path}'.")); return result; };
+        current = Some(Held::Loaded(tag));
+    }
+    let Some(current) = current else { return result; };
+    let Held::Loaded(tag) = current else { result.unavailable = Some("String-list sources must resolve to an external tag.".to_owned()); return result; };
+    let Some(list) = crate::string_list::read_string_list(&tag) else { result.unavailable = Some("The source is not a readable string list.".to_owned()); return result; };
+    if list.storage != crate::string_list::Storage::Multilingual { result.unavailable = Some("The source string list does not contain String IDs.".to_owned()); return result; }
+    let language = list.languages.iter().position(|language| language.name.eq_ignore_ascii_case(&spec.language));
+    result.entries = list.entries.into_iter().filter_map(|entry| Some(StringReferenceEntry {
+        id: entry.id.filter(|id| !id.is_empty())?,
+        preview: language.and_then(|index| entry.texts.get(index).cloned().flatten()).filter(|text| !text.is_empty()),
+    })).collect();
+    result.entries.sort_by(|a,b| a.id.as_bytes().cmp(b.id.as_bytes()));
+    result.unavailable = None;
+    result
 }
