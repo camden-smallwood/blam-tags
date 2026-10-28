@@ -13,7 +13,7 @@
 
 mod hud;
 mod markup;
-pub use hud::{HUD_GROUP, HUD_TOKENS, parse_hud_messages_file, hud_messages_file, validate_hud_name};
+pub use hud::{HUD_GROUP, hud_messages_file, parse_hud_messages_file, validate_hud_name};
 mod syntax;
 #[cfg(test)]
 mod tests;
@@ -68,9 +68,9 @@ pub struct Language {
 pub struct StringEntry {
     /// A string ID, a HUD message name, or `None` for CE Unicode lists.
     pub id: Option<String>,
-    /// One per language; `None` where a language has no text. HUD text uses
-    /// `%token` for runtime elements, `%%` for literal percent, and `%{token}`
-    /// when adjoining literal text would otherwise change the token identity.
+    /// One per language; `None` where a language has no text. A HUD
+    /// message's text holds a runtime element as `%{code}` and a literal
+    /// percent as `%%`; a syntax with HUD messages on shows the game's names.
     pub texts: Vec<Option<String>>,
 }
 
@@ -90,13 +90,24 @@ pub struct StringList {
 }
 
 impl Storage {
-    pub fn has_ids(self) -> bool { self != Self::Classic }
-    pub fn identity_label(self) -> &'static str { if self == Self::HudMessages { "Name" } else { "String ID" } }
-    pub fn text_label(self) -> &'static str { if self == Self::HudMessages { "Text" } else { "String Text" } }
-    pub fn text_extension(self) -> &'static str { if self == Self::HudMessages { "hmt" } else { "txt" } }
-    pub fn rows_block(self) -> &'static str { if self == Self::HudMessages { "messages" } else { "string references" } }
-    /// Apply only this storage's additional notation to a game's syntax.
-    pub fn text_syntax(self, syntax: TextSyntax) -> TextSyntax { syntax.with_hud_messages(self == Self::HudMessages) }
+    /// Whether entries carry an id: a string id, or a HUD message's name.
+    pub fn has_ids(self) -> bool {
+        self != Self::Classic
+    }
+
+    /// The block holding one element per entry.
+    pub fn rows_block(self) -> &'static str {
+        match self {
+            Self::HudMessages => hud::MESSAGES_BLOCK,
+            Self::Multilingual | Self::Classic => REFERENCES_BLOCK,
+        }
+    }
+
+    /// A game's syntax with this storage's own notation: HUD messages'
+    /// `%` elements.
+    pub fn text_syntax(self, syntax: TextSyntax) -> TextSyntax {
+        syntax.with_hud_messages(self == Self::HudMessages)
+    }
 }
 
 impl StringList {
@@ -112,6 +123,7 @@ impl StringList {
         match self.storage {
             Storage::Multilingual => MULTILINGUAL_MAX_UNITS,
             Storage::Classic => CLASSIC_MAX_UNITS,
+            // `start index into text blob` is a short.
             Storage::HudMessages => 32767,
         }
     }

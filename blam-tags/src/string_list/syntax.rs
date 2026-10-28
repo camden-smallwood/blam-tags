@@ -48,7 +48,11 @@ pub struct TextSyntax {
     /// Whether `&` starts a glyph. Off for Halo CE, whose tool copies text as
     /// written.
     glyphs: bool,
+    /// Whether `%` starts a HUD message's runtime element (Halo CE's
+    /// `hud_message_text`); see [`TextSyntax::with_hud_messages`].
     hud_messages: bool,
+    /// The game's HUD runtime element names, in code order.
+    hud_tokens: Arc<[String]>,
     /// The game's `&name` table, in its tool's order. Empty for a game whose
     /// table is not known.
     names: Arc<[(String, u16)]>,
@@ -71,6 +75,8 @@ pub struct TextSyntax {
 ///   where `screens` maps a tag to the screens that fill it in and
 ///   `bad_tag` is `literal` or `fails_string`.
 /// - `cui`: `null`, or `{"offset": bool}` for `{cui:…}` bindings.
+/// - `hud_tokens`: the names of `hud_message_text`'s runtime elements, in
+///   code order (Halo CE only).
 /// - `source`: where it was read from (not read by the engine).
 #[derive(Deserialize)]
 struct StringTextFile {
@@ -83,6 +89,8 @@ struct StringTextFile {
     escapes: Pipes,
     tags: Option<XmlTags>,
     cui: Option<Cui>,
+    #[serde(default)]
+    hud_tokens: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -141,7 +149,14 @@ impl TextSyntax {
             keywords: file.keywords,
             keyword_match: file.keyword_match,
         };
-        Ok(Self { hud_messages: false, glyphs: file.glyphs, names: names.into(), rule: file.glyph_match, markup: Arc::new(markup) })
+        Ok(Self {
+            glyphs: file.glyphs,
+            hud_messages: false,
+            hud_tokens: file.hud_tokens.into(),
+            names: names.into(),
+            rule: file.glyph_match,
+            markup: Arc::new(markup),
+        })
     }
 
     /// A game nothing is known of: `&&` and `&U+XXXX`, no names, no markup.
@@ -151,10 +166,61 @@ impl TextSyntax {
 
     /// Text with no glyphs and no markup: `&` is an ordinary character.
     pub fn plain() -> Self {
-        Self { glyphs: false, hud_messages: false, names: Arc::from([]), rule: GlyphMatch::Longest, markup: Arc::default() }
+        Self {
+            glyphs: false,
+            hud_messages: false,
+            hud_tokens: Arc::from([]),
+            names: Arc::from([]),
+            rule: GlyphMatch::Longest,
+            markup: Arc::default(),
+        }
     }
 
-    pub fn with_hud_messages(mut self, enabled: bool) -> Self { self.hud_messages = enabled; self }
+    /// This syntax with `%` read as a HUD message's runtime element, by the
+    /// game's [`hud_tokens`](Self::hud_tokens), when `enabled`.
+    pub fn with_hud_messages(mut self, enabled: bool) -> Self {
+        self.hud_messages = enabled;
+        self
+    }
+
+    /// The game's HUD runtime element names, in code order.
+    pub fn hud_tokens(&self) -> &[String] {
+        &self.hud_tokens
+    }
+
+    /// The runtime element name `text` (what follows a `%`) starts with, as
+    /// tool.exe's import matches it: the first in code order, ignoring
+    /// case. Its code and length.
+    pub(super) fn match_hud_token(&self, text: &str) -> Option<(u8, usize)> {
+        self.hud_tokens.iter().enumerate().find_map(|(code, name)| {
+            let matches = text.get(..name.len()).is_some_and(|start| start.eq_ignore_ascii_case(name));
+            matches.then(|| (u8::try_from(code).ok(), name.len())).and_then(|(code, len)| Some((code?, len)))
+        })
+    }
+
+    /// The runtime element at the start of `text` (what follows a `%`) in
+    /// shown text: `{name}`, `{code}` or a name. Its code and length.
+    fn hud_element_at(&self, text: &str) -> Option<(u8, usize)> {
+        if let Some(inner) = text.strip_prefix('{') {
+            let end = inner.find('}')?;
+            let code = match self.hud_tokens.iter().position(|name| name.eq_ignore_ascii_case(&inner[..end])) {
+                Some(code) => u8::try_from(code).ok()?,
+                None => return super::hud::coded_element(text),
+            };
+            return Some((code, end + 2));
+        }
+        self.match_hud_token(text)
+    }
+
+    /// How runtime element `code` is shown before `suffix`: by its name if
+    /// it reads back, else `{name}`, else `{code}`.
+    fn hud_element_shown(&self, code: u8, suffix: &str) -> String {
+        match self.hud_tokens.get(usize::from(code)) {
+            Some(name) if self.match_hud_token(&format!("{name}{suffix}")) == Some((code, name.len())) => format!("%{name}"),
+            Some(name) => format!("%{{{name}}}"),
+            None => super::hud::element_text(code),
+        }
+    }
 
     pub fn has_glyphs(&self) -> bool {
         self.glyphs
@@ -284,11 +350,25 @@ fn lex_mapped(shown: &str, syntax: &TextSyntax, rule: GlyphMatch) -> (Vec<Token>
         }
         if c == '%' && syntax.hud_messages {
             let after = &rest[1..];
-            let (len, kind) = if after.starts_with('%') { (2, TokenKind::Ampersand) }
-                else if let Some((_, len)) = super::hud::token_at(after) { (len+1, TokenKind::Glyph) }
-                else { (1+name_run(after), TokenKind::BadGlyph) };
-            for (offset,c) in rest[..len].char_indices() { emit(&mut text,c,at+offset..at+offset+c.len_utf8()); }
-            push(&mut tokens,at..at+len,kind); at += len; continue;
+            if after.starts_with('%') {
+                emit(&mut text, '%', at..at + 2);
+                emit(&mut text, '%', at..at + 2);
+                push(&mut tokens, at..at + 2, TokenKind::Ampersand);
+                at += 2;
+                continue;
+            }
+            if let Some((code, len)) = syntax.hud_element_at(after) {
+                for c in super::hud::element_text(code).chars() {
+                    emit(&mut text, c, at..at + 1 + len);
+                }
+                push(&mut tokens, at..at + 1 + len, TokenKind::Glyph);
+                at += 1 + len;
+                continue;
+            }
+            let len = 1 + name_run(after);
+            push(&mut tokens, at..at + len, TokenKind::BadGlyph);
+            at += len;
+            continue;
         }
         if c == '&' && syntax.glyphs {
             let after = &rest[1..];
@@ -388,7 +468,19 @@ fn format_by(text: &str, syntax: &TextSyntax, rule: GlyphMatch) -> String {
     // Built back to front: whether a name reads back depends on what follows
     // it.
     let mut suffix = String::new();
-    for c in text.chars().rev() {
+    for unit in units(text, syntax).into_iter().rev() {
+        let c = match unit {
+            Unit::Char(c) => c,
+            Unit::Percent => {
+                suffix.insert_str(0, "%%");
+                continue;
+            }
+            Unit::Element(code) => {
+                let shown = syntax.hud_element_shown(code, &suffix);
+                suffix.insert_str(0, &shown);
+                continue;
+            }
+        };
         let piece = match c {
             '\\' => "\\\\".to_owned(),
             '\n' => "\\n".to_owned(),
@@ -411,6 +503,29 @@ fn format_by(text: &str, syntax: &TextSyntax, rule: GlyphMatch) -> String {
         suffix.insert_str(0, &piece);
     }
     suffix
+}
+
+/// A character of the text, or with HUD messages on, a literal percent or a
+/// runtime element.
+enum Unit {
+    Char(char),
+    Percent,
+    Element(u8),
+}
+
+fn units(text: &str, syntax: &TextSyntax) -> Vec<Unit> {
+    let pieces = if syntax.hud_messages { super::hud::pieces(text).ok() } else { None };
+    match pieces {
+        Some(pieces) => pieces
+            .into_iter()
+            .map(|piece| match piece {
+                super::hud::Piece::Text('%') => Unit::Percent,
+                super::hud::Piece::Text(c) => Unit::Char(c),
+                super::hud::Piece::Element(code) => Unit::Element(code),
+            })
+            .collect(),
+        None => text.chars().map(Unit::Char).collect(),
+    }
 }
 
 /// Whether `&name` followed by `suffix` reads back as `value` by `rule`.
@@ -525,7 +640,7 @@ impl CompletionKind {
 
     fn offered_by(self, syntax: &TextSyntax) -> bool {
         match self {
-            CompletionKind::Hud => syntax.hud_messages,
+            CompletionKind::Hud => syntax.hud_messages && !syntax.hud_tokens.is_empty(),
             CompletionKind::Glyph => syntax.glyphs,
             CompletionKind::Keyword => !syntax.keywords().is_empty(),
             CompletionKind::Escape => syntax.markup.has_pipes(),
@@ -613,7 +728,14 @@ impl Choice {
 /// Everything `syntax`'s game offers for a completion of `kind`.
 pub fn choices(syntax: &TextSyntax, kind: CompletionKind) -> Vec<Choice> {
     match kind {
-        CompletionKind::Hud => super::HUD_TOKENS.iter().map(|name| Choice::new(*name, format!("%{name}"), format!("%{name}"), if name.starts_with("custom-") { "runtime substitution" } else { "button or action" })).collect(),
+        CompletionKind::Hud => syntax
+            .hud_tokens
+            .iter()
+            .map(|name| {
+                let kind = if name.starts_with("custom-") { "runtime substitution" } else { "button or action" };
+                Choice::new(name.as_str(), format!("%{name}"), format!("%{name}"), kind)
+            })
+            .collect(),
         CompletionKind::Glyph => syntax
             .names
             .iter()
