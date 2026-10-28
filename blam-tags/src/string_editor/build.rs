@@ -80,7 +80,11 @@ pub(crate) enum Step {
     Tag { tag: String, group: String },
     /// A reference shared by every element of a block (e.g. HUD skins).
     /// Different or missing targets need context and must not be guessed.
-    BlockRef { block: String, #[serde(rename = "ref")] field: String },
+    BlockRef {
+        block: String,
+        #[serde(rename = "ref")]
+        field: String,
+    },
     /// The tag a reference field of the current tag points at.
     Ref {
         #[serde(rename = "ref")]
@@ -98,56 +102,100 @@ pub(crate) enum Step {
 
 fn default_source() -> Vec<Step> { vec![Step::Named("self".to_owned())] }
 
-/// The tag `steps` lead to from the edited tag.
-fn follow(editors: &StringEditors, steps: &[Step], ctx: &Context<'_>, source: &dyn TagSource) -> Option<Held> {
-    let mut current: Option<Held> = None;
-    for step in steps {
-        current = Some(match step {
-            Step::Named(name) if name == "self" => Held::Edited,
-            Step::Named(name) if name == "scenario" => {
-                if ctx.tag.group().tag == u32::from_be_bytes(*b"scnr") {
-                    Held::Edited
-                } else {
-                    Held::Loaded(source.owning_scenario(ctx.tag.group().tag, ctx.tag_path)?)
-                }
-            }
-            Step::Named(name) if name == "globals" => Held::Loaded(source.tag(u32::from_be_bytes(*b"matg"), "globals\\globals")?),
-            Step::Named(_) => return None,
-            Step::Tag { tag, group } => Held::Loaded(source.tag(editors.group_tag(group)?, tag)?),
-            Step::Element { element, field } => Held::Loaded(source.tag_of(enclosing(ctx, element)?.field(field)?)?),
-            Step::BlockRef { block, field } => {
-                let root = current.as_ref().map(|held| held.root(ctx)).unwrap_or_else(|| ctx.tag.root());
-                let (group,path) = shared_block_reference(root,block,field).ok()?;
-                Held::Loaded(source.tag(group,&path)?)
-            }
-            Step::Ref { field } => {
-                let root = current.as_ref().map(|held| held.root(ctx)).unwrap_or_else(|| ctx.tag.root());
-                let (group, path) = inherited(root, field)?.read_ref()?;
-                Held::Loaded(source.tag(group, &path)?)
-            }
-        });
-    }
-    current
+/// The globals tag every game keeps at the same path.
+fn globals_tag() -> (u32, String) {
+    (u32::from_be_bytes(*b"matg"), "globals\\globals".to_owned())
 }
 
-/// Resolve a reference repeated by every block element without choosing an
-/// arbitrary active player/HUD skin. Keep the original spelling for navigation.
-fn shared_block_reference(root: TagStruct<'_>, path: &str, field: &str) -> Result<(u32,String),String> {
-    let block = inherited(root,path).and_then(|field|field.as_block())
-        .ok_or_else(||format!("Source block '{path}' is unavailable."))?;
-    let mut target:Option<(u32,String)> = None;
-    for element in block.iter() {
-        let reference = element.field_path(field).and_then(|field|field.read_ref())
-            .filter(|(_, path)| !path.trim_end_matches('\0').is_empty())
-            .ok_or_else(||format!("A source '{path}' entry has no '{field}' reference."))?;
-        if let Some((group,ref existing)) = target {
-            let normalize = |path:&str| path.trim_end_matches('\0').replace('/',"\\").to_ascii_lowercase();
-            if group != reference.0 || normalize(existing) != normalize(&reference.1) {
-                return Err(format!("Source '{path}' entries reference different string lists; a HUD-skin context is required."));
+/// The tag `steps` lead to from the edited tag.
+fn follow(editors: &StringEditors, steps: &[Step], ctx: &Context<'_>, source: &dyn TagSource) -> Option<Held> {
+    trace(editors, steps, ctx, source).tag.ok()
+}
+
+/// Where a source chain led: its tag, or why it led nowhere.
+struct Traced {
+    tag: Result<Held, String>,
+    /// The reference the last step names, known even when its tag can't be
+    /// loaded. `None` when the chain fails before it, or ends at the edited
+    /// tag or its scenario.
+    last: Option<(u32, String)>,
+}
+
+/// [`follow`], keeping why a chain fails and where its last step points.
+fn trace(editors: &StringEditors, steps: &[Step], ctx: &Context<'_>, source: &dyn TagSource) -> Traced {
+    let failed = |reason: String| Traced { tag: Err(reason), last: None };
+    let mut current: Option<Held> = None;
+    let mut last = None;
+    for (index, step) in steps.iter().enumerate() {
+        let root = current.as_ref().map(|held| held.root(ctx)).unwrap_or_else(|| ctx.tag.root());
+        let target = match step {
+            Step::Named(name) if name == "self" => {
+                current = Some(Held::Edited);
+                continue;
             }
-        } else { target=Some(reference); }
+            Step::Named(name) if name == "scenario" => {
+                if ctx.tag.group().tag == u32::from_be_bytes(*b"scnr") {
+                    current = Some(Held::Edited);
+                } else {
+                    let Some(scenario) = source.owning_scenario(ctx.tag.group().tag, ctx.tag_path) else {
+                        return failed("No scenario owns the edited tag.".to_owned());
+                    };
+                    current = Some(Held::Loaded(scenario));
+                }
+                continue;
+            }
+            Step::Named(name) if name == "globals" => Ok(globals_tag()),
+            Step::Named(name) => Err(format!("Unknown source '{name}'.")),
+            Step::Tag { tag, group } => {
+                editors.group_tag(group).map(|group| (group, tag.clone())).ok_or_else(|| format!("Unknown tag group '{group}'."))
+            }
+            Step::Element { element, field } => enclosing(ctx, element)
+                .and_then(|element| element.field(field)?.read_ref())
+                .ok_or_else(|| format!("The enclosing '{element}' has no '{field}' reference.")),
+            Step::BlockRef { block, field } => shared_block_reference(root, block, field),
+            Step::Ref { field } => inherited(root, field)
+                .and_then(|field| field.read_ref())
+                .filter(|(_, path)| !path.trim_end_matches('\0').is_empty())
+                .ok_or_else(|| format!("Source reference '{field}' is empty or unavailable.")),
+        };
+        let (group, path) = match target {
+            Ok((group, path)) => (group, path.trim_end_matches('\0').to_owned()),
+            Err(reason) => return failed(reason),
+        };
+        last = (index + 1 == steps.len()).then(|| (group, path.clone()));
+        match source.tag(group, &path) {
+            Some(tag) => current = Some(Held::Loaded(tag)),
+            None => return Traced { tag: Err(format!("Could not load source tag '{path}'.")), last },
+        }
     }
-    target.ok_or_else(||format!("Source block '{path}' is empty."))
+    Traced { tag: current.ok_or_else(|| "The source rule names no tag.".to_owned()), last }
+}
+
+/// The tag every element of `path`'s block references in `field`, the
+/// spelling of the first. Elements that reference different tags (HUD skins
+/// with their own text) need a context the menu doesn't have, so they are
+/// an error rather than a guess.
+fn shared_block_reference(root: TagStruct<'_>, path: &str, field: &str) -> Result<(u32, String), String> {
+    let block = inherited(root, path)
+        .and_then(|field| field.as_block())
+        .ok_or_else(|| format!("Source block '{path}' is unavailable."))?;
+    let normalize = |path: &str| path.trim_end_matches('\0').replace('/', "\\").to_ascii_lowercase();
+    let mut target: Option<(u32, String)> = None;
+    for element in block.iter() {
+        let reference = element
+            .field_path(field)
+            .and_then(|field| field.read_ref())
+            .filter(|(_, path)| !path.trim_end_matches('\0').is_empty())
+            .ok_or_else(|| format!("A source '{path}' entry has no '{field}' reference."))?;
+        match &target {
+            Some((group, existing)) if *group != reference.0 || normalize(existing) != normalize(&reference.1) => {
+                return Err(format!("Source '{path}' entries reference different tags in '{field}'."));
+            }
+            Some(_) => {}
+            None => target = Some(reference),
+        }
+    }
+    target.ok_or_else(|| format!("Source block '{path}' is empty."))
 }
 
 /// A tag a builder reads: the edited one, or one the source loaded.
@@ -1284,7 +1332,7 @@ impl Builder {
         steps
             .iter()
             .filter_map(|step| match step {
-                Step::Named(name) if name == "globals" => Some((u32::from_be_bytes(*b"matg"), "globals\\globals".to_owned())),
+                Step::Named(name) if name == "globals" => Some(globals_tag()),
                 Step::Tag { tag, group } => crate::fields::parse_group_tag(group).map(|group| (group, tag.clone())),
                 _ => None,
             })
@@ -1298,7 +1346,7 @@ pub(crate) fn build(editors: &StringEditors, builder: &Builder, ctx: &Context<'_
         Builder::StringList(spec) => {
             let list = string_references(editors, spec, ctx, source);
             Menu { items: list.entries.iter().map(|entry| MenuItem::item(&entry.id)).collect(), note: list.unavailable, ..Default::default() }
-        },
+        }
         Builder::List { items } => Menu { items: list_items(items), ..Default::default() },
         Builder::ObjectFunction(spec) => spec.build(editors, ctx, source),
         Builder::AiActivities(spec) => spec.build(editors, ctx, source),
@@ -1312,59 +1360,58 @@ pub(crate) fn build(editors: &StringEditors, builder: &Builder, ctx: &Context<'_
     }
 }
 
-
+/// IDs from a `multilingual_unicode_string_list` the `source` chain leads
+/// to, previewed in `language`'s text.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct StringListSpec {
     source: Vec<Step>,
     #[serde(default = "english_language")]
     language: String,
 }
-fn english_language() -> String { "English".to_owned() }
+
+fn english_language() -> String {
+    "English".to_owned()
+}
 
 pub(crate) fn string_references(editors: &StringEditors, spec: &StringListSpec, ctx: &Context<'_>, source: &dyn TagSource) -> super::StringReferenceList {
     use super::{StringReferenceEntry, StringReferenceList, StringReferenceSource};
-    let mut result = StringReferenceList::unavailable("No string-list source was resolved.");
-    let mut current = None;
-    for (step_index, step) in spec.source.iter().enumerate() {
-        let target = match step {
-            Step::Named(name) if name == "globals" => Some((u32::from_be_bytes(*b"matg"), "globals\\globals".to_owned())),
-            Step::Tag { tag, group } => editors.group_tag(group).map(|group| (group, tag.clone())),
-            Step::BlockRef { block, field } => {
-                let root = current.as_ref().map(|held: &Held| held.root(ctx)).unwrap_or_else(|| ctx.tag.root());
-                match shared_block_reference(root,block,field) {
-                    Ok(target) => Some(target),
-                    Err(error) => {result.unavailable=Some(error);result.source=None;return result;}
-                }
-            }
-            Step::Ref { field } => {
-                let root = current.as_ref().map(|held: &Held| held.root(ctx)).unwrap_or_else(|| ctx.tag.root());
-                let target = inherited(root, field).and_then(|field| field.read_ref());
-                if target.is_none() { result.unavailable = Some(format!("Source reference '{field}' is empty or unavailable.")); return result; }
-                target
-            }
-            Step::Named(name) if name == "self" => { current = Some(Held::Edited); continue; }
-            _ => { result.unavailable = Some("This string-list source rule is not supported.".to_owned()); return result; }
-        };
-        let Some((group_tag, path)) = target else { result.unavailable = Some("The source rule names an unknown tag group.".to_owned()); return result; };
-        let path = path.trim_end_matches('\0').to_owned();
-        // Only the final reference is an Open destination; never expose an
-        // intermediate globals tag as though it were the string-list source.
-        result.source = None;
-        let last = step_index + 1 == spec.source.len();
-        if last { result.source = Some(StringReferenceSource { group_tag, path:path.clone() }); }
-        let Some(tag) = source.tag(group_tag, &path) else { result.unavailable = Some(format!("Could not load source tag '{path}'.")); return result; };
-        current = Some(Held::Loaded(tag));
+    let traced = trace(editors, &spec.source, ctx, source);
+    // Only the last step's tag is the list to open; never an intermediate
+    // globals tag.
+    let mut result = StringReferenceList {
+        source: traced.last.map(|(group_tag, path)| StringReferenceSource { group_tag, path }),
+        ..Default::default()
+    };
+    let tag = match traced.tag {
+        Ok(Held::Loaded(tag)) => tag,
+        Ok(Held::Edited) => {
+            result.unavailable = Some("String-list sources must resolve to an external tag.".to_owned());
+            return result;
+        }
+        Err(reason) => {
+            result.unavailable = Some(reason);
+            return result;
+        }
+    };
+    let Some(list) = crate::string_list::read_string_list(&tag) else {
+        result.unavailable = Some("The source is not a readable string list.".to_owned());
+        return result;
+    };
+    if list.storage != crate::string_list::Storage::Multilingual {
+        result.unavailable = Some("The source string list does not contain String IDs.".to_owned());
+        return result;
     }
-    let Some(current) = current else { return result; };
-    let Held::Loaded(tag) = current else { result.unavailable = Some("String-list sources must resolve to an external tag.".to_owned()); return result; };
-    let Some(list) = crate::string_list::read_string_list(&tag) else { result.unavailable = Some("The source is not a readable string list.".to_owned()); return result; };
-    if list.storage != crate::string_list::Storage::Multilingual { result.unavailable = Some("The source string list does not contain String IDs.".to_owned()); return result; }
     let language = list.languages.iter().position(|language| language.name.eq_ignore_ascii_case(&spec.language));
-    result.entries = list.entries.into_iter().filter_map(|entry| Some(StringReferenceEntry {
-        id: entry.id.filter(|id| !id.is_empty())?,
-        preview: language.and_then(|index| entry.texts.get(index).cloned().flatten()).filter(|text| !text.is_empty()),
-    })).collect();
-    result.entries.sort_by(|a,b| a.id.as_bytes().cmp(b.id.as_bytes()));
-    result.unavailable = None;
+    result.entries = list
+        .entries
+        .into_iter()
+        .filter_map(|entry| {
+            Some(StringReferenceEntry {
+                id: entry.id.filter(|id| !id.is_empty())?,
+                preview: language.and_then(|index| entry.texts.get(index).cloned().flatten()).filter(|text| !text.is_empty()),
+            })
+        })
+        .collect();
+    result.entries.sort_by(|a, b| a.id.as_bytes().cmp(b.id.as_bytes()));
     result
 }
