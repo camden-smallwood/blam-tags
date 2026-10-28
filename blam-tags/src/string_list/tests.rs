@@ -746,3 +746,116 @@ fn colors_carry_their_value_and_where_their_digits_are() {
     assert_eq!(&shown[color.digits.clone()], "55ffffff");
     assert_eq!(color.replaced_in(shown, 0x12345678), "&&<color argb=#12345678>");
 }
+
+
+fn hud_tag(text: &str) -> TagFile {
+    let mut tag = TagFile::new_classic(definitions().join("haloce_mcc/hud_message_text.json"), crate::classic::ClassicEngine::HaloCe).unwrap();
+    apply_string_list_edits(&mut tag, Some(GameId::HaloCe), &[StringListEdit::Insert { at: 0, entries: vec![StringEntry { id: Some("message".into()), texts: vec![Some(text.into())] }] }]).unwrap();
+    tag
+}
+
+fn reopen_hud(tag: &TagFile) -> TagFile {
+    read_classic_tag_file(&tag.write_to_bytes().unwrap(), TagLayout::from_json(definitions().join("haloce_mcc/hud_message_text.json")).unwrap()).unwrap()
+}
+
+#[test]
+fn hud_runtime_tokens_and_utf16_chunks_survive_classic_save_and_reopen() {
+    let text = format!("{}😀%action|n{}%% complete %custom-1%custom-8", "日".repeat(253), "a".repeat(600));
+    let tag = hud_tag(&text);
+    assert_eq!(read_string_list(&reopen_hud(&tag)).unwrap().entries[0].texts[0].as_deref(), Some(text.as_str()));
+    let elements = tag.root().field_path("message elements").unwrap().as_block().unwrap();
+    assert!(elements.iter().any(|element| element.read_int_any("data").unwrap() < 0), "text length is an unsigned byte even above 127");
+    for name in HUD_TOKENS {
+        let text = format!("%{name}");
+        assert_eq!(read_string_list(&reopen_hud(&hud_tag(&text))).unwrap().entries[0].texts[0].as_deref(), Some(text.as_str()));
+    }
+    assert_eq!(read_string_list(&reopen_hud(&hud_tag(""))).unwrap().entries[0].texts[0], None);
+}
+
+#[test]
+fn hud_invalid_edits_fail_before_mutating_the_tag() {
+    let mut tag = hud_tag("Original %action");
+    let before = tag.write_to_bytes().unwrap();
+    for text in ["%unknown".to_owned(), "abc\0def".to_owned(), "a".repeat(32768), "%action".repeat(256)] {
+        assert!(apply_string_list_edits(&mut tag,None,&[StringListEdit::SetText { index:0,language:0,text }]).is_err());
+        assert_eq!(tag.write_to_bytes().unwrap(),before);
+    }
+    for name in ["", " leading", "a=b", "名前", "abcdefghijklmnopqrstuvwxyz123456"] {
+        assert!(apply_string_list_edits(&mut tag,None,&[StringListEdit::SetId { index:0,id:name.into() }]).is_err());
+        assert_eq!(tag.write_to_bytes().unwrap(),before);
+    }
+    let entry = read_string_list(&tag).unwrap().entries[0].clone();
+    assert!(apply_string_list_edits(&mut tag,None,&[StringListEdit::Insert { at:1,entries:vec![entry;1024] }]).is_err());
+    assert_eq!(tag.write_to_bytes().unwrap(),before);
+}
+
+#[test]
+fn hud_unknown_elements_and_bad_offsets_are_not_silently_rewritten() {
+    for (field,value) in [("start index into text blob",TagFieldData::ShortInteger(-1)), ("panel count",TagFieldData::CharInteger(127))] {
+        let mut tag=hud_tag("Text %action");
+        { let mut root=tag.root_mut(); let mut field_ref=root.field_path_mut("messages").unwrap(); let mut block=field_ref.as_block_mut().unwrap(); set(&mut block.element_mut(0).unwrap(),field,value).unwrap(); }
+        assert!(read_string_list(&tag).is_none());
+        let before=tag.write_to_bytes().unwrap();
+        assert!(apply_string_list_edits(&mut tag,None,&[StringListEdit::SetText {index:0,language:0,text:"Edit".into()}]).is_err());
+        assert_eq!(tag.write_to_bytes().unwrap(),before);
+    }
+    let mut tag=hud_tag("%action");
+    { let mut root=tag.root_mut(); let mut field=root.field_path_mut("message elements").unwrap(); let mut block=field.as_block_mut().unwrap(); set(&mut block.element_mut(0).unwrap(),"data",TagFieldData::CharInteger(99)).unwrap(); }
+    assert!(read_string_list(&tag).is_none());
+}
+
+#[test]
+fn hud_native_source_and_editor_syntax_have_distinct_escaping() {
+    let syntax=Storage::HudMessages.text_syntax(game_syntax("haloce_mcc"));
+    let text="Hold %action|n%something";
+    assert!(parse_shown(text,&syntax).is_err());
+    assert!(parse_shown(text,&game_syntax("haloce_mcc")).is_ok(), "ordinary CE strings do not acquire HUD syntax");
+    let completion=completion_at("Press %cust",11,&syntax).unwrap();
+    assert_eq!(completion.kind,CompletionKind::Hud);
+    assert_eq!(choices(&syntax,completion.kind).len(),40);
+    let native="pickup= Hold %action to pick up %custom-1\\literal=equals\r\nempty=\r\n";
+    let rows=parse_hud_messages_file(native).unwrap();
+    let entries:Vec<_>=rows.into_iter().map(|(id,text)| StringEntry {id:Some(id),texts:vec![Some(text)]}).collect();
+    assert_eq!(hud_messages_file(&entries).unwrap(),native);
+    assert!(parse_hud_messages_file("same=a\nsame=b").is_err());
+    let tag=hud_tag("100%% complete");
+    assert!(hud_messages_file(&read_string_list(&tag).unwrap().entries).is_err(), "native HMT cannot encode a literal percent unambiguously");
+}
+
+#[test]
+fn hud_hceek_corpus_rebuild_edit_and_source_comparison() {
+    let Some(kit)=std::env::var_os("BLAM_TEST_HCEEK").map(PathBuf::from) else { eprintln!("skipped: no BLAM_TEST_HCEEK"); return; };
+    fn visit(dir:&Path,paths:&mut Vec<PathBuf>) { for entry in std::fs::read_dir(dir).unwrap().flatten() { let path=entry.path(); if path.is_dir() {visit(&path,paths)} else if path.extension().is_some_and(|ext|ext=="hud_message_text") {paths.push(path)} } }
+    let mut paths=Vec::new(); visit(&kit.join("tags"),&mut paths); assert!(!paths.is_empty());
+    let mut count=0;
+    for path in &paths {
+        let mut tag=read_kit_tag(path,"haloce_mcc"); let list=read_string_list(&tag).unwrap(); count+=list.entries.len();
+        let original=tag.write_to_bytes().unwrap();
+        write_string_list(&mut tag,&list).unwrap(); assert_eq!(tag.write_to_bytes().unwrap(),original,"unchanged HUD tags preserve bytes"); assert_eq!(read_string_list(&reopen_hud(&tag)).unwrap(),list,"{}",path.display());
+        let syntax=list.storage.text_syntax(game_syntax("haloce_mcc"));
+        for text in list.entries.iter().flat_map(|entry|entry.texts.iter().flatten()) { assert_eq!(parse_shown(&format_shown(text,&syntax),&syntax).unwrap(),*text); }
+        if !list.entries.is_empty() {
+            apply_string_list_edits(&mut tag,Some(GameId::HaloCe),&[StringListEdit::SetText {index:0,language:0,text:"Changed %action|n日本語 %custom-2".into()},StringListEdit::SetId {index:0,id:"edited_message".into()}]).unwrap();
+            let edited=read_string_list(&reopen_hud(&tag)).unwrap(); assert_eq!(edited.entries[0].id.as_deref(),Some("edited_message")); assert_eq!(edited.entries[0].texts[0].as_deref(),Some("Changed %action|n日本語 %custom-2")); assert_eq!(edited.entries[1..],list.entries[1..]);
+        }
+    }
+    let source=std::fs::read(kit.join("data/ui/hud/hud messages.hmt")).unwrap();
+    let source=decode_utf16_text(&source[2..]); let parsed=parse_hud_messages_file(&source).unwrap();
+    let list=read_string_list(&read_kit_tag(&kit.join("tags/ui/hud/hud messages.hud_message_text"),"haloce_mcc")).unwrap();
+    assert_eq!(parsed,list.entries.iter().map(|entry|(entry.id.clone().unwrap(),entry.texts[0].clone().unwrap_or_default())).collect::<Vec<_>>());
+    eprintln!("Checked {} HUD tags / {count} messages; source text matches exactly",paths.len());
+}
+
+
+#[test]
+fn hud_runtime_boundaries_are_not_reinterpreted_as_different_tokens() {
+    let tag=hud_tag("%{back}-button %back-button");
+    let list=read_string_list(&reopen_hud(&tag)).unwrap();
+    assert_eq!(list.entries[0].texts[0].as_deref(),Some("%{back}-button %back-button"));
+    let elements=tag.root().field_path("message elements").unwrap().as_block().unwrap();
+    assert_eq!(elements.element(0).unwrap().read_int_any("data"),Some(29));
+    let mut rewritten=reopen_hud(&tag); write_string_list(&mut rewritten,&list).unwrap();
+    assert_eq!(read_string_list(&reopen_hud(&rewritten)).unwrap(),list);
+    assert!(hud_messages_file(&list.entries).is_err());
+    assert!(parse_hud_messages_file("name=%%").is_err());
+}

@@ -48,6 +48,7 @@ pub struct TextSyntax {
     /// Whether `&` starts a glyph. Off for Halo CE, whose tool copies text as
     /// written.
     glyphs: bool,
+    hud_messages: bool,
     /// The game's `&name` table, in its tool's order. Empty for a game whose
     /// table is not known.
     names: Arc<[(String, u16)]>,
@@ -140,7 +141,7 @@ impl TextSyntax {
             keywords: file.keywords,
             keyword_match: file.keyword_match,
         };
-        Ok(Self { glyphs: file.glyphs, names: names.into(), rule: file.glyph_match, markup: Arc::new(markup) })
+        Ok(Self { hud_messages: false, glyphs: file.glyphs, names: names.into(), rule: file.glyph_match, markup: Arc::new(markup) })
     }
 
     /// A game nothing is known of: `&&` and `&U+XXXX`, no names, no markup.
@@ -150,8 +151,10 @@ impl TextSyntax {
 
     /// Text with no glyphs and no markup: `&` is an ordinary character.
     pub fn plain() -> Self {
-        Self { glyphs: false, names: Arc::from([]), rule: GlyphMatch::Longest, markup: Arc::default() }
+        Self { glyphs: false, hud_messages: false, names: Arc::from([]), rule: GlyphMatch::Longest, markup: Arc::default() }
     }
+
+    pub fn with_hud_messages(mut self, enabled: bool) -> Self { self.hud_messages = enabled; self }
 
     pub fn has_glyphs(&self) -> bool {
         self.glyphs
@@ -278,6 +281,14 @@ fn lex_mapped(shown: &str, syntax: &TextSyntax, rule: GlyphMatch) -> (Vec<Token>
             }
             at += len;
             continue;
+        }
+        if c == '%' && syntax.hud_messages {
+            let after = &rest[1..];
+            let (len, kind) = if after.starts_with('%') { (2, TokenKind::Ampersand) }
+                else if let Some((_, len)) = super::hud::token_at(after) { (len+1, TokenKind::Glyph) }
+                else { (1+name_run(after), TokenKind::BadGlyph) };
+            for (offset,c) in rest[..len].char_indices() { emit(&mut text,c,at+offset..at+offset+c.len_utf8()); }
+            push(&mut tokens,at..at+len,kind); at += len; continue;
         }
         if c == '&' && syntax.glyphs {
             let after = &rest[1..];
@@ -468,6 +479,8 @@ fn is_keyword_char(c: char) -> bool {
 /// What a completion inserts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionKind {
+    /// A CE HUD runtime prompt or substitution.
+    Hud,
     /// An `&name` glyph.
     Glyph,
     /// A `#keyword` of multiplayer event text.
@@ -479,11 +492,12 @@ pub enum CompletionKind {
 }
 
 impl CompletionKind {
-    const ALL: [CompletionKind; 4] =
-        [CompletionKind::Glyph, CompletionKind::Keyword, CompletionKind::Escape, CompletionKind::Tag];
+    const ALL: [CompletionKind; 5] =
+        [CompletionKind::Hud, CompletionKind::Glyph, CompletionKind::Keyword, CompletionKind::Escape, CompletionKind::Tag];
 
     fn mark(self) -> char {
         match self {
+            CompletionKind::Hud => '%',
             CompletionKind::Glyph => '&',
             CompletionKind::Keyword => '#',
             CompletionKind::Escape => '|',
@@ -494,7 +508,7 @@ impl CompletionKind {
     /// Whether `c` can be part of what is typed after the mark.
     fn is_name_char(self, c: char) -> bool {
         match self {
-            CompletionKind::Glyph => is_name_char(c),
+            CompletionKind::Hud | CompletionKind::Glyph => is_name_char(c),
             CompletionKind::Keyword => is_keyword_char(c),
             CompletionKind::Escape => c.is_ascii_alphabetic(),
             CompletionKind::Tag => c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/' | '!'),
@@ -511,6 +525,7 @@ impl CompletionKind {
 
     fn offered_by(self, syntax: &TextSyntax) -> bool {
         match self {
+            CompletionKind::Hud => syntax.hud_messages,
             CompletionKind::Glyph => syntax.glyphs,
             CompletionKind::Keyword => !syntax.keywords().is_empty(),
             CompletionKind::Escape => syntax.markup.has_pipes(),
@@ -556,7 +571,7 @@ pub fn completion_at(shown: &str, cursor: usize, syntax: &TextSyntax) -> Option<
         // The mark must be read as one, as the text is read.
         let token = tokens.iter().find(|token| token.range.start <= mark && mark < token.range.end)?;
         let read_as_mark = match kind {
-            CompletionKind::Glyph => token.range.start == mark && token.kind != TokenKind::Ampersand,
+            CompletionKind::Hud | CompletionKind::Glyph => token.range.start == mark && token.kind != TokenKind::Ampersand,
             _ => token.kind == TokenKind::Text,
         };
         if !read_as_mark {
@@ -598,6 +613,7 @@ impl Choice {
 /// Everything `syntax`'s game offers for a completion of `kind`.
 pub fn choices(syntax: &TextSyntax, kind: CompletionKind) -> Vec<Choice> {
     match kind {
+        CompletionKind::Hud => super::HUD_TOKENS.iter().map(|name| Choice::new(*name, format!("%{name}"), format!("%{name}"), if name.starts_with("custom-") { "runtime substitution" } else { "button or action" })).collect(),
         CompletionKind::Glyph => syntax
             .names
             .iter()

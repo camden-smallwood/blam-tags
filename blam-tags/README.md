@@ -662,9 +662,18 @@ Pageable-resource shapes handled: `tg\0c` (null), `tgrc` (exploded with inner `t
 ApiInterop (`ti][`) fields are parsed into `TagFieldData::ApiInterop` with `descriptor` / `address` / `definition_address` accessors and a `reset()` builder for BCS's canonical `{0, UINT_MAX, 0}` pattern.
 VertexBuffer fields are preserved as raw bytes through the roundtrip but not yet parsed into typed values.
 
-
 ### Localized string-reference editors
 
 A `string_editor` definition can use the `string_list` builder with a `source` chain (`globals`, fixed tag, or successive `ref` steps) and preview `language` (default `English`). Halo 2's shared item and seat HUD message fields resolve globals → HUD globals → its HUD text Unicode list this way. Halo 3, ODST, Reach, and Campaign Evolved follow CHUD globals and use a `{"block":"skins","ref":"chud text"}` step. This requires every skin to reference the same populated destination; empty, missing, or conflicting references are unavailable rather than selecting an arbitrary skin.
 
 Use `StringEditors::is_string_reference` and `string_references` for the richer result: original IDs, optional language previews, the resolved source tag, and an explicit unavailable reason. `StringReferenceList::validate` distinguishes `Valid`, `Missing`, and `Unavailable`; a successfully loaded empty list is distinct from an unavailable source, missing preview text does not invalidate an ID, and blank is unset. IDs are compared exactly as stored. This is separate from the legacy Foundation-style `Menu::accepts` behavior. Callers own saved/unsaved data policy and refresh timing through `TagSource`; the engine performs no file I/O or UI navigation itself.
+
+### Halo CE HUD message text
+
+`string_list` also reads and edits `hud_message_text` (`hmt `) through the existing `read_string_list`, `apply_string_list_edits`, and `write_string_list` API. `Storage::HudMessages` exposes one text column and a plain message name in `StringEntry::id`. `Storage::has_ids`, `identity_label`, `text_label`, `rows_block`, and `text_extension` describe the format without assuming every named list is multilingual. Apply `list.storage.text_syntax(game_syntax)` for highlighting, parsing, and completion.
+
+HUD texts represent runtime elements as `%action`, `%a-button`, or `%custom-1` through `%custom-8`; literal percent signs use `%%`. An ambiguous short token followed by text uses braces (`%{back}-button`) to preserve its element identity. `hud_messages_file` and `parse_hud_messages_file` handle native `name=text` source lines; native HMT cannot represent editor-only percent escapes or actual embedded line breaks and export refuses those values. The caller handles UTF-16 file encoding.
+
+Edits validate names, UTF-16 storage, message/element counts, and byte-sized run limits before changing the tag. Malformed spans or unknown element codes cause `read_string_list` to return `None`; no lossy recovery is attempted. Unchanged HUD lists preserve their serialized bytes. Set `BLAM_TEST_HCEEK` to an editing-kit root to exercise real tags and matching UI source data in the test suite.
+
+Message order remains significant: the global HUD interaction prompts use engine-defined indexes, and mission HSC message names compile to indexes in the scenario scripts. Editing text in place preserves those indexes. Callers that allow insertion, deletion, or reordering must account for those references; mission script references require recompilation after index changes, and recompilation does not remap the global prompt slots. This module serializes the requested order and does not rewrite external references or enforce editor-specific Expert Mode policies.
