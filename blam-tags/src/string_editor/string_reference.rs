@@ -57,9 +57,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     fn root() -> std::path::PathBuf {
-        std::env::var_os("BLAM_TEST_DEFINITIONS")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| "../definitions".into())
+        "../definitions".into()
     }
     fn tag(group: &str) -> TagFile {
         TagFile::new_classic(
@@ -69,9 +67,7 @@ mod tests {
         .unwrap()
     }
     fn editors() -> StringEditors {
-        let mut editors = StringEditors::load(root().join("halo2_mcc")).unwrap();
-        editors.specs.entry("hud_message".into()).or_insert_with(||serde_json::from_value(serde_json::json!({"builder":"string_list","source":["globals",{"ref":"interface tags[0]/hud globals"},{"ref":"new globals/hud text"}],"language":"English"})).unwrap());
-        editors
+        StringEditors::load(root().join("halo2_mcc")).unwrap()
     }
     fn set_ref(tag: &mut TagFile, path: &str, group: &[u8; 4], target: &str) {
         tag.root_mut()
@@ -225,9 +221,6 @@ mod tests {
     }
     #[test]
     fn string_references_h2_definition_annotations_cover_weapon_and_equipment() {
-        if std::env::var_os("BLAM_TEST_DEFINITIONS").is_none() {
-            return;
-        }
         let editors = StringEditors::load(root().join("halo2_mcc")).unwrap();
         for group in ["weapon", "equipment"] {
             let tag = tag(group);
@@ -372,9 +365,6 @@ mod tests {
     }
     #[test]
     fn string_references_chud_chains_and_inherited_item_and_seat_annotations() {
-        if std::env::var_os("BLAM_TEST_DEFINITIONS").is_none() {
-            return;
-        }
         for game in [
             "halo3_mcc",
             "halo3odst_mcc",
@@ -476,9 +466,6 @@ mod tests {
     }
     #[test]
     fn string_references_chud_requires_a_shared_populated_skin_reference() {
-        if std::env::var_os("BLAM_TEST_DEFINITIONS").is_none() {
-            return;
-        }
         let game = "halo3_mcc";
         let editors = StringEditors::load(root().join(game)).unwrap();
         let tag = gen3_tag(game, "weapon");
@@ -526,9 +513,6 @@ mod tests {
     }
     #[test]
     fn string_references_optional_chud_saved_corpus_lookup() {
-        if std::env::var_os("BLAM_TEST_DEFINITIONS").is_none() {
-            return;
-        }
         for (game, var) in [
             ("halo3_mcc", "BLAM_TEST_H3EK"),
             ("halo3odst_mcc", "BLAM_TEST_ODSTEK"),
