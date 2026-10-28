@@ -9,7 +9,11 @@
 //!
 //! A tag's own layout names a data field's definition but keeps none of it,
 //! so the flags and maximum size come from the definitions:
-//! `definitions/<game>/<group>.json`'s `datas`.
+//! `definitions/<game>/<group>.json`'s `datas`. A name is only a group's:
+//! two groups can give one name different definitions (Halo 3's
+//! `code_block` holds 262140 bytes in a shader include, 131070 in a render
+//! method option), so a definition is looked up from the tag's group up
+//! through its parent groups, whose fields a tag of the group also has.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -17,6 +21,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::api::TagField;
+use crate::fields::parse_group_tag;
 
 /// `tag_data_definition` flag: the bytes are text.
 const DATA_IS_TEXT: u32 = 1 << 1;
@@ -36,9 +41,16 @@ impl DataDefinitionInfo {
     }
 }
 
-/// One game's data definitions, by name.
+/// One game's data definitions, by group and name.
 #[derive(Debug, Default, Clone)]
 pub struct DataDefinitions {
+    groups: HashMap<u32, GroupDefinitions>,
+}
+
+/// One group's own data definitions, and its parent group.
+#[derive(Debug, Default, Clone)]
+struct GroupDefinitions {
+    parent: Option<u32>,
     by_name: HashMap<String, DataDefinitionInfo>,
 }
 
@@ -65,6 +77,9 @@ impl From<std::io::Error> for DataDefinitionsError {
 
 #[derive(Deserialize)]
 struct GroupDatas {
+    tag: String,
+    #[serde(default)]
+    parent_tag: Option<String>,
     #[serde(default)]
     datas: HashMap<String, DataJson>,
 }
@@ -91,25 +106,41 @@ impl DataDefinitions {
             }
             let group: GroupDatas = serde_json::from_slice(&std::fs::read(&path)?)
                 .map_err(|error| DataDefinitionsError::Json(path.clone(), error))?;
-            for (name, data) in group.datas {
-                definitions
-                    .by_name
-                    .entry(name)
-                    .or_insert(DataDefinitionInfo { flags: data.flags, max_size: data.max_size });
-            }
+            let Some(group_tag) = parse_group_tag(&group.tag) else {
+                continue;
+            };
+            let by_name = group
+                .datas
+                .into_iter()
+                .map(|(name, data)| (name, DataDefinitionInfo { flags: data.flags, max_size: data.max_size }))
+                .collect();
+            let parent = group.parent_tag.as_deref().and_then(parse_group_tag);
+            definitions.groups.insert(group_tag, GroupDefinitions { parent, by_name });
         }
         Ok(definitions)
     }
 
-    /// The data definition named `name`.
-    pub fn get(&self, name: &str) -> Option<DataDefinitionInfo> {
-        self.by_name.get(name).copied()
+    /// The data definition named `name` in a tag of group `group_tag`: the
+    /// group's own, or failing that its nearest parent group's.
+    pub fn get(&self, group_tag: u32, name: &str) -> Option<DataDefinitionInfo> {
+        let mut group = Some(group_tag);
+        // A parent chain is a few groups deep (weapon → item → object); the
+        // bound keeps a cycle in hand-edited definitions from hanging.
+        for _ in 0..8 {
+            let definitions = self.groups.get(&group?)?;
+            if let Some(info) = definitions.by_name.get(name) {
+                return Some(*info);
+            }
+            group = definitions.parent;
+        }
+        None
     }
 
-    /// The definition of a `data` field; `None` for any other field, or one
-    /// whose definition the game doesn't have.
-    pub fn of_field(&self, field: &TagField<'_>) -> Option<DataDefinitionInfo> {
-        self.get(field.data_definition_name()?)
+    /// The definition of a `data` field of a tag of group `group_tag`;
+    /// `None` for any other field, or one whose definition the game doesn't
+    /// have.
+    pub fn of_field(&self, group_tag: u32, field: &TagField<'_>) -> Option<DataDefinitionInfo> {
+        self.get(group_tag, field.data_definition_name()?)
     }
 }
 
@@ -190,21 +221,43 @@ mod tests {
     #[test]
     fn text_comes_from_the_definitions_flags() {
         let halo3 = definitions("halo3_mcc");
-        let include = halo3.get("code_block").unwrap();
+        let include = halo3.get(group(b"hlsl"), "code_block").unwrap();
         assert!(include.is_text());
         assert_eq!(include.max_size, 262_140);
-        for name in ["hs_source_data_definition", "parameters_text_definition", "event_text_data_definition"] {
-            assert!(halo3.get(name).unwrap().is_text(), "{name}");
+        for (tag, name) in [(b"scnr", "hs_source_data_definition"), (b"hlmt", "parameters_text_definition"), (b"info", "event_text_data_definition")] {
+            assert!(halo3.get(group(tag), name).unwrap().is_text(), "{name}");
         }
-        for name in ["function_definition_data", "render_geometry_vertex_buffer_data", "sound_samples", "utf8_string_data"] {
-            assert!(!halo3.get(name).unwrap().is_text(), "{name}");
+        for (tag, name) in [(b"obje", "function_definition_data"), (b"mode", "render_geometry_vertex_buffer_data"), (b"snd!", "sound_samples"), (b"unic", "utf8_string_data")] {
+            assert!(!halo3.get(group(tag), name).unwrap().is_text(), "{name}");
         }
         let halo1 = definitions("haloce_mcc");
-        assert!(halo1.get("hs_source_data_definition").unwrap().is_text());
+        assert!(halo1.get(group(b"scnr"), "hs_source_data_definition").unwrap().is_text());
         let halo2 = definitions("halo2_mcc");
-        assert!(halo2.get("hs_source_data_definition").unwrap().is_text());
-        assert!(halo2.get("shader_text_definition").unwrap().is_text());
-        assert!(!halo2.get("sound_samples").unwrap().is_text());
+        assert!(halo2.get(group(b"scnr"), "hs_source_data_definition").unwrap().is_text());
+        assert!(halo2.get(group(b"spas"), "shader_text_definition").unwrap().is_text());
+        assert!(!halo2.get(group(b"snd!"), "sound_samples").unwrap().is_text());
+    }
+
+    fn group(tag: &[u8; 4]) -> u32 {
+        u32::from_be_bytes(*tag)
+    }
+
+    /// Groups that give one name different definitions each read their own,
+    /// whichever order the files are found in, and a tag reads its parent
+    /// groups' definitions too.
+    #[test]
+    fn a_definition_is_its_groups_or_a_parent_groups() {
+        let halo3 = definitions("halo3_mcc");
+        assert_eq!(halo3.get(group(b"hlsl"), "code_block").unwrap().max_size, 262_140);
+        assert_eq!(halo3.get(group(b"rmop"), "code_block").unwrap().max_size, 131_070);
+        assert_eq!(halo3.get(group(b"weap"), "function_definition_data"), halo3.get(group(b"obje"), "function_definition_data"));
+        assert!(halo3.get(group(b"weap"), "function_definition_data").is_some(), "weapon → item → object");
+        assert_eq!(halo3.get(group(b"obje"), "code_block"), None);
+        let halo1 = definitions("haloce_mcc");
+        let hud = halo1.get(group(b"hmt "), "string data").unwrap();
+        let strings = halo1.get(group(b"ustr"), "string data").unwrap();
+        assert_ne!(hud, strings);
+        assert_eq!(hud.max_size, 65_536);
     }
 
     const TEXT: DataDefinitionInfo = DataDefinitionInfo { flags: DATA_IS_TEXT, max_size: 16 };
@@ -255,7 +308,7 @@ mod tests {
                 }
                 let tag = crate::TagFile::read(&path).unwrap();
                 let field = tag.root().fields().find(|field| field.as_data().is_some()).unwrap();
-                let definition = halo3.of_field(&field).unwrap();
+                let definition = halo3.of_field(tag.group().tag, &field).unwrap();
                 assert!(definition.is_text());
                 let bytes = field.as_data().unwrap();
                 read += 1;
