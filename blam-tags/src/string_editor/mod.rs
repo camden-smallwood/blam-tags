@@ -18,7 +18,7 @@
 
 mod build;
 mod string_reference;
-pub use string_reference::{StringReferenceEntry, StringReferenceList, StringReferenceSource, StringReferenceValidation};
+pub use string_reference::{StringReferenceEntry, StringReferenceGroup, StringReferenceList, StringReferenceSource, StringReferenceValidation};
 
 use std::collections::HashMap;
 use std::path::Path;
