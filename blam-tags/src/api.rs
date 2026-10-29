@@ -170,6 +170,36 @@ pub struct TagStruct<'a> {
 }
 
 impl<'a> TagStruct<'a> {
+    /// Read the byte elements of a classic Halo 2 mapping function's data block.
+    /// This is storage decoding only; malformed elements return `None`.
+    pub fn halo2_function_bytes(&self) -> Option<Vec<u8>> {
+        let block = self.field("data")?.as_block()?;
+        block.iter().map(|element| element.read_int_any("Value").map(|value| value as i8 as u8)).collect()
+    }
+
+    /// Decode a wrapped mapping function and return its data field's name.
+    /// Empty declared functions use the engine's creation default without
+    /// mutating the tag. Arbitrary data fields are never guessed to be functions.
+    pub fn mapping_function(&self) -> Option<(crate::TagFunction, String)> {
+        if let Some(bytes) = self.halo2_function_bytes() {
+            let function = if bytes.is_empty() {
+                Some(crate::TagFunction::H2(crate::H2Function::new(crate::FunctionType::Identity)))
+            } else {
+                crate::TagFunction::parse_encoded(crate::FunctionEncoding::H2, &bytes).ok()
+            };
+            if let Some(function) = function { return Some((function, "data".into())); }
+        }
+        for field in self.fields_all() {
+            if !field.is_function_data() { continue; }
+            let function = field.as_function().or_else(|| {
+                field.as_data().filter(|bytes| bytes.is_empty())
+                    .and_then(|_| crate::TagFunction::parse(&crate::default_function_definition_bytes(crate::Endian::Le)).ok())
+            });
+            if let Some(function) = function { return Some((function, field.clean_name().into_owned())); }
+        }
+        None
+    }
+
     /// A view of the same struct type over somebody else's bytes.
     ///
     /// For reading a struct that is not part of a tag's chunk tree -- a
@@ -2616,5 +2646,57 @@ mod set_type_tests {
         assert_eq!(error.to_string(), "expected a short integer value, got a long integer");
         let error: &dyn std::error::Error = &super::TagIndexError::OutOfRange { index: 3, len: 2 };
         assert_eq!(error.to_string(), "index 3 is out of range for 2 elements");
+    }
+}
+
+#[cfg(test)]
+mod mapping_function_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tag(block: bool, function_data: bool) -> TagFile {
+        let definition = if function_data { "function_definition_data" } else { "unrelated_data" };
+        let fields = if block {
+            json!([{"type":"block","name":"data","definition":"bytes"},{"type":"terminator"}])
+        } else {
+            json!([{"type":"data","name":"data","definition":definition},{"type":"terminator"}])
+        };
+        let schema = json!({"tag":"test","version":0,"flags":0,"block":"root",
+            "structs":{
+                "root":{"guid":"00000000000000000000000000000001","size":if block {12} else {20},"fields":fields},
+                "byte":{"guid":"00000000000000000000000000000002","size":1,"fields":[{"type":"char_integer","name":"Value"},{"type":"terminator"}]}
+            },
+            "blocks":{"root":{"max_count":1,"struct":"root"},"bytes":{"max_count":4096,"struct":"byte"}},
+            "datas":{definition:{}}
+        });
+        let layout = TagLayout::from_json_value(schema).unwrap();
+        TagFile::from_parts(crate::TagFileHeader {
+            pad:[0;36], build_version:0, build_number:0, version:0,
+            group_tag:u32::from_be_bytes(*b"test"), group_version:0, checksum:0,
+            signature:u32::from_be_bytes(*b"BLAM"),
+        }, crate::file::TagContainer::Mcc, Endian::Le, crate::stream::TagStream::new_default(layout))
+    }
+
+    #[test]
+    fn empty_declared_functions_use_their_encoding_without_mutating_storage() {
+        for block in [true, false] {
+            let mut tag = tag(block, true);
+            if !block {
+                tag.root_mut().field_path_mut("data").unwrap().set(TagFieldData::Data(Vec::new())).unwrap();
+            }
+            let before = tag.write_to_bytes().unwrap();
+            let (function, data) = tag.root().mapping_function().unwrap();
+            assert_eq!(data, "data");
+            assert_eq!(function.encoding(), if block { crate::FunctionEncoding::H2 } else { crate::FunctionEncoding::Blob });
+            assert!(function.evaluate(0.5, 0.5).is_finite());
+            assert_eq!(tag.write_to_bytes().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn unrelated_data_is_not_treated_as_a_function_even_if_its_bytes_parse() {
+        let mut tag = tag(false, false);
+        tag.root_mut().field_path_mut("data").unwrap().set(TagFieldData::Data(crate::default_function_definition_bytes(Endian::Le))).unwrap();
+        assert!(tag.root().mapping_function().is_none());
     }
 }
