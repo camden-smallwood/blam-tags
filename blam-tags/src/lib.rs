@@ -68,6 +68,8 @@ pub mod error;
 pub mod fields;
 pub mod field_name;
 pub mod element_label;
+pub mod string_editor;
+pub mod string_list;
 pub mod layout;
 pub mod schema;
 pub mod schema_compare;
@@ -125,6 +127,9 @@ pub mod audio;
 
 #[cfg(feature = "iostore")]
 pub mod iostore;
+
+#[cfg(feature = "halo5")]
+pub mod halo5;
 
 
 // Facade re-exports — the recommended surface for editing tags.
@@ -192,6 +197,3 @@ pub use animation::{
     MovementData, MovementFrame, MovementKind, NodeFlags, NodeTransform, ObjectSpaceParentNode,
     OrientationComponents, PackedDataSizes, Pose, SizeLayout, Skeleton, SkeletonNode,
 };
-
-#[cfg(feature = "halo5")]
-pub mod halo5;
