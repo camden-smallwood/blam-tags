@@ -33,6 +33,7 @@ struct DataBlock {
 }
 #[derive(Clone, Debug)]
 struct Structure {
+    guid: [u8; 16],
     kind: u16,
     target: i32,
     host: i32,
@@ -135,6 +136,7 @@ impl NativeTag {
                 "invalid structure host {host}"
             );
             structures.push(Structure {
+                guid: fixed_bytes::<16>(&bytes, offset)?,
                 kind: u16::from_le_bytes(fixed_bytes::<2>(&bytes, offset + 16)?),
                 target,
                 host,
@@ -377,6 +379,26 @@ impl NativeTag {
                         budget,
                     )?))
                 }
+                TagFieldType::Array => {
+                    let array = &layout.array_layouts[f.definition as usize];
+                    let size = layout.struct_layouts[array.struct_index as usize].size;
+                    let mut elements = Vec::new();
+                    for i in 0..array.count as usize {
+                        let start = off + i * size;
+                        let region = range(start, size, raw.len())?;
+                        elements.push(self.structure(
+                            layout,
+                            array.struct_index,
+                            native_index,
+                            base + start,
+                            &mut raw[region],
+                            &format!("{path}[{i}]"),
+                            depth + 1,
+                            budget,
+                        )?);
+                    }
+                    Some(TagSubChunkContent::Array(elements))
+                }
                 TagFieldType::Block => {
                     let n = count(&self.bytes, address + 16)?;
                     let target = self
@@ -459,7 +481,7 @@ impl NativeTag {
                 }
                 _ => None,
             };
-            if f.field_type != TagFieldType::Struct {
+            if !matches!(f.field_type, TagFieldType::Struct | TagFieldType::Array) {
                 self.bindings.insert(path, binding);
             }
             if let Some(content) = content {
@@ -543,6 +565,10 @@ impl NativeTag {
                 for (i, child) in block.iter().enumerate() {
                     self.patch(child, &format!("{path}[{i}]"), output)?;
                 }
+            } else if let Some(array) = f.as_array() {
+                for (i, child) in array.iter().enumerate() {
+                    self.patch(child, &format!("{path}[{i}]"), output)?;
+                }
             }
         }
         Ok(())
@@ -555,6 +581,18 @@ pub fn read_halo5_tag_file(bytes: &[u8], layout: TagLayout, group_tag: u32) -> R
     let root_size =
         layout.struct_layouts[layout.block_layouts[root as usize].struct_index as usize].size;
     let mut native = NativeTag::parse(bytes.to_vec(), root_size)?;
+    let root_guid =
+        layout.struct_layouts[layout.block_layouts[root as usize].struct_index as usize].guid;
+    let native_guid = native
+        .structures
+        .iter()
+        .find(|s| s.kind == 0 && s.target == native.root_block as i32)
+        .context("missing root structure")?
+        .guid;
+    ensure!(
+        native_guid == root_guid,
+        "Halo 5 root GUID does not match the supplied definitions"
+    );
     let data = native.block(
         &layout,
         root,
@@ -651,6 +689,66 @@ mod tests {
     fn definitions() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../definitions/halo5_guardians")
     }
+    fn native_bytes(layout: &TagLayout) -> Vec<u8> {
+        let root = &layout.struct_layouts[layout.block_layouts
+            [layout.header.tag_group_block_index as usize]
+            .struct_index as usize];
+        let mut bytes = vec![0u8; 128 + root.size];
+        bytes[..4].copy_from_slice(b"ucsh");
+        for (offset, value) in [
+            (4, 27u32),
+            (32, 1),
+            (36, 1),
+            (60, 128),
+            (64, root.size as u32),
+            (80, root.size as u32),
+            (120, u32::MAX),
+        ] {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        bytes[86] = 1;
+        bytes[96..112].copy_from_slice(&root.guid);
+        bytes
+    }
+    #[test]
+    fn fixed_arrays_edit_through_the_shared_api_and_wrong_root_layout_is_refused() {
+        let (layout, meta) = TagLayout::from_json_with_meta(
+            definitions().join("multilingual_unicode_string_list.json"),
+        )
+        .unwrap();
+        let original = native_bytes(&layout);
+        let mut tag = read_halo5_tag_file(&original, layout.clone(), meta.tag).unwrap();
+        let array_field = tag
+            .root()
+            .fields()
+            .find(|f| f.as_array().is_some())
+            .unwrap();
+        let element = array_field.as_array().unwrap().iter().nth(1).unwrap();
+        let scalar = element
+            .fields()
+            .find(|f| f.type_name() == "short integer")
+            .unwrap();
+        let path = crate::TagFieldPath::default()
+            .with_field(&array_field)
+            .with_index(1)
+            .with_field(&scalar)
+            .to_string();
+        tag.root_mut()
+            .field_path_mut(&path)
+            .unwrap()
+            .set(TagFieldData::ShortInteger(7))
+            .unwrap();
+        let saved = tag.write_to_bytes().unwrap();
+        assert_ne!(saved, original);
+        let reopened = read_halo5_tag_file(&saved, layout.clone(), meta.tag).unwrap();
+        assert!(matches!(
+            reopened.root().field_path(&path).unwrap().value(),
+            Some(TagFieldData::ShortInteger(7))
+        ));
+        let mut wrong_guid = original;
+        wrong_guid[96] ^= 1;
+        assert!(read_halo5_tag_file(&wrong_guid, layout, meta.tag).is_err());
+    }
     #[test]
     fn all_json_definitions_use_the_shared_layout_importer() {
         let mut count = 0;
@@ -661,24 +759,7 @@ mod tests {
             {
                 let (layout, meta) = TagLayout::from_json_with_meta(&path)
                     .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-                let size = layout.struct_layouts[layout.block_layouts
-                    [layout.header.tag_group_block_index as usize]
-                    .struct_index as usize]
-                    .size;
-                let mut bytes = vec![0u8; 128 + size];
-                bytes[..4].copy_from_slice(b"ucsh");
-                for (offset, value) in [
-                    (4, 27u32),
-                    (32, 1),
-                    (36, 1),
-                    (60, 128),
-                    (64, size as u32),
-                    (80, size as u32),
-                    (120, u32::MAX),
-                ] {
-                    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-                }
-                bytes[86] = 1;
+                let bytes = native_bytes(&layout);
                 let tag = read_halo5_tag_file(&bytes, layout, meta.tag)
                     .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
                 assert_eq!(tag.write_to_bytes().unwrap(), bytes, "{}", path.display());
@@ -696,6 +777,39 @@ mod tests {
             let layout = TagLayout::from_json(definitions().join("biped.json")).unwrap();
             assert!(read_halo5_tag_file(&bytes, layout, u32::from_be_bytes(*b"bipd")).is_err());
         }
+    }
+    #[test]
+    fn xbox_character_tag_groups_roundtrip_with_executable_definitions() {
+        let Some(root) = std::env::var_os("HALO5_TEST_DUMP") else {
+            return;
+        };
+        let root = PathBuf::from(root).join("tag_dump/objects/characters/grunt_mecha");
+        let mut count = 0;
+        for entry in std::fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(extension) = path.extension().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let schema = definitions().join(format!("{extension}.json"));
+            if !schema.is_file() {
+                continue;
+            }
+            let (layout, meta) = TagLayout::from_json_with_meta(schema).unwrap();
+            let original = std::fs::read(&path).unwrap();
+            let tag = read_halo5_tag_file(&original, layout, meta.tag)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert_eq!(
+                tag.write_to_bytes().unwrap(),
+                original,
+                "{}",
+                path.display()
+            );
+            count += 1;
+        }
+        assert!(count >= 8, "too few real tag groups: {count}");
     }
     #[test]
     fn xbox_biped_shared_fields_native_roundtrip_and_atomic_edit() {

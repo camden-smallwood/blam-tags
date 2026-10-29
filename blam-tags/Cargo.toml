@@ -51,9 +51,6 @@ ruzstd = { version = "0.7", optional = true }
 # `hull_corpus` recovers each shipped physics_model's source JMS from the
 # tag's zlib-compressed `info` stream. Same version as the normal
 # dependency above, so nothing new is pulled in.
-roxmltree = { version = "0.20", optional = true }
-walkdir = { version = "2", optional = true }
-
 [dev-dependencies]
 flate2 = "1"
 # Reads the workspace `parity.toml` in tests/parity_symbols.rs.

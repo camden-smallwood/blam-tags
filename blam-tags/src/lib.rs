@@ -197,6 +197,3 @@ pub use animation::{
     MovementData, MovementFrame, MovementKind, NodeFlags, NodeTransform, ObjectSpaceParentNode,
     OrientationComponents, PackedDataSizes, Pose, SizeLayout, Skeleton, SkeletonNode,
 };
-
-#[cfg(feature = "halo5")]
-pub mod halo5;

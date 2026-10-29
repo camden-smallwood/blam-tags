@@ -19,7 +19,7 @@ use crate::stream::TagStream;
 /// as classic, an MCC tag writes back as MCC.
 #[derive(Debug, Clone)]
 pub enum TagContainer {
-    /// Extracted Halo 5 tag, retaining native metadata for lossless writes.
+    /// Extracted Halo 5 data and its original native metadata.
     #[cfg(feature = "halo5")]
     Halo5(Box<crate::halo5::NativeTag>),
     /// MCC self-describing container (`tag!`/`blay`/`tgbl` chunks).
@@ -466,9 +466,19 @@ impl TagFile {
     /// `path` only once verification succeeds. Leaves the original untouched on
     /// any failure (a bad encode never clobbers the tag already on disk).
     pub fn write_atomic<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
-        write_bytes_atomic(path.as_ref(), &self.write_atomic_bytes()?, |temp_path| {
+        let path = path.as_ref();
+        let (temp_path, file) = create_save_temp_file(path)?;
+        let result = (|| {
+            let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
+            writer.write_all(&self.write_atomic_bytes()?)?;
+            writer.flush()?;
+            let file = writer.into_inner().map_err(|error| error.into_error())?;
+            file.sync_all()?;
+            // Verify the freshly-written TEMP file parses before replacing the
+            // original. A bad encode must never clobber the user's tag on disk,
+            // so the commit happens only after verification succeeds.
             if let TagContainer::Classic { engine, .. } = self.container {
-                let bytes = std::fs::read(temp_path)?;
+                let bytes = std::fs::read(&temp_path)?;
                 crate::classic::ClassicHeader::parse(&bytes).ok_or_else(|| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -490,15 +500,19 @@ impl TagFile {
                     self.header.group_tag,
                 ).map_err(std::io::Error::other)?;
             } else {
-                Self::read(temp_path).map_err(|error| {
+                Self::read(&temp_path).map_err(|error| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!("saved tag failed verification: {error}"),
                     )
                 })?;
             }
-            Ok(())
-        })
+            commit_temp_file(&temp_path, path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        result
     }
 
     fn write_atomic_bytes(&self) -> std::io::Result<Vec<u8>> {
@@ -516,9 +530,7 @@ impl TagFile {
     /// Whether this tag retains an extracted Halo 5 container.
     pub fn is_halo5(&self) -> bool {
         #[cfg(feature = "halo5")]
-        if matches!(self.container, TagContainer::Halo5(_)) {
-            return true;
-        }
+        if matches!(self.container, TagContainer::Halo5(_)) { return true; }
         false
     }
 
@@ -820,21 +832,6 @@ fn collect_from_field(f: &crate::TagField<'_>, out: &mut Vec<(u32, String)>) {
         && let Some((g, p)) = r.group_tag_and_name {
             out.push((g, p));
     }
-}
-
-/// Publish bytes only after a format-specific reader verifies the temporary file.
-pub(crate) fn write_bytes_atomic(path: &Path, bytes: &[u8], verify: impl FnOnce(&Path) -> std::io::Result<()>) -> std::io::Result<()> {
-    let (temp_path, file) = create_save_temp_file(path)?;
-    let result = (|| {
-        let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
-        writer.write_all(bytes)?;
-        writer.flush()?;
-        writer.into_inner().map_err(|error| error.into_error())?.sync_all()?;
-        verify(&temp_path)?;
-        commit_temp_file(&temp_path, path)
-    })();
-    if result.is_err() { let _ = std::fs::remove_file(&temp_path); }
-    result
 }
 
 fn create_save_temp_file(path: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
