@@ -19,6 +19,9 @@ use crate::stream::TagStream;
 /// as classic, an MCC tag writes back as MCC.
 #[derive(Debug, Clone)]
 pub enum TagContainer {
+    /// Extracted Halo 5 tag, retaining native metadata for lossless writes.
+    #[cfg(feature = "halo5")]
+    Halo5(Box<crate::halo5::NativeTag>),
     /// MCC self-describing container (`tag!`/`blay`/`tgbl` chunks).
     Mcc,
     /// Classic (Halo CE / H2) flat tag — no embedded layout. Carries the
@@ -479,6 +482,13 @@ impl TagFile {
                             format!("saved classic tag failed verification: {error}"),
                         )
                     })?;
+            } else if self.is_halo5() {
+                #[cfg(feature = "halo5")]
+                crate::halo5::read_halo5_tag_file(
+                    &std::fs::read(&temp_path)?,
+                    self.tag_stream.layout.clone(),
+                    self.header.group_tag,
+                ).map_err(std::io::Error::other)?;
             } else {
                 Self::read(temp_path).map_err(|error| {
                     std::io::Error::new(
@@ -503,6 +513,15 @@ impl TagFile {
         Ok(bytes)
     }
 
+    /// Whether this tag retains an extracted Halo 5 container.
+    pub fn is_halo5(&self) -> bool {
+        #[cfg(feature = "halo5")]
+        if matches!(self.container, TagContainer::Halo5(_)) {
+            return true;
+        }
+        false
+    }
+
     /// The classic engine (Halo CE / Halo 2) this tag was read as, or
     /// `None` for MCC self-describing tags. Lets callers branch on the
     /// engine — e.g. preferring the color-plate source for classic
@@ -510,13 +529,18 @@ impl TagFile {
     pub fn classic_engine(&self) -> Option<crate::classic::ClassicEngine> {
         match self.container {
             TagContainer::Classic { engine, .. } => Some(engine),
-            TagContainer::Mcc => None,
+            _ => None,
         }
     }
 
     /// Serialize this tag to a `Vec<u8>`. Mirrors [`TagFile::write`];
     /// useful for fuzzing roundtrips and in-memory tag pipelines.
     pub fn write_to_bytes(&self) -> std::io::Result<Vec<u8>> {
+        #[cfg(feature = "halo5")]
+        if let TagContainer::Halo5(native) = &self.container {
+            return native.write(self);
+        }
+
         // Classic (Halo CE / H2) tags serialize as flat bytes with a
         // reconstructed 64-byte header — no MCC chunking.
         if let TagContainer::Classic { engine, header } = &self.container {

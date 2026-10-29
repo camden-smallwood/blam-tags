@@ -119,6 +119,8 @@ impl From<serde_json::Error> for TagSchemaError {
 
 #[derive(Debug, Deserialize)]
 struct TagSchema {
+    /// Per-container wire widths, keyed by canonical field type name.
+    #[serde(default)] field_type_sizes: BTreeMap<String, u32>,
     tag: String,
     #[serde(default)] parent_tag: Option<String>,
     version: u32,
@@ -999,7 +1001,7 @@ fn build_layout_from_schema(
         let i = field_types.len() as u32;
         field_types.push(TagFieldTypeLayout {
             name_offset,
-            size,
+            size: schema.field_type_sizes.get(canonical).copied().unwrap_or(size),
             needs_sub_chunk: needs_sub,
         });
         field_type_index_by_name.insert(canonical, i);
