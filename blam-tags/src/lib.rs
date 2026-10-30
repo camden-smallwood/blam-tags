@@ -128,6 +128,9 @@ pub mod audio;
 #[cfg(feature = "iostore")]
 pub mod iostore;
 
+#[cfg(feature = "halo5")]
+pub mod halo5;
+
 
 // Facade re-exports — the recommended surface for editing tags.
 pub use api::{

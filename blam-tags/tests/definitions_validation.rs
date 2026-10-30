@@ -32,18 +32,24 @@ use blam_tags::convert::{GameTagIndex, CAMPAIGN_EVOLVED_GENERATION};
 use blam_tags::{TagFile, TagLayout};
 use serde_json::Value;
 
+/// A new tag's `(build_version, build_number, version)`.
+type Generation = (i32, i32, u32);
+
 /// Every definitions folder, with the generation `TagFile::new` stamps into a
 /// new tag's header: `(build_version, build_number, version)`. The classic
-/// games have no MCC generation and keep the header zeroed.
-const GAMES: &[(&str, (i32, i32, u32))] = &[
-    ("halo2_mcc", (0, 0, 0)),
-    ("halo2amp_mcc", (1, 2, u32::MAX)),
-    ("halo3_mcc", (1, 1, u32::MAX)),
-    ("halo3odst_mcc", (1, 1, u32::MAX)),
-    ("halo4_mcc", (1, 2, u32::MAX)),
-    ("haloce_evolved", CAMPAIGN_EVOLVED_GENERATION),
-    ("haloce_mcc", (0, 0, 0)),
-    ("haloreach_mcc", (1, 2, u32::MAX)),
+/// games have no MCC generation and keep the header zeroed. `None` where
+/// `TagFile::new` refuses the game: Halo 5 Guardians' tags are only edited
+/// from extracted ucsh files.
+const GAMES: &[(&str, Option<Generation>)] = &[
+    ("halo2_mcc", Some((0, 0, 0))),
+    ("halo2amp_mcc", Some((1, 2, u32::MAX))),
+    ("halo3_mcc", Some((1, 1, u32::MAX))),
+    ("halo3odst_mcc", Some((1, 1, u32::MAX))),
+    ("halo4_mcc", Some((1, 2, u32::MAX))),
+    ("halo5_guardians", None),
+    ("haloce_evolved", Some(CAMPAIGN_EVOLVED_GENERATION)),
+    ("haloce_mcc", Some((0, 0, 0))),
+    ("haloreach_mcc", Some((1, 2, u32::MAX))),
 ];
 
 fn read_json(path: &Path) -> Value {
@@ -130,8 +136,80 @@ fn tag_index_and_group_files_agree() {
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
-/// Seven Halo 4 / Halo 2 Anniversary MP groups have mixed-case names, and the
-/// file names match. Every lookup the engine makes goes through the index's
+/// Halo 5 Guardians' mixed-case group names.
+const HALO5_MIXED: &[(&str, &str)] = &[
+    ("aTag", "AnyTag"),
+    ("aaap", "AmbientActionPointDefinitionTag"),
+    ("ames", "AnimatedMesh"),
+    ("apab", "assetPhotoToolAssetSpecBlockTag"),
+    ("apcb", "assetPhotoToolConfigurationBlockTag"),
+    ("apct", "assetPhotoToolConfigurationTag"),
+    ("aplt", "assetPhotoToolLightingSpecBlockTag"),
+    ("appb", "assetPhotoToolPhotoSpecBlockTag"),
+    ("appt", "assetPhotoToolPhotoSpecTag"),
+    ("cfdf", "CollisionFilterDefinition"),
+    ("clac", "collisionLayerAuditConfigurationTag"),
+    ("clct", "CollectibleGlobalsDefinition"),
+    ("cmpg", "CampaignGlobalsDefinition"),
+    ("drdg", "DamageReportingDisplayGlobals"),
+    ("fanf", "FanfareDefinition"),
+    ("ffgt", "GameEngineFirefightVariantTag"),
+    ("fpal", "ForgePaletteDefinition"),
+    ("fsld", "ForgeSoundListDefinition"),
+    ("fuic", "ComponentDefinition"),
+    ("fuis", "ScreenDefinition"),
+    ("glca", "CameraGlobalsDefinition"),
+    ("glch", "CheatGlobalsDefinition"),
+    ("glcm", "ComposerGlobalsDefinition"),
+    ("glcn", "ControlGlobalsDefinition"),
+    ("glco", "ColorGlobalsDefinition"),
+    ("glda", "DamageGlobalsDefinition"),
+    ("gldi", "DifficultyGlobalsDefinition"),
+    ("glga", "GarbageCollectionGlobalsDefinition"),
+    ("glgo", "GameplayObjectGlobalsDefinition"),
+    ("glin", "InterfaceGlobalsDefinition"),
+    ("gllo", "LOCGlobalsDefinition"),
+    ("glma", "MaterialGlobalsDefinition"),
+    ("glpa", "PlayerGlobalsDefinition"),
+    ("glsa", "SkillRankingGlobalsDefinition"),
+    ("glsk", "SkullGlobalsDefinition"),
+    ("glso", "SoftCeilingGlobalsDefinition"),
+    ("gmpm", "GenericModifierDefinitionTag"),
+    ("ludg", "LevelDisplayMappingDefinition"),
+    ("mgee", "multiplayerEffects"),
+    ("mglb", "MeleeGlobals"),
+    ("narg", "NarrativeGlobals"),
+    ("nava", "NavPointAnimationDefinition"),
+    ("navl", "NavPointLayoutDefinition"),
+    ("navp", "NavPointParametersTag"),
+    ("pugm", "PowerupDefinition"),
+    ("rbcl", "requisition_CMSLink"),
+    ("retm", "ResolutionTextureMapDefinition"),
+    ("rqgs", "RequisitionGlobalsDefinition"),
+    ("rtcl", "TagChecksums"),
+    ("saev", "EvadeDefinitionTag"),
+    ("sagp", "GroundPoundDefinitionTag"),
+    ("sasb", "ShoulderBashDefinitionTag"),
+    ("sasp", "SprintDefinitionTag"),
+    ("sast", "StabilizerDefinitionTag"),
+    ("sggg", "SpeechGrammarGroup"),
+    ("sggs", "SpeechGrammarGlobals"),
+    ("sigd", "SuppressedIncident"),
+    ("spab", "SpartanAbilityComponentDefinition"),
+    ("sptg", "SpartanTrackingGlobalsDefinition"),
+    ("sptr", "SpartanTrackingComponentDefinition"),
+    ("ssdf", "SpawnSettings"),
+    ("trds", "TrackDecalSystem"),
+    ("uipd", "uiPlacementDefinition"),
+    ("uivi", "UIVehicleDisplayInfoDefinition"),
+    ("uiwi", "UIWeaponDisplayInfoDefinition"),
+    ("urcd", "UnitRecordingDefinition"),
+    ("vatc", "VehicleAttachment"),
+    ("vcdd", "VehicleConfiguration"),
+];
+
+/// Seven Halo 4 / Halo 2 Anniversary MP groups have mixed-case names (and
+/// Halo 5 Guardians' [`HALO5_MIXED`]), and the file names match. Every lookup the engine makes goes through the index's
 /// own spelling, so it opens the right file on a case-sensitive filesystem;
 /// this pins that the names really are mixed case (or the test proves
 /// nothing) and that both of the engine's group-name tables spell them as the
@@ -152,11 +230,13 @@ fn mixed_case_group_names_are_looked_up_with_their_own_case() {
             .into_iter()
             .filter(|(_, name)| name.chars().any(|c| c.is_ascii_uppercase()))
             .collect();
-        let expected: BTreeSet<(String, String)> = if matches!(*game, "halo4_mcc" | "halo2amp_mcc") {
-            MIXED.iter().map(|(tag, name)| ((*tag).to_owned(), (*name).to_owned())).collect()
-        } else {
-            BTreeSet::new()
+        let expected: &[(&str, &str)] = match *game {
+            "halo4_mcc" | "halo2amp_mcc" => MIXED,
+            "halo5_guardians" => HALO5_MIXED,
+            _ => &[],
         };
+        let expected: BTreeSet<(String, String)> =
+            expected.iter().map(|(tag, name)| ((*tag).to_owned(), (*name).to_owned())).collect();
         assert_eq!(mixed, expected, "{game}: mixed-case group names changed");
 
         let index = GameTagIndex::load(&common::definitions_root(), game).unwrap();
@@ -164,11 +244,14 @@ fn mixed_case_group_names_are_looked_up_with_their_own_case() {
         for (tag, name) in &expected {
             let group = blam_tags::parse_group_tag(tag).unwrap();
             assert_eq!(index.by_tag.get(&group), Some(name), "{game} {tag}: GameTagIndex");
-            assert_eq!(
-                blam_tags::paths::group_tag_to_extension(group),
-                Some(name.as_str()),
-                "{tag}: the cross-game table"
-            );
+            // Halo 5 is not in the cross-game table; see HALO5_NOT_IN_TABLE.
+            if *game != "halo5_guardians" {
+                assert_eq!(
+                    blam_tags::paths::group_tag_to_extension(group),
+                    Some(name.as_str()),
+                    "{tag}: the cross-game table"
+                );
+            }
             assert!(files.contains(name), "{game}: no file spelled {name}.json");
             assert!(!files.contains(&name.to_ascii_lowercase()), "{game}: {name} also exists lower-cased");
             // Building the group goes through the same spelling.
@@ -220,12 +303,148 @@ fn the_cross_game_group_table_is_wrong_for_these_groups_only() {
     }
     let expected: BTreeSet<(String, String, String, Option<String>)> = WRONG
         .iter()
+        .copied()
+        .chain(HALO5_NOT_IN_TABLE.iter().map(|&(tag, name, table)| ("halo5_guardians", tag, name, table)))
         .map(|(game, tag, name, table)| {
-            ((*game).to_owned(), (*tag).to_owned(), (*name).to_owned(), table.map(str::to_owned))
+            (game.to_owned(), tag.to_owned(), name.to_owned(), table.map(str::to_owned))
         })
         .collect();
     assert_eq!(found, expected);
 }
+
+/// Halo 5 Guardians' groups the cross-game table gets wrong. The table is
+/// built from the MCC titles' indexes, and Halo 5 is not one: its own groups
+/// have no entry, and four FOURCCs name another game's group.
+const HALO5_NOT_IN_TABLE: &[(&str, &str, Option<&str>)] = &[
+    ("aaap", "AmbientActionPointDefinitionTag", None),
+    ("acme", "gestalt", None),
+    ("alic", "attached_light_cone", None),
+    ("ames", "AnimatedMesh", None),
+    ("apab", "assetPhotoToolAssetSpecBlockTag", None),
+    ("apcb", "assetPhotoToolConfigurationBlockTag", None),
+    ("apct", "assetPhotoToolConfigurationTag", None),
+    ("aplt", "assetPhotoToolLightingSpecBlockTag", None),
+    ("appb", "assetPhotoToolPhotoSpecBlockTag", None),
+    ("appt", "assetPhotoToolPhotoSpecTag", None),
+    ("aTag", "AnyTag", None),
+    ("bitd", "bitmap_dictionary", None),
+    ("blvo", "bsp_lighting_volumes", None),
+    ("bspv", "bsp_volumes", None),
+    ("camg", "camera_animation_graph", None),
+    ("cfdf", "CollisionFilterDefinition", None),
+    ("clac", "collisionLayerAuditConfigurationTag", None),
+    ("clct", "CollectibleGlobalsDefinition", None),
+    ("cmpg", "CampaignGlobalsDefinition", None),
+    ("cmps", "composition_scene", Some("compute_shader")),
+    ("cmpt", "composer_transition", None),
+    ("colt", "custom_object_lighting", None),
+    ("comp", "composition", None),
+    ("drdg", "DamageReportingDisplayGlobals", None),
+    ("efex", "effect_exposure", None),
+    ("empt", "empty_object", None),
+    ("fanf", "FanfareDefinition", None),
+    ("flni", "flinch_impulse", None),
+    ("flns", "flinch_system", None),
+    ("fnts", "wpf_font_set", None),
+    ("font", "wpf_font", Some("font")),
+    ("fpal", "ForgePaletteDefinition", None),
+    ("fsld", "ForgeSoundListDefinition", None),
+    ("fuic", "ComponentDefinition", None),
+    ("fuis", "ScreenDefinition", None),
+    ("glca", "CameraGlobalsDefinition", None),
+    ("glch", "CheatGlobalsDefinition", None),
+    ("glcm", "ComposerGlobalsDefinition", None),
+    ("glcn", "ControlGlobalsDefinition", None),
+    ("glco", "ColorGlobalsDefinition", None),
+    ("glda", "DamageGlobalsDefinition", None),
+    ("gldi", "DifficultyGlobalsDefinition", None),
+    ("glga", "GarbageCollectionGlobalsDefinition", None),
+    ("glgo", "GameplayObjectGlobalsDefinition", None),
+    ("glin", "InterfaceGlobalsDefinition", None),
+    ("gllo", "LOCGlobalsDefinition", None),
+    ("glma", "MaterialGlobalsDefinition", None),
+    ("glpa", "PlayerGlobalsDefinition", None),
+    ("glsa", "SkillRankingGlobalsDefinition", None),
+    ("glsk", "SkullGlobalsDefinition", None),
+    ("glso", "SoftCeilingGlobalsDefinition", None),
+    ("gmpm", "GenericModifierDefinitionTag", None),
+    ("GobS", "gobo_setting", None),
+    ("gpso", "pso_globals", None),
+    ("holt", "hologram_lighting", None),
+    ("hsc*", "lua", Some("scenario_hs_source_file")),
+    ("LigS", "lighting_settings", None),
+    ("luas", "lua_script", None),
+    ("ludg", "LevelDisplayMappingDefinition", None),
+    ("mglb", "MeleeGlobals", None),
+    ("mtrd", "musketeer_toe_definition_tag", None),
+    ("musc", "music_control", None),
+    ("nava", "NavPointAnimationDefinition", None),
+    ("navl", "NavPointLayoutDefinition", None),
+    ("navp", "NavPointParametersTag", None),
+    ("ngst", "node_graph_stack", None),
+    ("ocfg", "object_configuration", None),
+    ("odis", "object_dispenser_component", None),
+    ("pphs", "physics_phantom_sounds", None),
+    ("psoc", "compute_pso", None),
+    ("psog", "graphics_pso", None),
+    ("pugm", "PowerupDefinition", None),
+    ("pvsb", "zoneset_baked_pvs", None),
+    ("rbcl", "requisition_CMSLink", None),
+    ("rbdd", "requisition_deployable", None),
+    ("retm", "ResolutionTextureMapDefinition", None),
+    ("revi", "revive_globals", None),
+    ("rpca", "prototype_requisition_category", None),
+    ("rpcd", "prototype_requisition_card", None),
+    ("rpcp", "prototype_requisition_card_pool", None),
+    ("rppd", "prototype_requisition_pack", None),
+    ("rpsg", "prototype_requisition_service_globals", None),
+    ("rqgs", "RequisitionGlobalsDefinition", None),
+    ("rscn", "reactive_scenery", None),
+    ("rtcl", "TagChecksums", None),
+    ("saev", "EvadeDefinitionTag", None),
+    ("sagp", "GroundPoundDefinitionTag", None),
+    ("sasb", "ShoulderBashDefinitionTag", None),
+    ("sasp", "SprintDefinitionTag", None),
+    ("sast", "StabilizerDefinitionTag", None),
+    ("sggg", "SpeechGrammarGroup", None),
+    ("sggs", "SpeechGrammarGlobals", None),
+    ("sklt", "sky_lighting", None),
+    ("slvo", "scenario_lighting_volumes", None),
+    ("sngl", "sound_globals", None),
+    ("spab", "SpartanAbilityComponentDefinition", None),
+    ("spry", "supply_relay", None),
+    ("sptg", "SpartanTrackingGlobalsDefinition", None),
+    ("sptr", "SpartanTrackingComponentDefinition", None),
+    ("sred", "scenario_render_data", None),
+    ("ssgp", "sound_state_group", None),
+    ("sssc", "scenario_sound_constants", None),
+    ("stai", "sound_tail", None),
+    ("stlm", "structure_lightmap", None),
+    ("strl", "structure_lights", None),
+    ("subt", "composer_subtracks", None),
+    ("trds", "TrackDecalSystem", None),
+    ("tvcm", "trigger_volume_component", None),
+    ("uipd", "uiPlacementDefinition", None),
+    ("uivi", "UIVehicleDisplayInfoDefinition", None),
+    ("uivn", "ui_vehicle_node_definition", None),
+    ("uiwi", "UIWeaponDisplayInfoDefinition", None),
+    ("uiwn", "ui_ads_weapon_node_definition", None),
+    ("urcd", "UnitRecordingDefinition", None),
+    ("vatc", "VehicleAttachment", None),
+    ("vcdd", "VehicleConfiguration", None),
+    ("wcfg", "weapon_configuration", None),
+    ("wdof", "weapon_depth_of_field", None),
+    ("weab", "weapon_attachment_barrel", None),
+    ("weam", "weapon_attachment_magazine", None),
+    ("weat", "weapon_attachment", Some("weather_system")),
+    ("weme", "weapon_attachment_melee", None),
+    ("west", "weapon_attachment_sight", None),
+    ("wetr", "weapon_attachment_trigger", None),
+    ("wett", "weapon_attachment_target_tracking", None),
+    ("wgbl", "weapon_globals", None),
+    ("wpat", "wpf_polyart", None),
+    ("wpfs", "wpf_screen", None),
+];
 
 /// Every `parent_tag` is a group of the same game, and every chain ends.
 /// `merge_parent_schemas` stops silently at a parent it cannot find, so a
@@ -301,6 +520,7 @@ fn every_group_builds_a_layout_and_a_new_tag() {
     let mut failures = BTreeSet::new();
     let mut headers = Vec::new();
     let mut built = 0;
+    let mut refused = 0;
     for (game, generation) in GAMES {
         for (tag, name) in tag_index(game) {
             let path = common::definitions(game).join(format!("{name}.json"));
@@ -308,6 +528,13 @@ fn every_group_builds_a_layout_and_a_new_tag() {
                 failures.insert((game.to_string(), tag.clone(), format!("layout: {error}")));
                 continue;
             }
+            let Some(generation) = generation else {
+                if TagFile::new(&path).is_ok() {
+                    headers.push(format!("{game} {tag}: a new tag was built, where none should be"));
+                }
+                refused += 1;
+                continue;
+            };
             match TagFile::new(&path) {
                 Ok(new) => {
                     built += 1;
@@ -333,6 +560,7 @@ fn every_group_builds_a_layout_and_a_new_tag() {
     assert_eq!(failures, expected, "groups that fail to build");
     assert!(headers.is_empty(), "{}", headers.join("\n"));
     assert!(built > 1400, "only {built} groups built");
+    assert_eq!(refused, tag_index("halo5_guardians").len(), "Halo 5 groups refused");
 }
 
 /// Structs whose fields do not add up to their declared size:

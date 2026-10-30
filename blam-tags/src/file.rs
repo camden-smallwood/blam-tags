@@ -19,6 +19,9 @@ use crate::stream::TagStream;
 /// as classic, an MCC tag writes back as MCC.
 #[derive(Debug, Clone)]
 pub enum TagContainer {
+    /// Extracted Halo 5 data and its original native metadata.
+    #[cfg(feature = "halo5")]
+    Halo5(Box<crate::halo5::NativeTag>),
     /// MCC self-describing container (`tag!`/`blay`/`tgbl` chunks).
     Mcc,
     /// Classic (Halo CE / H2) flat tag — no embedded layout. Carries the
@@ -200,9 +203,19 @@ impl TagFile {
     ///
     /// Fails if the schema JSON doesn't parse or any struct's
     /// computed size doesn't match the schema's stated size
-    /// (both surfaced as `blam_tags::TagSchemaError`).
+    /// (both surfaced as `blam_tags::TagSchemaError`), and for Halo 5
+    /// Guardians' definitions, whose tags are only edited, never created.
     pub fn new<P: AsRef<Path>>(schema_path: P) -> Result<Self, Box<dyn Error>> {
         let schema_path = schema_path.as_ref();
+        // A Halo 5 tag is a native ucsh file read with the original bytes it
+        // patches on save; a fresh one has none, and would save as MCC.
+        if schema_profile_names(schema_path).iter().any(|game| game == HALO5_GAME) {
+            return Err(format!(
+                "{}: new Halo 5 tags cannot be created; Halo 5 tags are edited from extracted ucsh files",
+                schema_path.display()
+            )
+            .into());
+        }
         let (layout, meta) = TagLayout::from_json_with_meta(schema_path)?;
         let tag_stream = TagStream::new_default(layout);
         let header = TagFileHeader {
@@ -489,6 +502,14 @@ impl TagFile {
                             format!("saved classic tag failed verification: {error}"),
                         )
                     })?;
+            } else if self.is_halo5() {
+                #[cfg(feature = "halo5")]
+                crate::halo5::read_halo5_tag_file(
+                    &std::fs::read(&temp_path)?,
+                    self.tag_stream.layout.clone(),
+                    self.header.group_tag,
+                )
+                .map_err(std::io::Error::other)?;
             } else {
                 Self::read(&temp_path).map_err(|error| {
                     std::io::Error::new(
@@ -517,6 +538,15 @@ impl TagFile {
         Ok(bytes)
     }
 
+    /// Whether this tag retains an extracted Halo 5 container.
+    pub fn is_halo5(&self) -> bool {
+        #[cfg(feature = "halo5")]
+        if matches!(self.container, TagContainer::Halo5(_)) {
+            return true;
+        }
+        false
+    }
+
     /// The classic engine (Halo CE / Halo 2) this tag was read as, or
     /// `None` for MCC self-describing tags. Lets callers branch on the
     /// engine — e.g. preferring the color-plate source for classic
@@ -524,13 +554,18 @@ impl TagFile {
     pub fn classic_engine(&self) -> Option<crate::classic::ClassicEngine> {
         match self.container {
             TagContainer::Classic { engine, .. } => Some(engine),
-            TagContainer::Mcc => None,
+            _ => None,
         }
     }
 
     /// Serialize this tag to a `Vec<u8>`. Mirrors [`TagFile::write`];
     /// useful for fuzzing roundtrips and in-memory tag pipelines.
     pub fn write_to_bytes(&self) -> std::io::Result<Vec<u8>> {
+        #[cfg(feature = "halo5")]
+        if let TagContainer::Halo5(native) = &self.container {
+            return native.write(self);
+        }
+
         // Classic (Halo CE / H2) tags serialize as flat bytes with a
         // reconstructed 64-byte header — no MCC chunking.
         if let TagContainer::Classic { engine, header } = &self.container {
@@ -856,6 +891,9 @@ fn save_temp_location(path: &Path) -> std::io::Result<(PathBuf, String)> {
 /// then the `game` its `_meta.json` declares. The two agree for every game
 /// but Campaign Evolved, whose folder is `haloce_evolved` and whose meta says
 /// `halocampaignevolved`.
+/// The definitions folder, and `_meta.json` game, of Halo 5 Guardians.
+const HALO5_GAME: &str = "halo5_guardians";
+
 fn schema_profile_names(schema_path: &Path) -> Vec<String> {
     let Some(directory) = schema_path.parent() else { return Vec::new() };
     let mut names: Vec<String> =
