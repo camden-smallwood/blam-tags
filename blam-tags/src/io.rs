@@ -412,3 +412,115 @@ pub(crate) fn check_chunk_end<R: Seek>(
     }
     Ok(())
 }
+
+/// Checked reads from a byte slice at an offset, for formats read whole
+/// into memory rather than streamed.
+// Halo 5 is the only user so far, and is a feature; the other modules' own
+// slice readers move here next.
+#[cfg_attr(not(feature = "halo5"), allow(dead_code))]
+pub(crate) mod slice {
+    use super::Endian;
+
+    /// A read from a byte slice that runs past its end: `size` bytes at
+    /// `offset` in data `length` bytes long. A size or offset too large to add
+    /// up is past the end too.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct OutOfBounds {
+        pub offset: usize,
+        pub size: usize,
+        pub length: usize,
+    }
+
+    impl std::fmt::Display for OutOfBounds {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "{:#x} bytes at {:#x} run past the end of {:#x} bytes",
+                self.size, self.offset, self.length
+            )
+        }
+    }
+
+    impl std::error::Error for OutOfBounds {}
+
+    /// The range of `size` bytes at `offset`, if it lies within `length` bytes.
+    pub(crate) fn range(offset: usize, size: usize, length: usize) -> Result<std::ops::Range<usize>, OutOfBounds> {
+        match offset.checked_add(size) {
+            Some(end) if end <= length => Ok(offset..end),
+            _ => Err(OutOfBounds { offset, size, length }),
+        }
+    }
+
+    /// Where a table of `count` entries of `stride` bytes at `start` ends, if
+    /// it lies within `length` bytes.
+    pub(crate) fn table_end(start: usize, count: usize, stride: usize, length: usize) -> Result<usize, OutOfBounds> {
+        Ok(range(start, count.saturating_mul(stride), length)?.end)
+    }
+
+    /// The `N` bytes at `offset` in `data`.
+    pub(crate) fn bytes_at<const N: usize>(data: &[u8], offset: usize) -> Result<[u8; N], OutOfBounds> {
+        let bytes = &data[range(offset, N, data.len())?];
+        Ok(bytes.try_into().expect("range is N bytes long"))
+    }
+
+    /// The `u16` at `offset` in `data`, in `endian`.
+    pub(crate) fn u16_at(data: &[u8], offset: usize, endian: Endian) -> Result<u16, OutOfBounds> {
+        let bytes = bytes_at(data, offset)?;
+        Ok(match endian {
+            Endian::Le => u16::from_le_bytes(bytes),
+            Endian::Be => u16::from_be_bytes(bytes),
+        })
+    }
+
+    /// The `u32` at `offset` in `data`, in `endian`.
+    pub(crate) fn u32_at(data: &[u8], offset: usize, endian: Endian) -> Result<u32, OutOfBounds> {
+        let bytes = bytes_at(data, offset)?;
+        Ok(match endian {
+            Endian::Le => u32::from_le_bytes(bytes),
+            Endian::Be => u32::from_be_bytes(bytes),
+        })
+    }
+
+    /// The `i32` at `offset` in `data`, in `endian`.
+    pub(crate) fn i32_at(data: &[u8], offset: usize, endian: Endian) -> Result<i32, OutOfBounds> {
+        Ok(u32_at(data, offset, endian)? as i32)
+    }
+
+    /// The `u64` at `offset` in `data`, in `endian`.
+    pub(crate) fn u64_at(data: &[u8], offset: usize, endian: Endian) -> Result<u64, OutOfBounds> {
+        let bytes = bytes_at(data, offset)?;
+        Ok(match endian {
+            Endian::Le => u64::from_le_bytes(bytes),
+            Endian::Be => u64::from_be_bytes(bytes),
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn slice_reads_take_the_bytes_at_the_offset_in_either_order() {
+            let data = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99];
+            assert_eq!(u16_at(&data, 1, Endian::Le), Ok(0x3322));
+            assert_eq!(u16_at(&data, 1, Endian::Be), Ok(0x2233));
+            assert_eq!(u32_at(&data, 5, Endian::Le), Ok(0x9988_7766));
+            assert_eq!(u32_at(&data, 5, Endian::Be), Ok(0x6677_8899));
+            assert_eq!(i32_at(&data, 5, Endian::Le), Ok(0x9988_7766u32 as i32));
+            assert_eq!(u64_at(&data, 1, Endian::Le), Ok(0x9988_7766_5544_3322));
+            assert_eq!(bytes_at::<2>(&data, 7), Ok([0x88, 0x99]));
+        }
+
+        #[test]
+        fn slice_reads_past_the_end_or_that_overflow_are_out_of_bounds() {
+            let data = [0u8; 8];
+            assert_eq!(u32_at(&data, 4, Endian::Le), Ok(0));
+            assert_eq!(u32_at(&data, 5, Endian::Le), Err(OutOfBounds { offset: 5, size: 4, length: 8 }));
+            assert_eq!(u64_at(&data, usize::MAX, Endian::Le), Err(OutOfBounds { offset: usize::MAX, size: 8, length: 8 }));
+            assert_eq!(range(8, 0, 8), Ok(8..8));
+            assert_eq!(table_end(0, 2, 4, 8), Ok(8));
+            assert_eq!(table_end(0, 3, 4, 8), Err(OutOfBounds { offset: 0, size: 12, length: 8 }));
+            assert_eq!(table_end(0, usize::MAX, 4, 8), Err(OutOfBounds { offset: 0, size: usize::MAX, length: 8 }));
+        }
+    }
+}

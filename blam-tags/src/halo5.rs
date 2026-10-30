@@ -5,15 +5,18 @@ use crate::data::{
     MAX_BLOCK_NESTING, TagBlockData, TagStructData, TagSubChunkContent, TagSubChunkEntry,
 };
 use crate::file::TagContainer;
+use crate::io::slice::{bytes_at, i32_at, range, table_end, u16_at, u32_at, u64_at};
 use crate::stream::TagStream;
 use crate::{Endian, TagFieldData, TagFieldType, TagFile, TagFileHeader, TagLayout, TagStruct};
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::HashMap;
-use std::ops::Range;
 
 /// The `ucsh` versions read as Halo 5, by [`NativeTag::parse`] and
 /// [`looks_like_halo5`] alike.
 const SUPPORTED_VERSIONS: [u32; 2] = [23, 27];
+
+/// Extracted Halo 5 tags are little-endian throughout.
+const LE: Endian = Endian::Le;
 
 #[derive(Clone, Debug)]
 enum BindingKind {
@@ -72,7 +75,7 @@ impl NativeTag {
             "not an extracted Halo 5 ucsh tag"
         );
         ensure!(bytes.len() >= 80, "truncated Halo 5 tag header");
-        let version = u32_at(&bytes, 4)?;
+        let version = u32_at(&bytes, 4, LE)?;
         ensure!(
             SUPPORTED_VERSIONS.contains(&version),
             "unsupported Halo 5 tag version {version}"
@@ -95,12 +98,12 @@ impl NativeTag {
         let db_end = table_end(cursor, db_count, 16, header_size)?;
         let mut blocks = Vec::with_capacity(db_count);
         for offset in (cursor..db_end).step_by(16) {
-            let section = usize::from(u16::from_le_bytes(fixed_bytes::<2>(&bytes, offset + 6)?));
+            let section = usize::from(u16_at(&bytes, offset + 6, LE)?);
             ensure!(section <= 2, "unsupported tag data section {section}");
             blocks.push(DataBlock {
                 size: count(&bytes, offset)?,
                 section,
-                offset: usize::try_from(u64_at(&bytes, offset + 8)?)?,
+                offset: usize::try_from(u64_at(&bytes, offset + 8, LE)?)?,
                 address: 0,
             });
         }
@@ -127,8 +130,8 @@ impl NativeTag {
         let st_end = table_end(cursor, st_count, 32, header_size)?;
         let mut structures = Vec::with_capacity(st_count);
         for offset in (cursor..st_end).step_by(32) {
-            let target = i32_at(&bytes, offset + 20)?;
-            let host = i32_at(&bytes, offset + 24)?;
+            let target = i32_at(&bytes, offset + 20, LE)?;
+            let host = i32_at(&bytes, offset + 24, LE)?;
             ensure!(
                 target >= -1 && (target == -1 || (target as usize) < blocks.len()),
                 "invalid structure target {target}"
@@ -138,8 +141,8 @@ impl NativeTag {
                 "invalid structure host {host}"
             );
             structures.push(Structure {
-                guid: fixed_bytes::<16>(&bytes, offset)?,
-                kind: u16::from_le_bytes(fixed_bytes::<2>(&bytes, offset + 16)?),
+                guid: bytes_at::<16>(&bytes, offset)?,
+                kind: u16_at(&bytes, offset + 16, LE)?,
                 target,
                 host,
                 offset: count(&bytes, offset + 28)?,
@@ -148,7 +151,7 @@ impl NativeTag {
         let reference_start = table_end(st_end, count(&bytes, 40)?, 20, header_size)?;
         let mut data_targets = HashMap::new();
         for at in (st_end..reference_start).step_by(20) {
-            let target = i32_at(&bytes, at + 8)?;
+            let target = i32_at(&bytes, at + 8, LE)?;
             if target == -1 {
                 continue;
             }
@@ -182,7 +185,7 @@ impl NativeTag {
         };
         let mut references = HashMap::new();
         for at in (reference_start..reference_end).step_by(16) {
-            let dependency = i32_at(&bytes, at + 12)?;
+            let dependency = i32_at(&bytes, at + 12, LE)?;
             if dependency == -1 {
                 continue;
             }
@@ -199,18 +202,18 @@ impl NativeTag {
                 .checked_add(offset)
                 .context("reference address overflow")?;
             let dependency = 80 + dependency as usize * 24;
-            let dependency_name = i32_at(&bytes, dependency + 4)?;
-            let path = string_at(i32_at(&bytes, at + 8)?)
+            let dependency_name = i32_at(&bytes, dependency + 4, LE)?;
+            let path = string_at(i32_at(&bytes, at + 8, LE)?)
                 .filter(|path| !path.is_empty())
                 .or_else(|| string_at(dependency_name));
             if let Some(path) = path.filter(|path| !path.is_empty()) {
                 references.insert(
                     address,
                     TagReference {
-                        group: u32_at(&bytes, dependency)?,
+                        group: u32_at(&bytes, dependency, LE)?,
                         path,
-                        global_id: u32_at(&bytes, dependency + 16)?,
-                        asset_id: u64_at(&bytes, dependency + 8)?,
+                        global_id: u32_at(&bytes, dependency + 16, LE)?,
+                        asset_id: u64_at(&bytes, dependency + 8, LE)?,
                     },
                 );
             }
@@ -444,12 +447,12 @@ impl NativeTag {
                     ))
                 }
                 TagFieldType::TagReference => {
-                    let id = u32_at(&self.bytes, address + 12)?;
+                    let id = u32_at(&self.bytes, address + 12, LE)?;
                     let reference = if id == u32::MAX {
                         None
                     } else {
-                        let group = u32_at(&self.bytes, address + 24)?;
-                        let asset = u64_at(&self.bytes, address + 16)?;
+                        let group = u32_at(&self.bytes, address + 24, LE)?;
+                        let asset = u64_at(&self.bytes, address + 16, LE)?;
                         if let Some(r) = self.references.get(&address) {
                             ensure!(
                                 r.global_id == id && r.asset_id == asset && r.group == group,
@@ -471,7 +474,7 @@ impl NativeTag {
                     Some(TagSubChunkContent::TagReference(data))
                 }
                 TagFieldType::StringId | TagFieldType::OldStringId => {
-                    let id = u32_at(&self.bytes, address)?;
+                    let id = u32_at(&self.bytes, address, LE)?;
                     let text = self
                         .strings
                         .get(&id)
@@ -631,32 +634,8 @@ pub fn looks_like_halo5(bytes: &[u8]) -> bool {
             SUPPORTED_VERSIONS.contains(&u32::from_le_bytes(b.try_into().unwrap()))
         })
 }
-fn range(offset: usize, size: usize, length: usize) -> Result<Range<usize>> {
-    let end = offset.checked_add(size).context("byte range overflow")?;
-    ensure!(
-        end <= length,
-        "byte range {offset:#x}..{end:#x} exceeds {length:#x} bytes"
-    );
-    Ok(offset..end)
-}
-fn fixed_bytes<const N: usize>(data: &[u8], offset: usize) -> Result<[u8; N]> {
-    Ok(data[range(offset, N, data.len())?].try_into().unwrap())
-}
-fn u32_at(data: &[u8], offset: usize) -> Result<u32> {
-    Ok(u32::from_le_bytes(fixed_bytes(data, offset)?))
-}
-fn i32_at(data: &[u8], offset: usize) -> Result<i32> {
-    Ok(i32::from_le_bytes(fixed_bytes(data, offset)?))
-}
 fn count(data: &[u8], offset: usize) -> Result<usize> {
-    usize::try_from(i32_at(data, offset)?).context("negative table count")
-}
-fn u64_at(data: &[u8], offset: usize) -> Result<u64> {
-    Ok(u64::from_le_bytes(fixed_bytes(data, offset)?))
-}
-fn table_end(start: usize, count: usize, stride: usize, length: usize) -> Result<usize> {
-    let size = count.checked_mul(stride).context("table size overflow")?;
-    Ok(range(start, size, length)?.end)
+    usize::try_from(i32_at(data, offset, LE)?).context("negative table count")
 }
 
 // Halo's string-id hash (MurmurHash3 x86, seed 0).
