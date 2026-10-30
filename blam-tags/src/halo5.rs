@@ -1,7 +1,9 @@
 //! Extracted Halo 5 (`ucsh`) tags using the shared JSON layout and data tree.
 //! Native metadata is retained by TagContainer, like classic tag headers.
 //! Module/cache readers and presentation do not belong to this adapter.
-use crate::data::{MAX_BLOCK_NESTING, TagBlockData, TagStructData, TagSubChunkContent, TagSubChunkEntry};
+use crate::data::{
+    MAX_BLOCK_NESTING, TagBlockData, TagStructData, TagSubChunkContent, TagSubChunkEntry,
+};
 use crate::file::TagContainer;
 use crate::stream::TagStream;
 use crate::{Endian, TagFieldData, TagFieldType, TagFile, TagFileHeader, TagLayout, TagStruct};
@@ -625,9 +627,9 @@ pub fn read_halo5_tag_file(bytes: &[u8], layout: TagLayout, group_tag: u32) -> R
 /// Header-only detection; Infinite's newer ucsh versions are not Halo 5.
 pub fn looks_like_halo5(bytes: &[u8]) -> bool {
     bytes.get(..4) == Some(b"ucsh")
-        && bytes
-            .get(4..8)
-            .is_some_and(|b| SUPPORTED_VERSIONS.contains(&u32::from_le_bytes(b.try_into().unwrap())))
+        && bytes.get(4..8).is_some_and(|b| {
+            SUPPORTED_VERSIONS.contains(&u32::from_le_bytes(b.try_into().unwrap()))
+        })
 }
 fn range(offset: usize, size: usize, length: usize) -> Result<Range<usize>> {
     let end = offset.checked_add(size).context("byte range overflow")?;
@@ -731,7 +733,10 @@ mod tests {
                 .filter(|f| f.field_type == TagFieldType::Block)
                 .map(|f| {
                     let element = layout.block_layouts[f.definition as usize].struct_index;
-                    (f.offset as usize, layout.struct_layouts[element as usize].size)
+                    (
+                        f.offset as usize,
+                        layout.struct_layouts[element as usize].size,
+                    )
                 })
                 .filter(|&(_, size)| size > 0)
                 .take(2)

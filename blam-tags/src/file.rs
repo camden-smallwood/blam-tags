@@ -498,7 +498,8 @@ impl TagFile {
                     &std::fs::read(&temp_path)?,
                     self.tag_stream.layout.clone(),
                     self.header.group_tag,
-                ).map_err(std::io::Error::other)?;
+                )
+                .map_err(std::io::Error::other)?;
             } else {
                 Self::read(&temp_path).map_err(|error| {
                     std::io::Error::new(
@@ -530,7 +531,9 @@ impl TagFile {
     /// Whether this tag retains an extracted Halo 5 container.
     pub fn is_halo5(&self) -> bool {
         #[cfg(feature = "halo5")]
-        if matches!(self.container, TagContainer::Halo5(_)) { return true; }
+        if matches!(self.container, TagContainer::Halo5(_)) {
+            return true;
+        }
         false
     }
 
