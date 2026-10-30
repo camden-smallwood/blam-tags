@@ -317,3 +317,7 @@ reason = "tangent-space helper used by the importers"
 [module.strip]
 strategy = "skip"
 reason = "triangle-strip helper used by geometry extraction"
+
+[module.index_targets]
+strategy = "skip"
+reason = "Editor annotation catalog and borrowed TagStruct target resolution; not part of the Python editing facade."

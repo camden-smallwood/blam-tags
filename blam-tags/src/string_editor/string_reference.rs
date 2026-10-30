@@ -67,7 +67,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     fn root() -> std::path::PathBuf {
-        std::env::var_os("BLAM_TEST_DEFINITIONS").map(std::path::PathBuf::from).unwrap_or_else(|| "../definitions".into())
+        std::env::var_os("BLAM_TEST_DEFINITIONS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "../definitions".into())
     }
     fn tag(group: &str) -> TagFile {
         TagFile::new_classic(
@@ -384,7 +386,14 @@ mod tests {
             let editors = StringEditors::load(root().join(game)).unwrap();
             let source = chud_fixture(game);
             if ["haloreach_mcc", "haloce_evolved"].contains(&game) {
-                for group in ["weapon", "equipment", "vehicle", "biped", "scenery", "crate"] {
+                for group in [
+                    "weapon",
+                    "equipment",
+                    "vehicle",
+                    "biped",
+                    "scenery",
+                    "crate",
+                ] {
                     let tag = gen3_tag(game, group);
                     let path = match group {
                         "weapon" | "equipment" => "item/object/generic hud text",
@@ -555,84 +564,290 @@ mod tests {
     fn collection_editors(game: &str) -> StringEditors {
         let mut editors = StringEditors::load(root().join(game)).unwrap();
         let chain = |mode: &str| serde_json::json!(["globals", {"ref": format!("interface tags[0]/{mode} ui globals")}, {"ref": "HUD globals"}]);
-        editors.specs.insert("hud_message".into(), serde_json::from_value(serde_json::json!({
-            "builder": "string_list", "sources": [chain("singleplayer"), chain("multiplayer")],
-            "lists": {"block": "string references", "ref": "string list"}
-        })).unwrap());
+        editors.specs.insert(
+            "hud_message".into(),
+            serde_json::from_value(serde_json::json!({
+                "builder": "string_list", "sources": [chain("singleplayer"), chain("multiplayer")],
+                "lists": {"block": "string references", "ref": "string list"}
+            }))
+            .unwrap(),
+        );
         editors
     }
     fn collection_strings(game: &str, rows: &[(&str, &str)]) -> TagFile {
         let mut tag = gen3_tag(game, "multilingual_unicode_string_list");
         let list = string_list::read_string_list(&tag).unwrap();
-        let entries = rows.iter().map(|(id,text)| {let mut row=list.new_entry();row.id=Some((*id).into());row.texts[0]=Some((*text).into());row}).collect();
-        string_list::apply_string_list_edits(&mut tag,None,&[StringListEdit::Insert{at:0,entries}]).unwrap();tag
+        let entries = rows
+            .iter()
+            .map(|(id, text)| {
+                let mut row = list.new_entry();
+                row.id = Some((*id).into());
+                row.texts[0] = Some((*text).into());
+                row
+            })
+            .collect();
+        string_list::apply_string_list_edits(
+            &mut tag,
+            None,
+            &[StringListEdit::Insert { at: 0, entries }],
+        )
+        .unwrap();
+        tag
     }
     fn collection_fixture(game: &str) -> Tags {
-        let mut globals=gen3_tag(game,"globals");add_elements(&mut globals,"interface tags",1);
-        set_ref(&mut globals,"interface tags[0]/multiplayer ui globals",b"wgtz","ui\\mp");
+        let mut globals = gen3_tag(game, "globals");
+        add_elements(&mut globals, "interface tags", 1);
+        set_ref(
+            &mut globals,
+            "interface tags[0]/multiplayer ui globals",
+            b"wgtz",
+            "ui\\mp",
+        );
         // A mode-specific kit can retain dangling references to other modes.
-        set_ref(&mut globals,"interface tags[0]/singleplayer ui globals",b"wgtz","ui\\missing_sp");
-        let mut ui=gen3_tag(game,"user_interface_globals_definition");set_ref(&mut ui,"HUD globals",b"uihg","ui\\hud");
-        let mut hud=gen3_tag(game,"user_interface_hud_globals_definition");add_elements(&mut hud,"string references",4);
-        for(i,path)in ["ui\\strings\\first","ui\\strings\\second","UI/STRINGS/FIRST"].iter().enumerate(){set_ref(&mut hud,&format!("string references[{i}]/string list"),b"unic",path);}
-        Tags([
-            (b"matg","globals\\globals",globals),(b"wgtz","ui\\mp",ui),(b"uihg","ui\\hud",hud),
-            (b"unic","ui\\strings\\first",collection_strings(game,&[("shared","First preview"),("first_only","First only")])),
-            (b"unic","ui\\strings\\second",collection_strings(game,&[("second_only","Second only"),("shared","Second preview")])),
-        ].into_iter().map(|(g,p,t)|((u32::from_be_bytes(*g),p.into()),Arc::new(t))).collect())
+        set_ref(
+            &mut globals,
+            "interface tags[0]/singleplayer ui globals",
+            b"wgtz",
+            "ui\\missing_sp",
+        );
+        let mut ui = gen3_tag(game, "user_interface_globals_definition");
+        set_ref(&mut ui, "HUD globals", b"uihg", "ui\\hud");
+        let mut hud = gen3_tag(game, "user_interface_hud_globals_definition");
+        add_elements(&mut hud, "string references", 4);
+        for (i, path) in [
+            "ui\\strings\\first",
+            "ui\\strings\\second",
+            "UI/STRINGS/FIRST",
+        ]
+        .iter()
+        .enumerate()
+        {
+            set_ref(
+                &mut hud,
+                &format!("string references[{i}]/string list"),
+                b"unic",
+                path,
+            );
+        }
+        Tags(
+            [
+                (b"matg", "globals\\globals", globals),
+                (b"wgtz", "ui\\mp", ui),
+                (b"uihg", "ui\\hud", hud),
+                (
+                    b"unic",
+                    "ui\\strings\\first",
+                    collection_strings(
+                        game,
+                        &[("shared", "First preview"), ("first_only", "First only")],
+                    ),
+                ),
+                (
+                    b"unic",
+                    "ui\\strings\\second",
+                    collection_strings(
+                        game,
+                        &[("second_only", "Second only"), ("shared", "Second preview")],
+                    ),
+                ),
+            ]
+            .into_iter()
+            .map(|(g, p, t)| ((u32::from_be_bytes(*g), p.into()), Arc::new(t)))
+            .collect(),
+        )
     }
     #[test]
     fn string_references_collect_lists_preserving_source_order_and_conflicting_previews() {
-        for game in ["halo2amp_mcc","halo4_mcc"] {
-            let editors=collection_editors(game);let tags=collection_fixture(game);let tag=gen3_tag(game,"vehicle");
-            let list=editors.string_references("hud_message",&Context{tag:&tag,tag_path:"",field_path:"flip message"},&tags).unwrap();
-            assert_eq!(list.unavailable,None);assert_eq!(list.source,None);assert_eq!(list.groups.len(),2);
-            assert_eq!(list.groups[0].source.path,"ui\\strings\\first");assert_eq!(list.groups[0].entries,0..2);
-            assert_eq!(list.groups[1].entries,2..4);
-            assert_eq!(list.entries.iter().filter(|e|e.id=="shared").map(|e|e.preview.as_deref().unwrap()).collect::<Vec<_>>(),["First preview","Second preview"]);
-            for id in ["first_only","second_only","shared",""]{assert_eq!(list.validate(id),StringReferenceValidation::Valid);}
-            assert_eq!(list.validate("FIRST_ONLY"),StringReferenceValidation::Missing);
-            assert_eq!(list.validate("unlisted"),StringReferenceValidation::Missing);
+        for game in ["halo2amp_mcc", "halo4_mcc"] {
+            let editors = collection_editors(game);
+            let tags = collection_fixture(game);
+            let tag = gen3_tag(game, "vehicle");
+            let list = editors
+                .string_references(
+                    "hud_message",
+                    &Context {
+                        tag: &tag,
+                        tag_path: "",
+                        field_path: "flip message",
+                    },
+                    &tags,
+                )
+                .unwrap();
+            assert_eq!(list.unavailable, None);
+            assert_eq!(list.source, None);
+            assert_eq!(list.groups.len(), 2);
+            assert_eq!(list.groups[0].source.path, "ui\\strings\\first");
+            assert_eq!(list.groups[0].entries, 0..2);
+            assert_eq!(list.groups[1].entries, 2..4);
+            assert_eq!(
+                list.entries
+                    .iter()
+                    .filter(|e| e.id == "shared")
+                    .map(|e| e.preview.as_deref().unwrap())
+                    .collect::<Vec<_>>(),
+                ["First preview", "Second preview"]
+            );
+            for id in ["first_only", "second_only", "shared", ""] {
+                assert_eq!(list.validate(id), StringReferenceValidation::Valid);
+            }
+            assert_eq!(
+                list.validate("FIRST_ONLY"),
+                StringReferenceValidation::Missing
+            );
+            assert_eq!(
+                list.validate("unlisted"),
+                StringReferenceValidation::Missing
+            );
         }
     }
     #[test]
     fn string_references_partial_collection_keeps_known_ids_and_marks_unknowns_unavailable() {
-        let game="halo2amp_mcc";let editors=collection_editors(game);let mut tags=collection_fixture(game);let tag=gen3_tag(game,"vehicle");
-        tags.0.remove(&(u32::from_be_bytes(*b"unic"),"ui\\strings\\second".into()));
-        let list=editors.string_references("hud_message",&Context{tag:&tag,tag_path:"",field_path:""},&tags).unwrap();
-        assert!(list.unavailable.is_some());assert_eq!(list.groups.len(),2);assert!(list.groups[1].unavailable.is_some());
-        assert_eq!(list.groups[1].entries,2..2);assert_eq!(list.validate("first_only"),StringReferenceValidation::Valid);
-        assert_eq!(list.validate("second_only"),StringReferenceValidation::Unavailable);assert_eq!(list.validate(""),StringReferenceValidation::Valid);
+        let game = "halo2amp_mcc";
+        let editors = collection_editors(game);
+        let mut tags = collection_fixture(game);
+        let tag = gen3_tag(game, "vehicle");
+        tags.0
+            .remove(&(u32::from_be_bytes(*b"unic"), "ui\\strings\\second".into()));
+        let list = editors
+            .string_references(
+                "hud_message",
+                &Context {
+                    tag: &tag,
+                    tag_path: "",
+                    field_path: "",
+                },
+                &tags,
+            )
+            .unwrap();
+        assert!(list.unavailable.is_some());
+        assert_eq!(list.groups.len(), 2);
+        assert!(list.groups[1].unavailable.is_some());
+        assert_eq!(list.groups[1].entries, 2..2);
+        assert_eq!(
+            list.validate("first_only"),
+            StringReferenceValidation::Valid
+        );
+        assert_eq!(
+            list.validate("second_only"),
+            StringReferenceValidation::Unavailable
+        );
+        assert_eq!(list.validate(""), StringReferenceValidation::Valid);
     }
     #[test]
     fn string_references_empty_collection_is_known_empty_and_missing_roots_are_unavailable() {
-        let game="halo4_mcc";let editors=collection_editors(game);let mut tags=collection_fixture(game);let tag=gen3_tag(game,"vehicle");
-        let key=(u32::from_be_bytes(*b"uihg"),"ui\\hud".into());
-        tags.0.insert(key,Arc::new(gen3_tag(game,"user_interface_hud_globals_definition")));
-        let ctx=Context{tag:&tag,tag_path:"",field_path:""};let list=editors.string_references("hud_message",&ctx,&tags).unwrap();
-        assert_eq!(list.unavailable,None);assert_eq!(list.validate("anything"),StringReferenceValidation::Missing);
-        tags.0.clear();let list=editors.string_references("hud_message",&ctx,&tags).unwrap();
-        assert_eq!(list.validate("anything"),StringReferenceValidation::Unavailable);assert!(list.groups.is_empty());assert!(list.source.is_none());
+        let game = "halo4_mcc";
+        let editors = collection_editors(game);
+        let mut tags = collection_fixture(game);
+        let tag = gen3_tag(game, "vehicle");
+        let key = (u32::from_be_bytes(*b"uihg"), "ui\\hud".into());
+        tags.0.insert(
+            key,
+            Arc::new(gen3_tag(game, "user_interface_hud_globals_definition")),
+        );
+        let ctx = Context {
+            tag: &tag,
+            tag_path: "",
+            field_path: "",
+        };
+        let list = editors
+            .string_references("hud_message", &ctx, &tags)
+            .unwrap();
+        assert_eq!(list.unavailable, None);
+        assert_eq!(
+            list.validate("anything"),
+            StringReferenceValidation::Missing
+        );
+        tags.0.clear();
+        let list = editors
+            .string_references("hud_message", &ctx, &tags)
+            .unwrap();
+        assert_eq!(
+            list.validate("anything"),
+            StringReferenceValidation::Unavailable
+        );
+        assert!(list.groups.is_empty());
+        assert!(list.source.is_none());
     }
     #[test]
     fn string_references_collect_distinct_available_mode_roots() {
-        let game="halo4_mcc";let editors=collection_editors(game);let mut tags=collection_fixture(game);let tag=gen3_tag(game,"vehicle");
-        let mut ui=gen3_tag(game,"user_interface_globals_definition");set_ref(&mut ui,"HUD globals",b"uihg","ui\\sp_hud");
-        tags.0.insert((u32::from_be_bytes(*b"wgtz"),"ui\\missing_sp".into()),Arc::new(ui));
-        let mut hud=gen3_tag(game,"user_interface_hud_globals_definition");add_elements(&mut hud,"string references",1);set_ref(&mut hud,"string references[0]/string list",b"unic","ui\\strings\\sp");
-        tags.0.insert((u32::from_be_bytes(*b"uihg"),"ui\\sp_hud".into()),Arc::new(hud));
-        tags.0.insert((u32::from_be_bytes(*b"unic"),"ui\\strings\\sp".into()),Arc::new(collection_strings(game,&[("sp_only","Campaign text")])));
-        let list=editors.string_references("hud_message",&Context{tag:&tag,tag_path:"",field_path:""},&tags).unwrap();
-        assert_eq!(list.unavailable,None);assert_eq!(list.groups.len(),3);assert_eq!(list.groups[0].source.path,"ui\\strings\\sp");
-        assert_eq!(list.validate("sp_only"),StringReferenceValidation::Valid);assert_eq!(list.validate("second_only"),StringReferenceValidation::Valid);
+        let game = "halo4_mcc";
+        let editors = collection_editors(game);
+        let mut tags = collection_fixture(game);
+        let tag = gen3_tag(game, "vehicle");
+        let mut ui = gen3_tag(game, "user_interface_globals_definition");
+        set_ref(&mut ui, "HUD globals", b"uihg", "ui\\sp_hud");
+        tags.0.insert(
+            (u32::from_be_bytes(*b"wgtz"), "ui\\missing_sp".into()),
+            Arc::new(ui),
+        );
+        let mut hud = gen3_tag(game, "user_interface_hud_globals_definition");
+        add_elements(&mut hud, "string references", 1);
+        set_ref(
+            &mut hud,
+            "string references[0]/string list",
+            b"unic",
+            "ui\\strings\\sp",
+        );
+        tags.0.insert(
+            (u32::from_be_bytes(*b"uihg"), "ui\\sp_hud".into()),
+            Arc::new(hud),
+        );
+        tags.0.insert(
+            (u32::from_be_bytes(*b"unic"), "ui\\strings\\sp".into()),
+            Arc::new(collection_strings(game, &[("sp_only", "Campaign text")])),
+        );
+        let list = editors
+            .string_references(
+                "hud_message",
+                &Context {
+                    tag: &tag,
+                    tag_path: "",
+                    field_path: "",
+                },
+                &tags,
+            )
+            .unwrap();
+        assert_eq!(list.unavailable, None);
+        assert_eq!(list.groups.len(), 3);
+        assert_eq!(list.groups[0].source.path, "ui\\strings\\sp");
+        assert_eq!(list.validate("sp_only"), StringReferenceValidation::Valid);
+        assert_eq!(
+            list.validate("second_only"),
+            StringReferenceValidation::Valid
+        );
     }
     #[test]
+    #[ignore = "requires H2A editing-kit tags; set BLAM_TEST_H2AMPEK"]
     fn string_references_optional_h2a_saved_collection() {
-        let Some(root)=std::env::var_os("BLAM_TEST_H2AMPEK")else{return};let game="halo2amp_mcc";
-        let editors=collection_editors(game);let tags=super::super::tests::KitTags::new(root.into(),game);let tag=gen3_tag(game,"vehicle");
-        let list=editors.string_references("hud_message",&Context{tag:&tag,tag_path:"",field_path:"flip message"},&tags).unwrap();
-        assert_eq!(list.unavailable,None);assert_eq!(list.groups.len(),6);assert_eq!(list.entries.len(),1788);
-        let ids:std::collections::BTreeSet<_>=list.entries.iter().map(|e|&e.id).collect();assert_eq!(ids.len(),1766);
-        assert_eq!(list.validate("warthog_flip"),StringReferenceValidation::Valid);assert_eq!(list.validate("device_h2a_coagulation_emp_use"),StringReferenceValidation::Valid);
+        let root = std::env::var_os("BLAM_TEST_H2AMPEK")
+            .expect("set BLAM_TEST_H2AMPEK to the kit's tags folder");
+        let game = "halo2amp_mcc";
+        let editors = collection_editors(game);
+        let tags = super::super::tests::KitTags::new(root.into(), game);
+        let tag = gen3_tag(game, "vehicle");
+        let list = editors
+            .string_references(
+                "hud_message",
+                &Context {
+                    tag: &tag,
+                    tag_path: "",
+                    field_path: "flip message",
+                },
+                &tags,
+            )
+            .unwrap();
+        assert_eq!(list.unavailable, None);
+        assert_eq!(list.groups.len(), 6);
+        assert_eq!(list.entries.len(), 1788);
+        let ids: std::collections::BTreeSet<_> = list.entries.iter().map(|e| &e.id).collect();
+        assert_eq!(ids.len(), 1766);
+        assert_eq!(
+            list.validate("warthog_flip"),
+            StringReferenceValidation::Valid
+        );
+        assert_eq!(
+            list.validate("device_h2a_coagulation_emp_use"),
+            StringReferenceValidation::Valid
+        );
     }
 }
