@@ -199,11 +199,45 @@ impl IndexTargets {
         self.resolve_inner(root, field_path, 0)
     }
 
+    /// [`resolve`](Self::resolve) for a caller already holding the field and
+    /// its struct, as a walk over a whole tag does. Declared targets need no
+    /// descent from the root, and their paths keep `holder_path`'s spelling.
+    pub fn resolve_field(
+        &self,
+        root: TagStruct<'_>,
+        holder: TagStruct<'_>,
+        holder_path: &str,
+        field: TagField<'_>,
+    ) -> Option<IndexTarget> {
+        if self.annotation(holder, field).is_some() {
+            return self.resolve(root, &join(holder_path, &segment(field)));
+        }
+        declared_target(root, holder, holder_path, field)
+    }
+
+    /// Whether `holder`'s `field` has an `index_target` rule. Without one, its
+    /// target depends only on the holder and the declared definition, so a
+    /// caller walking a whole tag can share one [`resolve`](Self::resolve).
+    pub fn is_annotated(&self, holder: TagStruct<'_>, field: TagField<'_>) -> bool {
+        self.annotation(holder, field).is_some()
+    }
+
     fn annotation(&self, holder: TagStruct<'_>, field: TagField<'_>) -> Option<&Rule> {
         if field.field_type() == crate::TagFieldType::Explanation {
             return None;
         }
         let clean = field.clean_name();
+        // Counting occurrences walks the holder; most fields can skip it.
+        let by_guid = self.by_guid.get(&holder.definition().guid());
+        let by_name = self.by_name.get(holder.name());
+        if !by_guid
+            .into_iter()
+            .chain(by_name)
+            .flatten()
+            .any(|a| a.name == clean)
+        {
+            return None;
+        }
         let occurrence = holder
             .fields_all()
             .take(field.ordinal())
@@ -212,10 +246,9 @@ impl IndexTargets {
             })
             .count();
         let matches = |a: &&Annotation| a.name == clean && a.occurrence == occurrence;
-        self.by_guid
-            .get(&holder.definition().guid())
+        by_guid
             .and_then(|fields| fields.iter().find(matches))
-            .or_else(|| self.by_name.get(holder.name())?.iter().find(matches))
+            .or_else(|| by_name?.iter().find(matches))
             .map(|a| &a.rule)
     }
 
@@ -259,28 +292,44 @@ impl IndexTargets {
                 }
             };
         }
-        let definition = field.definition();
-        let target = definition
-            .block_index_target()
-            .or_else(|| definition.block_flags_target())?;
-        let mut current = holder_path;
-        loop {
-            let holder = if current.is_empty() {
-                root
-            } else {
-                root.descend(current)?
-            };
-            if let Some(field) = holder.fields_all().find(|f| {
-                f.as_block()
-                    .is_some_and(|b| b.definition().name() == target.name())
-            }) {
-                return block_at(root, &join(current, &segment(field)));
-            }
-            if current.is_empty() {
-                return None;
-            }
-            current = current.rsplit_once('/').map_or("", |(parent, _)| parent);
+        let target = declared_target(root, holder, holder_path, field)?;
+        block_at(root, &target.path)
+    }
+}
+
+/// The first block of a field's declared definition in its holder or nearest
+/// ancestor, with the path prefixed by `holder_path` as given.
+fn declared_target(
+    root: TagStruct<'_>,
+    holder: TagStruct<'_>,
+    holder_path: &str,
+    field: TagField<'_>,
+) -> Option<IndexTarget> {
+    let definition = field.definition();
+    let target = definition
+        .block_index_target()
+        .or_else(|| definition.block_flags_target())?;
+    let mut current = holder_path;
+    let mut holder = holder;
+    loop {
+        if let Some(field) = holder.fields_all().find(|f| {
+            f.as_block()
+                .is_some_and(|b| b.definition().name() == target.name())
+        }) {
+            return Some(IndexTarget {
+                path: join(current, &segment(field)),
+                len: field.as_block()?.len(),
+            });
         }
+        if current.is_empty() {
+            return None;
+        }
+        current = current.rsplit_once('/').map_or("", |(parent, _)| parent);
+        holder = if current.is_empty() {
+            root
+        } else {
+            root.descend(current)?
+        };
     }
 }
 
@@ -558,6 +607,47 @@ mod tests {
                         .is_none()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn only_fields_with_rules_report_an_annotation() {
+        let fixture = Fixture::new();
+        fixture.write(&schema());
+        let targets = IndexTargets::load(&fixture.0).unwrap();
+        let mut tag = TagFile::new(fixture.0.join("example.json")).unwrap();
+        add(&mut tag, "holders", 1);
+        let root = tag.root();
+        let holder = root.descend("holders[0]").unwrap();
+        let annotated = |name| targets.is_annotated(holder, holder.field_path(name).unwrap());
+        assert!(annotated("child"));
+        assert!(!annotated("parent"), "a declared index has no rule");
+        assert!(!annotated("points"), "a block has no rule");
+    }
+
+    #[test]
+    fn resolve_field_agrees_with_resolve() {
+        let fixture = Fixture::new();
+        fixture.write(&schema());
+        let targets = IndexTargets::load(&fixture.0).unwrap();
+        let mut tag = TagFile::new(fixture.0.join("example.json")).unwrap();
+        add(&mut tag, "parents", 2);
+        add(&mut tag, "parents[1]/children", 3);
+        add(&mut tag, "holders", 1);
+        add(&mut tag, "holders[0]/points", 1);
+        select(&mut tag, 1);
+        let root = tag.root();
+        for (holder_path, name) in [
+            ("holders[0]", "parent"),
+            ("holders[0]", "child"),
+            ("holders[0]/points[0]", "point"),
+        ] {
+            let holder = root.descend(holder_path).unwrap();
+            let field = holder.field_path(name).unwrap();
+            let direct = targets.resolve_field(root, holder, holder_path, field);
+            let by_path = targets.resolve(root, &format!("{holder_path}/{name}"));
+            assert!(by_path.is_some(), "{name}");
+            assert_eq!(direct, by_path, "{name}");
         }
     }
 
