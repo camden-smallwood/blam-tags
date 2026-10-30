@@ -85,16 +85,16 @@ pub(crate) enum Step {
         #[serde(rename = "ref")]
         field: String,
     },
-    /// The tag a reference field of the current tag points at.
-    Ref {
-        #[serde(rename = "ref")]
-        field: String,
-    },
     /// The tag a reference field of the edited field's enclosing `element`
     /// of the named block points at (a cinematic scene object's model
     /// animation graph).
     Element {
         element: String,
+        #[serde(rename = "ref")]
+        field: String,
+    },
+    /// The tag a reference field of the current tag points at.
+    Ref {
         #[serde(rename = "ref")]
         field: String,
     },

@@ -203,6 +203,8 @@ struct StructFile {
 
 #[derive(Deserialize)]
 struct FieldFile {
+    #[serde(default, rename = "type")]
+    field_type: String,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -298,6 +300,9 @@ impl StringEditors {
                 let mut fields = Vec::new();
                 let mut seen: HashMap<String, usize> = HashMap::new();
                 for field in &structure.fields {
+                    // Explanatory headings may repeat a data field's name;
+                    // saved layouts may omit their names or the heading itself.
+                    if field.field_type == "explanation" { continue; }
                     let name = field.name.as_deref().unwrap_or("");
                     let clean_name = crate::field_name::clean_field_name(name).into_owned();
                     let occurrence = seen.entry(clean_name.clone()).or_default();
@@ -338,8 +343,10 @@ impl StringEditors {
     /// The editor of the field at `ordinal` in `holder`, if it has one.
     pub fn editor_of(&self, holder: TagStruct<'_>, ordinal: usize) -> Option<&str> {
         let field = holder.fields_all().nth(ordinal)?;
+        if field.field_type() == crate::TagFieldType::Explanation { return None; }
         let clean = field.clean_name();
-        let occurrence = holder.fields_all().take(ordinal).filter(|earlier| earlier.clean_name() == clean).count();
+        let occurrence = holder.fields_all().take(ordinal)
+            .filter(|earlier| earlier.field_type() != crate::TagFieldType::Explanation && earlier.clean_name() == clean).count();
         let matches = |entry: &&FieldEditor| entry.occurrence == occurrence && entry.clean_name == clean;
         let guid = holder.definition().guid();
         (guid != [0; 16])
