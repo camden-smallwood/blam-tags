@@ -1,7 +1,7 @@
 //! Extracted Halo 5 (`ucsh`) tags using the shared JSON layout and data tree.
 //! Native metadata is retained by TagContainer, like classic tag headers.
 //! Module/cache readers and presentation do not belong to this adapter.
-use crate::data::{TagBlockData, TagStructData, TagSubChunkContent, TagSubChunkEntry};
+use crate::data::{MAX_BLOCK_NESTING, TagBlockData, TagStructData, TagSubChunkContent, TagSubChunkEntry};
 use crate::file::TagContainer;
 use crate::stream::TagStream;
 use crate::{Endian, TagFieldData, TagFieldType, TagFile, TagFileHeader, TagLayout, TagStruct};
@@ -66,10 +66,6 @@ impl NativeTag {
             "not an extracted Halo 5 ucsh tag"
         );
         ensure!(bytes.len() >= 80, "truncated Halo 5 tag header");
-        ensure!(
-            bytes.len() <= 256 * 1024 * 1024,
-            "tag exceeds 256 MiB limit"
-        );
         let version = u32_at(&bytes, 4)?;
         ensure!(
             matches!(version, 23 | 27),
@@ -263,14 +259,13 @@ impl NativeTag {
         target: Option<usize>,
         count: usize,
         prefix: &str,
-        depth: usize,
-        budget: &mut usize,
+        depth: u32,
+        claimed: &mut [bool],
     ) -> Result<TagBlockData> {
         ensure!(
-            depth < 64 && count <= *budget,
-            "tag nesting or element limit exceeded"
+            depth <= MAX_BLOCK_NESTING,
+            "blocks nest more than {MAX_BLOCK_NESTING} deep"
         );
-        *budget -= count;
         let si = layout.block_layouts[index as usize].struct_index;
         let size = layout.struct_layouts[si as usize].size;
         let (address, native_index) = if count == 0 {
@@ -281,6 +276,13 @@ impl NativeTag {
             ensure!(
                 b.section == 1 && count.checked_mul(size) == Some(b.size),
                 "block JSON layout does not match native data"
+            );
+            // Each data block holds one block's elements, as each block's
+            // bytes are its own in an MCC tag; a second claim is a cycle or
+            // a shared target that would decode the same elements again.
+            ensure!(
+                !std::mem::replace(&mut claimed[target], true),
+                "native data block {target} is read by more than one tag block"
             );
             (b.address, target)
         };
@@ -304,8 +306,8 @@ impl NativeTag {
                 i * size,
                 &mut raw[i * size..(i + 1) * size],
                 &path,
-                depth + 1,
-                budget,
+                depth,
+                claimed,
             )?);
         }
         Ok(TagBlockData {
@@ -327,10 +329,9 @@ impl NativeTag {
         base: usize,
         raw: &mut [u8],
         prefix: &str,
-        depth: usize,
-        budget: &mut usize,
+        depth: u32,
+        claimed: &mut [bool],
     ) -> Result<TagStructData> {
-        ensure!(depth < 64, "inline nesting exceeds limit");
         let first = layout.struct_layouts[si as usize].first_field_index as usize;
         let mut sub_chunks = Vec::new();
         for (ordinal, f) in layout.fields[first..]
@@ -338,8 +339,6 @@ impl NativeTag {
             .take_while(|f| f.field_type != TagFieldType::Terminator)
             .enumerate()
         {
-            ensure!(*budget > 0, "field limit exceeded");
-            *budget -= 1;
             let segment = format!("#{ordinal}");
             let path = if prefix.is_empty() {
                 segment
@@ -375,8 +374,8 @@ impl NativeTag {
                         base + off,
                         &mut raw[region],
                         &path,
-                        depth + 1,
-                        budget,
+                        depth,
+                        claimed,
                     )?))
                 }
                 TagFieldType::Array => {
@@ -393,8 +392,8 @@ impl NativeTag {
                             base + start,
                             &mut raw[region],
                             &format!("{path}[{i}]"),
-                            depth + 1,
-                            budget,
+                            depth,
+                            claimed,
                         )?);
                     }
                     Some(TagSubChunkContent::Array(elements))
@@ -416,7 +415,7 @@ impl NativeTag {
                         n,
                         &path,
                         depth + 1,
-                        budget,
+                        claimed,
                     )?))
                 }
                 TagFieldType::Data => {
@@ -600,7 +599,7 @@ pub fn read_halo5_tag_file(bytes: &[u8], layout: TagLayout, group_tag: u32) -> R
         1,
         "",
         0,
-        &mut 1_000_000,
+        &mut vec![false; native.blocks.len()],
     )?;
     Ok(TagFile::from_parts(
         TagFileHeader {
@@ -709,6 +708,83 @@ mod tests {
         bytes[86] = 1;
         bytes[96..112].copy_from_slice(&root.guid);
         bytes
+    }
+    /// A tag whose root's first two block fields hold elements, in one
+    /// native data block both point at, or in a data block each.
+    fn two_root_blocks(shared: bool) -> (Vec<u8>, TagLayout, u32) {
+        for entry in std::fs::read_dir(definitions()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name().unwrap() == "_meta.json" {
+                continue;
+            }
+            let (layout, meta) = TagLayout::from_json_with_meta(&path).unwrap();
+            let root = &layout.struct_layouts[layout.block_layouts
+                [layout.header.tag_group_block_index as usize]
+                .struct_index as usize];
+            let blocks: Vec<(usize, usize)> = layout.fields[root.first_field_index as usize..]
+                .iter()
+                .take_while(|f| f.field_type != TagFieldType::Terminator)
+                .filter(|f| f.field_type == TagFieldType::Block)
+                .map(|f| {
+                    let element = layout.block_layouts[f.definition as usize].struct_index;
+                    (f.offset as usize, layout.struct_layouts[element as usize].size)
+                })
+                .filter(|&(_, size)| size > 0)
+                .take(2)
+                .collect();
+            let [(first, a), (second, b)] = blocks[..] else {
+                continue;
+            };
+            // Shared: a*b bytes read as b elements of a and a elements of b.
+            let (sizes, fields) = if shared {
+                (vec![root.size, a * b], [(first, 1, b), (second, 1, a)])
+            } else {
+                (vec![root.size, a, b], [(first, 1, 1), (second, 2, 1)])
+            };
+            let header = 80 + 16 * sizes.len() + 32 * (1 + fields.len());
+            let mut bytes = vec![0u8; header + sizes.iter().sum::<usize>()];
+            fn put(bytes: &mut [u8], at: usize, value: u32) {
+                bytes[at..at + 4].copy_from_slice(&value.to_le_bytes())
+            }
+            put(&mut bytes, 0, u32::from_le_bytes(*b"ucsh"));
+            put(&mut bytes, 4, 27);
+            put(&mut bytes, 32, sizes.len() as u32);
+            put(&mut bytes, 36, 1 + fields.len() as u32);
+            put(&mut bytes, 60, header as u32);
+            put(&mut bytes, 64, sizes.iter().sum::<usize>() as u32);
+            let mut section_offset = 0;
+            for (i, size) in sizes.iter().enumerate() {
+                put(&mut bytes, 80 + 16 * i, *size as u32);
+                bytes[80 + 16 * i + 6] = 1;
+                bytes[80 + 16 * i + 8..80 + 16 * i + 16]
+                    .copy_from_slice(&(section_offset as u64).to_le_bytes());
+                section_offset += size;
+            }
+            let structures = 80 + 16 * sizes.len();
+            bytes[structures..structures + 16].copy_from_slice(&root.guid);
+            put(&mut bytes, structures + 24, u32::MAX);
+            for (i, (offset, target, count)) in fields.into_iter().enumerate() {
+                let at = structures + 32 * (1 + i);
+                bytes[at + 16] = 1;
+                put(&mut bytes, at + 20, target);
+                put(&mut bytes, at + 28, offset as u32);
+                put(&mut bytes, header + offset + 16, count as u32);
+            }
+            return (bytes, layout, meta.tag);
+        }
+        panic!("no group's root has two block fields with elements");
+    }
+    #[test]
+    fn a_native_data_block_is_read_by_one_tag_block() {
+        let (bytes, layout, group) = two_root_blocks(false);
+        let tag = read_halo5_tag_file(&bytes, layout, group).unwrap();
+        assert_eq!(tag.write_to_bytes().unwrap(), bytes);
+        let (bytes, layout, group) = two_root_blocks(true);
+        let error = read_halo5_tag_file(&bytes, layout, group).unwrap_err();
+        assert!(
+            error.to_string().contains("more than one tag block"),
+            "{error}"
+        );
     }
     #[test]
     fn fixed_arrays_edit_through_the_shared_api_and_wrong_root_layout_is_refused() {
