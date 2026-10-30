@@ -280,3 +280,35 @@ fn like_borrows_another_editors_spec() {
     std::fs::remove_dir_all(&dir).ok();
     assert!(matches!(error, StringEditorsError::BadLike { ref editor, .. } if editor == "lost"), "{error}");
 }
+
+
+#[test]
+fn built_in_function_catalog_is_static_grouped_and_deterministic() {
+    let dir = std::env::temp_dir().join(format!("builtin_function_catalog_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("_meta.json"), r#"{
+        "string_editors": {"object_function": {
+            "builder": "object_function", "own_functions": true,
+            "own": [{"block": "functions", "label": "export name"}],
+            "object_types": ["vehicle"], "titles": {"vehicle": "Vehicles"},
+            "lists": {"vehicle": ["engine_power", "ENGINE_POWER"],
+                      "object": ["zero", "one"], "weapon": ["heat"]},
+            "extra": [{"text": "custom seats", "groups": ["vehicle"],
+                       "block": "seats", "label": "open function name"}],
+            "trailing": [{"text": "scenario interpolators", "items": ["scenario_interpolator1"]}]
+        }}
+    }"#).unwrap();
+    let editors = StringEditors::load(&dir).unwrap();
+    let catalog = editors.built_in_function_menu().unwrap();
+    assert_eq!(catalog, editors.built_in_function_menu().unwrap());
+    assert_eq!(catalog.items, vec![
+        MenuItem::submenu("object", vec![MenuItem::item("zero"), MenuItem::item("one")]),
+        MenuItem::submenu("Vehicles", vec![MenuItem::item("engine_power")]),
+        MenuItem::submenu("weapon", vec![MenuItem::item("heat")]),
+        MenuItem::submenu("scenario interpolators", vec![MenuItem::item("scenario_interpolator1")]),
+    ]);
+    assert!(catalog.accepts("my_custom_function"), "suggestions must not reject manual names");
+    std::fs::write(dir.join("_meta.json"), "{}").unwrap();
+    assert!(StringEditors::load(&dir).unwrap().built_in_function_menu().is_none());
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -323,6 +323,18 @@ impl StringEditors {
     /// Whether the game has any string editors at all.
     pub fn is_empty(&self) -> bool { self.specs.is_empty() }
 
+    /// All built-in object function groups recorded for this game, without
+    /// requiring an owning object or including tag-defined function names.
+    /// This is a suggestion catalog, not validation for an unknown consumer.
+    /// `None` means the definitions do not provide an object function catalog.
+    pub fn built_in_function_menu(&self) -> Option<Menu> {
+        match &self.specs.get("object_function")?.builder {
+            build::Builder::ObjectFunction(functions) => Some(functions.built_in_menu()),
+            _ => None,
+        }
+    }
+
+
     /// The editor of the field at `ordinal` in `holder`, if it has one.
     pub fn editor_of(&self, holder: TagStruct<'_>, ordinal: usize) -> Option<&str> {
         let field = holder.fields_all().nth(ordinal)?;

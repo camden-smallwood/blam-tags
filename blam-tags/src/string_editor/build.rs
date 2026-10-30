@@ -580,6 +580,29 @@ pub(crate) struct ExtraSubmenu {
 }
 
 impl ObjectFunction {
+    /// Static suggestions for tags whose consuming object type is unknown.
+    /// Do not read exported functions, seats, feelers or other tag-owned names.
+    pub(super) fn built_in_menu(&self) -> Menu {
+        const ORDER: [&str; 11] = ["object", "unit", "biped", "vehicle", "item",
+            "weapon", "equipment", "device", "projectile", "creature", "entity"];
+        let mut groups: Vec<_> = self.lists.keys().collect();
+        groups.sort_by_key(|name| (ORDER.iter().position(|group| *group == name.as_str()).unwrap_or(ORDER.len()), name.as_str()));
+        let mut items = Vec::new();
+        for group in groups {
+            let mut seen = std::collections::HashSet::new();
+            let names: Vec<_> = self.lists[group].iter()
+                .filter(|name| !name.is_empty() && seen.insert(name.to_lowercase()))
+                .map(MenuItem::item).collect();
+            if !names.is_empty() {
+                let title = self.titles.get(group).unwrap_or(group);
+                items.push(MenuItem::submenu(title, names));
+            }
+        }
+        items.extend(list_items(&self.trailing));
+        // Suggestions cannot validate object-specific or manually typed names.
+        Menu { items, accepts_anything: true, ..Default::default() }
+    }
+
     fn build(&self, editors: &StringEditors, ctx: &Context<'_>, source: &dyn TagSource) -> Menu {
         let group = ctx.tag.group().tag;
         let group_name = editors.group_name(group).unwrap_or("");
