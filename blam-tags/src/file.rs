@@ -203,9 +203,19 @@ impl TagFile {
     ///
     /// Fails if the schema JSON doesn't parse or any struct's
     /// computed size doesn't match the schema's stated size
-    /// (both surfaced as `blam_tags::TagSchemaError`).
+    /// (both surfaced as `blam_tags::TagSchemaError`), and for Halo 5
+    /// Guardians' definitions, whose tags are only edited, never created.
     pub fn new<P: AsRef<Path>>(schema_path: P) -> Result<Self, Box<dyn Error>> {
         let schema_path = schema_path.as_ref();
+        // A Halo 5 tag is a native ucsh file read with the original bytes it
+        // patches on save; a fresh one has none, and would save as MCC.
+        if schema_profile_names(schema_path).iter().any(|game| game == HALO5_GAME) {
+            return Err(format!(
+                "{}: new Halo 5 tags cannot be created; Halo 5 tags are edited from extracted ucsh files",
+                schema_path.display()
+            )
+            .into());
+        }
         let (layout, meta) = TagLayout::from_json_with_meta(schema_path)?;
         let tag_stream = TagStream::new_default(layout);
         let header = TagFileHeader {
@@ -881,6 +891,9 @@ fn save_temp_location(path: &Path) -> std::io::Result<(PathBuf, String)> {
 /// then the `game` its `_meta.json` declares. The two agree for every game
 /// but Campaign Evolved, whose folder is `haloce_evolved` and whose meta says
 /// `halocampaignevolved`.
+/// The definitions folder, and `_meta.json` game, of Halo 5 Guardians.
+const HALO5_GAME: &str = "halo5_guardians";
+
 fn schema_profile_names(schema_path: &Path) -> Vec<String> {
     let Some(directory) = schema_path.parent() else { return Vec::new() };
     let mut names: Vec<String> =
