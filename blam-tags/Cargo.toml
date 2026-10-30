@@ -57,6 +57,7 @@ flate2 = "1"
 toml = "1"
 
 [features]
+halo5 = ["dep:anyhow"]
 audio = ["dep:lewton", "dep:log", "dep:opus", "dep:vorbis_rs"]
 iostore = ["dep:oozextract", "dep:memmap2", "dep:blake3", "dep:anyhow", "dep:byteorder", "dep:sha1", "dep:ruzstd"]
 
