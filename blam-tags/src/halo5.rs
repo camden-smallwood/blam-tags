@@ -9,6 +9,10 @@ use anyhow::{Context, Result, bail, ensure};
 use std::collections::HashMap;
 use std::ops::Range;
 
+/// The `ucsh` versions read as Halo 5, by [`NativeTag::parse`] and
+/// [`looks_like_halo5`] alike.
+const SUPPORTED_VERSIONS: [u32; 2] = [23, 27];
+
 #[derive(Clone, Debug)]
 enum BindingKind {
     Raw,
@@ -68,7 +72,7 @@ impl NativeTag {
         ensure!(bytes.len() >= 80, "truncated Halo 5 tag header");
         let version = u32_at(&bytes, 4)?;
         ensure!(
-            matches!(version, 23 | 27),
+            SUPPORTED_VERSIONS.contains(&version),
             "unsupported Halo 5 tag version {version}"
         );
         let header_size = count(&bytes, 60)?;
@@ -619,11 +623,11 @@ pub fn read_halo5_tag_file(bytes: &[u8], layout: TagLayout, group_tag: u32) -> R
 }
 
 /// Header-only detection; Infinite's newer ucsh versions are not Halo 5.
-pub fn is_halo5(bytes: &[u8]) -> bool {
+pub fn looks_like_halo5(bytes: &[u8]) -> bool {
     bytes.get(..4) == Some(b"ucsh")
         && bytes
             .get(4..8)
-            .is_some_and(|b| matches!(u32::from_le_bytes(b.try_into().unwrap()), 23 | 27))
+            .is_some_and(|b| SUPPORTED_VERSIONS.contains(&u32::from_le_bytes(b.try_into().unwrap())))
 }
 fn range(offset: usize, size: usize, length: usize) -> Result<Range<usize>> {
     let end = offset.checked_add(size).context("byte range overflow")?;
@@ -846,10 +850,10 @@ mod tests {
     }
     #[test]
     fn header_detection_rejects_other_ucsh_generations_and_truncation() {
-        assert!(!is_halo5(b"ucsh"));
+        assert!(!looks_like_halo5(b"ucsh"));
         for version in [23u32, 27, 53] {
             let bytes = [b"ucsh".as_slice(), version.to_le_bytes().as_slice()].concat();
-            assert_eq!(is_halo5(&bytes), version != 53);
+            assert_eq!(looks_like_halo5(&bytes), version != 53);
             let layout = TagLayout::from_json(definitions().join("biped.json")).unwrap();
             assert!(read_halo5_tag_file(&bytes, layout, u32::from_be_bytes(*b"bipd")).is_err());
         }
