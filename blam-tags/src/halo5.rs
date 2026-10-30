@@ -846,7 +846,11 @@ mod tests {
                 count += 1;
             }
         }
-        assert_eq!(count, 289);
+        // Every group the dump lists, so a missing file fails here.
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(definitions().join("_meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(count, meta["tag_index"].as_object().unwrap().len());
     }
     #[test]
     fn header_detection_rejects_other_ucsh_generations_and_truncation() {
@@ -859,8 +863,10 @@ mod tests {
         }
     }
     #[test]
+    #[ignore = "requires an extracted Halo 5 tag dump; set HALO5_TEST_DUMP"]
     fn xbox_character_tag_groups_roundtrip_with_executable_definitions() {
         let Some(root) = std::env::var_os("HALO5_TEST_DUMP") else {
+            eprintln!("skipping: set HALO5_TEST_DUMP to an extracted Halo 5 tag dump");
             return;
         };
         let root = PathBuf::from(root).join("tag_dump/objects/characters/grunt_mecha");
@@ -892,8 +898,10 @@ mod tests {
         assert!(count >= 8, "too few real tag groups: {count}");
     }
     #[test]
+    #[ignore = "requires an extracted Halo 5 tag dump; set HALO5_TEST_DUMP"]
     fn xbox_biped_shared_fields_native_roundtrip_and_atomic_edit() {
         let Some(root) = std::env::var_os("HALO5_TEST_DUMP") else {
+            eprintln!("skipping: set HALO5_TEST_DUMP to an extracted Halo 5 tag dump");
             return;
         };
         let path =
