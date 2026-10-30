@@ -15,14 +15,17 @@ mod common;
 use blam_tags::render_method::{RenderMethod, RenderMethodError};
 use common::synthetic::{classic_engine, groups, new_tag};
 
-/// Every definitions folder of a game whose tags are gen3+ files.
+/// Every definitions folder of a game whose tags are gen3+ files. Not Halo 5
+/// Guardians: its tags are native ucsh files, and `TagFile::new` refuses it.
 fn gen3_games() -> Vec<String> {
     let mut games: Vec<String> = std::fs::read_dir(common::definitions_root())
         .unwrap()
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let name = entry.file_name().into_string().ok()?;
-            (entry.path().join("_meta.json").is_file() && classic_engine(&name).is_none())
+            (entry.path().join("_meta.json").is_file()
+                && classic_engine(&name).is_none()
+                && name != "halo5_guardians")
                 .then_some(name)
         })
         .collect();
