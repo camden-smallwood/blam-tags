@@ -668,6 +668,65 @@ A `string_editor` definition can use the `string_list` builder with a `source` c
 
 Use `StringEditors::is_string_reference` and `string_references` for the richer result: original IDs, optional language previews, the resolved source tag, and an explicit unavailable reason. `StringReferenceList::validate` distinguishes `Valid`, `Missing`, and `Unavailable`; a successfully loaded empty list is distinct from an unavailable source, missing preview text does not invalidate an ID, and blank is unset. IDs are compared exactly as stored. This is separate from the legacy Foundation-style `Menu::accepts` behavior. Callers own saved/unsaved data policy and refresh timing through `TagSource`; the engine performs no file I/O or UI navigation itself.
 
+For HUD collections, add `"lists": {"block":"string references", "ref":"string list"}`
+to the `source` chain ending at the HUD globals tag. Unlike the shared-target
+block step, this collects different Unicode lists. A `sources` array of
+chains can collect available mode roots instead of one `source`; missing
+mode roots are skipped if at least one resolves. An empty reference block
+is known empty; a configured leaf that cannot load marks the collection
+incomplete. Known IDs still validate, while unknown IDs become unavailable.
+
+`StringReferenceList::groups` retains each source and a range into `entries`,
+with an unavailable reason for failed leaf lists. References are deduplicated
+by normalized tag identity, preserving first-reference order; IDs are sorted
+within each list. IDs shared by different lists keep each localized preview.
+The single `source` Open destination remains populated for single-list
+results; consumers of collections should offer source selection and group
+choices before optional ID-prefix groups. Shared CHUD-skin conflict
+detection is unchanged.
+
+### Index-target annotations
+
+`index_targets::IndexTargets::load(game_definitions_directory)` reads editor-only
+`index_target` annotations. `resolve(root, field_path)` returns the concrete
+root-relative target block path (with field ordinals) and its current length.
+Ordinary block indices and flags still use their declared target block, searching
+the holder and its ancestors. An annotation overrides that default search:
+
+```json
+{"type":"custom_short_block_index", "name":"initial task",
+ "index_target":{"selector":"initial objective", "child":"tasks"}}
+{"type":"custom_short_block_index", "name":"point",
+ "index_target":{"selector":"../point set", "child":"points"}}
+{"type":"custom_short_block_index", "name":"damage section",
+ "index_target":{"path":"new damage info[0]/damage sections"}}
+```
+
+`path` starts at the tag root unless `"base":"holder"` is specified. A selector
+starts in the referencing field's holder; each leading `../` climbs one enclosing
+struct or block entry. Its own target is resolved first, then `child` addresses a
+block within its selected entry. Negative/out-of-range selectors and absent
+elements return `None`; the resolver never substitutes another parent's block.
+For self-describing standalone tags with no game profile, `IndexTargets::load_all`
+combines bundled game folders. GUID matches stay exact; conflicting struct-name
+fallbacks are omitted instead of selecting one game's rule arbitrarily.
+
+Rules match GUID or struct name plus clean field-name occurrence, skipping
+explanation headings, so the same table works with current and saved layouts.
+Annotations do not alter binary field types or serialized layouts.
+
+Load errors are errors, including malformed or conflicting annotations. Callers
+must use the same successfully loaded table for pickers and index repair, and
+refuse structural edits when that table is unavailable. This module resolves
+relationships; the caller owns mutations, remapping, undo and cache lifetime.
+It does not prescribe clearing a dependent value when its parent is unset.
+
+Tests that resolve HUD string lists can set `BLAM_TEST_DEFINITIONS` to an alternate
+definitions root (the directory containing game folders); otherwise they use the
+repository's `definitions` submodule. The saved H2A HUD collection test is ignored
+by default: set `BLAM_TEST_H2AMPEK` to the kit's `tags` folder and run it with
+`cargo test -p blam-tags string_references_optional_h2a_saved_collection -- --ignored`.
+
 ### Halo CE HUD message text
 
 `string_list` also reads and edits `hud_message_text` (`hmt `) through the existing `read_string_list`, `apply_string_list_edits`, and `write_string_list` API. `Storage::HudMessages` exposes one text column and a plain message name in `StringEntry::id`. `Storage::has_ids` and `rows_block` describe the format without assuming every named list is multilingual. Apply `list.storage.text_syntax(game_syntax)` for highlighting, parsing, and completion.

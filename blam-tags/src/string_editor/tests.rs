@@ -280,3 +280,87 @@ fn like_borrows_another_editors_spec() {
     std::fs::remove_dir_all(&dir).ok();
     assert!(matches!(error, StringEditorsError::BadLike { ref editor, .. } if editor == "lost"), "{error}");
 }
+
+
+#[test]
+fn built_in_function_catalog_is_static_grouped_and_deterministic() {
+    let dir = std::env::temp_dir().join(format!("builtin_function_catalog_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("_meta.json"), r#"{
+        "string_editors": {"object_function": {
+            "builder": "object_function", "own_functions": true,
+            "own": [{"block": "functions", "label": "export name"}],
+            "object_types": ["vehicle"], "titles": {"vehicle": "Vehicles"},
+            "lists": {"vehicle": ["engine_power", "ENGINE_POWER"],
+                      "object": ["zero", "one"], "weapon": ["heat"]},
+            "extra": [{"text": "custom seats", "groups": ["vehicle"],
+                       "block": "seats", "label": "open function name"}],
+            "trailing": [{"text": "scenario interpolators", "items": ["scenario_interpolator1"]}]
+        }}
+    }"#).unwrap();
+    let editors = StringEditors::load(&dir).unwrap();
+    let catalog = editors.built_in_function_menu().unwrap();
+    assert_eq!(catalog, editors.built_in_function_menu().unwrap());
+    assert_eq!(catalog.items, vec![
+        MenuItem::submenu("object", vec![MenuItem::item("zero"), MenuItem::item("one")]),
+        MenuItem::submenu("Vehicles", vec![MenuItem::item("engine_power")]),
+        MenuItem::submenu("weapon", vec![MenuItem::item("heat")]),
+        MenuItem::submenu("scenario interpolators", vec![MenuItem::item("scenario_interpolator1")]),
+    ]);
+    assert!(catalog.accepts("my_custom_function"), "suggestions must not reject manual names");
+    std::fs::write(dir.join("_meta.json"), "{}").unwrap();
+    assert!(StringEditors::load(&dir).unwrap().built_in_function_menu().is_none());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// `ref` is also present in Element and BlockRef rules. The more specific
+/// variants must deserialize first rather than silently discarding context.
+#[test]
+fn contextual_reference_sources_keep_their_enclosing_element() {
+    let element: build::Step = serde_json::from_str(r#"{"element":"objects","ref":"child object"}"#).unwrap();
+    assert!(matches!(element, build::Step::Element { element, field } if element == "objects" && field == "child object"));
+    let block: build::Step = serde_json::from_str(r#"{"block":"hud globals","ref":"string collection"}"#).unwrap();
+    assert!(matches!(block, build::Step::BlockRef { block, field } if block == "hud globals" && field == "string collection"));
+    let reference: build::Step = serde_json::from_str(r#"{"ref":"model"}"#).unwrap();
+    assert!(matches!(reference, build::Step::Ref { field } if field == "model"));
+}
+
+#[test]
+fn explanatory_headings_do_not_shift_string_editor_occurrences() {
+    use serde_json::json;
+    let dir = std::env::temp_dir().join(format!("string_editor_headings_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("_meta.json"), r#"{"string_editors": {
+        "first": {"builder":"list","items":["a"]},
+        "second": {"builder":"list","items":["b"]}}}"#).unwrap();
+    let fields = vec![
+        json!({"type":"explanation","name":"marker","definition":"first marker"}),
+        json!({"type":"string_id","name":"marker","string_editor":"first"}),
+        json!({"type":"explanation","name":"marker","definition":"second marker"}),
+        json!({"type":"string_id","name":"marker","string_editor":"second"}),
+        json!({"type":"terminator","name":null}),
+    ];
+    let schema = |fields| json!({"name":"test","tag":"tst!","version":1,"flags":0,"block":"root",
+        "blocks":{"root":{"max_count":1,"struct":"root"}},
+        "structs":{"root":{"guid":"12345678901234567890123456789012","size":8,"fields":fields}}});
+    let path = dir.join("test.json");
+    std::fs::write(&path, schema(fields.clone()).to_string()).unwrap();
+    let editors = StringEditors::load(&dir).unwrap();
+    for headings in [true, false] {
+        let fields: Vec<_> = fields.iter().filter(|f| headings || f["type"] != "explanation").cloned().collect();
+        std::fs::write(&path, schema(fields).to_string()).unwrap();
+        let tag = TagFile::new(&path).unwrap();
+        let bytes = tag.write_to_bytes().unwrap();
+        for tag in [tag, TagFile::read_from_bytes(&bytes).unwrap()] {
+            let root = tag.root();
+            let actual: Vec<_> = root.fields_all().enumerate().filter_map(|(ordinal, field)| {
+                if field.field_type() == crate::TagFieldType::Explanation {
+                    assert!(editors.editor_of(root, ordinal).is_none());
+                    None
+                } else { editors.editor_of(root, ordinal) }
+            }).collect();
+            assert_eq!(actual, ["first", "second"]);
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}

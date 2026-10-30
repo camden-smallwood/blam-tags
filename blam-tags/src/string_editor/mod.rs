@@ -18,7 +18,7 @@
 
 mod build;
 mod string_reference;
-pub use string_reference::{StringReferenceEntry, StringReferenceList, StringReferenceSource, StringReferenceValidation};
+pub use string_reference::{StringReferenceEntry, StringReferenceGroup, StringReferenceList, StringReferenceSource, StringReferenceValidation};
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -203,6 +203,8 @@ struct StructFile {
 
 #[derive(Deserialize)]
 struct FieldFile {
+    #[serde(default, rename = "type")]
+    field_type: String,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -298,6 +300,9 @@ impl StringEditors {
                 let mut fields = Vec::new();
                 let mut seen: HashMap<String, usize> = HashMap::new();
                 for field in &structure.fields {
+                    // Explanatory headings may repeat a data field's name;
+                    // saved layouts may omit their names or the heading itself.
+                    if field.field_type == "explanation" { continue; }
                     let name = field.name.as_deref().unwrap_or("");
                     let clean_name = crate::field_name::clean_field_name(name).into_owned();
                     let occurrence = seen.entry(clean_name.clone()).or_default();
@@ -323,11 +328,25 @@ impl StringEditors {
     /// Whether the game has any string editors at all.
     pub fn is_empty(&self) -> bool { self.specs.is_empty() }
 
+    /// All built-in object function groups recorded for this game, without
+    /// requiring an owning object or including tag-defined function names.
+    /// This is a suggestion catalog, not validation for an unknown consumer.
+    /// `None` means the definitions do not provide an object function catalog.
+    pub fn built_in_function_menu(&self) -> Option<Menu> {
+        match &self.specs.get("object_function")?.builder {
+            build::Builder::ObjectFunction(functions) => Some(functions.built_in_menu()),
+            _ => None,
+        }
+    }
+
+
     /// The editor of the field at `ordinal` in `holder`, if it has one.
     pub fn editor_of(&self, holder: TagStruct<'_>, ordinal: usize) -> Option<&str> {
         let field = holder.fields_all().nth(ordinal)?;
+        if field.field_type() == crate::TagFieldType::Explanation { return None; }
         let clean = field.clean_name();
-        let occurrence = holder.fields_all().take(ordinal).filter(|earlier| earlier.clean_name() == clean).count();
+        let occurrence = holder.fields_all().take(ordinal)
+            .filter(|earlier| earlier.field_type() != crate::TagFieldType::Explanation && earlier.clean_name() == clean).count();
         let matches = |entry: &&FieldEditor| entry.occurrence == occurrence && entry.clean_name == clean;
         let guid = holder.definition().guid();
         (guid != [0; 16])

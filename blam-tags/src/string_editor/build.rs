@@ -85,16 +85,16 @@ pub(crate) enum Step {
         #[serde(rename = "ref")]
         field: String,
     },
-    /// The tag a reference field of the current tag points at.
-    Ref {
-        #[serde(rename = "ref")]
-        field: String,
-    },
     /// The tag a reference field of the edited field's enclosing `element`
     /// of the named block points at (a cinematic scene object's model
     /// animation graph).
     Element {
         element: String,
+        #[serde(rename = "ref")]
+        field: String,
+    },
+    /// The tag a reference field of the current tag points at.
+    Ref {
         #[serde(rename = "ref")]
         field: String,
     },
@@ -580,6 +580,29 @@ pub(crate) struct ExtraSubmenu {
 }
 
 impl ObjectFunction {
+    /// Static suggestions for tags whose consuming object type is unknown.
+    /// Do not read exported functions, seats, feelers or other tag-owned names.
+    pub(super) fn built_in_menu(&self) -> Menu {
+        const ORDER: [&str; 11] = ["object", "unit", "biped", "vehicle", "item",
+            "weapon", "equipment", "device", "projectile", "creature", "entity"];
+        let mut groups: Vec<_> = self.lists.keys().collect();
+        groups.sort_by_key(|name| (ORDER.iter().position(|group| *group == name.as_str()).unwrap_or(ORDER.len()), name.as_str()));
+        let mut items = Vec::new();
+        for group in groups {
+            let mut seen = std::collections::HashSet::new();
+            let names: Vec<_> = self.lists[group].iter()
+                .filter(|name| !name.is_empty() && seen.insert(name.to_lowercase()))
+                .map(MenuItem::item).collect();
+            if !names.is_empty() {
+                let title = self.titles.get(group).unwrap_or(group);
+                items.push(MenuItem::submenu(title, names));
+            }
+        }
+        items.extend(list_items(&self.trailing));
+        // Suggestions cannot validate object-specific or manually typed names.
+        Menu { items, accepts_anything: true, ..Default::default() }
+    }
+
     fn build(&self, editors: &StringEditors, ctx: &Context<'_>, source: &dyn TagSource) -> Menu {
         let group = ctx.tag.group().tag;
         let group_name = editors.group_name(group).unwrap_or("");
@@ -1323,14 +1346,14 @@ impl LoadRef for dyn TagSource + '_ {
 impl Builder {
     /// Tags at fixed paths the menu reads.
     pub(crate) fn fixed_sources(&self) -> Vec<(u32, String)> {
-        let steps: &[Step] = match self {
-            Builder::Names(names) => &names.source,
-            Builder::StringList(spec) => &spec.source,
-            Builder::Incident(incident) => &incident.definitions.source,
-            _ => &[],
+        let steps: Vec<&Step> = match self {
+            Builder::Names(names) => names.source.iter().collect(),
+            Builder::StringList(spec) => spec.source.iter().chain(spec.sources.iter().flatten()).collect(),
+            Builder::Incident(incident) => incident.definitions.source.iter().collect(),
+            _ => Vec::new(),
         };
         steps
-            .iter()
+            .into_iter()
             .filter_map(|step| match step {
                 Step::Named(name) if name == "globals" => Some(globals_tag()),
                 Step::Tag { tag, group } => crate::fields::parse_group_tag(group).map(|group| (group, tag.clone())),
@@ -1364,9 +1387,24 @@ pub(crate) fn build(editors: &StringEditors, builder: &Builder, ctx: &Context<'_
 /// to, previewed in `language`'s text.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct StringListSpec {
+    #[serde(default)]
     source: Vec<Step>,
+    /// Collect lists from each available root (e.g. SP/MP UI globals). Missing
+    /// roots are expected in mode-specific kits; at least one must resolve.
+    #[serde(default)]
+    sources: Vec<Vec<Step>>,
+    /// Collect distinct lists referenced by this block, rather than requiring
+    /// a shared target as Step::BlockRef does for CHUD skins.
+    lists: Option<StringListReferences>,
     #[serde(default = "english_language")]
     language: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct StringListReferences {
+    block: String,
+    #[serde(rename = "ref")]
+    field: String,
 }
 
 fn english_language() -> String {
@@ -1375,6 +1413,12 @@ fn english_language() -> String {
 
 pub(crate) fn string_references(editors: &StringEditors, spec: &StringListSpec, ctx: &Context<'_>, source: &dyn TagSource) -> super::StringReferenceList {
     use super::{StringReferenceEntry, StringReferenceList, StringReferenceSource};
+    if let Some(lists) = &spec.lists {
+        return string_reference_collection(editors, spec, lists, ctx, source);
+    }
+    if !spec.sources.is_empty() {
+        return StringReferenceList::unavailable("Multiple roots require a string-list reference block.");
+    }
     let traced = trace(editors, &spec.source, ctx, source);
     // Only the last step's tag is the list to open; never an intermediate
     // globals tag.
@@ -1413,5 +1457,74 @@ pub(crate) fn string_references(editors: &StringEditors, spec: &StringListSpec, 
         })
         .collect();
     result.entries.sort_by(|a, b| a.id.as_bytes().cmp(b.id.as_bytes()));
+    result
+}
+
+/// Resolve a collection without changing the shared-target rule used by CHUD.
+fn string_reference_collection(editors: &StringEditors, spec: &StringListSpec, lists: &StringListReferences, ctx: &Context<'_>, source: &dyn TagSource) -> super::StringReferenceList {
+    use super::{StringReferenceEntry, StringReferenceGroup, StringReferenceList, StringReferenceSource};
+    if !spec.source.is_empty() && !spec.sources.is_empty() {
+        return StringReferenceList::unavailable("Use either source or sources, not both.");
+    }
+    let chains: Vec<&[Step]> = if spec.sources.is_empty() {
+        vec![&spec.source]
+    } else {
+        spec.sources.iter().map(Vec::as_slice).collect()
+    };
+    let mut result = StringReferenceList::default();
+    let mut seen = std::collections::HashSet::new();
+    let mut errors = Vec::new();
+    let mut root_errors = Vec::new();
+    let mut resolved = false;
+    for steps in chains {
+        let traced = trace(editors, steps, ctx, source);
+        let held = match traced.tag {
+            Ok(held) => held,
+            Err(reason) => { root_errors.push(reason); continue; }
+        };
+        resolved = true;
+        let Some(block) = inherited(held.root(ctx), &lists.block).and_then(|f| f.as_block()) else {
+            errors.push(format!("Source block '{}' is unavailable.", lists.block));
+            continue;
+        };
+        for element in block.iter() {
+            let Some((group_tag, path)) = element.field_path(&lists.field).and_then(|f| f.read_ref()) else {
+                // Empty reference slots do not contribute a list.
+                continue;
+            };
+            let path = path.trim_end_matches('\0').to_owned();
+            if path.is_empty() { continue; }
+            let key = (group_tag, path.replace('/', "\\").to_ascii_lowercase());
+            if !seen.insert(key) { continue; }
+            let start = result.entries.len();
+            let loaded = source.tag(group_tag, &path)
+                .ok_or_else(|| format!("Could not load source string list '{path}'."))
+                .and_then(|tag| crate::string_list::read_string_list(&tag)
+                    .ok_or_else(|| format!("Source '{path}' is not a readable string list.")))
+                .and_then(|list| if list.storage == crate::string_list::Storage::Multilingual {
+                    Ok(list)
+                } else { Err(format!("Source '{path}' does not contain String IDs.")) });
+            let unavailable = match loaded {
+                Ok(list) => {
+                    let language = list.languages.iter().position(|l| l.name.eq_ignore_ascii_case(&spec.language));
+                    let mut entries: Vec<_> = list.entries.into_iter().filter_map(|entry| Some(StringReferenceEntry {
+                        id: entry.id.filter(|id| !id.is_empty())?,
+                        preview: language.and_then(|i| entry.texts.get(i).cloned().flatten()).filter(|text| !text.is_empty()),
+                    })).collect();
+                    entries.sort_by(|a,b| a.id.as_bytes().cmp(b.id.as_bytes()));
+                    result.entries.extend(entries);
+                    None
+                }
+                Err(reason) => { errors.push(reason.clone()); Some(reason) }
+            };
+            result.groups.push(StringReferenceGroup {
+                source: StringReferenceSource { group_tag, path },
+                entries: start..result.entries.len(), unavailable,
+            });
+        }
+    }
+    if !resolved { errors.extend(root_errors); }
+    if !errors.is_empty() { result.unavailable = Some(errors.join("\n")); }
+    if result.groups.len() == 1 { result.source = Some(result.groups[0].source.clone()); }
     result
 }
