@@ -69,7 +69,14 @@ fn allowed_unresolved(game: &str, name: &str) -> bool {
     // 20,776 images across 4,184 tags), and their channel order is unverified;
     // a guessed layout would decode wrong rather than refuse. Remove from here
     // when they get variants.
-    game == "halo2_mcc" && matches!(lower.as_str(), "argbfp32" | "rgbfp32" | "rgbfp16")
+    if game == "halo2_mcc" && matches!(lower.as_str(), "argbfp32" | "rgbfp32" | "rgbfp16") {
+        return true;
+    }
+    // Known gap: Halo 5's DXGI-style names (`bc1_unorm (dxt1){dxt1}`, 45 of
+    // its 52). Nothing reads Halo 5 pixel data yet, and there are no Halo 5
+    // bitmaps at hand to check that a name means the format its `{alias}`
+    // does. Remove from here when Halo 5 bitmaps are read.
+    game == "halo5_guardians"
 }
 
 #[test]
