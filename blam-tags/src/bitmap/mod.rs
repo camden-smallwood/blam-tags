@@ -232,7 +232,7 @@ impl<'a> Bitmap<'a> {
             per_image_mip_override,
             p8_palette,
             x360: use_x360,
-            top_levels_first: tag.classic_engine().is_some_and(|engine| engine.is_halo2()),
+            top_levels_first: tag.classic_engine().is_some(),
         })
     }
 
@@ -814,14 +814,15 @@ pub struct BitmapImage<'a> {
     /// `true` when these pixels came from the tag's Xbox 360 side.
     /// See [`Bitmap::x360`] — it decides how `dxn` endpoints are read.
     x360: bool,
-    /// `true` for Halo 2, which keeps every face's top level together ahead
-    /// of the smaller levels, instead of a whole mip chain per face.
+    /// `true` for Halo CE and Halo 2, which keep every face's top level together
+    /// ahead of the smaller levels, instead of a whole mip chain per face.
     top_levels_first: bool,
 }
 
-/// Where Halo 2 stores each face of [`BitmapImage::cube_face_bytes`]'s order.
-/// Its tool lays a cube out as a ring around the Z-up world: `+X +Y -X -Y +Z -Z`.
-const HALO2_CUBE_FACE_SLOTS: [u32; 6] = [0, 2, 1, 3, 4, 5];
+/// Where Halo CE and Halo 2 store each face of [`BitmapImage::cube_face_bytes`]'s
+/// order. Their tools lay a cube out as a ring around the Z-up world:
+/// `+X +Y -X -Y +Z -Z`.
+const CLASSIC_CUBE_FACE_SLOTS: [u32; 6] = [0, 2, 1, 3, 4, 5];
 
 impl<'a> BitmapImage<'a> {
     /// Base-mip width in pixels.
@@ -949,7 +950,7 @@ impl<'a> BitmapImage<'a> {
             format.surface_bytes(width, height, self.mipmap_levels())
         };
         let slot = if self.top_levels_first {
-            HALO2_CUBE_FACE_SLOTS.get(face as usize).copied().unwrap_or(face)
+            CLASSIC_CUBE_FACE_SLOTS.get(face as usize).copied().unwrap_or(face)
         } else {
             face
         };

@@ -1,7 +1,7 @@
-//! Halo 2 stores a cube's six top levels together, as a ring around the Z-up
-//! world, and a volume's slices one after another.
+//! Halo CE and Halo 2 store a cube's six top levels together, as a ring around
+//! the Z-up world, and a volume's slices one after another.
 //!
-//! Needs the Halo 2 kit: set `BLAM_TEST_H2EK` to its root.
+//! Needs the kits: set `BLAM_TEST_H2EK` and `BLAM_TEST_HCEEK` to their roots.
 
 mod common;
 
@@ -18,6 +18,13 @@ fn load(rel: &str) -> Option<TagFile> {
     read_classic_tag_file(&bytes, layout).ok()
 }
 
+fn load_halo_ce(rel: &str) -> Option<TagFile> {
+    let tags = common::kit("BLAM_TEST_HCEEK")?.tags();
+    let bytes = std::fs::read(tags.join(rel)).ok()?;
+    let layout = TagLayout::from_json(common::definitions("haloce_mcc").join("bitmap.json")).ok()?;
+    read_classic_tag_file(&bytes, layout).ok()
+}
+
 /// `+X`'s top row is `+Y`'s right column reversed, so faces in the right
 /// order join there. In storage order this pair is `+X` and `-X`, which share
 /// no edge at all, and a mip-chain stride reads noise.
@@ -27,7 +34,20 @@ fn cube_faces_come_back_in_directx_order_and_join() {
         eprintln!("skipping: BLAM_TEST_H2EK is not set");
         return;
     };
-    let bitmap = Bitmap::new(&tag).unwrap();
+    assert_faces_join(&tag);
+}
+
+#[test]
+fn halo_ce_cube_faces_come_back_in_directx_order_and_join() {
+    let Some(tag) = load_halo_ce("characters/cyborg/bitmaps/cubemap mirror surface.bitmap") else {
+        eprintln!("skipping: BLAM_TEST_HCEEK is not set");
+        return;
+    };
+    assert_faces_join(&tag);
+}
+
+fn assert_faces_join(tag: &TagFile) {
+    let bitmap = Bitmap::new(tag).unwrap();
     let image = bitmap.image(0).unwrap();
     assert!(image.is_cube());
     let (size, format) = (image.width(), image.format().unwrap());
