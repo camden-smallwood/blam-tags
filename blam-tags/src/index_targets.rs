@@ -275,7 +275,7 @@ impl IndexTargets {
                         Base::Root => "",
                         Base::Holder => holder_path,
                     };
-                    block_at(root, &join(base, &rule.path))
+                    block_at(root, &relative_field(base, &rule.path)?)
                 }
                 Rule::Selected(rule) => {
                     let selector = relative_field(holder_path, &rule.selector)?;
@@ -336,10 +336,18 @@ fn declared_target(
 impl Rule {
     fn validate(&self) -> Result<(), String> {
         let valid = |path: &str| !path.is_empty() && !path.starts_with('/') && !path.ends_with('/');
-        match self {
-            Self::Path(rule) if valid(&rule.path) && !rule.path.split('/').any(|p| p == "..") => {
-                Ok(())
+        // Only a holder has enclosing entries to climb, and only leading steps.
+        let climbed = |rule: &PathRule| {
+            let mut path = rule.path.as_str();
+            while rule.base == Base::Holder
+                && let Some(rest) = path.strip_prefix("../")
+            {
+                path = rest;
             }
+            !path.split('/').any(|p| p == "..")
+        };
+        match self {
+            Self::Path(rule) if valid(&rule.path) && climbed(rule) => Ok(()),
             Self::Selected(rule)
                 if valid(&rule.selector)
                     && valid(&rule.child)
@@ -611,6 +619,28 @@ mod tests {
     }
 
     #[test]
+    fn holder_paths_climb_to_the_enclosing_entry() {
+        let fixture = Fixture::new();
+        let mut value = schema();
+        value["structs"]["point"]["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"custom_short_block_index", "name":"sibling", "index_target":{"path":"../points", "base":"holder"}}));
+        fixture.write(&value);
+        let targets = IndexTargets::load(&fixture.0).unwrap();
+        let mut tag = TagFile::new(fixture.0.join("example.json")).unwrap();
+        add(&mut tag, "holders", 2);
+        add(&mut tag, "holders[0]/points", 1);
+        add(&mut tag, "holders[1]/points", 3);
+        for (path, len) in [
+            ("holders[0]/points[0]/sibling", 1),
+            ("holders[1]/points[2]/sibling", 3),
+        ] {
+            assert_eq!(targets.resolve(tag.root(), path).unwrap().len, len, "{path}");
+        }
+    }
+
+    #[test]
     fn only_fields_with_rules_report_an_annotation() {
         let fixture = Fixture::new();
         fixture.write(&schema());
@@ -735,6 +765,7 @@ mod tests {
         for rule in [
             json!({"path":""}),
             json!({"path":"../elsewhere"}),
+            json!({"path":"sections/../elsewhere", "base":"holder"}),
             json!({"selector":"parent"}),
             json!({"unknown":"value"}),
         ] {
