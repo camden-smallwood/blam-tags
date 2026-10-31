@@ -567,7 +567,7 @@ pub fn read_classic_tag_file(bytes: &[u8], mut layout: TagLayout) -> Result<TagF
         build_number: 0,
         version: header.version as u32,
         group_tag: u32::from_be_bytes(header.group_tag),
-        group_version: 0,
+        group_version: header.version as u32,
         // Preserve the original stored checksum; the writer recomputes
         // it unless it's the "unchecksummed" 0xFFFFFFFF sentinel.
         checksum: header.checksum,
@@ -671,7 +671,7 @@ impl TagFile {
             build_number: 0,
             version: meta.version,
             group_tag: meta.tag,
-            group_version: 0,
+            group_version: meta.version,
             checksum: 0,
             signature: u32::from_be_bytes(*b"BLAM"),
         };
@@ -1533,6 +1533,7 @@ mod tests {
     fn a_new_halo_2_tag_has_a_root_block_header_and_reads_back() {
         let path = "../definitions/halo2_mcc/weapon.json";
         let tag = crate::TagFile::new_classic(path, super::ClassicEngine::Halo2V4).expect("new weapon");
+        assert_eq!(tag.header.group_version, 2);
         let bytes = tag.write_to_bytes().unwrap();
         assert_eq!(&bytes[36..40], b"paew");
         assert_eq!(bytes[40..44], classic_checksum(&bytes[64..]).to_le_bytes());
@@ -1549,6 +1550,7 @@ mod tests {
         assert_eq!(bytes[76..80], size.to_le_bytes(), "root element size");
 
         let read = super::read_classic_tag_file(&bytes, layout).expect("read back");
+        assert_eq!(read.header.group_version, 2, "the header's version, as the definitions give it");
         assert_eq!(read.classic_engine(), Some(super::ClassicEngine::Halo2V4));
         assert_eq!(read.header.group_tag, u32::from_be_bytes(*b"weap"));
         assert_eq!(read.write_to_bytes().unwrap(), bytes);
