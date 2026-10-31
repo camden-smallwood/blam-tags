@@ -1047,6 +1047,7 @@ impl JmsFile {
         let mut regions: Vec<String> = Vec::with_capacity(regions_block.len());
         let mut vertices: Vec<JmsVertex> = Vec::new();
         let mut triangles: Vec<JmsTriangle> = Vec::new();
+        let mut markers: Vec<JmsMarker> = Vec::new();
 
         for ri in 0..regions_block.len() {
             let region = regions_block.element(ri).unwrap();
@@ -1061,6 +1062,7 @@ impl JmsFile {
                 if permutation.is_some_and(|want| perm.read_string("name").unwrap_or_default() != want) {
                     continue;
                 }
+                read_gbxmodel_permutation_markers(&perm, &mut markers);
                 let ngeo = geometries_block.len();
                 let geo_idx = ["super high", "high", "medium", "low", "super low"]
                     .iter()
@@ -1119,7 +1121,7 @@ impl JmsFile {
                 }
             }
         }
-        Ok(Self { nodes: world_nodes, materials, regions, vertices, triangles, ..Default::default() })
+        Ok(Self { nodes: world_nodes, materials, markers, regions, vertices, triangles, ..Default::default() })
     }
 
     /// The world-space rest pose held in a model's `nodes` block —
@@ -2926,6 +2928,34 @@ fn rotation_from_basis(cts: &TagStruct<'_>) -> RealQuaternion {
         RealVector3d { i: row_i.j, j: row_j.j, k: row_k.j },
         RealVector3d { i: row_i.k, j: row_j.k, k: row_k.k },
     )
+}
+
+/// A gbxmodel permutation's markers, in the H2/H3 quaternion convention every
+/// `JmsFile` holds: a gbxmodel stores the conjugate, as it does for a node. A
+/// marker can repeat across permutations, and the JMS needs it once.
+fn read_gbxmodel_permutation_markers(perm: &TagStruct<'_>, markers: &mut Vec<JmsMarker>) {
+    let Some(block) = perm.field("markers").and_then(|f| f.as_block()) else {
+        return;
+    };
+    for mi in 0..block.len() {
+        let m = block.element(mi).unwrap();
+        let marker = JmsMarker {
+            name: m.read_string("name").unwrap_or_default(),
+            node_index: m.read_int_any("node index").unwrap_or(-1) as i16,
+            rotation: m.read_quat("rotation").conjugate(),
+            translation: m.read_point3d("translation") * SCALE,
+            radius: -1.0,
+        };
+        let repeats = markers.iter().any(|other| {
+            other.name == marker.name
+                && other.node_index == marker.node_index
+                && other.translation == marker.translation
+                && other.rotation == marker.rotation
+        });
+        if !repeats {
+            markers.push(marker);
+        }
+    }
 }
 
 fn read_markers(root: &TagStruct<'_>) -> Result<Vec<JmsMarker>, JmsError> {
