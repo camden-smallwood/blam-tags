@@ -83,7 +83,7 @@ impl ClassicEngine {
     }
 
     /// Any of the four Halo 2 variants (i.e. not Halo CE).
-    fn is_halo2(self) -> bool {
+    pub(crate) fn is_halo2(self) -> bool {
         !matches!(self, ClassicEngine::HaloCe)
     }
 

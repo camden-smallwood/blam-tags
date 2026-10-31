@@ -62,6 +62,9 @@ fn layer_mip0_bytes<'a>(
     image: &BitmapImage<'a>,
     layer_index: u32,
 ) -> Result<&'a [u8], BitmapError> {
+    if image.is_cube() {
+        return image.cube_face_bytes(layer_index);
+    }
     let format = image.format()?;
     let width = image.width();
     let height = image.height();
