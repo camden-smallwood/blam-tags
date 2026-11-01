@@ -939,6 +939,28 @@ impl<'a> BitmapImage<'a> {
         self.level_bytes_at(slot as u64 * stride)
     }
 
+    /// One face of a cube map at mip `level`. The levels lie one after the
+    /// other, with each level's six faces in [`Self::cube_face_bytes`]' order.
+    pub fn cube_face_level_bytes(&self, level: u32, face: u32) -> Result<&'a [u8], BitmapError> {
+        let format = self.format()?;
+        let side = |size: u32, level: u32| (size >> level).max(1);
+        let (width, height) = (self.width(), self.height());
+        let before: u64 = (0..level)
+            .map(|at| format.level_bytes(side(width, at), side(height, at)) * 6)
+            .sum();
+        let size = format.level_bytes(side(width, level), side(height, level));
+        let slot = CUBE_FACE_SLOTS.get(face as usize).copied().unwrap_or(face);
+        let offset = before + slot as u64 * size;
+        (offset as usize)
+            .checked_add(size as usize)
+            .and_then(|end| self.pixels.get(offset as usize..end))
+            .ok_or(BitmapError::PixelSliceOutOfBounds {
+                offset,
+                size,
+                available: self.pixels.len() as u64,
+            })
+    }
+
     /// One slice of a volume's top level. [`Self::pixel_bytes`] sizes a volume
     /// as a single surface, so it stops at the first of these.
     pub fn volume_slice_bytes(&self, slice: u32) -> Result<&'a [u8], BitmapError> {
