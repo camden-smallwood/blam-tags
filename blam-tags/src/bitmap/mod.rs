@@ -978,7 +978,13 @@ impl<'a> BitmapImage<'a> {
         if !is_cube && !is_array && !is_2d {
             return Err(BitmapError::UnsupportedTextureType(type_name.unwrap_or_default()));
         }
-        let bytes = self.pixel_bytes()?;
+        let chains;
+        let bytes = if is_cube {
+            chains = self.cube_face_chains(format)?;
+            &chains
+        } else {
+            self.pixel_bytes()?
+        };
 
         // Formats with no clean legacy DDS pixelformat get decoded
         // to RGBA8 per mip-and-face, then written as A8R8G8B8. So do
@@ -992,6 +998,24 @@ impl<'a> BitmapImage<'a> {
         }
 
         self.write_dds_with_format(out, format, bytes, is_cube, is_array)
+    }
+
+    /// A cube's pixels as a DDS holds them: each face's whole chain in the
+    /// DirectX order, where the tag keeps each level's six faces together.
+    fn cube_face_chains(&self, format: BitmapFormat) -> Result<Vec<u8>, BitmapError> {
+        let pixels = self.pixel_bytes()?;
+        let mut chains = Vec::with_capacity(pixels.len());
+        for slot in CUBE_FACE_SLOTS {
+            let mut level_start = 0;
+            for level in 0..self.mipmap_levels() {
+                let side = |side: u32| (side >> level).max(1);
+                let size = format.level_bytes(side(self.width()), side(self.height())) as usize;
+                let face_start = level_start + slot as usize * size;
+                chains.extend_from_slice(&pixels[face_start..face_start + size]);
+                level_start += size * CUBE_FACE_SLOTS.len();
+            }
+        }
+        Ok(chains)
     }
 
     /// Decode every mip of every face/layer to RGBA8, concatenated in

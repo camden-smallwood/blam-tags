@@ -6,6 +6,9 @@
 
 mod common;
 
+/// `DDS ` and its legacy header.
+const DDS_HEADER: usize = 128;
+
 use blam_tags::bitmap::decode::decode_to_rgba8;
 use blam_tags::bitmap::Bitmap;
 use blam_tags::classic::read_classic_tag_file;
@@ -69,6 +72,7 @@ fn halo_reach_cube_faces_come_back_in_directx_order_and_join() {
 
 fn assert_faces_join(tag: &TagFile) {
     let bitmap = Bitmap::new(tag).unwrap();
+    assert_dds_holds_each_faces_chain(&bitmap);
     let image = bitmap.image(0).unwrap();
     assert!(image.is_cube());
     let (size, format) = (image.width(), image.format().unwrap());
@@ -89,6 +93,34 @@ fn assert_faces_join(tag: &TagFile) {
     };
     assert!(seam(&positive_y) < 10.0, "+X and +Y should join: {}", seam(&positive_y));
     assert!(seam(&negative_x) > seam(&positive_y) * 2.0);
+}
+
+/// A DDS cube is one whole mip chain per face, in DirectX order. The tags keep
+/// a level's six faces together, so a face's chain has to be gathered up.
+fn assert_dds_holds_each_faces_chain(bitmap: &Bitmap<'_>) {
+    let image = bitmap.image(0).unwrap();
+    let format = image.format().unwrap();
+    let (size, levels) = (image.width(), image.mipmap_levels());
+    let mut dds = Vec::new();
+    image.write_dds(&mut dds).unwrap();
+    let chain = format.surface_bytes(size, size, levels) as usize;
+    let chains = &dds[DDS_HEADER..];
+    eprintln!("cube of {format:?}, {size}, {levels} levels");
+    // A format with no DDS of its own goes out decoded, in the same order.
+    if chains.len() != chain * 6 {
+        return;
+    }
+    let pixels = image.pixel_bytes().unwrap();
+    let first_level = format.level_bytes(size, size) as usize;
+    let second_level = format.level_bytes((size >> 1).max(1), (size >> 1).max(1)) as usize;
+    for (face, slot) in [0, 2, 1, 3, 4, 5].into_iter().enumerate() {
+        let held = &chains[face * chain..];
+        assert_eq!(&held[..first_level], image.cube_face_bytes(face as u32).unwrap(), "face {face}");
+        if levels > 1 {
+            let stored = &pixels[first_level * 6 + slot * second_level..][..second_level];
+            assert_eq!(&held[first_level..][..second_level], stored, "face {face}'s next level");
+        }
+    }
 }
 
 #[test]
