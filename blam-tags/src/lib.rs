@@ -179,7 +179,7 @@ pub use ass::{
 };
 pub use render_model::{
     extract_per_instance_lightmap_uvs, Geometry, Marker, MarkerGroup, Material, MaterialProperty,
-    Mesh, Node, Part, PerInstanceLightmapUvs, Permutation, Region, RenderMesh, RenderMeshPart,
+    Mesh, Node, Part, PerInstanceLightmapUvs, Permutation, Region, RenderMesh, RenderMeshPart, RenderMeshSubpart,
     RenderModel, RenderModelError, RenderVertex, Subpart,
 };
 pub use tag_function::{

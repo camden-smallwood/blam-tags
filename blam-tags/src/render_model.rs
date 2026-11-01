@@ -363,6 +363,8 @@ pub struct RenderModel {
     pub flags: Flags<RenderModelFlags, u16>,
     pub regions: Vec<Region>,
     pub instance_placements: Vec<InstancePlacement>,
+    /// The mesh whose subparts [`Self::instance_placements`] draw, one each.
+    pub instance_mesh_index: Option<usize>,
     pub nodes: Vec<Node>,
     pub marker_groups: Vec<MarkerGroup>,
     pub materials: Vec<Material>,
@@ -703,6 +705,10 @@ pub struct RenderMesh {
     /// it), with parts reassembled into contiguous draw ranges.
     pub indices: Vec<u32>,
     pub parts: Vec<RenderMeshPart>,
+    /// Each subpart's span of [`Self::indices`], in the tag's order. An
+    /// instance mesh draws one of these per placement. Empty for meshes read
+    /// from a format with no subparts.
+    pub subparts: Vec<RenderMeshSubpart>,
     /// For rigid meshes, the single bone all vertices bind to. `None` for
     /// skinned meshes whose vertices carry per-vertex weights.
     pub rigid_node_index: Option<i16>,
@@ -784,6 +790,15 @@ pub struct RenderVertex {
     pub vert_color: RealVector3d,
 }
 
+/// One subpart's range within a [`RenderMesh`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderMeshSubpart {
+    /// Index into [`RenderMesh::parts`].
+    pub part_index: u32,
+    pub index_start: u32,
+    pub index_count: u32,
+}
+
 /// One draw range within a [`RenderMesh`]. `material_index` indexes
 /// [`RenderModel::materials`].
 #[derive(Debug, Clone, Copy)]
@@ -844,6 +859,7 @@ impl RenderModel {
             flags: root.try_read_flags("flags").unwrap_or_default(),
             regions: read_regions(&root, game)?,
             instance_placements: read_instance_placements(&root),
+            instance_mesh_index: usize::try_from(root.read_int_any("instance mesh index").unwrap_or(-1)).ok(),
             nodes: read_nodes(&root)?,
             marker_groups: read_marker_groups(&root),
             materials: read_materials(&root)?,
@@ -1175,6 +1191,7 @@ impl RenderModel {
                 .collect();
 
             let mesh = RenderMesh {
+                subparts: Vec::new(),
                 vertices,
                 indices: part.mesh.indices.clone(),
                 parts: mesh_parts,
@@ -1271,6 +1288,7 @@ impl RenderModel {
                 .cloned()
                 .unwrap_or_else(|| format!("static_{}", part.name));
             let mesh = RenderMesh {
+                subparts: Vec::new(),
                 vertices,
                 indices: part.mesh.indices.clone(),
                 parts: vec![RenderMeshPart {
@@ -1355,6 +1373,7 @@ impl RenderModel {
                 })
                 .collect();
             let mesh = RenderMesh {
+                subparts: Vec::new(),
                 vertices,
                 indices: part.mesh.indices.clone(),
                 parts: mesh_parts,
@@ -1453,6 +1472,7 @@ impl RenderModel {
             flags: Flags::default(),
             regions,
             instance_placements: Vec::new(),
+            instance_mesh_index: None,
             nodes,
             marker_groups,
             materials,
@@ -1483,6 +1503,7 @@ impl RenderModel {
             flags: Flags::default(),
             regions: read_gbxmodel_regions(&root, geometry_count)?,
             instance_placements: Vec::new(),
+            instance_mesh_index: None,
             // CE nodes carry none of the H3 inverse-bind fields, so they need
             // their own reader. They provide the bind pose that places markers.
             nodes: read_gbxmodel_nodes(&root),
@@ -1786,6 +1807,7 @@ fn read_h2_section(section: &TagStruct<'_>) -> RenderMesh {
     }
 
     RenderMesh {
+        subparts: Vec::new(),
         vertices,
         indices,
         parts,
@@ -2143,6 +2165,7 @@ fn read_gbxmodel_geometry(geo: &TagStruct<'_>, uv_scale: [f32; 2], local_nodes: 
     }
 
     RenderMesh {
+        subparts: Vec::new(),
         vertices,
         indices,
         parts,
@@ -2858,6 +2881,7 @@ where
             mesh_flags.contains(MeshFlags::UseRegionIndexForSorting);
 
         let empty_mesh = || RenderMesh {
+            subparts: Vec::new(),
             vertices: Vec::new(),
             indices: Vec::new(),
             parts: Vec::new(),
@@ -2926,6 +2950,7 @@ where
 
         let mut indices: Vec<u32> = Vec::new();
         let mut parts: Vec<RenderMeshPart> = Vec::with_capacity(parts_block.len());
+        let mut subparts: Vec<RenderMeshSubpart> = Vec::new();
 
         if !is_strip {
             // Triangle-list (BSP cluster/instance) meshes: keep the RAW index
@@ -2957,6 +2982,11 @@ where
                             let c = sp.read_int_any("index count").unwrap_or(0).max(0) as usize;
                             start = start.min(s);
                             total += c;
+                            subparts.push(RenderMeshSubpart {
+                                part_index: pi as u32,
+                                index_start: s as u32,
+                                index_count: c as u32,
+                            });
                         }
                         if start != usize::MAX {
                             index_start = start as u32;
@@ -3010,7 +3040,13 @@ where
                             let Some(sp) = sps.element(sub_start as usize + off) else { break };
                             let s = sp.read_int_any("index start").unwrap_or(0);
                             let c = sp.read_int_any("index count").unwrap_or(0);
+                            let index_start = indices.len() as u32;
                             emit_range(s, c, &mut indices);
+                            subparts.push(RenderMeshSubpart {
+                                part_index: pi as u32,
+                                index_start,
+                                index_count: indices.len() as u32 - index_start,
+                            });
                         }
                         used_subparts = true;
                     }
@@ -3063,6 +3099,7 @@ where
             .any(|v| v.lightmap_texcoord.x != 0.0 || v.lightmap_texcoord.y != 0.0);
 
         out.push(RenderMesh {
+            subparts,
             vertices,
             indices,
             parts,
