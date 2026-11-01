@@ -293,12 +293,8 @@ impl RenderMethodExtern {
     pub const COUNT: usize = 84;
 
     /// Map by index. **Only for raw integer fields that carry no embedded
-    /// name** — the rmsh `bitmap extern RTT mode` / postprocess `extern
-    /// texture mode` are plain `short_integer`/`char_integer` (already-
-    /// upgraded runtime indices, rebuilt by the tools on save), so the
-    /// index is the current-schema index. The name-bearing rmop `source
-    /// extern` field is resolved by name instead (drift-immune) via the
-    /// typed [`Enum`] wrapper. Discriminants 0..49 match the JSON schema
+    /// name**. The name-bearing rmop `source extern` field is resolved by
+    /// name instead (drift-immune) via the typed [`Enum`] wrapper. Discriminants 0..49 match the JSON schema
     /// (including `emblem color background` at 20); everything above that is
     /// appended name-only space, which an index-only field never reaches.
     pub fn from_index(i: i128) -> Option<Self> {
@@ -786,9 +782,9 @@ pub struct RenderMethodPostprocessTexture {
     pub address_mode_y: BitmapAddressMode,
     pub filter_mode: BitmapFilterMode,
     pub comparison_function: BitmapComparisonFunction,
-    /// `None` when the slot uses the inline `bitmap_path`; `Some(extern)`
-    /// when the texture is sourced from engine state.
-    pub extern_texture_mode: Option<RenderMethodExtern>,
+    /// The render target to bind ahead of `bitmap_path`, when there is one
+    /// live. `bitmap_path` still binds whenever there is not.
+    pub extern_texture_mode: Option<RenderMethodBitmapExternMode>,
     pub texture_transform_constant_index: i8,
     pub texture_transform_overlay_indices: TagBlockIndex,
 }
@@ -821,10 +817,37 @@ pub struct RenderMethodParameter {
     pub bitmap_address_mode_x: BitmapAddressMode,
     pub bitmap_address_mode_y: BitmapAddressMode,
     pub bitmap_anisotropy_amount: i16,
-    /// `None` when the slot uses an inline bitmap; `Some(extern)` when
-    /// the texture is sourced from engine state (e.g., scene HDR).
-    pub bitmap_extern_mode: Option<RenderMethodExtern>,
+    /// `bitmap extern RTT mode`. Only takes effect when `bitmap_flags` has
+    /// bit 4 set; see [`RenderMethodBitmapExternMode`].
+    pub bitmap_extern_mode: Option<RenderMethodBitmapExternMode>,
     pub animated_parameters: Vec<RenderMethodAnimatedParameter>,
+}
+
+/// The render target a bitmap parameter asks for in place of its bitmap,
+/// `e_render_method_extern_mode`. Separate from [`RenderMethodExtern`], whose
+/// indices these are not. With none live the bitmap binds, so nothing about a
+/// parameter's bitmap goes away because it has a mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RenderMethodBitmapExternMode {
+    TextureCamera,
+    TextureCameraZ,
+    Mirror,
+    Refraction,
+    Scope,
+}
+
+impl RenderMethodBitmapExternMode {
+    /// 0 is `nothing`, so it and anything out of range are `None`.
+    pub fn from_index(index: i128) -> Option<Self> {
+        match index {
+            1 => Some(Self::TextureCamera),
+            2 => Some(Self::TextureCameraZ),
+            3 => Some(Self::Mirror),
+            4 => Some(Self::Refraction),
+            5 => Some(Self::Scope),
+            _ => None,
+        }
+    }
 }
 
 /// One entry in [`RenderMethodOption::parameters`] — a definition-time
@@ -1519,8 +1542,7 @@ impl RenderMethodPostprocessTexture {
                 .and_then(BitmapComparisonFunction::from_index)
                 .unwrap_or_default(),
             extern_texture_mode: s.read_int_any("extern texture mode")
-                .and_then(RenderMethodExtern::from_index)
-                .filter(|e| !matches!(e, RenderMethodExtern::None)),
+                .and_then(RenderMethodBitmapExternMode::from_index),
             texture_transform_constant_index: s.read_int_any("texture transform constant index")
                 .unwrap_or(-1) as i8,
             texture_transform_overlay_indices,
@@ -1565,12 +1587,8 @@ impl RenderMethodParameter {
                 .and_then(BitmapAddressMode::from_index)
                 .unwrap_or_default(),
             bitmap_anisotropy_amount: s.read_int_any("bitmap anisotropy amount").unwrap_or(0) as i16,
-            // `bitmap extern RTT mode` is `_field_short_integer` in the
-            // rmsh schema (no enum binding) — convert via from_index to
-            // match the rmop's `source extern` enum semantics. 0 = None.
             bitmap_extern_mode: s.read_int_any("bitmap extern RTT mode")
-                .and_then(RenderMethodExtern::from_index)
-                .filter(|e| !matches!(e, RenderMethodExtern::None)),
+                .and_then(RenderMethodBitmapExternMode::from_index),
             animated_parameters,
         })
     }

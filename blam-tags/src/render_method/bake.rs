@@ -11,10 +11,13 @@
 
 use std::collections::HashMap;
 
+use crate::typed_enums::Enum;
+
 use super::types::{
     BitmapAddressMode, BitmapComparisonFunction, BitmapFilterMode, RenderMethod,
-    RenderMethodAnimatedParameter, RenderMethodDefinition, RenderMethodExtern,
-    RenderMethodOption, RenderMethodOptionParameter, RenderMethodParameter,
+    RenderMethodAnimatedParameter, RenderMethodAnimatedParameterType, RenderMethodDefinition,
+    RenderMethodDefinitionCategory, RenderMethodOption,
+    RenderMethodOptionParameter, RenderMethodParameter, RenderMethodParameterType,
     RenderMethodPostprocessDefinition, RenderMethodPostprocessTexture, RenderMethodTemplate,
     TagBlockIndex,
 };
@@ -90,7 +93,7 @@ fn split_animated_parameters(
 
     for op in rmop_chain {
         let start = overlays.len();
-        if let Some(rm_param) = rmsh.parameters.iter().find(|p| p.parameter_name == op.parameter_name) {
+        if let Some(rm_param) = find_rmsh_override(rmsh, op) {
             for anim in &rm_param.animated_parameters {
                 let is_constant = anim
                     .function
@@ -98,7 +101,12 @@ fn split_animated_parameters(
                     .map(|f| f.is_constant())
                     .unwrap_or(true);
                 if !is_constant {
-                    overlays.push(anim.clone());
+                    let mut overlay = anim.clone();
+                    // `sub_140C4F690` stores a period of about 0 as 1.
+                    if overlay.time_period_in_seconds.abs() < 0.0001 {
+                        overlay.time_period_in_seconds = 1.0;
+                    }
+                    overlays.push(overlay);
                 }
             }
         }
@@ -121,74 +129,165 @@ fn split_animated_parameters(
 // rmop chain build — sub_140C4EB10
 // =============================================================================
 
-/// Concatenate every rmop's parameters in rmdf category order. Optionally
-/// prepends `rmdf.global_options`. Mirrors `sub_140C4EB10`.
+/// `rmdf.flags` bit 0: the definition uses automatic macros, and each category
+/// adds parameters carrying its chosen option.
+const DEFINITION_AUTOMATIC_MACROS: u32 = 1;
+
+/// What `sub_140C4EB10` leaves in a category marker's rmop `flags` slot.
+const CATEGORY_MARKER: i16 = 0xABCDu16 as i16;
+
+/// Every parameter a render method's options declare, `rmdf.global_options`
+/// first and then each category in order. Mirrors `sub_140C4EB10`.
 ///
-/// **Gap from engine**: `rmdf.flags & 1` marker synthesis isn't ported
-/// yet — flagged in the reference doc. Add when we hit an rmdf that uses it.
-fn build_rmop_chain(
-    rmsh: &RenderMethod,
+/// A negative option adds nothing and neither does one past the end, where
+/// the shader macros clamp instead. A category `rm.options` has no entry for
+/// takes its first option. Lookups take the first match, so a name a global
+/// option declares shadows any later one.
+pub(super) fn build_rmop_chain(
+    rm: &RenderMethod,
     rmdf: &RenderMethodDefinition,
     mut load_rmop: impl FnMut(&str) -> Option<RenderMethodOption>,
 ) -> Vec<RenderMethodOptionParameter> {
     let mut chain: Vec<RenderMethodOptionParameter> = Vec::new();
+    let mut add = |chain: &mut Vec<RenderMethodOptionParameter>, path: &str| {
+        if path.is_empty() {
+            return;
+        }
+        if let Some(rmop) = load_rmop(path) {
+            chain.extend(rmop.parameters.into_iter().filter(|p| !p.parameter_name.is_empty()));
+        }
+    };
 
-    // Phase 1: rmdf.global_options
-    if !rmdf.global_options_path.is_empty() {
-        if let Some(rmop) = load_rmop(&rmdf.global_options_path) {
-            for p in rmop.parameters {
-                if !p.parameter_name.is_empty() {
-                    chain.push(p);
-                }
+    add(&mut chain, &rmdf.global_options_path);
+    for (index, category) in rmdf.categories.iter().enumerate() {
+        let chosen = rm.options.get(index).copied().unwrap_or(0);
+        if let Some(option) = usize::try_from(chosen).ok().and_then(|at| category.options.get(at)) {
+            add(&mut chain, &option.option_path);
+        }
+        if rmdf.flags & DEFINITION_AUTOMATIC_MACROS != 0 {
+            chain.push(category_marker(category, RenderMethodParameterType::Real, chosen));
+            if category.options.len() <= 2 {
+                chain.push(category_marker(category, RenderMethodParameterType::Bool, chosen));
             }
         }
     }
-
-    // Phase 2: per-category rmop chain
-    for (cat_idx, category) in rmdf.categories.iter().enumerate() {
-        let opt_idx = rmsh.options.get(cat_idx).copied().unwrap_or(0).max(0) as usize;
-        let Some(category_option) = category.options.get(opt_idx) else { continue };
-        if category_option.option_path.is_empty() {
-            continue;
-        }
-        let Some(rmop) = load_rmop(&category_option.option_path) else { continue };
-        for p in rmop.parameters {
-            if !p.parameter_name.is_empty() {
-                chain.push(p);
-            }
-        }
-    }
-
     chain
+}
+
+/// One of the parameters that hand a category's option to `category_<name>`.
+fn category_marker(
+    category: &RenderMethodDefinitionCategory,
+    kind: RenderMethodParameterType,
+    chosen: i16,
+) -> RenderMethodOptionParameter {
+    RenderMethodOptionParameter {
+        parameter_name: category.category_name.clone(),
+        parameter_type: Some(Enum::from_variant(kind)),
+        source_extern: None,
+        default_bitmap_path: String::new(),
+        default_real_value: f32::from(chosen),
+        default_int_bool_value: i32::from(chosen),
+        flags: CATEGORY_MARKER,
+        default_filter_mode: Enum::default(),
+        default_comparison_function: Enum::default(),
+        default_address_mode: Enum::default(),
+        default_filter_mode_index: 0,
+        default_address_mode_index: 0,
+        anisotropy_amount: 0,
+        default_color: Default::default(),
+        default_bitmap_scale: 0.0,
+        help_text: String::new(),
+    }
 }
 
 // =============================================================================
 // Texture bake — sub_140C50260
 // =============================================================================
 
-/// Find the rmsh-side parameter override for a given rmop parameter (matched
-/// by name and parameter_type), if present.
-fn find_rmsh_override<'a>(
+/// The rmsh's own entry for an rmop parameter: `sub_140C51CA0` matches on name
+/// and type both.
+pub(super) fn find_rmsh_override<'a>(
     rmsh: &'a RenderMethod,
     op: &RenderMethodOptionParameter,
 ) -> Option<&'a RenderMethodParameter> {
+    let kind = op.parameter_type.map(|kind| kind.get());
     rmsh.parameters
         .iter()
-        .find(|p| p.parameter_name == op.parameter_name)
+        .find(|p| p.parameter_name == op.parameter_name && p.parameter_type.map(|kind| kind.get()) == kind)
 }
 
-/// Build one `texture_constant` slot. Mirrors `update_texture_parameter @
-/// tool.exe 0x140C50260`. Sampler-state overrides are gated per-field by
-/// `rmsh.bitmap_flags`:
+/// What a missing bitmap reference bakes to.
+pub const DEFAULT_BITMAP: &str = "shaders\\default_bitmaps\\bitmaps\\color_white";
+
+/// A bitmap parameter's binding, as `sub_140C50260` works it out.
 ///
-/// | Bit | Override |
-/// |---:|---|
-/// | 0   | filter_mode |
-/// | 1   | address_mode (unified, broadcasts to BOTH axes) |
-/// | 2   | address_mode_x (precedence over bit 1 for x) |
-/// | 3   | address_mode_y (precedence over bit 1 for y) |
-/// | 4   | anisotropy (DEAD in runtime sampler — kept for completeness) |
-/// | 5   | comparison_function (DEAD in runtime sampler) |
+/// A parameter without a bitmap of its own takes everything from the rmop,
+/// whatever else it authors. One with a bitmap takes each sampler field only
+/// when `bitmap_flags` says to; `bitmap_extern_mode` is gated the same way,
+/// by bit 4. Its `real_parameter` is the image index, which a `FrameIndex`
+/// animation replaces.
+pub(super) fn bake_texture(
+    op: &RenderMethodOptionParameter,
+    rm: Option<&RenderMethodParameter>,
+) -> RenderMethodPostprocessTexture {
+    const FLAG_FILTER: i16 = 0x01;
+    const FLAG_ADDRESS: i16 = 0x02;
+    const FLAG_ADDRESS_X: i16 = 0x04;
+    const FLAG_ADDRESS_Y: i16 = 0x08;
+    const FLAG_EXTERN: i16 = 0x10;
+    const FLAG_COMPARISON: i16 = 0x20;
+
+    let default_address = op.default_address_mode.get();
+    let mut texture = RenderMethodPostprocessTexture {
+        bitmap_path: op.default_bitmap_path.clone(),
+        bitmap_index: 0,
+        address_mode_x: default_address,
+        address_mode_y: default_address,
+        filter_mode: op.default_filter_mode.get(),
+        comparison_function: op.default_comparison_function.get(),
+        extern_texture_mode: None,
+        texture_transform_constant_index: -1,
+        texture_transform_overlay_indices: TagBlockIndex::default(),
+    };
+    if let Some(rm) = rm.filter(|rm| !rm.bitmap_path.is_empty()) {
+        let set = |flag: i16| rm.bitmap_flags & flag != 0;
+        texture.bitmap_path = rm.bitmap_path.clone();
+        texture.bitmap_index = rm.real_parameter as i32 as i16;
+        if set(FLAG_FILTER) {
+            texture.filter_mode = rm.bitmap_filter_mode;
+        }
+        if set(FLAG_COMPARISON) {
+            texture.comparison_function = rm.bitmap_comparison_function;
+        }
+        if set(FLAG_ADDRESS) {
+            texture.address_mode_x = rm.bitmap_address_mode;
+            texture.address_mode_y = rm.bitmap_address_mode;
+        }
+        if set(FLAG_ADDRESS_X) {
+            texture.address_mode_x = rm.bitmap_address_mode_x;
+        }
+        if set(FLAG_ADDRESS_Y) {
+            texture.address_mode_y = rm.bitmap_address_mode_y;
+        }
+        if set(FLAG_EXTERN) {
+            texture.extern_texture_mode = rm.bitmap_extern_mode;
+        }
+        for animated in &rm.animated_parameters {
+            let kind = animated.parameter_type.map(|kind| kind.get());
+            if kind == Some(RenderMethodAnimatedParameterType::FrameIndex) {
+                let value = animated.function.as_ref().map_or(0.0, |f| f.evaluate(0.0, 0.0));
+                texture.bitmap_index = value as i32 as i16;
+            }
+        }
+    }
+    if texture.bitmap_path.is_empty() {
+        texture.bitmap_path = DEFAULT_BITMAP.to_owned();
+    }
+    texture
+}
+
+/// Build one `texture_constant` slot: [`bake_texture`], and where its
+/// transform and animation live.
 fn bake_texture_constant(
     rmsh: &RenderMethod,
     rmop_chain: &[RenderMethodOptionParameter],
@@ -198,9 +297,7 @@ fn bake_texture_constant(
     texture_name: &str,
 ) -> RenderMethodPostprocessTexture {
     let Some(&op_idx) = rmop_idx_by_name.get(texture_name) else {
-        // Texture name not found in any rmop — emit an empty slot
-        // (engine emits a SHADER LINK ERROR but we degrade silently
-        // since blam-tags isn't a tool-side validator).
+        // The engine logs a SHADER LINK ERROR and leaves the slot zeroed.
         return RenderMethodPostprocessTexture {
             bitmap_path: String::new(),
             bitmap_index: 0,
@@ -214,70 +311,15 @@ fn bake_texture_constant(
         };
     };
     let op = &rmop_chain[op_idx];
-    let rm = find_rmsh_override(rmsh, op);
-
-    // `bitmap_flags` per-field override gates (engine bits 0..5).
-    const FLAG_FILTER:     i16 = 0x01;
-    const FLAG_ADDRESS:    i16 = 0x02;
-    const FLAG_ADDRESS_X:  i16 = 0x04;
-    const FLAG_ADDRESS_Y:  i16 = 0x08;
-    const FLAG_COMPARISON: i16 = 0x20;
-    let flags = rm.map(|p| p.bitmap_flags).unwrap_or(0);
-
-    // bitmap_path: rmsh wins when non-empty, else rmop default.
-    let bitmap_path = rm
-        .map(|p| p.bitmap_path.as_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(op.default_bitmap_path.as_str())
-        .to_owned();
-
-    let filter_mode = match rm {
-        Some(p) if flags & FLAG_FILTER != 0 => p.bitmap_filter_mode,
-        _ => op.default_filter_mode.get(),
-    };
-    let address_mode_x = match rm {
-        Some(p) if flags & FLAG_ADDRESS_X != 0 => p.bitmap_address_mode_x,
-        Some(p) if flags & FLAG_ADDRESS    != 0 => p.bitmap_address_mode,
-        _ => op.default_address_mode.get(),
-    };
-    let address_mode_y = match rm {
-        Some(p) if flags & FLAG_ADDRESS_Y != 0 => p.bitmap_address_mode_y,
-        Some(p) if flags & FLAG_ADDRESS    != 0 => p.bitmap_address_mode,
-        _ => op.default_address_mode.get(),
-    };
-    let comparison_function = match rm {
-        Some(p) if flags & FLAG_COMPARISON != 0 => p.bitmap_comparison_function,
-        _ => op.default_comparison_function.get(),
-    };
-    let extern_texture_mode = rm
-        .and_then(|p| p.bitmap_extern_mode)
-        .or_else(|| op.source_extern.map(|e| e.get()).filter(|e| !matches!(e, RenderMethodExtern::None)));
-
-    // texture_transform_constant_index: linear search rmt2.float_constants
-    // for an entry with this texture's name; matching index is the byte
-    // value. 0xFF (-1) means no xform applies (e.g., cubemap parameter).
-    let texture_transform_constant_index: i8 = rmt2_real_param_names
+    let mut texture = bake_texture(op, find_rmsh_override(rmsh, op));
+    // 0xFF (-1) means no xform applies (e.g., cubemap parameter).
+    texture.texture_transform_constant_index = rmt2_real_param_names
         .iter()
         .position(|n| n == texture_name)
         .and_then(|i| i8::try_from(i).ok())
         .unwrap_or(-1);
-
-    // texture_transform_overlay_indices: per-rmop-parameter packed
-    // (start, count) into the postprocess.overlays block. Filled from
-    // the overlay split above.
-    let texture_transform_overlay_indices = overlays.for_rmop_param(op_idx);
-
-    RenderMethodPostprocessTexture {
-        bitmap_path,
-        bitmap_index: 0,
-        address_mode_x,
-        address_mode_y,
-        filter_mode,
-        comparison_function,
-        extern_texture_mode,
-        texture_transform_constant_index,
-        texture_transform_overlay_indices,
-    }
+    texture.texture_transform_overlay_indices = overlays.for_rmop_param(op_idx);
+    texture
 }
 
 // =============================================================================
@@ -316,6 +358,10 @@ fn bake_int_constant(
         return 0;
     };
     let op = &rmop_chain[op_idx];
+    let kind = op.parameter_type.map(|kind| kind.get());
+    if !matches!(kind, Some(RenderMethodParameterType::Int | RenderMethodParameterType::Bool)) {
+        return 0;
+    }
     if let Some(rm) = find_rmsh_override(rmsh, op) {
         rm.int_parameter as u32
     } else {
@@ -335,6 +381,9 @@ fn bake_bool_constant(
         return false;
     };
     let op = &rmop_chain[op_idx];
+    if op.parameter_type.map(|kind| kind.get()) != Some(RenderMethodParameterType::Bool) {
+        return false;
+    }
     if let Some(rm) = find_rmsh_override(rmsh, op) {
         rm.int_parameter != 0
     } else {
@@ -357,7 +406,7 @@ fn bake_bool_constant(
 /// 3: `_query_albedo_base_map_2` → "base_map_m_2"
 /// 4: `_query_albedo_color`     → "albedo_color" (real_constants)
 /// 5: `_query_albedo_base_map_3` → "base_map_m_3"
-/// 6: `_query_alpha_map`        → "alpha_test_map"
+/// 6: `_query_alpha_map`        → "alpha_map"
 /// 7: `_query_pad`              → unused (always -1)
 ///
 /// Multi-name slots (1) handle the rmsh/rmhg "base_map" vs rmtr
@@ -369,7 +418,7 @@ const QUERYABLE_NAMES: [&[&str]; 8] = [
     &["base_map_m_2"],
     &["albedo_color"], // slot 4 — real_constants, not textures
     &["base_map_m_3"],
-    &["alpha_test_map"],
+    &["alpha_map"],
     &[],
 ];
 
@@ -453,21 +502,37 @@ fn canonical_template_path(template_path: &str, rmsh_options: &[i16], category_c
 // blend_mode resolution — sub_140C638C0
 // =============================================================================
 
-/// Resolve the rmsh's chosen `blend_mode` category option name to its
-/// enum index. The engine uses a 14-entry string table (`"opaque"`,
-/// `"additive"`, `"multiply"`, `"alpha_blend"`, ...). We re-derive the
-/// index from the rmdf's category-options ordering — the rmdf's
-/// `blend_mode` category lists its options in the same order as
-/// `e_render_method_blend_mode`.
-fn resolve_blend_mode(rmsh: &RenderMethod, rmdf: &RenderMethodDefinition) -> i32 {
-    let Some(cat_idx) = rmdf
-        .categories
-        .iter()
-        .position(|c| c.category_name == "blend_mode")
-    else {
+/// `blend_mode_from_string`'s table, `e_render_method_blend_mode`'s order.
+pub const BLEND_MODES: [&str; 14] = [
+    "opaque",
+    "additive",
+    "multiply",
+    "alpha_blend",
+    "double_multiply",
+    "pre_multiplied_alpha",
+    "maximum",
+    "multiply_add",
+    "add_src_times_dstalpha",
+    "add_src_times_srcalpha",
+    "inv_alpha_blend",
+    "motion_blur_static",
+    "motion_blur_inhibit",
+    "add_src_times_srcalpha_accum_alpha",
+];
+
+/// The chosen `blend_mode` option as an index into [`BLEND_MODES`], which is
+/// not the option's own index. The engine compares each entry as a prefix, in
+/// order, ignoring case, so the longest name in the table can never match.
+pub fn resolve_blend_mode(rmsh: &RenderMethod, rmdf: &RenderMethodDefinition) -> i32 {
+    let Some(at) = rmdf.categories.iter().position(|c| c.category_name == "blend_mode") else {
         return 0;
     };
-    rmsh.options.get(cat_idx).copied().unwrap_or(0) as i32
+    let option = rmsh.options.get(at).copied().unwrap_or(0);
+    let Some(option) = usize::try_from(option).ok().and_then(|o| rmdf.categories[at].options.get(o)) else {
+        return 0;
+    };
+    let name = option.option_name.to_ascii_lowercase();
+    BLEND_MODES.iter().position(|mode| name.starts_with(mode)).unwrap_or(0) as i32
 }
 
 // =============================================================================
@@ -734,11 +799,11 @@ impl RenderMethod {
         // Phase 2: rmop chain
         let rmop_chain = build_rmop_chain(self, rmdf, load_rmop);
         // Build a name → rmop-chain-index map so each baker can O(1) the lookup.
-        let rmop_idx_by_name: HashMap<&str, usize> = rmop_chain
-            .iter()
-            .enumerate()
-            .map(|(i, p)| (p.parameter_name.as_str(), i))
-            .collect();
+        // `sub_140C51C10` scans from the front, so the first of a name wins.
+        let mut rmop_idx_by_name: HashMap<&str, usize> = HashMap::new();
+        for (i, p) in rmop_chain.iter().enumerate() {
+            rmop_idx_by_name.entry(p.parameter_name.as_str()).or_insert(i);
+        }
 
         // Phase 3: animated overlay split (static-vs-dynamic)
         let overlays = split_animated_parameters(self, &rmop_chain);
@@ -823,6 +888,205 @@ impl RenderMethod {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::types::{RenderMethodBitmapExternMode, RenderMethodDefinitionCategoryOption};
+
+    fn option_parameter(name: &str, kind: RenderMethodParameterType) -> RenderMethodOptionParameter {
+        RenderMethodOptionParameter {
+            default_bitmap_path: "default".to_owned(),
+            default_address_mode: Enum::from_variant(BitmapAddressMode::Clamp),
+            default_bitmap_scale: 16.0,
+            ..category_marker_named(name, kind)
+        }
+    }
+
+    fn category_marker_named(name: &str, kind: RenderMethodParameterType) -> RenderMethodOptionParameter {
+        let category = RenderMethodDefinitionCategory {
+            category_name: name.to_owned(),
+            vertex_function: String::new(),
+            pixel_function: String::new(),
+            options: Vec::new(),
+        };
+        category_marker(&category, kind, 0)
+    }
+
+    fn bitmap_parameter(path: &str, flags: i16) -> RenderMethodParameter {
+        RenderMethodParameter {
+            parameter_name: "base_map".to_owned(),
+            parameter_type: Some(Enum::from_variant(RenderMethodParameterType::Bitmap)),
+            bitmap_path: path.to_owned(),
+            real_parameter: 3.0,
+            int_parameter: 0,
+            color_parameter: Default::default(),
+            bitmap_flags: flags,
+            bitmap_filter_mode: BitmapFilterMode::Point,
+            bitmap_comparison_function: BitmapComparisonFunction::Never,
+            bitmap_address_mode: BitmapAddressMode::Mirror,
+            bitmap_address_mode_x: BitmapAddressMode::BlackBorder,
+            bitmap_address_mode_y: BitmapAddressMode::BlackBorder,
+            bitmap_anisotropy_amount: 0,
+            bitmap_extern_mode: Some(RenderMethodBitmapExternMode::TextureCamera),
+            animated_parameters: Vec::new(),
+        }
+    }
+
+    fn bitmap_option() -> RenderMethodOptionParameter {
+        option_parameter("base_map", RenderMethodParameterType::Bitmap)
+    }
+
+    fn method(options: &[i16]) -> RenderMethod {
+        RenderMethod {
+            definition_path: String::new(),
+            options: options.to_vec(),
+            parameters: Vec::new(),
+            postprocess_definition: None,
+            flags: Default::default(),
+            sort_layer: Default::default(),
+            runtime_flags: Default::default(),
+            custom_fog_setting_index: 0,
+            prediction_atom_index: 0,
+            group_tag: 0,
+            class: Default::default(),
+            material_names: Vec::new(),
+        }
+    }
+
+    fn definition(flags: u32, global: &str, options: &[&[&str]]) -> RenderMethodDefinition {
+        RenderMethodDefinition {
+            global_options_path: global.to_owned(),
+            categories: options
+                .iter()
+                .enumerate()
+                .map(|(at, paths)| RenderMethodDefinitionCategory {
+                    category_name: format!("category{at}"),
+                    vertex_function: String::new(),
+                    pixel_function: String::new(),
+                    options: paths
+                        .iter()
+                        .map(|path| RenderMethodDefinitionCategoryOption {
+                            option_name: path.to_string(),
+                            option_path: path.to_string(),
+                            vertex_function: String::new(),
+                            pixel_function: String::new(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            shared_pixel_shaders_path: String::new(),
+            shared_vertex_shaders_path: String::new(),
+            flags,
+            version: 0,
+        }
+    }
+
+    /// Each path stands for an option declaring one real of that name.
+    fn chain_names(rm: &RenderMethod, rmdf: &RenderMethodDefinition) -> Vec<String> {
+        build_rmop_chain(rm, rmdf, |path| {
+            Some(RenderMethodOption {
+                parameters: vec![option_parameter(path, RenderMethodParameterType::Real)],
+                filter_mode_names: Vec::new(),
+                address_mode_names: Vec::new(),
+            })
+        })
+        .into_iter()
+        .map(|parameter| parameter.parameter_name)
+        .collect()
+    }
+
+    #[test]
+    fn a_parameter_with_no_bitmap_of_its_own_ignores_everything_it_authors() {
+        let rm = bitmap_parameter("", 0x1F);
+        let texture = bake_texture(&bitmap_option(), Some(&rm));
+        assert_eq!(texture.bitmap_path, "default");
+        assert_eq!(texture.bitmap_index, 0);
+        assert_eq!(texture.address_mode_x, BitmapAddressMode::Clamp);
+        assert_eq!(texture.extern_texture_mode, None);
+    }
+
+    #[test]
+    fn a_missing_bitmap_bakes_to_white() {
+        let mut option = bitmap_option();
+        option.default_bitmap_path.clear();
+        assert_eq!(bake_texture(&option, None).bitmap_path, DEFAULT_BITMAP);
+    }
+
+    #[test]
+    fn the_image_index_is_the_real_parameter() {
+        let rm = bitmap_parameter("own", 0);
+        assert_eq!(bake_texture(&bitmap_option(), Some(&rm)).bitmap_index, 3);
+    }
+
+    #[test]
+    fn bit_4_gates_the_extern_mode() {
+        let off = bake_texture(&bitmap_option(), Some(&bitmap_parameter("own", 0x01)));
+        assert_eq!(off.extern_texture_mode, None);
+        assert_eq!(off.bitmap_path, "own");
+        let on = bake_texture(&bitmap_option(), Some(&bitmap_parameter("own", 0x10)));
+        assert_eq!(on.extern_texture_mode, Some(RenderMethodBitmapExternMode::TextureCamera));
+    }
+
+    #[test]
+    fn address_flags_prefer_the_axis_over_the_unified_mode() {
+        let unset = bake_texture(&bitmap_option(), Some(&bitmap_parameter("own", 0)));
+        assert_eq!(unset.address_mode_x, BitmapAddressMode::Clamp);
+        let unified = bake_texture(&bitmap_option(), Some(&bitmap_parameter("own", 0x02)));
+        assert_eq!(unified.address_mode_y, BitmapAddressMode::Mirror);
+        let axis = bake_texture(&bitmap_option(), Some(&bitmap_parameter("own", 0x06)));
+        assert_eq!(axis.address_mode_x, BitmapAddressMode::BlackBorder);
+        assert_eq!(axis.address_mode_y, BitmapAddressMode::Mirror);
+    }
+
+    #[test]
+    fn a_parameter_of_another_type_is_not_an_override() {
+        let mut rm = method(&[]);
+        rm.parameters.push(bitmap_parameter("own", 0));
+        let same = bitmap_option();
+        assert!(find_rmsh_override(&rm, &same).is_some());
+        let other = option_parameter("base_map", RenderMethodParameterType::Real);
+        assert!(find_rmsh_override(&rm, &other).is_none());
+    }
+
+    #[test]
+    fn the_chain_starts_with_global_options() {
+        let names = chain_names(&method(&[0]), &definition(0, "global", &[&["first"]]));
+        assert_eq!(names, ["global", "first"]);
+    }
+
+    #[test]
+    fn a_missing_option_means_the_first_a_bad_one_adds_nothing() {
+        let rmdf = definition(0, "", &[&["a", "b"], &["c"], &["d"]]);
+        assert_eq!(chain_names(&method(&[1, -1]), &rmdf), ["b", "d"]);
+        assert_eq!(chain_names(&method(&[9, 0, 0]), &rmdf), ["c", "d"]);
+    }
+
+    #[test]
+    fn automatic_macros_add_the_category_and_its_bool_when_small() {
+        let rmdf = definition(1, "", &[&["a", "b"], &["c", "d", "e"]]);
+        assert_eq!(
+            chain_names(&method(&[1, 2]), &rmdf),
+            ["b", "category0", "category0", "e", "category1"],
+        );
+        let chain = build_rmop_chain(&method(&[1, 2]), &rmdf, |_| None);
+        assert_eq!(chain[0].default_real_value, 1.0);
+        assert_eq!(chain[1].default_int_bool_value, 1);
+        assert_eq!(chain[2].default_real_value, 2.0);
+        assert_eq!(chain[0].flags, CATEGORY_MARKER);
+    }
+
+    #[test]
+    fn blend_mode_is_the_tables_index_not_the_options() {
+        let mut rmdf = definition(0, "", &[&["opaque", "pre_multiplied_alpha", "ADDITIVE"]]);
+        rmdf.categories[0].category_name = "blend_mode".to_owned();
+        assert_eq!(resolve_blend_mode(&method(&[1]), &rmdf), 5);
+        assert_eq!(resolve_blend_mode(&method(&[2]), &rmdf), 1);
+        assert_eq!(resolve_blend_mode(&method(&[7]), &rmdf), 0);
+    }
+
+    #[test]
+    fn the_longest_blend_mode_matches_as_its_prefix() {
+        let mut rmdf = definition(0, "", &[&["add_src_times_srcalpha_accum_alpha"]]);
+        rmdf.categories[0].category_name = "blend_mode".to_owned();
+        assert_eq!(resolve_blend_mode(&method(&[0]), &rmdf), 9);
+    }
 
     #[test]
     fn block_index_packing_matches_engine() {

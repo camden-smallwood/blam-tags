@@ -45,7 +45,7 @@ mod choices;
 mod types;
 mod walker;
 
-pub use bake::BakeError;
+pub use bake::{resolve_blend_mode, BakeError, BLEND_MODES, DEFAULT_BITMAP};
 pub use choices::{RenderMethodCategoryChoice, RenderMethodChoices};
 pub use cbuffer::{
     compile_real_constant, compile_real_constant_at_time, is_cbuffer_animated,
