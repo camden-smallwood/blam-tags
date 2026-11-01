@@ -142,8 +142,7 @@ pub struct Bitmap<'a> {
     /// tag (`xenon bitmaps[]` + per-image texture resources) rather
     /// than the PC `processed pixel data` blob. Only `dxn` cares:
     /// the two builds disagree about whether its endpoints are signed.
-    x360: bool,    /// Whether images keep every face's top level together; see [`BitmapImage`].
-    top_levels_first: bool,
+    x360: bool,
 }
 
 impl<'a> Bitmap<'a> {
@@ -232,7 +231,6 @@ impl<'a> Bitmap<'a> {
             per_image_mip_override,
             p8_palette,
             x360: use_x360,
-            top_levels_first: tag.classic_engine().is_some(),
         })
     }
 
@@ -289,7 +287,6 @@ impl<'a> Bitmap<'a> {
             mip_override,
             p8_palette: self.p8_palette,
             x360: self.x360,
-            top_levels_first: self.top_levels_first,
         })
     }
 
@@ -299,14 +296,12 @@ impl<'a> Bitmap<'a> {
         let overrides = &self.per_image_mip_override;
         let p8_palette = self.p8_palette;
         let x360 = self.x360;
-        let top_levels_first = self.top_levels_first;
         self.bitmaps.iter().enumerate().map(move |(i, elem)| BitmapImage {
             elem,
             pixels: per_image[i].as_ref(),
             mip_override: overrides[i],
             p8_palette,
             x360,
-            top_levels_first,
         })
     }
 
@@ -814,15 +809,12 @@ pub struct BitmapImage<'a> {
     /// `true` when these pixels came from the tag's Xbox 360 side.
     /// See [`Bitmap::x360`] — it decides how `dxn` endpoints are read.
     x360: bool,
-    /// `true` for Halo CE and Halo 2, which keep every face's top level together
-    /// ahead of the smaller levels, instead of a whole mip chain per face.
-    top_levels_first: bool,
 }
 
-/// Where Halo CE and Halo 2 store each face of [`BitmapImage::cube_face_bytes`]'s
-/// order. Their tools lay a cube out as a ring around the Z-up world:
-/// `+X +Y -X -Y +Z -Z`.
-const CLASSIC_CUBE_FACE_SLOTS: [u32; 6] = [0, 2, 1, 3, 4, 5];
+/// Where a cube stores each face of [`BitmapImage::cube_face_bytes`]'s order.
+/// Each level holds all six, as `bitmap_cube_map_address` reads them, in a ring
+/// around the Z-up world: `+X +Y -X -Y +Z -Z`.
+const CUBE_FACE_SLOTS: [u32; 6] = [0, 2, 1, 3, 4, 5];
 
 impl<'a> BitmapImage<'a> {
     /// Base-mip width in pixels.
@@ -942,18 +934,8 @@ impl<'a> BitmapImage<'a> {
     /// The top level of one cube face, `face` counted in the DirectX order
     /// `+X -X +Y -Y +Z -Z` whatever order the game stores them in.
     pub fn cube_face_bytes(&self, face: u32) -> Result<&'a [u8], BitmapError> {
-        let format = self.format()?;
-        let (width, height) = (self.width(), self.height());
-        let stride = if self.top_levels_first {
-            format.level_bytes(width, height)
-        } else {
-            format.surface_bytes(width, height, self.mipmap_levels())
-        };
-        let slot = if self.top_levels_first {
-            CLASSIC_CUBE_FACE_SLOTS.get(face as usize).copied().unwrap_or(face)
-        } else {
-            face
-        };
+        let stride = self.format()?.level_bytes(self.width(), self.height());
+        let slot = CUBE_FACE_SLOTS.get(face as usize).copied().unwrap_or(face);
         self.level_bytes_at(slot as u64 * stride)
     }
 

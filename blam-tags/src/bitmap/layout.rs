@@ -55,9 +55,9 @@ const CUBE_CROSS_CELLS: [(u32, u32, u32); 6] = [
 const CROSS_BG: [u8; 4] = [0x00, 0x00, 0xFF, 0xFF];
 
 /// Pull mip 0 of layer `layer_index` from a multi-layer bitmap.
-/// Layers in `processed pixel data` are laid out chain-major:
+/// Array layers in `processed pixel data` are laid out chain-major:
 /// each layer holds its full mip chain contiguously, then the next
-/// layer begins.
+/// layer begins. A cube is not; see [`BitmapImage::cube_face_bytes`].
 fn layer_mip0_bytes<'a>(
     image: &BitmapImage<'a>,
     layer_index: u32,

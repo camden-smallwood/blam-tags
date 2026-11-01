@@ -1,7 +1,8 @@
-//! Halo CE and Halo 2 store a cube's six top levels together, as a ring around
-//! the Z-up world, and a volume's slices one after another.
+//! Every engine stores a cube's six top levels together, as a ring around the
+//! Z-up world, and Halo CE and Halo 2 a volume's slices one after another.
 //!
-//! Needs the kits: set `BLAM_TEST_H2EK` and `BLAM_TEST_HCEEK` to their roots.
+//! Needs the kits: set `BLAM_TEST_H2EK`, `BLAM_TEST_HCEEK`, `BLAM_TEST_H3EK` and
+//! `BLAM_TEST_HREK` to their roots.
 
 mod common;
 
@@ -25,6 +26,10 @@ fn load_halo_ce(rel: &str) -> Option<TagFile> {
     read_classic_tag_file(&bytes, layout).ok()
 }
 
+fn load_gen3(env: &str, rel: &str) -> Option<TagFile> {
+    TagFile::read(common::kit(env)?.tags().join(rel)).ok()
+}
+
 /// `+X`'s top row is `+Y`'s right column reversed, so faces in the right
 /// order join there. In storage order this pair is `+X` and `-X`, which share
 /// no edge at all, and a mip-chain stride reads noise.
@@ -41,6 +46,22 @@ fn cube_faces_come_back_in_directx_order_and_join() {
 fn halo_ce_cube_faces_come_back_in_directx_order_and_join() {
     let Some(tag) = load_halo_ce("characters/cyborg/bitmaps/cubemap mirror surface.bitmap") else {
         eprintln!("skipping: BLAM_TEST_HCEEK is not set");
+        return;
+    };
+    assert_faces_join(&tag);
+}
+
+#[test]
+fn halo_3_cube_faces_come_back_in_directx_order_and_join() {
+    let Some(tag) = load_gen3("BLAM_TEST_H3EK", "levels/dlc/armory/armory_armory_cubemaps.bitmap") else {
+        return;
+    };
+    assert_faces_join(&tag);
+}
+
+#[test]
+fn halo_reach_cube_faces_come_back_in_directx_order_and_join() {
+    let Some(tag) = load_gen3("BLAM_TEST_HREK", "levels/dlc/cex_beaver_creek/cex_beaver_creek_cex_beaver_creek_cubemaps.bitmap") else {
         return;
     };
     assert_faces_join(&tag);
