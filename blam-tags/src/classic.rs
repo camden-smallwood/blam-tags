@@ -1434,6 +1434,71 @@ mod tests {
     /// Run with:
     ///   H2_TAGS=~/Halo/halo2_mcc/tags H2_DEFS=<definitions>/halo2_mcc \
     ///     cargo test legacy_string_tag -- --ignored
+    /// A property's `mapping_function` is stored at the version its own header
+    /// names: on these tags the older 32 bytes, where the layout allows 12.
+    /// Everything after the first property has to be found past that, and
+    /// writing to one must not reach into the next.
+    ///
+    /// Run with `H2_TAGS` and `H2_DEFS`, as above.
+    #[test]
+    #[ignore = "requires a loose Halo 2 tag tree; set H2_TAGS and H2_DEFS"]
+    fn an_inline_struct_of_an_older_version_moves_what_follows_it() {
+        let (Ok(tags), Ok(defs)) = (std::env::var("H2_TAGS"), std::env::var("H2_DEFS")) else {
+            eprintln!("skipping: set H2_TAGS and H2_DEFS");
+            return;
+        };
+        let definition = std::path::PathBuf::from(defs).join("particle.json");
+        let mut files = Vec::new();
+        let mut folders = vec![std::path::PathBuf::from(&tags)];
+        while let Some(folder) = folders.pop() {
+            for entry in std::fs::read_dir(folder).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    folders.push(path);
+                } else if path.extension().is_some_and(|extension| extension == "particle") {
+                    files.push(path);
+                }
+            }
+        }
+        assert!(files.len() > 200, "{} particles", files.len());
+        let mut older = 0;
+        for path in &files {
+            let bytes = std::fs::read(path).unwrap();
+            let layout = crate::TagLayout::from_json(&definition).unwrap();
+            let tag = super::read_classic_tag_file(&bytes, layout).unwrap();
+            for name in ["color", "alpha", "scale", "rotation", "frame index"] {
+                let mapping = tag.root().descend(name).and_then(|property| property.descend("Mapping")).unwrap();
+                if let Some(kind) = mapping.read_int_any("Function Type") {
+                    older += 1;
+                    assert!((0..=10).contains(&kind), "{}: {name} is function type {kind}", path.display());
+                }
+            }
+            assert_eq!(tag.write_to_bytes().unwrap(), bytes, "{} changed", path.display());
+        }
+        assert!(older > 500, "only {older} older properties: this proves nothing");
+
+        let path = std::path::PathBuf::from(&tags).join("effects/generic/fires/fire_bits.particle");
+        let bytes = std::fs::read(path).unwrap();
+        let layout = crate::TagLayout::from_json(&definition).unwrap();
+        let mut tag = super::read_classic_tag_file(&bytes, layout).unwrap();
+        let kind = |tag: &crate::TagFile, name: &str| {
+            tag.root().descend(name).unwrap().descend("Mapping").unwrap().read_int_any("Function Type").unwrap()
+        };
+        let color = kind(&tag, "color");
+        assert_eq!((color, kind(&tag, "alpha")), (5, 7));
+        tag.root_mut()
+            .field_path_mut("alpha/Mapping/Function Type")
+            .unwrap()
+            .set(crate::TagFieldData::CharInteger(3))
+            .unwrap();
+        let written = tag.write_to_bytes().unwrap();
+        let layout = crate::TagLayout::from_json(&definition).unwrap();
+        let read = super::read_classic_tag_file(&written, layout).unwrap();
+        assert_eq!((kind(&read, "color"), kind(&read, "alpha")), (color, 3));
+        let body = written[64..].iter().zip(&bytes[64..]);
+        assert_eq!(body.filter(|(a, b)| a != b).count(), 1, "one byte, in its place");
+    }
+
     #[test]
     #[ignore = "requires a loose Halo 2 tag tree; set H2_TAGS and H2_DEFS"]
     fn legacy_string_tag_reads_its_names_and_the_fields_after_them() {

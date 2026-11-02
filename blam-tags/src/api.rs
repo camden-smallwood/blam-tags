@@ -810,7 +810,7 @@ impl<'a> TagField<'a> {
         let array_layout_index = field.definition;
         let array_def = &self.layout.array_layouts[array_layout_index as usize];
         let element_size = self.layout.struct_layouts[array_def.struct_index as usize].size;
-        let start = field.offset as usize;
+        let start = self.struct_data.field_offset(self.layout, self.field_index);
         // A truncated (clamped) parent element may not carry the full
         // array — clamp to what's present (fully-absent → None). Element
         // accessors bounds-check against this slice.
@@ -1704,7 +1704,7 @@ impl<'a> TagFieldMut<'a> {
         let array_layout_index = field.definition;
         let array_def = &self.layout.array_layouts[array_layout_index as usize];
         let element_size = self.layout.struct_layouts[array_def.struct_index as usize].size;
-        let start = field.offset as usize;
+        let start = self.struct_data.field_offset(self.layout, self.field_index);
 
         let field_index = self.field_index;
         let elements = self

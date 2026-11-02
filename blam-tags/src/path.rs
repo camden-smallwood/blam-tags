@@ -198,11 +198,17 @@ fn plan_step(
         TagFieldType::Struct => {
             // A truncated (clamped) element can end partway through an inline
             // struct, or before it: take what is there.
-            let offset = field.offset as usize;
+            let offset = current_struct.field_offset(layout, field_index);
             if offset >= raw_len {
                 return None;
             }
-            let size = layout.struct_layouts[field.definition as usize].size;
+            let nested = current_struct.sub_chunks.iter().find_map(|entry| match &entry.content {
+                TagSubChunkContent::Struct(nested) if entry.field_index == Some(field_index as u32) => Some(nested),
+                _ => None,
+            });
+            let size = nested.map_or(layout.struct_layouts[field.definition as usize].size, |nested| {
+                nested.stored_size(layout)
+            });
             Step::Struct { field_index, range: offset..(offset + size).min(raw_len) }
         }
         TagFieldType::Block => {
@@ -228,7 +234,7 @@ fn plan_step(
         TagFieldType::Array => {
             let array_def = &layout.array_layouts[field.definition as usize];
             let element_size = layout.struct_layouts[array_def.struct_index as usize].size;
-            let start = field.offset as usize + element * element_size;
+            let start = current_struct.field_offset(layout, field_index) + element * element_size;
             let end = start + element_size;
             if end > raw_len {
                 return None;

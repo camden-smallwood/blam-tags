@@ -690,13 +690,53 @@ impl TagStructData {
         field_index: usize,
         endian: Endian,
     ) -> Option<TagFieldData> {
-        let field = &layout.fields[field_index];
+        let field = self.placed_field(layout, field_index);
         let sub_chunk = self
             .sub_chunks
             .iter()
             .find(|entry| entry.field_index == Some(field_index as u32))
             .map(|entry| &entry.content);
-        deserialize_field(layout, field, struct_raw, sub_chunk, endian)
+        deserialize_field(layout, &field, struct_raw, sub_chunk, endian)
+    }
+
+    /// A field with `offset` where it really lies in this struct's bytes.
+    fn placed_field(&self, layout: &TagLayout, field_index: usize) -> TagFieldLayout {
+        TagFieldLayout { offset: self.field_offset(layout, field_index) as u32, ..layout.fields[field_index].clone() }
+    }
+
+    /// Where a field lies in this struct's bytes. The layout's offsets assume
+    /// every inline struct is the version it sizes, but a tagged one carries
+    /// its own in a header, and an older Halo 2 tag stores the older size: a
+    /// `mapping_function` of 32 bytes where the layout allows 12.
+    pub(crate) fn field_offset(&self, layout: &TagLayout, field_index: usize) -> usize {
+        let offset = layout.fields[field_index].offset as usize;
+        offset.saturating_add_signed(self.inline_growth(layout, field_index))
+    }
+
+    /// This struct's bytes as stored, its inline structs' versions included.
+    pub(crate) fn stored_size(&self, layout: &TagLayout) -> usize {
+        let size = layout.struct_layouts[self.struct_index as usize].size;
+        size.saturating_add_signed(self.inline_growth(layout, usize::MAX))
+    }
+
+    /// How much further on the inline structs ahead of `field_index` end up
+    /// than the layout has them.
+    fn inline_growth(&self, layout: &TagLayout, field_index: usize) -> isize {
+        let mut growth = 0;
+        for entry in &self.sub_chunks {
+            let (Some(at), TagSubChunkContent::Struct(nested)) = (entry.field_index, &entry.content) else {
+                continue;
+            };
+            if (at as usize) < field_index {
+                // A tagged struct is sized as its latest, any other as what
+                // it is; see `inline_struct_static_index`.
+                let definition = layout.fields[at as usize].definition as usize;
+                let tagged = layout.struct_tags.get(definition).is_some_and(|tag| *tag != 0);
+                let sized = if tagged { definition } else { nested.struct_index as usize };
+                growth += nested.stored_size(layout) as isize - layout.struct_layouts[sized].size as isize;
+            }
+        }
+        growth
     }
 
     /// Write `value` back to this struct.
@@ -715,7 +755,7 @@ impl TagStructData {
         value: TagFieldData,
         endian: Endian,
     ) -> Result<(), TagSetError> {
-        let field = &layout.fields[field_index];
+        let field = &self.placed_field(layout, field_index);
         let size = layout.field_types.get(field.type_index as usize).map_or(0, |t| t.size as usize);
         // A classic legacy `old string id` is 32 inline bytes with no
         // sub-chunk (see `deserialize_field`).
@@ -947,8 +987,8 @@ impl TagStructData {
             TagSubChunkContent::Struct(s) => s,
             _ => return None,
         };
-        let nested_size = layout.struct_layouts[nested.struct_index as usize].size;
-        let offset = field.offset as usize;
+        let nested_size = nested.stored_size(layout);
+        let offset = self.field_offset(layout, field_index);
         // A truncated (clamped) parent element may not carry this inline
         // struct's full bytes (or any of them). Clamp the sub-slice to
         // what's present — fully-absent → None, partially-present → the
@@ -974,7 +1014,7 @@ impl TagStructData {
             return None;
         }
         // Pre-compute sizing before borrowing sub_chunks mutably.
-        let offset = field.offset as usize;
+        let offset = self.field_offset(layout, field_index);
 
         let entry = self
             .sub_chunks
@@ -984,7 +1024,7 @@ impl TagStructData {
             TagSubChunkContent::Struct(s) => s,
             _ => return None,
         };
-        let nested_size = layout.struct_layouts[nested.struct_index as usize].size;
+        let nested_size = nested.stored_size(layout);
         // Same truncated-element clamp as the read-path `nested_struct`.
         if offset >= element_raw.len() {
             return None;
