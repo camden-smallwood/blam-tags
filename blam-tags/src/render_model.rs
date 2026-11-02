@@ -2988,7 +2988,8 @@ where
                                 index_count: c as u32,
                             });
                         }
-                        if start != usize::MAX {
+                        // Tags from before subparts were filled leave them zeroed.
+                        if start != usize::MAX && total > 0 {
                             index_start = start as u32;
                             index_count = total as u32;
                             from_subparts = true;
@@ -3048,7 +3049,8 @@ where
                                 index_count: indices.len() as u32 - index_start,
                             });
                         }
-                        used_subparts = true;
+                        // Tags from before subparts were filled leave them zeroed.
+                        used_subparts = indices.len() as u32 > part_index_start;
                     }
                 }
                 if !used_subparts {
