@@ -834,6 +834,8 @@ pub enum RenderMethodBitmapExternMode {
     Mirror,
     Refraction,
     Scope,
+    /// ODST's: the surface a `shader_screen` is drawn over.
+    Screen,
 }
 
 impl RenderMethodBitmapExternMode {
@@ -845,6 +847,7 @@ impl RenderMethodBitmapExternMode {
             3 => Some(Self::Mirror),
             4 => Some(Self::Refraction),
             5 => Some(Self::Scope),
+            6 => Some(Self::Screen),
             _ => None,
         }
     }
