@@ -1002,12 +1002,13 @@ fn build_layout_from_schema(
         i
     };
 
-    // Build custom_block_index_search_names_offsets — one entry per
-    // *distinct* search-name string seen on custom_*_block_index
-    // fields. Fields' `definition` becomes the index into here.
-    // (Our JSON doesn't currently carry search names, so this stays
-    // empty unless the dumper starts emitting them.)
-    let custom_block_index_search_names_offsets: Vec<u32> = Vec::new();
+    // custom_block_index_search_names_offsets — one entry per *distinct*
+    // search-definition name on the custom_*_block_index fields, filled as
+    // the fields are emitted; each field's `definition` is its index here.
+    // Tool and Guerilla match these names against their own search
+    // definitions: an empty table makes them fail `valid_index` reading the
+    // layout, and a wrong name drops the field's value.
+    let mut custom_block_index_search_names_offsets: Vec<u32> = Vec::new();
 
     // Build data_definition_name_offsets from `datas` keys.
     let data_definition_name_offsets: Vec<u32> = schema
@@ -1146,6 +1147,21 @@ fn build_layout_from_schema(
 
             let definition = if explanation {
                 0
+            } else if let (
+                TagFieldType::CustomCharBlockIndex
+                | TagFieldType::CustomShortBlockIndex
+                | TagFieldType::CustomLongBlockIndex,
+                Some(search),
+            ) = (ty, field.definition.as_str())
+            {
+                let offset = strings.intern(search);
+                match custom_block_index_search_names_offsets.iter().position(|&o| o == offset) {
+                    Some(index) => index as u32,
+                    None => {
+                        custom_block_index_search_names_offsets.push(offset);
+                        custom_block_index_search_names_offsets.len() as u32 - 1
+                    }
+                }
             } else {
                 resolve_field_definition(field, info.ty, &schema)?
             };
@@ -2319,6 +2335,90 @@ mod tests {
         let first = TagLayout::from_json("../definitions/halo4_mcc/particle.json").unwrap();
         let second = TagLayout::from_json("../definitions/halo4_mcc/particle.json").unwrap();
         assert_ne!(first.guid, second.guid);
+    }
+
+    /// The custom block index fields of `layout`, as (struct, field, search name).
+    fn custom_block_index_search_names(layout: &TagLayout) -> Vec<(String, String, Option<String>)> {
+        let mut out = Vec::new();
+        for structure in &layout.struct_layouts {
+            let mut index = structure.first_field_index as usize;
+            while layout.fields[index].field_type != TagFieldType::Terminator {
+                let field = &layout.fields[index];
+                if matches!(
+                    field.field_type,
+                    TagFieldType::CustomCharBlockIndex
+                        | TagFieldType::CustomShortBlockIndex
+                        | TagFieldType::CustomLongBlockIndex
+                ) {
+                    let search = layout
+                        .custom_block_index_search_names_offsets
+                        .get(field.definition as usize)
+                        .and_then(|&offset| layout.get_string(offset))
+                        .map(str::to_owned);
+                    out.push((
+                        layout.get_string(structure.name_offset).unwrap_or_default().to_owned(),
+                        layout.get_string(field.name_offset).unwrap_or_default().to_owned(),
+                        search,
+                    ));
+                }
+                index += 1;
+            }
+        }
+        out
+    }
+
+    /// A custom block index names the engine's search definition for it.
+    ///
+    /// Halo 3's tool refused a `model` Baboon created — `valid_index(index)`
+    /// reading the layout's fields — where the same tag from Guerilla ran PRT.
+    /// The only difference was this table: Guerilla writes
+    /// `damage_section_search_definition` and points the model's three damage
+    /// section indices at it; a layout built from the schema wrote no names
+    /// and index 0 for all three.
+    #[test]
+    fn custom_block_indices_name_the_search_the_kit_writes() {
+        let layout = TagLayout::from_json("../definitions/halo3_mcc/model.json").unwrap();
+        let names: Vec<_> = layout
+            .custom_block_index_search_names_offsets
+            .iter()
+            .map(|&offset| layout.get_string(offset).unwrap())
+            .collect();
+        assert_eq!(names, ["damage_section_search_definition"]);
+        let fields = custom_block_index_search_names(&layout);
+        assert_eq!(fields.len(), 3, "{fields:?}");
+        for (structure, field, search) in fields {
+            assert_eq!(
+                search.as_deref(),
+                Some("damage_section_search_definition"),
+                "{structure}/{field}"
+            );
+        }
+    }
+
+    /// Every custom block index in the games whose definitions carry search
+    /// names resolves to one, so no generated layout has an index into an
+    /// empty or short table.
+    #[test]
+    fn every_custom_block_index_has_a_search_name() {
+        for game in ["halo3_mcc", "halo3odst_mcc", "haloreach_mcc", "halo4_mcc", "halo2amp_mcc"] {
+            let mut checked = 0;
+            for entry in std::fs::read_dir(format!("../definitions/{game}")).unwrap() {
+                let path = entry.unwrap().path();
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if !name.ends_with(".json") || name.starts_with('_') {
+                    continue;
+                }
+                if !std::fs::read_to_string(&path).unwrap().contains("custom_") {
+                    continue;
+                }
+                let layout = TagLayout::from_json(&path).unwrap();
+                for (structure, field, search) in custom_block_index_search_names(&layout) {
+                    assert!(search.is_some(), "{game}/{name}: {structure}/{field} has no search name");
+                    checked += 1;
+                }
+            }
+            assert!(checked > 0, "{game} has no custom block indices");
+        }
     }
 
     /// A cached layout is rebuilt once its definition changes on disk.
