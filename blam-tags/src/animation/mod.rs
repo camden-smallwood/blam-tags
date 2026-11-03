@@ -26,7 +26,7 @@ pub mod jma;
 pub mod name;
 pub mod pose;
 
-pub use codec::Codec;
+pub use codec::{decode_extended_block, Codec, ExtendedChannel};
 pub use graph::{
     AnimationGraph, GraphAction, GraphActionAnimation, GraphMode, GraphSet, GraphTransition,
     GraphWeaponClass, GraphWeaponType,
@@ -60,6 +60,11 @@ pub enum AnimationError {
     /// end. Common cause: the codec header's offsets disagree with
     /// the engine's actual layout.
     TruncatedPayload { codec: Codec, want_end: usize, blob_size: usize },
+    /// An extended block section (`ik_chain_*`) packed by a codec other
+    /// than the curve streams this reads.
+    UnsupportedExtendedCodec(u8),
+    /// An extended block entry whose stream tag is none of `R`, `T`, `S`.
+    UnknownExtendedChannel(u8),
 }
 
 impl std::fmt::Display for AnimationError {
@@ -73,6 +78,8 @@ impl std::fmt::Display for AnimationError {
                 write!(f, "{codec:?} header: need {want} bytes, blob has {have}"),
             Self::TruncatedPayload { codec, want_end, blob_size } =>
                 write!(f, "{codec:?} payload: slice ends at {want_end} but blob is {blob_size} bytes"),
+            Self::UnsupportedExtendedCodec(codec) => write!(f, "extended block codec {codec} not yet supported"),
+            Self::UnknownExtendedChannel(tag) => write!(f, "extended block entry tagged 0x{tag:02x}, not R, T or S"),
         }
     }
 }
@@ -229,6 +236,23 @@ pub struct AnimationGroup<'a> {
 }
 
 impl<'a> AnimationGroup<'a> {
+    /// One section of a Reach-style blob, by its `data sizes` name
+    /// (`blend_screen_data`, `ik_chain_event_data`, ...): the sections lie in
+    /// the struct's order, each starting where those before it end
+    /// (`c_animation_data_sizes::get_data_offset`). None when it is empty.
+    pub fn data_section(&self, name: &str) -> Option<&'a [u8]> {
+        let sizes = self.data_sizes.as_ref()?;
+        let mut offset = 0usize;
+        for (field, size) in &sizes.fields {
+            let size = usize::try_from(*size).ok()?;
+            if field == name {
+                return (size > 0).then(|| self.blob.get(offset..offset + size)).flatten();
+            }
+            offset += size;
+        }
+        None
+    }
+
     /// A group standing for nothing but a blob, so it can be decoded on its own.
     ///
     /// The converter uses this to read a 360 animation back after turning it

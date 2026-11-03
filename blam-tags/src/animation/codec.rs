@@ -1143,6 +1143,53 @@ fn decode_curve_inner(
     Ok(AnimationTracks { codec, frame_count, rotations, translations, scales })
 }
 
+/// One entry of an extended block section (`s_extended_block_data_header`,
+/// the `ik_chain_*` sections): a single component, sampled per frame. An
+/// orientation spans three entries, rotation then translation then scale.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExtendedChannel {
+    Rotation(Vec<RealQuaternion>),
+    Translation(Vec<RealPoint3d>),
+    /// A scale or a lone float (an effector weight).
+    Scalar(Vec<f32>),
+}
+
+/// An extended block section's entries, decoded per frame. The header is a
+/// codec byte, the entry count, then the offsets of an `i16` frame count and
+/// an `i32` stream offset per entry; codec 1 entries are the curve codec's
+/// own keyed streams, told apart by their first byte (`R`, `T`, `S`).
+pub fn decode_extended_block(section: &[u8]) -> Result<Vec<ExtendedChannel>, AnimationError> {
+    let mut c = Cursor::new(section);
+    let codec = c.read_u8()?;
+    let count = c.read_u8()? as usize;
+    c.read_u16()?;
+    let frame_counts = c.read_u32()? as usize;
+    let offsets = c.read_u32()? as usize;
+    if codec != 1 {
+        return Err(AnimationError::UnsupportedExtendedCodec(codec));
+    }
+    let mut channels = Vec::with_capacity(count);
+    for entry in 0..count {
+        c.seek(frame_counts + 2 * entry)?;
+        let frames = c.read_s16()?.max(0) as usize;
+        c.seek(offsets + 4 * entry)?;
+        let at = c.read_u32()? as usize;
+        c.seek(at)?;
+        let tag = *section.get(at).ok_or(AnimationError::TruncatedPayload {
+            codec: Codec::Curve,
+            want_end: at + 1,
+            blob_size: section.len(),
+        })?;
+        channels.push(match tag {
+            b'R' => ExtendedChannel::Rotation(read_curve_rotation_node(&mut c, frames, false)?),
+            b'T' => ExtendedChannel::Translation(read_curve_translation_node(&mut c, frames)?),
+            b'S' => ExtendedChannel::Scalar(read_curve_scale_node(&mut c, frames)?),
+            other => return Err(AnimationError::UnknownExtendedChannel(other)),
+        });
+    }
+    Ok(channels)
+}
+
 fn read_curve_rotation_node(c: &mut Cursor<'_>, frames: usize, revised: bool) -> Result<Vec<RealQuaternion>, AnimationError> {
     // Two bytes, not a word. The decoder has no use for either, so nothing
     // ever checked their width -- and the kit's own copy of the same
