@@ -47,6 +47,10 @@ pub enum GlobalRenderMethodFlags {
     #[strum(serialize = "don't fog me")] DontFogMe = 0,
     #[strum(serialize = "use custom setting")] UseCustomSetting = 1,
     #[strum(serialize = "calculate Z camera")] CalculateZCamera = 2,
+    // Reach: `render_model_postprocess` makes a part of a material with the
+    // first a shield's only by the second, which the normal passes skip.
+    #[strum(serialize = "never render for shields")] NeverRenderForShields = 3,
+    #[strum(serialize = "only render for shields")] OnlyRenderForShields = 4,
 }
 
 /// `global_sort_layer_enum_defintion` (char_enum, schema `sort layer*`).
