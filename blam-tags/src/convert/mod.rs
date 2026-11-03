@@ -2875,7 +2875,7 @@ fn build_target_from_definitions(schema_path: &Path, allow_template_hole: bool) 
             return None;
         }
         let mut target = TagFile::new(schema_path).ok()?;
-        crate::api::default_new_element_block_indices(target.root_mut());
+        crate::api::default_new_element_fields(target.root_mut());
         Some(target)
     })
     .ok()
@@ -4083,7 +4083,7 @@ fn create_companion_tag(
                 schema.display()
             )
         })?;
-        crate::api::default_new_element_block_indices(tag.root_mut());
+        crate::api::default_new_element_fields(tag.root_mut());
         (tag, None)
     };
     apply_editing_kit_mcc_header(&mut tag, context.target_game)?;
@@ -6843,14 +6843,16 @@ fn value_is_meaningful(value: TagFieldData) -> bool {
         TagFieldData::ByteFlags { value, .. } | TagFieldData::ByteBlockFlags(value) => value != 0,
         TagFieldData::WordFlags { value, .. } | TagFieldData::WordBlockFlags(value) => value != 0,
         TagFieldData::LongFlags { value, .. } | TagFieldData::LongBlockFlags(value) => value != 0,
+        // An index's unset value is NONE, which is what a new element holds;
+        // 0 names the target's first element, so it is as authored as any.
         TagFieldData::CharBlockIndex(value) | TagFieldData::CustomCharBlockIndex(value) => {
-            value != 0
+            value != -1
         }
         TagFieldData::ShortBlockIndex(value) | TagFieldData::CustomShortBlockIndex(value) => {
-            value != 0
+            value != -1
         }
         TagFieldData::LongBlockIndex(value) | TagFieldData::CustomLongBlockIndex(value) => {
-            value != 0
+            value != -1
         }
         TagFieldData::Angle(value)
         | TagFieldData::Real(value)
@@ -8986,6 +8988,9 @@ mod tests {
             }
         )));
         assert!(!value_is_meaningful(TagFieldData::Data(Vec::new())));
+        assert!(!value_is_meaningful(TagFieldData::ShortBlockIndex(-1)));
+        assert!(!value_is_meaningful(TagFieldData::CustomCharBlockIndex(-1)));
+        assert!(value_is_meaningful(TagFieldData::LongBlockIndex(0)));
     }
 
     #[test]
@@ -9182,7 +9187,7 @@ mod tests {
         let mut responses = responses_field.as_block_mut().unwrap();
         let response_index = responses.add_element();
         let response = responses.element_mut(response_index).unwrap();
-        crate::api::default_new_element_block_indices(response);
+        crate::api::default_new_element_fields(response);
         let mut response = responses.element_mut(response_index).unwrap();
         let response_type = field_ordinal_by_key(response.as_ref(), "response type").unwrap();
         response

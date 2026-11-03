@@ -196,8 +196,8 @@ impl TagFile {
     ///   schema, `signature = b"BLAM"`, and everything else zeroed
     ///   (pad, build_version, build_number, version, checksum).
     /// - A `tag!` stream whose layout matches the schema and whose
-    ///   root block contains one zero-filled default element (nested
-    ///   blocks empty, tag_references null, string_ids empty,
+    ///   root block contains one default element (nested blocks empty,
+    ///   block indices and tag_references NONE, string_ids empty,
     ///   api_interops reset).
     /// - No `want` / `info` streams.
     ///
@@ -237,6 +237,9 @@ impl TagFile {
             import_info_stream: None,
             asset_depot_storage_stream: None,
         };
+        // The root element is a new element like any other: Guerilla's has its
+        // block indices and empty references at NONE, not the zero-fill.
+        crate::api::default_new_element_fields(tag.root_mut());
         // Stamp the generation the profile's kit expects. The header's `version`
         // has to agree with the one the embedded layout carries — the engine
         // accepts an identifier only when exactly one of "build is -1" and "guid

@@ -1917,6 +1917,57 @@ mod new_element_block_index_default_tests {
             "pills[0]/base/phantom (inside inline `base` struct) should default to NONE, not 0",
         );
     }
+
+    /// The raw 16 bytes of every tag reference directly in `element`.
+    fn references(layout: &crate::TagLayout, element: crate::TagStruct<'_>) -> Vec<(String, [u8; 16])> {
+        let structure = layout
+            .struct_layouts
+            .iter()
+            .find(|s| layout.get_string(s.name_offset) == Some(element.name()))
+            .unwrap();
+        let mut out = Vec::new();
+        let mut index = structure.first_field_index as usize;
+        while layout.fields[index].field_type != crate::TagFieldType::Terminator {
+            let field = &layout.fields[index];
+            if field.field_type == crate::TagFieldType::TagReference {
+                let at = field.offset as usize;
+                out.push((
+                    layout.get_string(field.name_offset).unwrap_or_default().to_owned(),
+                    element.raw()[at..at + 16].try_into().unwrap(),
+                ));
+            }
+            index += 1;
+        }
+        out
+    }
+
+    /// An empty reference is group `NONE` and index `NONE`, as Guerilla
+    /// writes it, in a new tag's root element and in an added element alike.
+    /// The zero-fill put group 0 there — loadable, since the reader takes the
+    /// group from the `tgrf` sub-chunk, but not the tag Guerilla makes.
+    #[test]
+    fn new_tag_references_are_the_engines_empty_reference() {
+        const EMPTY: [u8; 16] = [0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF];
+        let path = definition("halo3_mcc", "model");
+        let layout = crate::TagLayout::from_json(&path).unwrap();
+        let mut tag = TagFile::new(&path).unwrap();
+        {
+            let mut root = tag.root_mut();
+            let mut parameters = root.field_path_mut("scenario load parameters").unwrap();
+            parameters.as_block_mut().unwrap().add_element();
+        }
+        let bytes = tag.write_to_bytes().unwrap();
+        for tag in [tag, TagFile::read_from_bytes(&bytes).unwrap()] {
+            let root = references(&layout, tag.root());
+            assert_eq!(root.len(), 9, "{root:?}");
+            let parameters = tag.root().field_path("scenario load parameters").unwrap();
+            let added = references(&layout, parameters.as_block().unwrap().element(0).unwrap());
+            assert_eq!(added.len(), 1, "{added:?}");
+            for (name, raw) in root.iter().chain(&added) {
+                assert_eq!(*raw, EMPTY, "{name}");
+            }
+        }
+    }
 }
 
 /// An orphan empty `tgst` — the chunk of a zero-byte struct the persisted

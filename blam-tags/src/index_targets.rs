@@ -200,8 +200,8 @@ impl IndexTargets {
     }
 
     /// [`resolve`](Self::resolve) for a caller already holding the field and
-    /// its struct, as a walk over a whole tag does. Declared targets need no
-    /// descent from the root, and their paths keep `holder_path`'s spelling.
+    /// its struct, as a walk over a whole tag does. Declared targets keep
+    /// `holder_path`'s spelling.
     pub fn resolve_field(
         &self,
         root: TagStruct<'_>,
@@ -212,7 +212,7 @@ impl IndexTargets {
         if self.annotation(holder, field).is_some() {
             return self.resolve(root, &join(holder_path, &segment(field)));
         }
-        declared_target(root, holder, holder_path, field)
+        declared_target(root, holder_path, field)
     }
 
     /// Whether `holder`'s `field` has an `index_target` rule. Without one, its
@@ -292,16 +292,20 @@ impl IndexTargets {
                 }
             };
         }
-        let target = declared_target(root, holder, holder_path, field)?;
+        let target = declared_target(root, holder_path, field)?;
         block_at(root, &target.path)
     }
 }
 
-/// The first block of a field's declared definition in its holder or nearest
-/// ancestor, with the path prefixed by `holder_path` as given.
+/// A declared index or flags field's target block, found the way the engine's
+/// `c_tag_block_resolver::find_block_recursive` finds it: try each block
+/// element enclosing the field, innermost first, then the root. In each, look
+/// at every field the element holds inline, including those of its inline
+/// structs and every entry of its inline arrays, but none in child blocks.
+/// When several blocks of the definition match there, the engine keeps the
+/// last one. Paths keep `holder_path`'s spelling.
 fn declared_target(
     root: TagStruct<'_>,
-    holder: TagStruct<'_>,
     holder_path: &str,
     field: TagField<'_>,
 ) -> Option<IndexTarget> {
@@ -309,28 +313,60 @@ fn declared_target(
     let target = definition
         .block_index_target()
         .or_else(|| definition.block_flags_target())?;
-    let mut current = holder_path;
-    let mut holder = holder;
-    loop {
-        if let Some(field) = holder.fields_all().find(|f| {
-            f.as_block()
-                .is_some_and(|b| b.definition().name() == target.name())
-        }) {
-            return Some(IndexTarget {
-                path: join(current, &segment(field)),
-                len: field.as_block()?.len(),
-            });
-        }
-        if current.is_empty() {
-            return None;
-        }
-        current = current.rsplit_once('/').map_or("", |(parent, _)| parent);
-        holder = if current.is_empty() {
+    let name = target.name();
+    let ends = holder_path
+        .match_indices('/')
+        .map(|(i, _)| i)
+        .chain(std::iter::once(holder_path.len()));
+    // Outermost first: the root, then each enclosing block element.
+    let elements: Vec<&str> = std::iter::once("")
+        .chain(
+            ends.map(|end| &holder_path[..end])
+                .filter(|path| is_block_element(root, path)),
+        )
+        .collect();
+    elements.into_iter().rev().find_map(|path| {
+        let element = if path.is_empty() {
             root
         } else {
-            root.descend(current)?
+            root.descend(path)?
         };
+        last_inline_block(element, path, name)
+    })
+}
+
+/// Whether `path` names an entry of a block, not of an inline array.
+fn is_block_element(root: TagStruct<'_>, path: &str) -> bool {
+    path.strip_suffix(']')
+        .and_then(|path| path.rsplit_once('['))
+        .and_then(|(field, _)| root.field_path(field))
+        .is_some_and(|field| field.as_block().is_some())
+}
+
+/// The last block of `definition` among the fields `element` holds inline.
+fn last_inline_block(element: TagStruct<'_>, path: &str, definition: &str) -> Option<IndexTarget> {
+    let mut found = None;
+    for field in element.fields_all() {
+        if let Some(block) = field.as_block() {
+            if block.definition().name() == definition {
+                found = Some(IndexTarget {
+                    path: join(path, &segment(field)),
+                    len: block.len(),
+                });
+            }
+        } else if let Some(inner) = field.as_struct() {
+            found = last_inline_block(inner, &join(path, &segment(field)), definition).or(found);
+        } else if let Some(array) = field.as_array() {
+            let field_path = join(path, &segment(field));
+            for index in 0..array.len() {
+                if let Some(entry) = array.element(index) {
+                    found = last_inline_block(entry, &format!("{field_path}[{index}]"), definition)
+                        .or(found);
+                }
+            }
+        }
     }
+    found
 }
 
 impl Rule {
@@ -482,6 +518,7 @@ mod tests {
                         "block" => 12,
                         "string_id" => 4,
                         "explanation" | "terminator" => 0,
+                        "struct" => size_of(value, field["definition"].as_str().unwrap()),
                         "array" => {
                             let array = &value["arrays"][field["definition"].as_str().unwrap()];
                             array["count"].as_u64().unwrap()
@@ -756,6 +793,115 @@ mod tests {
                 .unwrap();
             assert_eq!(target.len, 2);
             assert_eq!(target.path, "array holders#4[0]/points#2");
+        }
+    }
+
+    /// A model animation graph's shape: the blocks its indices name sit in
+    /// one inline struct of the root, the indices under a sibling one.
+    fn graph_schema() -> serde_json::Value {
+        json!({
+            "name":"graph", "tag":"test", "version":1, "flags":2, "block":"root",
+            "blocks": {
+                "root":{"struct":"root", "max_count":1},
+                "sets":{"struct":"set", "max_count":10},
+                "modes":{"struct":"mode", "max_count":10},
+                "entries":{"struct":"entry", "max_count":10}
+            },
+            "arrays": {"later_array":{"count":2, "struct":"later"}},
+            "structs": {
+                "root":{"fields":[
+                    {"type":"struct", "name":"definitions", "definition":"definitions"},
+                    {"type":"struct", "name":"content", "definition":"content"}
+                ]},
+                "definitions":{"fields":[{"type":"block", "name":"ik sets", "definition":"sets"}]},
+                "content":{"fields":[{"type":"block", "name":"modes", "definition":"modes"}]},
+                "mode":{"fields":[
+                    {"type":"short_block_index", "name":"ik set", "definition":"sets"},
+                    {"type":"block", "name":"entries", "definition":"entries"}
+                ]},
+                "entry":{"fields":[{"type":"short_block_index", "name":"ik set", "definition":"sets"}]},
+                "later":{"fields":[{"type":"block", "name":"ik sets", "definition":"sets"}]},
+                "set":{"fields":[{"type":"string_id", "name":"name"}]}
+            }
+        })
+    }
+
+    fn graph_tag(fixture: &Fixture) -> TagFile {
+        let mut tag = TagFile::new(fixture.0.join("example.json")).unwrap();
+        add(&mut tag, "definitions/ik sets", 2);
+        add(&mut tag, "content/modes", 1);
+        add(&mut tag, "content/modes[0]/entries", 1);
+        tag
+    }
+
+    const GRAPH_INDICES: [(&str, &str); 2] = [
+        ("content/modes[0]", "ik set"),
+        ("content/modes[0]/entries[0]", "ik set"),
+    ];
+
+    #[test]
+    fn declared_indices_find_blocks_inside_an_enclosing_elements_inline_structs() {
+        let fixture = Fixture::new();
+        fixture.write(&graph_schema());
+        let targets = IndexTargets::load(&fixture.0).unwrap();
+        let tag = graph_tag(&fixture);
+        let bytes = tag.write_to_bytes().unwrap();
+        for tag in [tag, TagFile::read_from_bytes(&bytes).unwrap()] {
+            let root = tag.root();
+            for (holder_path, name) in GRAPH_INDICES {
+                let path = format!("{holder_path}/{name}");
+                assert_eq!(
+                    targets.resolve(root, &path),
+                    Some(IndexTarget {
+                        path: "definitions#0/ik sets#0".into(),
+                        len: 2
+                    }),
+                    "{path}"
+                );
+                let holder = root.descend(holder_path).unwrap();
+                let direct = targets
+                    .resolve_field(root, holder, holder_path, holder.field_path(name).unwrap());
+                assert_eq!(direct, targets.resolve(root, &path), "{path}");
+            }
+        }
+    }
+
+    #[test]
+    fn declared_indices_keep_the_last_match_in_the_innermost_element_that_has_one() {
+        // Inline arrays count every entry, as tool's field scanner does, and
+        // a later match in the same element replaces an earlier one.
+        let fixture = Fixture::new();
+        let mut value = graph_schema();
+        value["structs"]["root"]["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"array", "name":"later", "definition":"later_array"}));
+        fixture.write(&value);
+        let targets = IndexTargets::load(&fixture.0).unwrap();
+        let mut tag = graph_tag(&fixture);
+        add(&mut tag, "later[1]/ik sets", 3);
+        for (holder_path, name) in GRAPH_INDICES {
+            let path = format!("{holder_path}/{name}");
+            let target = targets.resolve(tag.root(), &path).unwrap();
+            assert_eq!(target.path, "later#2[1]/ik sets#0", "{path}");
+            assert_eq!(target.len, 3, "{path}");
+        }
+
+        // A match in a nearer enclosing element wins over the root's, even
+        // inside one of that element's inline structs.
+        value["structs"]["mode"]["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"struct", "name":"local", "definition":"later"}));
+        fixture.write(&value);
+        let targets = IndexTargets::load(&fixture.0).unwrap();
+        let mut tag = graph_tag(&fixture);
+        add(&mut tag, "content/modes[0]/local/ik sets", 4);
+        for (holder_path, name) in GRAPH_INDICES {
+            let path = format!("{holder_path}/{name}");
+            let target = targets.resolve(tag.root(), &path).unwrap();
+            assert_eq!(target.path, "content#1/modes#0[0]/local#2/ik sets#0", "{path}");
+            assert_eq!(target.len, 4, "{path}");
         }
     }
 
