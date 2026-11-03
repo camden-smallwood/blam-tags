@@ -371,6 +371,14 @@ fn apply_delta_to_frame(
     }
 }
 
+/// One node of one overlay frame: the components the overlay animates.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct OverlayDelta {
+    pub rotation: Option<RealQuaternion>,
+    pub translation: Option<RealPoint3d>,
+    pub scale: Option<f32>,
+}
+
 impl AnimationClip {
     /// Compose `static_tracks` + `animated_tracks` against the skeleton
     /// using the per-component `node_flags` bitarrays. Result has one
@@ -501,6 +509,33 @@ impl AnimationClip {
         }
 
         (reference, Pose { frames })
+    }
+
+    /// An overlay's own values, frame by frame and node by node, for the
+    /// components it animates: what Reach's blend screens blend between
+    /// before laying the result over the base (`internal_compute_node_orientations_new`
+    /// decodes an overlay's animated tracks only). `None` leaves the base's.
+    pub fn overlay_deltas(&self, skeleton: &Skeleton) -> Vec<Vec<OverlayDelta>> {
+        let bones = skeleton.len();
+        let frames_n = self.frame_count.max(1) as usize;
+        let resolutions: Vec<BoneResolution> = (0..bones)
+            .map(|b| BoneResolution::for_bone(b, self.node_flags.as_ref()))
+            .collect();
+        (0..frames_n)
+            .map(|f| {
+                resolutions
+                    .iter()
+                    .map(|res| OverlayDelta {
+                        rotation: matches!(res.rotation, TrackSource::Animated(_))
+                            .then(|| pick_rotation(self, res, f).unwrap_or(RealQuaternion::IDENTITY)),
+                        translation: matches!(res.translation, TrackSource::Animated(_))
+                            .then(|| pick_translation(self, res, f).unwrap_or_default()),
+                        scale: matches!(res.scale, TrackSource::Animated(_))
+                            .then(|| pick_scale(self, res, f).unwrap_or(1.0)),
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     /// Compose an **overlay** the way the game plays one at full weight

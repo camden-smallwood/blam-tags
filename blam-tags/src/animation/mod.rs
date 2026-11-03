@@ -33,7 +33,7 @@ pub use graph::{
 };
 pub use jma::{JmaKind, JMA_ABSOLUTE_VERSION};
 pub use name::{base_state_candidates, AnimationName, AnimationStateType};
-pub use pose::{NodeTransform, Pose, Skeleton, SkeletonNode};
+pub use pose::{NodeTransform, OverlayDelta, Pose, Skeleton, SkeletonNode};
 
 use crate::api::TagStruct;
 use crate::fields::TagFieldData;
