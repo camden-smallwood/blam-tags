@@ -520,6 +520,50 @@ pub const BLEND_MODES: [&str; 14] = [
     "add_src_times_srcalpha_accum_alpha",
 ];
 
+/// Reach tool's `get_alpha_blend_mode_by_name` table (0x141167210). The first
+/// thirteen match Halo 3's; the fourteenth and after are Reach's own.
+pub const REACH_BLEND_MODES: [&str; 18] = [
+    "opaque",
+    "additive",
+    "multiply",
+    "alpha_blend",
+    "double_multiply",
+    "pre_multiplied_alpha",
+    "maximum",
+    "multiply_add",
+    "add_src_times_dstalpha",
+    "add_src_times_srcalpha",
+    "inv_alpha_blend",
+    "motion_blur_static",
+    "motion_blur_inhibit",
+    "apply_shadow_into_shadow_mask",
+    "alpha_blend_constant",
+    "overdraw_apply",
+    "wet_screen_effect",
+    "minimum",
+];
+
+/// `shader_glass`: the group Reach's bake makes alpha blend when its
+/// definition has no `blend_mode` category.
+const GROUP_SHADER_GLASS: u32 = u32::from_be_bytes(*b"rmgl");
+
+/// Reach's blend mode as an index into [`REACH_BLEND_MODES`], as
+/// `c_render_method::postprocess` (0x141165700) works it out: each entry is
+/// compared as a prefix, case and all, and the first match wins, so
+/// `alpha_blend_constant` reads as `alpha_blend`. A definition with no
+/// `blend_mode` category blends only for `shader_glass` (`group_tag`, set by
+/// [`RenderMethod::from_tag`]).
+pub fn resolve_reach_blend_mode(rmsh: &RenderMethod, rmdf: &RenderMethodDefinition) -> i32 {
+    let Some(at) = rmdf.categories.iter().position(|c| c.category_name == "blend_mode") else {
+        return if rmsh.group_tag == GROUP_SHADER_GLASS { 3 } else { 0 };
+    };
+    let option = rmsh.options.get(at).copied().unwrap_or(0);
+    let Some(option) = usize::try_from(option).ok().and_then(|o| rmdf.categories[at].options.get(o)) else {
+        return 0;
+    };
+    REACH_BLEND_MODES.iter().position(|mode| option.option_name.starts_with(mode)).unwrap_or(0) as i32
+}
+
 /// The chosen `blend_mode` option as an index into [`BLEND_MODES`], which is
 /// not the option's own index. The engine compares each entry as a prefix, in
 /// order, ignoring case, so the longest name in the table can never match.
@@ -925,6 +969,7 @@ mod tests {
             bitmap_address_mode_y: BitmapAddressMode::BlackBorder,
             bitmap_anisotropy_amount: 0,
             bitmap_extern_mode: Some(RenderMethodBitmapExternMode::TextureCamera),
+            bitmap_sharpen_mode: 0,
             animated_parameters: Vec::new(),
         }
     }
@@ -936,6 +981,8 @@ mod tests {
     fn method(options: &[i16]) -> RenderMethod {
         RenderMethod {
             definition_path: String::new(),
+            reference: None,
+            is_template: false,
             options: options.to_vec(),
             parameters: Vec::new(),
             postprocess_definition: None,
@@ -1086,6 +1133,28 @@ mod tests {
         let mut rmdf = definition(0, "", &[&["add_src_times_srcalpha_accum_alpha"]]);
         rmdf.categories[0].category_name = "blend_mode".to_owned();
         assert_eq!(resolve_blend_mode(&method(&[0]), &rmdf), 9);
+    }
+
+    #[test]
+    fn reach_matches_case_and_all_and_takes_the_first_prefix() {
+        let mut rmdf = definition(0, "", &[&["opaque", "ADDITIVE", "alpha_blend_constant", "minimum", "pre_multiplied_alpha"]]);
+        rmdf.categories[0].category_name = "blend_mode".to_owned();
+        assert_eq!(resolve_reach_blend_mode(&method(&[1]), &rmdf), 0, "Halo 3 ignores case; Reach does not");
+        assert_eq!(resolve_blend_mode(&method(&[1]), &rmdf), 1);
+        assert_eq!(resolve_reach_blend_mode(&method(&[2]), &rmdf), 3, "alpha_blend comes first");
+        assert_eq!(resolve_reach_blend_mode(&method(&[3]), &rmdf), 17);
+        assert_eq!(resolve_reach_blend_mode(&method(&[4]), &rmdf), 5);
+    }
+
+    #[test]
+    fn reach_glass_without_a_blend_mode_category_blends() {
+        let rmdf = definition(0, "", &[&["a", "b"]]);
+        let mut glass = method(&[0]);
+        glass.group_tag = u32::from_be_bytes(*b"rmgl");
+        assert_eq!(resolve_reach_blend_mode(&glass, &rmdf), 3);
+        let mut foliage = method(&[0]);
+        foliage.group_tag = u32::from_be_bytes(*b"rmfl");
+        assert_eq!(resolve_reach_blend_mode(&foliage, &rmdf), 0);
     }
 
     #[test]

@@ -820,6 +820,9 @@ pub struct RenderMethodParameter {
     /// `bitmap extern RTT mode`. Only takes effect when `bitmap_flags` has
     /// bit 4 set; see [`RenderMethodBitmapExternMode`].
     pub bitmap_extern_mode: Option<RenderMethodBitmapExternMode>,
+    /// Reach's `bitmap sharpen mode`, which `bitmap_flags` bit 5 applies in
+    /// place of Halo 3's comparison function. 0 where the field is absent.
+    pub bitmap_sharpen_mode: i16,
     pub animated_parameters: Vec<RenderMethodAnimatedParameter>,
 }
 
@@ -1028,6 +1031,13 @@ pub struct RenderMethodDefinition {
 #[derive(Debug, Clone)]
 pub struct RenderMethod {
     pub definition_path: String,
+    /// Reach's `reference`, as group and path: a template shader whose
+    /// options and parameters fill in what this one leaves unset (see
+    /// [`RenderMethod::apply_reference_shader`]). `None` without one, and in
+    /// every game before Reach.
+    pub reference: Option<(u32, String)>,
+    /// Reach's `is template`: this shader is one others reference.
+    pub is_template: bool,
     /// One option index per rmdf category (in category order). The
     /// schema stores these as `short_block` of `short`.
     pub options: Vec<i16>,
@@ -1182,8 +1192,13 @@ impl RenderMethod {
         let prediction_atom_index = s.read_int_any("prediction atom index")
             .unwrap_or(-1) as i32;
 
+        let reference = s.read_tag_ref_with_group("reference");
+        let is_template = s.read_int_any("is template").unwrap_or(0) != 0;
+
         Ok(Self {
             definition_path,
+            reference,
+            is_template,
             options,
             parameters,
             postprocess_definition,
@@ -1592,6 +1607,7 @@ impl RenderMethodParameter {
             bitmap_anisotropy_amount: s.read_int_any("bitmap anisotropy amount").unwrap_or(0) as i16,
             bitmap_extern_mode: s.read_int_any("bitmap extern RTT mode")
                 .and_then(RenderMethodBitmapExternMode::from_index),
+            bitmap_sharpen_mode: s.read_int_any("bitmap sharpen mode").unwrap_or(0) as i16,
             animated_parameters,
         })
     }

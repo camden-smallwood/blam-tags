@@ -42,10 +42,13 @@
 mod bake;
 mod cbuffer;
 mod choices;
+mod reference;
 mod types;
 mod walker;
 
-pub use bake::{resolve_blend_mode, BakeError, BLEND_MODES, DEFAULT_BITMAP};
+pub use bake::{
+    resolve_blend_mode, resolve_reach_blend_mode, BakeError, BLEND_MODES, DEFAULT_BITMAP, REACH_BLEND_MODES,
+};
 pub use choices::{RenderMethodCategoryChoice, RenderMethodChoices};
 pub use cbuffer::{
     compile_real_constant, compile_real_constant_at_time, is_cbuffer_animated,
