@@ -676,12 +676,15 @@ impl TagFile {
             signature: u32::from_be_bytes(*b"BLAM"),
         };
         let header = new_classic_header(meta.tag, meta.version as u16, engine);
-        Ok(TagFile::from_parts(
+        let mut tag = TagFile::from_parts(
             file_header,
             TagContainer::Classic { engine, header },
             engine.body_endian(),
             TagStream { layout, data: root },
-        ))
+        );
+        // As for an added element: block indices and references start NONE.
+        crate::api::default_new_element_fields(tag.root_mut());
+        Ok(tag)
     }
 }
 

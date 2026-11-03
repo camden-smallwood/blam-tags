@@ -1390,10 +1390,11 @@ impl<'a> TagFlag<'a> {
 // Write-side: mirrors of the read types
 //================================================================================
 
-/// Initialize every block-index field in a freshly created element to `NONE`
-/// (-1) instead of the raw zero-fill's `0`.
+/// Initialize a freshly created element's fields the way the engine's
+/// `tag_field_initialize` does, where the raw zero-fill disagrees: block
+/// indices to `NONE` (-1), and tag references to the engine's empty reference.
 ///
-/// A new element's bytes are zero-filled, but `0` is a *valid* index — it
+/// **Block indices.** A new element's bytes are zero-filled, but `0` is a *valid* index — it
 /// claims a reference to element 0 of the target block. When that block is
 /// empty, the engine's load-time postprocess still indexes it and trips
 /// `valid_index` (`wrapped_arrays.h`). This is the reported `physics_model`
@@ -1403,12 +1404,30 @@ impl<'a> TagFlag<'a> {
 /// failed to load. `NONE` is the sentinel the loader treats as "no reference",
 /// so it is the correct — and strictly safer — default for an unassigned index.
 ///
+/// **Tag references.** `tag_reference_initialize` makes an empty reference
+/// group `NONE` and index `NONE`, and that is what Guerilla writes into a new
+/// tag's element bytes; every empty reference in the shipped Halo 3 and Reach
+/// tags carries the same pair. The reader takes a reference's group and path
+/// from its `tgrf` sub-chunk and resets the in-memory reference first, so the
+/// zero-fill loaded either way — this only stops a new tag differing from
+/// Guerilla's. The middle two words (runtime name pointer and length) stay
+/// zero. A classic tag's encoder already writes `NONE` for the group of a
+/// pathless reference and takes the index from these bytes, where CE's and
+/// Halo 2's own tags store `NONE` too.
+///
 /// Recurses into inline `Struct` fields (e.g. a shape's `base`) and `Array`
 /// elements. Child `Block`s are left empty; their own elements get the same
 /// treatment as they are added. All six block-index variants (char/short/long,
 /// plain and custom) are covered, each written at its own width.
-pub(crate) fn default_new_element_block_indices(mut element: TagStructMut<'_>) {
+pub(crate) fn default_new_element_fields(mut element: TagStructMut<'_>) {
     element.for_each_field_mut(|mut field| match field.as_ref().field_type() {
+        TagFieldType::TagReference => {
+            let offset = field.layout.fields[field.field_index].offset as usize;
+            if let Some(reference) = field.struct_raw.get_mut(offset..offset + 16) {
+                reference[0..4].copy_from_slice(&[0xFF; 4]);
+                reference[12..16].copy_from_slice(&[0xFF; 4]);
+            }
+        }
         TagFieldType::CharBlockIndex => { let _ = field.set(TagFieldData::CharBlockIndex(-1)); }
         TagFieldType::CustomCharBlockIndex => { let _ = field.set(TagFieldData::CustomCharBlockIndex(-1)); }
         TagFieldType::ShortBlockIndex => { let _ = field.set(TagFieldData::ShortBlockIndex(-1)); }
@@ -1417,12 +1436,12 @@ pub(crate) fn default_new_element_block_indices(mut element: TagStructMut<'_>) {
         TagFieldType::CustomLongBlockIndex => { let _ = field.set(TagFieldData::CustomLongBlockIndex(-1)); }
         TagFieldType::Struct => {
             if let Some(sub) = field.as_struct_mut() {
-                default_new_element_block_indices(sub);
+                default_new_element_fields(sub);
             }
         }
         TagFieldType::Array => {
             if let Some(mut array) = field.as_array_mut() {
-                array.for_each_element_mut(|element| default_new_element_block_indices(element));
+                array.for_each_element_mut(|element| default_new_element_fields(element));
             }
         }
         _ => {}
@@ -1977,12 +1996,13 @@ impl<'a> TagBlockMut<'a> {
     /// Append a default-initialized element. Returns its new index.
     ///
     /// Block-index fields are initialized to `NONE` (-1), not the raw zero-fill's
-    /// `0` — see `default_new_element_block_indices`.
+    /// `0`, and tag references to the engine's empty reference — see
+    /// `default_new_element_fields`.
     pub fn add_element(&mut self) -> usize {
         self.block_data.add_element(self.layout);
         let index = self.block_data.elements.len() - 1;
         if let Some(element) = self.element_mut(index) {
-            default_new_element_block_indices(element);
+            default_new_element_fields(element);
         }
         index
     }
@@ -1991,7 +2011,8 @@ impl<'a> TagBlockMut<'a> {
     /// (valid range is `0..=len`).
     ///
     /// Block-index fields are initialized to `NONE` (-1), not the raw zero-fill's
-    /// `0` — see `default_new_element_block_indices`.
+    /// `0`, and tag references to the engine's empty reference — see
+    /// `default_new_element_fields`.
     pub fn insert_element(&mut self, index: usize) -> Result<(), TagIndexError> {
         let len = self.block_data.elements.len();
         if index > len {
@@ -1999,7 +2020,7 @@ impl<'a> TagBlockMut<'a> {
         }
         self.block_data.insert_element(self.layout, index);
         if let Some(element) = self.element_mut(index) {
-            default_new_element_block_indices(element);
+            default_new_element_fields(element);
         }
         Ok(())
     }
