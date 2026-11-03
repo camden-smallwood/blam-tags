@@ -2107,6 +2107,45 @@ pub(crate) fn gbxmodel_vertex_influences(v: &TagStruct<'_>, local_nodes: Option<
         .collect()
 }
 
+/// A CE part's transparent sort position, as tool's model postprocess bakes it
+/// (MCC `haloce_mcc_tool` 0x4A10C0); tags on disk leave the nodes zero. The
+/// part's own `centroid`, carried by the two nodes its vertices weigh most by
+/// their stored `node0`/`node1` indices, the weights shared out between them.
+/// `render_model_parts` sorts by the centroid under the primary node alone.
+fn gbxmodel_part_sort_position(part: &TagStruct<'_>) -> SortingPosition {
+    const MOST_NODES: usize = 64;
+    let mut totals = [0.0f32; MOST_NODES];
+    if let Some(vertices) = part.field("uncompressed vertices").and_then(|f| f.as_block()) {
+        for k in 0..vertices.len() {
+            let vertex = vertices.element(k).unwrap();
+            for (index, weight) in [("node0 index", "node0 weight"), ("node1 index", "node1 weight")] {
+                let node = vertex.read_int_any(index).and_then(|node| usize::try_from(node).ok());
+                if let Some(total) = node.and_then(|node| totals.get_mut(node)) {
+                    *total += vertex.read_real(weight).unwrap_or(0.0);
+                }
+            }
+        }
+    }
+    let (mut primary, mut secondary) = ((0, 0.0f32), (0, 0.0f32));
+    for (node, total) in totals.into_iter().enumerate() {
+        if total > primary.1 {
+            secondary = primary;
+            primary = (node, total);
+        } else if total > secondary.1 {
+            secondary = (node, total);
+        }
+    }
+    let sum = primary.1 + secondary.1;
+    let weights = if primary.1 == 0.0 { [1.0, 0.0, 0.0] } else { [primary.1 / sum, secondary.1 / sum, 0.0] };
+    SortingPosition {
+        plane: RealPlane3d::default(),
+        position: part.read_point3d("centroid"),
+        radius: 0.0,
+        node_indices: [primary.0 as u8, secondary.0 as u8, 0, 0],
+        node_weights: weights,
+    }
+}
+
 /// Decode one CE `geometries[i]` into a [`RenderMesh`]. Each part appends its own
 /// vertex pool (offsetting indices) and contributes one [`RenderMeshPart`].
 fn read_gbxmodel_geometry(geo: &TagStruct<'_>, uv_scale: [f32; 2], local_nodes: bool) -> RenderMesh {
@@ -2159,7 +2198,7 @@ fn read_gbxmodel_geometry(geo: &TagStruct<'_>, uv_scale: [f32; 2], local_nodes: 
                 index_count: indices.len() as u32 - index_start,
                 part_type: GeometryPartType::OpaqueNonShadowing,
                 transparent_sorting_index: -1,
-                sort_position: None,
+                sort_position: Some(gbxmodel_part_sort_position(&part)),
             });
         }
     }
