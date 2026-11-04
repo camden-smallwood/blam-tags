@@ -382,3 +382,104 @@ fn every_kit_material_bakes() {
     assert!(baked_count > 6000);
     assert!(white * 10 < textures, "most textures resolve: {white} of {textures} fell to white");
 }
+
+/// An identity curve mapped onto `min..max`.
+fn ramp(min: f32, max: f32) -> TagFunction {
+    let mut curve = constant(0.0);
+    let blob = curve.as_blob_mut().unwrap();
+    blob.set_function_type(crate::tag_function::FunctionType::Identity);
+    blob.set_clamp_range(min, max);
+    curve
+}
+
+struct Object {
+    values: Vec<(&'static str, f32)>,
+    time: f32,
+}
+
+impl FunctionContext for Object {
+    fn object_function(&self, name: &str) -> f32 {
+        self.values.iter().find(|(known, _)| *known == name).map_or(0.0, |(_, value)| *value)
+    }
+    fn time(&self) -> f32 {
+        self.time
+    }
+    fn object_index(&self) -> u32 {
+        0
+    }
+}
+
+fn run(function: &MaterialFunctionParameter, object: &Object) -> [f32; 4] {
+    let mut lanes = [9.0; 4];
+    evaluate_function_output(function, object, &mut lanes);
+    lanes
+}
+
+/// The input lambda (X360 0x83B06B48): a name is the object's value; no name
+/// runs on the clock over the period, wrapped to 0..1.
+#[test]
+fn a_function_reads_its_objects_value_or_else_the_clock() {
+    let mut named = function(MaterialFunctionType::Value, ramp(-100.0, 100.0));
+    named.input_name = "cortana_lgt_key_forward".to_owned();
+    named.time_period = 1.0;
+    let object = Object { values: vec![("cortana_lgt_key_forward", 0.25)], time: 7.0 };
+    assert_eq!(run(&named, &object)[0], -50.0);
+    let mut clocked = function(MaterialFunctionType::Value, ramp(0.0, 1.0));
+    clocked.time_period = 2.0;
+    assert_eq!(run(&clocked, &Object { values: Vec::new(), time: 3.0 })[0], 0.5, "3 s over 2 s wraps to 0.5");
+}
+
+/// `EvaluateFunction`: a modifier with an input scales or offsets what the
+/// curve maps to.
+#[test]
+fn an_output_modifier_scales_or_offsets_the_mapped_value() {
+    let mut scaled = function(MaterialFunctionType::Value, ramp(0.0, 10.0));
+    scaled.input_name = "a".to_owned();
+    scaled.output_modifier = 2;
+    scaled.output_modifier_input = "b".to_owned();
+    scaled.time_period = 1.0;
+    let object = Object { values: vec![("a", 0.5), ("b", 0.5)], time: 0.0 };
+    assert_eq!(run(&scaled, &object)[0], 2.5);
+    scaled.output_modifier = 1;
+    assert_eq!(run(&scaled, &object)[0], 5.5);
+}
+
+/// `EvaluateFunctionOutput`: each kind writes its own lanes from the
+/// register's lane, and a colour degammas into three.
+#[test]
+fn each_kind_writes_its_own_lanes() {
+    let object = Object { values: vec![("a", 0.5)], time: 0.0 };
+    let at = |kind| {
+        let mut function = function(kind, ramp(0.0, 1.0));
+        function.input_name = "a".to_owned();
+        function.time_period = 1.0;
+        run(&function, &object)
+    };
+    assert_eq!(at(MaterialFunctionType::ScaleUniform), [0.5, 0.5, 9.0, 9.0]);
+    assert_eq!(at(MaterialFunctionType::ScaleV), [9.0, 0.5, 9.0, 9.0]);
+    assert_eq!(at(MaterialFunctionType::OffsetU), [9.0, 9.0, 0.5, 9.0]);
+    assert_eq!(at(MaterialFunctionType::OffsetV), [9.0, 9.0, 9.0, 0.5]);
+    assert_eq!(at(MaterialFunctionType::Alpha), [0.5, 9.0, 9.0, 9.0]);
+    let gray = 0.5f32.powf(2.2);
+    assert_eq!(at(MaterialFunctionType::Color), [gray, gray, gray, 9.0], "a scalar graph is gray");
+}
+
+/// `MaterialSubmitUpdateConstants`: a function lands at its register's lane
+/// within the range it was handed, and only for the phases asked for.
+#[test]
+fn constants_update_in_range_and_phase() {
+    let shader = shader(vec![real("a", 161, 2, 1, [0.0; 4]), real("b", 240, 0, 1, [0.0; 4])]);
+    let dynamic = |name: &str| {
+        let mut function = function(MaterialFunctionType::Value, ramp(0.0, 4.0));
+        function.input_name = "a".to_owned();
+        MaterialParameter { functions: vec![function], ..parameter(name, MaterialParameterType::Real) }
+    };
+    let mut baked = bake(&material(vec![dynamic("a"), dynamic("b")]), &shader, &any_bitmap);
+    let object = Object { values: vec![("a", 0.5)], time: 0.0 };
+    let mut pixel = [[0.0; 4]; 24];
+    assert_eq!(update_constants(&baked, 0, PIXEL_REGISTERS, &mut pixel, &object), 1, "the vertex one is not in range");
+    assert_eq!(pixel[1], [0.0, 0.0, 2.0, 0.0]);
+    baked.functions[0].phase_mask = 1;
+    assert_eq!(update_constants(&baked, 4, PIXEL_REGISTERS, &mut pixel, &object), 0, "albedo-only, drawn single pass");
+    assert_eq!(update_constants(&baked, 1, PIXEL_REGISTERS, &mut pixel, &object), 1);
+}

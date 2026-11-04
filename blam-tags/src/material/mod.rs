@@ -10,8 +10,13 @@
 //! the registers from the shader and the values from the material.
 
 mod bake;
+mod submit;
 
-pub use bake::{bake, BakedBool, BakedFunction, BakedMaterial, BakedTexture, BitmapLookup, LayerBlendMode};
+pub use bake::{bake, postprocess_flags, BakedBool, BakedFunction, BakedMaterial, BakedTexture, BitmapLookup, LayerBlendMode};
+pub use submit::{
+    color_degamma, evaluate_function_output, update_constants, FunctionContext, PIXEL_REGISTERS,
+    TEXTURE_TRANSFORM_REGISTERS, VERTEX_REGISTERS,
+};
 
 use crate::api::TagStruct;
 use crate::file::TagFile;

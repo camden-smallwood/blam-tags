@@ -2,6 +2,7 @@
 //! `s_material_postprocess_definition::UpdateRelatedPostprocessProperties`,
 //! as MCC's tag_test runs them at load (0x140881FD0 and 0x140881B90).
 
+use super::submit::color_degamma;
 use super::{
     Material, MaterialFunctionParameter, MaterialFunctionType, MaterialParameter, MaterialParameterType, MaterialShader,
     shader_flags,
@@ -129,11 +130,6 @@ const VERTEX_WORLD: usize = 0;
 const EXTERN_EMBLEM: u8 = 18;
 const EXTERN_DYNAMIC_CUBEMAP: u8 = 26;
 
-/// `color_degamma` (`sub_14041A4E0`): clamp to 0..1, then x^2.2.
-fn degamma(value: f32) -> f32 {
-    value.clamp(0.0, 1.0).powf(2.2)
-}
-
 fn near_zero(value: f32) -> bool {
     value.abs() < 0.0001
 }
@@ -208,7 +204,7 @@ pub fn bake(material: &Material, shader: &MaterialShader, bitmaps: &impl BitmapL
                 MaterialParameterType::Color => {
                     if let Some((lanes, offset, is_pixel)) = real_storage(&mut baked, shader_parameter) {
                         let [alpha, red, green, blue] = source.color;
-                        let rgb = [degamma(red), degamma(green), degamma(blue)];
+                        let rgb = [color_degamma(red), color_degamma(green), color_degamma(blue)];
                         for (lane, value) in rgb.into_iter().enumerate() {
                             if let Some(slot) = lanes.get_mut(offset + lane) {
                                 *slot = value;
@@ -350,9 +346,9 @@ pub fn bake(material: &Material, shader: &MaterialShader, bitmaps: &impl BitmapL
                         };
                         if function.kind == MaterialFunctionType::Color {
                             let color = curve.evaluate_color(0.0, 0.0);
-                            write(0, degamma(color.red));
-                            write(1, degamma(color.green));
-                            write(2, degamma(color.blue));
+                            write(0, color_degamma(color.red));
+                            write(1, color_degamma(color.green));
+                            write(2, color_degamma(color.blue));
                         } else {
                             write_static(function.kind, curve.evaluate(0.0, 0.0), &mut write);
                         }
@@ -371,9 +367,9 @@ pub fn bake(material: &Material, shader: &MaterialShader, bitmaps: &impl BitmapL
                         let lanes = &mut baked.texture_constants[slot];
                         if function.kind == MaterialFunctionType::Color {
                             let color = curve.evaluate_color(0.0, 0.0);
-                            lanes[0] = degamma(color.red);
-                            lanes[1] = degamma(color.green);
-                            lanes[2] = degamma(color.blue);
+                            lanes[0] = color_degamma(color.red);
+                            lanes[1] = color_degamma(color.green);
+                            lanes[2] = color_degamma(color.blue);
                         } else {
                             write_static(function.kind, curve.evaluate(0.0, 0.0), &mut |lane, value| lanes[lane] = value);
                         }
