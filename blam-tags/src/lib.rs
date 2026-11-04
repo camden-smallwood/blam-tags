@@ -113,6 +113,7 @@ pub mod monolithic;
 pub mod tag_function;
 pub mod render_import;
 pub mod render_method;
+pub mod material;
 pub mod paths;
 pub mod typed_enums;
 pub mod weld;
