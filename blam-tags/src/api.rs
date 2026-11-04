@@ -716,8 +716,8 @@ impl<'a> TagField<'a> {
         crate::field_name::clean_field_name(self.name())
     }
 
-    /// The name to show a user: the `&`-introduced display override if the raw
-    /// name carries one, otherwise the clean name.
+    /// The name to show a user: an `&` override or the authored label with
+    /// literal bracket annotations, falling back to the clean name.
     pub fn display_name(&self) -> std::borrow::Cow<'a, str> {
         let info = crate::field_name::parse_field_name(self.name());
         match info.display_name {
