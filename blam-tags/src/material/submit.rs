@@ -125,6 +125,22 @@ pub fn evaluate_function_output(function: &MaterialFunctionParameter, context: &
     }
 }
 
+/// `MaterialSubmitGetBitmapIndex` (X360 0x83B07060): which of a bitmap's
+/// `image_count` images a frame-index function picks,
+/// `floor(fmod(mapped · scale + offset, count))` (the game adds `sgn · 0.5`
+/// before truncating, which changes nothing for a whole number). A bitmap of
+/// one image, or a function of another kind, picks the first. Negative when
+/// the value is.
+pub fn bitmap_index(function: &MaterialFunctionParameter, context: &impl FunctionContext, image_count: usize) -> i32 {
+    if image_count <= 1 || function.kind != MaterialFunctionType::FrameIndex {
+        return 0;
+    }
+    let Some(curve) = function.function.as_ref() else { return 0 };
+    let Some((value, range, scale, offset)) = evaluate(function, context) else { return 0 };
+    let mapped = curve.evaluate(value, range) * scale + offset;
+    (mapped % image_count as f32).floor() as i32
+}
+
 /// `MaterialSubmitUpdateConstants`: every queued function whose register
 /// falls in `start..start + count` and whose phases meet `phase_mask` (0
 /// meets all) rewrites `constants`, which hold that range from `start`. The

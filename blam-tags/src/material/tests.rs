@@ -483,3 +483,19 @@ fn constants_update_in_range_and_phase() {
     assert_eq!(update_constants(&baked, 4, PIXEL_REGISTERS, &mut pixel, &object), 0, "albedo-only, drawn single pass");
     assert_eq!(update_constants(&baked, 1, PIXEL_REGISTERS, &mut pixel, &object), 1);
 }
+
+/// `MaterialSubmitGetBitmapIndex`: the mapped value wraps by the image count;
+/// one image, or another kind, picks the first.
+#[test]
+fn a_frame_index_function_picks_an_image_by_its_value() {
+    let mut frames = function(MaterialFunctionType::FrameIndex, ramp(0.0, 10.0));
+    frames.input_name = "a".to_owned();
+    frames.time_period = 1.0;
+    let at = |value: f32, count: usize| bitmap_index(&frames, &Object { values: vec![("a", value)], time: 0.0 }, count);
+    assert_eq!(at(0.25, 4), 2, "2.5 of 4 images");
+    assert_eq!(at(0.65, 4), 2, "6.5 wraps to 2.5");
+    assert_eq!(at(0.65, 1), 0, "one image");
+    let mut value = frames.clone();
+    value.kind = MaterialFunctionType::Value;
+    assert_eq!(bitmap_index(&value, &Object { values: vec![("a", 0.5)], time: 0.0 }, 4), 0);
+}
