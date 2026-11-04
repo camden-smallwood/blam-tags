@@ -211,6 +211,7 @@ pub mod shader_flags {
     pub const IS_DECAL: u32 = 1 << 1;
     pub const IS_VOLUME_FOG: u32 = 1 << 4;
     pub const IS_HOLOGRAM: u32 = 1 << 7;
+    pub const IS_BLENDED_HOLOGRAM: u32 = 1 << 8;
     pub const IS_EMBLEM: u32 = 1 << 9;
     pub const IS_ALPHA_CLIP: u32 = 1 << 12;
     pub const IS_LIGHTABLE_TRANSPARENT: u32 = 1 << 13;
