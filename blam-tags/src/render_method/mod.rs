@@ -44,6 +44,7 @@ mod cbuffer;
 mod choices;
 mod reference;
 mod types;
+mod version_update;
 mod walker;
 
 pub use bake::{
@@ -58,6 +59,7 @@ pub use cbuffer::{
     RenderMethodEvalContext, ResolvedCbuffer,
 };
 pub use types::*;
+pub use version_update::SHADER_VERSION;
 pub use walker::{
     build_rmop_param_list, BitmapBinding, ExternResolver, NullExternResolver, ParameterSource,
     ResolvedParameter, ResolvedRenderMethod, ResolvedValue,

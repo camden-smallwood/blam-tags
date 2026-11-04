@@ -804,7 +804,7 @@ pub struct RenderMethodPostprocessTexture {
 /// `_field_short_enum`, but the underlying values index the same enums
 /// the rmop declares — they are stored as the strong enum type here so
 /// downstream code can pattern-match without re-converting from i16.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RenderMethodParameter {
     pub parameter_name: String,
     pub parameter_type: Option<Enum<RenderMethodParameterType, i32>>,
@@ -1035,6 +1035,9 @@ pub struct RenderMethodDefinition {
 #[derive(Debug, Clone)]
 pub struct RenderMethod {
     pub definition_path: String,
+    /// The tag's `version`: Reach's `shader` group runs
+    /// [`RenderMethod::version_update`] on anything older than 9.
+    pub version: u8,
     /// Reach's `reference`, as group and path: a template shader whose
     /// options and parameters fill in what this one leaves unset (see
     /// [`RenderMethod::apply_reference_shader`]). `None` without one, and in
@@ -1198,9 +1201,11 @@ impl RenderMethod {
 
         let reference = s.read_tag_ref_with_group("reference");
         let is_template = s.read_int_any("is template").unwrap_or(0) != 0;
+        let version = s.read_int_any("version").unwrap_or(0) as u8;
 
         Ok(Self {
             definition_path,
+            version,
             reference,
             is_template,
             options,

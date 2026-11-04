@@ -981,6 +981,7 @@ mod tests {
     fn method(options: &[i16]) -> RenderMethod {
         RenderMethod {
             definition_path: String::new(),
+            version: 9,
             reference: None,
             is_template: false,
             options: options.to_vec(),

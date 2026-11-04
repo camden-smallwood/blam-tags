@@ -171,6 +171,7 @@ mod tests {
     fn shader(options: &[i16], template: bool, parameters: Vec<RenderMethodParameter>) -> RenderMethod {
         RenderMethod {
             definition_path: "shaders\\shader".to_owned(),
+            version: 9,
             reference: None,
             is_template: template,
             options: options.to_vec(),
