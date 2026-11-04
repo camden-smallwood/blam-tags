@@ -182,7 +182,7 @@ fn real_storage<'a>(baked: &'a mut BakedMaterial, shader: &MaterialParameter) ->
 /// Where a function's static value lands.
 enum Storage {
     None,
-    Real { pixel: bool },
+    Real,
     Transform { slot: usize, texture: usize },
 }
 
@@ -202,7 +202,7 @@ pub fn bake(material: &Material, shader: &MaterialShader, bitmaps: &impl BitmapL
                         let count = usize::from(shader_parameter.register_count).min(4 - offset.min(4));
                         lanes[offset..offset + count].copy_from_slice(&values[..count]);
                         pixel = is_pixel;
-                        storage = Storage::Real { pixel: is_pixel };
+                        storage = Storage::Real;
                     }
                 }
                 MaterialParameterType::Color => {
@@ -220,7 +220,7 @@ pub fn bake(material: &Material, shader: &MaterialShader, bitmaps: &impl BitmapL
                             }
                         }
                         pixel = is_pixel;
-                        storage = Storage::Real { pixel: is_pixel };
+                        storage = Storage::Real;
                     }
                 }
                 MaterialParameterType::Bool => {
@@ -341,7 +341,7 @@ pub fn bake(material: &Material, shader: &MaterialShader, bitmaps: &impl BitmapL
                 let Some(curve) = function.function.as_ref() else { continue };
                 match storage {
                     Storage::None => {}
-                    Storage::Real { .. } => {
+                    Storage::Real => {
                         let Some((lanes, offset, _)) = real_storage(&mut baked, shader_parameter) else { continue };
                         let mut write = |lane: usize, value: f32| {
                             if let Some(slot) = lanes.get_mut(offset + lane) {
