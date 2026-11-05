@@ -28,7 +28,9 @@ use crate::api::{TagBlock, TagStruct};
 use crate::fields::TagFieldData;
 use crate::file::TagFile;
 use crate::game::Game;
-use crate::geometry::{read_compression_bounds, strip_to_list, CompressionBounds};
+use crate::geometry::{
+    read_compression_bounds, read_mesh_indices, read_mesh_strip_indices, strip_to_list, strip_to_list_u32, CompressionBounds,
+};
 use crate::math::{
     RealOrientation, RealPlane3d, RealPoint2d, RealPoint3d, RealQuaternion, RealVector3d,
 };
@@ -2941,10 +2943,6 @@ where
             out.push(empty_mesh());
             continue;
         };
-        let Some(raw_i) = pmt.field("raw indices").and_then(|f| f.as_block()) else {
-            out.push(empty_mesh());
-            continue;
-        };
 
         let mut vertices: Vec<RenderVertex> = Vec::with_capacity(raw_v.len());
         for k in 0..raw_v.len() {
@@ -2967,15 +2965,15 @@ where
             }
         }
 
-        let raw_index_list: Vec<u16> = (0..raw_i.len())
-            .filter_map(|k| raw_i.element(k))
-            .map(|e| e.read_int_any("word").unwrap_or(0) as u16)
-            .collect();
-
         let is_strip = match index_format {
             IndexFormatPolicy::ForceTriangleList => false,
             IndexFormatPolicy::PerMeshSchema => crate::geometry::mesh_is_triangle_strip(&mesh),
         };
+        // The 16-bit `raw indices`, or `raw indices32` for a mesh with more
+        // vertices than 16 bits address (Reach, Halo 4 and Halo 2
+        // Anniversary scenery such as m70's Infinity).
+        let raw_index_list = if is_strip { read_mesh_strip_indices(&pmt) } else { read_mesh_indices(&pmt) }
+            .unwrap_or_default();
 
         let parts_block = mesh
             .field("parts")
@@ -3001,7 +2999,7 @@ where
             // contiguous raw span; sum the subpart counts as u32 because the
             // part-level `index count` is an i16 that overflows on large meshes
             // (the bug the 2026-06-07 per-subpart pass worked around).
-            indices = raw_index_list.iter().map(|&i| i as u32).collect();
+            indices = raw_index_list.clone();
             let n = indices.len() as u32;
             for pi in 0..parts_block.len() {
                 let part = parts_block.element(pi).unwrap();
@@ -3060,10 +3058,8 @@ where
                 let count = count_i as usize;
                 if start >= raw_index_list.len() { return; }
                 let end = (start + count).min(raw_index_list.len());
-                for (a, b, c) in strip_to_list(&raw_index_list[start..end]) {
-                    indices.push(a as u32);
-                    indices.push(b as u32);
-                    indices.push(c as u32);
+                for (a, b, c) in strip_to_list_u32(&raw_index_list[start..end]) {
+                    indices.extend([a, b, c]);
                 }
             };
             for pi in 0..parts_block.len() {
@@ -3173,17 +3169,14 @@ pub fn extract_decorator_subparts(tag: &TagFile) -> Option<DecoratorSubpartGeome
     let bounds = bounds.for_mesh(&mesh);
     let pmt0 = pmt.element(0)?;
     let raw_v = pmt0.field("raw vertices").and_then(|f| f.as_block())?;
-    let raw_i = pmt0.field("raw indices").and_then(|f| f.as_block())?;
+    pmt0.field("raw indices").and_then(|f| f.as_block())?;
 
     let mut vertices: Vec<RenderVertex> = Vec::with_capacity(raw_v.len());
     for k in 0..raw_v.len() {
         let v = raw_v.element(k)?;
         vertices.push(decode_render_vertex(&v, &bounds, None));
     }
-    let raw_index_list: Vec<u16> = (0..raw_i.len())
-        .filter_map(|k| raw_i.element(k))
-        .map(|e| e.read_int_any("word").unwrap_or(0) as u16)
-        .collect();
+    let raw_index_list = read_mesh_strip_indices(&pmt0).unwrap_or_default();
 
     let mut subpart_indices: Vec<Vec<u32>> = Vec::new();
     if let Some(subparts) = mesh.field("subparts").and_then(|f| f.as_block()) {
@@ -3198,25 +3191,12 @@ pub fn extract_decorator_subparts(tag: &TagFile) -> Option<DecoratorSubpartGeome
                 continue;
             }
             let end = (start + count).min(raw_index_list.len());
-            let strip = &raw_index_list[start..end];
-            let tris = strip_to_list(strip);
-            let mut flat = Vec::with_capacity(tris.len() * 3);
-            for (a, b, c) in tris {
-                flat.push(a as u32);
-                flat.push(b as u32);
-                flat.push(c as u32);
-            }
-            subpart_indices.push(flat);
+            let tris = strip_to_list_u32(&raw_index_list[start..end]);
+            subpart_indices.push(tris.into_iter().flat_map(|(a, b, c)| [a, b, c]).collect());
         }
     } else {
-        let tris = strip_to_list(&raw_index_list);
-        let mut flat = Vec::with_capacity(tris.len() * 3);
-        for (a, b, c) in tris {
-            flat.push(a as u32);
-            flat.push(b as u32);
-            flat.push(c as u32);
-        }
-        subpart_indices.push(flat);
+        let tris = strip_to_list_u32(&raw_index_list);
+        subpart_indices.push(tris.into_iter().flat_map(|(a, b, c)| [a, b, c]).collect());
     }
 
     Some(DecoratorSubpartGeometry { vertices, subpart_indices })
@@ -3265,7 +3245,7 @@ pub fn extract_per_instance_lightmap_uvs(root: &TagStruct<'_>) -> Vec<PerInstanc
 fn read_raw_water_data(
     mesh: &TagStruct<'_>,
     pmt: &TagStruct<'_>,
-    raw_index_list: &[u16],
+    raw_index_list: &[u32],
     parts_block: &TagBlock<'_>,
 ) -> Option<RawWaterData> {
     let block = pmt.field("raw water data").and_then(|f| f.as_block())?;
@@ -3334,7 +3314,8 @@ fn read_raw_water_data(
             for j in 0..3 {
                 let off = tri * 3 + j;
                 control_points[j] = RawWaterControlPoint {
-                    regular_idx: raw_index_list[regular_base + off],
+                    // Water meshes are 16-bit; a widened restart narrows back.
+                    regular_idx: raw_index_list[regular_base + off] as u16,
                     water_idx: raw_water_indices[water_base + off],
                 };
             }
@@ -3790,6 +3771,26 @@ mod tests {
                 assert_eq!(v.node_weights, [1.0, 0.0, 0.0, 0.0]);
             }
         }
+    }
+
+    /// A mesh past 16 bits of vertices keeps its indices in `raw indices32`
+    /// and none in `raw indices`; read only the latter, m70's Infinity (93,891
+    /// vertices) derived no triangles and the preview had nothing to draw.
+    #[test]
+    fn halo4_large_meshes_read_their_32_bit_indices() {
+        let Some(tags) = kit_tags("BLAM_TEST_H4EK") else {
+            eprintln!("skipping halo4_large_meshes_read_their_32_bit_indices: set BLAM_TEST_H4EK");
+            return;
+        };
+        let path = tags.join("environments/solo/m70_liftoff/scenery/m70_infinity/m70_infinity.render_model");
+        let tag = TagFile::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let meshes = RenderModel::derive_render_meshes(&tag).expect("derive meshes");
+        let mesh = &meshes[0];
+        assert_eq!(mesh.vertices.len(), 93_891);
+        assert_eq!(mesh.indices.len(), 208_659, "raw indices32, as a triangle list");
+        assert!(mesh.indices.iter().any(|&index| index > 65_535), "past what 16 bits address");
+        assert!(mesh.indices.iter().all(|&index| (index as usize) < mesh.vertices.len()));
+        assert!(mesh.parts.iter().all(|part| part.index_count > 0));
     }
 
     /// Halo 4 types a raw vertex's `node index` as `byte_integer` (Halo 3 and

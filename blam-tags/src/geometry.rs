@@ -267,6 +267,20 @@ pub(crate) fn read_mesh_indices(pmt: &TagStruct<'_>) -> Option<Vec<u32>> {
     read("raw indices", "word", 0xFFFF).or_else(|| read("raw indices32", "dword", u32::MAX))
 }
 
+/// [`read_mesh_indices`] for a triangle strip, ready for
+/// [`strip_to_list_u32`]: a 16-bit strip's restart (0xFFFF) becomes the
+/// 32-bit one, so both widths split where they did.
+pub(crate) fn read_mesh_strip_indices(pmt: &TagStruct<'_>) -> Option<Vec<u32>> {
+    let narrow = pmt.field("raw indices").and_then(|f| f.as_block()).is_some_and(|b| !b.is_empty());
+    let mut indices = read_mesh_indices(pmt)?;
+    if narrow {
+        for index in indices.iter_mut().filter(|index| **index == 0xFFFF) {
+            *index = u32::MAX;
+        }
+    }
+    Some(indices)
+}
+
 /// A part's or subpart's `index start` as a position in the index buffer.
 /// Halo 3 declares it a signed `short_integer`, so a start past 32,767 reads
 /// back negative; Halo 4 widened it to `long_integer`. Negative can only be
@@ -404,6 +418,41 @@ mod tests {
         let pmt = tag.root().field_path("render geometry/per mesh temporary").unwrap();
         let pmt = pmt.as_block().unwrap().element(0).unwrap();
         assert_eq!(read_mesh_indices(&pmt), Some(vec![0, 32767, 32768, 65535]));
+    }
+
+    /// A 16-bit strip's 0xFFFF is its restart, which [`strip_to_list_u32`]
+    /// knows as `u32::MAX`; a 32-bit strip's 0xFFFF is a vertex.
+    #[test]
+    fn a_16_bit_strip_restart_widens_and_a_32_bit_index_does_not() {
+        let schema = "../definitions/haloreach_mcc/render_model.json";
+        if !std::path::Path::new(schema).exists() {
+            return;
+        }
+        let build = |block: &str, field: &str, values: &[i32], data: fn(i32) -> TagFieldData| {
+            let mut tag = TagFile::new(schema).unwrap();
+            let mut root = tag.root_mut();
+            let mut pmt = root.field_path_mut("render geometry/per mesh temporary").unwrap();
+            let mut pmt = pmt.as_block_mut().unwrap();
+            let element = pmt.add_element();
+            let mut element = pmt.element_mut(element).unwrap();
+            let mut holder = element.field_path_mut(block).unwrap();
+            let mut indices = holder.as_block_mut().unwrap();
+            for &value in values {
+                let index = indices.add_element();
+                let mut entry = indices.element_mut(index).unwrap();
+                entry.field_path_mut(field).unwrap().set(data(value)).unwrap();
+            }
+            tag
+        };
+        let narrow = build("raw indices", "word", &[0, 1, -1, 2], |value| TagFieldData::ShortInteger(value as i16));
+        let pmt = narrow.root().field_path("render geometry/per mesh temporary").unwrap();
+        let pmt = pmt.as_block().unwrap().element(0).unwrap();
+        assert_eq!(read_mesh_strip_indices(&pmt), Some(vec![0, 1, u32::MAX, 2]));
+        assert_eq!(read_mesh_indices(&pmt), Some(vec![0, 1, 65535, 2]), "a list keeps it");
+        let wide = build("raw indices32", "dword", &[0, 70_000, 65535, 2], TagFieldData::LongInteger);
+        let pmt = wide.root().field_path("render geometry/per mesh temporary").unwrap();
+        let pmt = pmt.as_block().unwrap().element(0).unwrap();
+        assert_eq!(read_mesh_strip_indices(&pmt), Some(vec![0, 70_000, 65535, 2]));
     }
 
     #[test]
