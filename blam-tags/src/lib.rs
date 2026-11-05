@@ -148,7 +148,7 @@ pub use fields::{
     format_group_tag, parse_group_tag, ApiInteropData, StringIdData, TagFieldData, TagFieldType,
     TagReferenceData,
 };
-pub use field_name::{clean_field_name, parse_field_name, FieldNameInfo};
+pub use field_name::{clean_field_name, option_display_name, parse_field_name, FieldNameInfo};
 pub use field_path::{TagFieldPath, TagFieldPathSegment};
 pub use error::TagReadError;
 pub use typed_enums::{Enum, Flags, SchemaEnum, TagInt};

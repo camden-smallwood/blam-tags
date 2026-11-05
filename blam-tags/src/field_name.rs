@@ -195,6 +195,21 @@ fn units_slot<'a>(head: &'a str, range: Option<&str>) -> Option<&'a str> {
     non_empty(unit)
 }
 
+/// An enum or flags option's name as the editors show it: the same markup
+/// as a field's (`#help`, `!`, `*`, `{alias}`, an `&` override) parsed the
+/// same way, as Foundation's `TagValueEnumItem` / `TagValueFlagItem` do.
+/// Code reading an option by name compares against this, so the option is
+/// written as the user sees it.
+pub fn option_display_name(raw: &str) -> Cow<'_, str> {
+    // `FieldNameInfo::display`, kept borrowing from `raw`.
+    let info = parse_field_name(raw);
+    match (info.display_name, info.clean_name) {
+        (Some(display), _) => Cow::Borrowed(display),
+        (None, clean) if clean.contains('\\') => Cow::Owned(clean.replace('\\', "/")),
+        (None, clean) => clean,
+    }
+}
+
 /// The bare addressable name for `raw` — markup stripped. Borrows when possible.
 ///
 /// This is the hot path used by `crate::data::field_name_matches` and the

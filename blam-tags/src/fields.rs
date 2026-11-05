@@ -850,14 +850,26 @@ fn resolve_enum_name(layout: &TagLayout, field: &TagFieldLayout, value: i64) -> 
     layout.get_string(string_offset).map(str::to_string)
 }
 
-/// Reverse of the name-resolution step: look up the bit index of a
-/// flags value whose variant name matches `name` (case-sensitive).
-/// Returns `None` if the field has no string list or no bit with that
-/// name exists. Used by the `flag` CLI command to map a user-supplied
-/// flag name to the bit it should set/clear.
+/// Reverse of the name-resolution step: the bit of a flags field whose
+/// option is `name` (case-sensitive). The stored name matches first, so
+/// raw names keep working. Otherwise `name` matches an option's display
+/// name ([`crate::field_name::option_display_name`]: markup such as
+/// `#help` or a trailing `!` left out) or its `{alias}`, which is how one
+/// game's name for an option reaches another's (ODST's
+/// `first person{first person only}`), unless two options match. `None` if
+/// the field has no string list or no option matches.
 pub(crate) fn find_flag_bit(layout: &TagLayout, field: &TagFieldLayout, name: &str) -> Option<u32> {
     let offsets = checked_string_list_offsets(layout, field)?;
-    let bit = offsets.iter().position(|&offset| layout.get_string(offset) == Some(name))?;
+    let names = || offsets.iter().map(|&offset| layout.get_string(offset).unwrap_or(""));
+    let bit = names().position(|raw| raw == name).or_else(|| {
+        let answers = |raw: &str| {
+            crate::field_name::option_display_name(raw) == name
+                || crate::field_name::parse_field_name(raw).alias == Some(name)
+        };
+        let mut matching = names().enumerate().filter(|(_, raw)| answers(raw));
+        let (bit, _) = matching.next()?;
+        matching.next().is_none().then_some(bit)
+    })?;
     u32::try_from(bit).ok()
 }
 
@@ -1453,6 +1465,49 @@ mod tests {
         assert_eq!(resolve_enum_name(&layout, &field, (1i64 << 32) + 1), None);
         assert_eq!(find_flag_bit(&layout, &field, "second"), Some(1));
         assert_eq!(field_option_names(&layout, &field).collect::<Vec<_>>(), ["first", "second"]);
+    }
+
+    /// A flag is found by its stored name or, failing that, by the name the
+    /// editors show or its alias; two options answering one name match neither.
+    #[test]
+    fn flags_match_by_stored_then_shown_name() {
+        let mut layout = TagLayout::from_json("../definitions/halo4_mcc/device_control.json").unwrap();
+        let options = [
+            "plain",
+            "with help#what it does",
+            "hidden!",
+            "twin#one",
+            "twin#two",
+            "a#x",
+            "a",
+            "first person{first person only}",
+        ];
+        layout.string_data = options.iter().flat_map(|name| name.bytes().chain([0])).collect();
+        layout.string_offsets = options
+            .iter()
+            .scan(0, |at, name| {
+                let offset = *at;
+                *at += name.len() as u32 + 1;
+                Some(offset)
+            })
+            .collect();
+        layout.string_lists =
+            vec![crate::layout::TagStringList { offset: 0, first: 0, count: options.len() as u32 }];
+        let field = TagFieldLayout {
+            name_offset: 0, type_index: 0, definition: 0,
+            field_type: TagFieldType::LongFlags, offset: 0,
+        };
+        let bit = |name: &str| find_flag_bit(&layout, &field, name);
+        assert_eq!(bit("plain"), Some(0));
+        assert_eq!(bit("with help"), Some(1), "shown name, help left out");
+        assert_eq!(bit("with help#what it does"), Some(1), "stored name still works");
+        assert_eq!(bit("hidden"), Some(2), "a hidden option's `!` left out");
+        assert_eq!(bit("twin"), None, "two options show `twin`");
+        assert_eq!(bit("twin#two"), Some(4));
+        assert_eq!(bit("a"), Some(6), "an exact stored name wins over another's shown name");
+        assert_eq!(bit("first person"), Some(7));
+        assert_eq!(bit("first person only"), Some(7), "the alias another game uses");
+        assert_eq!(bit("missing"), None);
     }
 
     /// `with_int` keeps the variant and cuts the value to its width; `int_any`

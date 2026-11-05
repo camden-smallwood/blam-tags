@@ -382,6 +382,15 @@ impl<'a> TagStruct<'a> {
         }
     }
 
+    /// An enum field's option as the editors show it
+    /// ([`crate::field_name::option_display_name`]), for code that reads
+    /// an option by name: `read_enum_option("coordinate system").as_deref()
+    /// == Some("world")`. [`Self::read_enum_name`] keeps the stored name.
+    pub fn read_enum_option(&self, name: &str) -> Option<String> {
+        let stored = self.read_enum_name(name)?;
+        Some(crate::field_name::option_display_name(&stored).into_owned())
+    }
+
     /// Read the resolved `(bit, name)` pairs of the set bits of a flags
     /// field, regardless of width. `None` if the field is missing or
     /// isn't a (non-block) flags field.
