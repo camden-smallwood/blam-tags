@@ -171,8 +171,8 @@ pub use jms::{
 };
 pub use jmi::{JmiError, JmiFile, JMI_MIN_VERSION, JMI_VERSION};
 pub use particle_model::{
-    is_particle_model_group, particle_model_meshes, read_particle_model, ParticleModelObject,
-    ParticleModelSource, ParticleObjectMesh, ParticleVertex,
+    is_particle_model_group, particle_model_meshes, particle_model_strip, read_particle_model,
+    ParticleModelObject, ParticleModelSource, ParticleModelStrip, ParticleObjectMesh, ParticleVertex,
 };
 pub use ass::{
     AssError, AssFile, AssInstance, AssLight, AssLightKind, AssMaterial, AssObject,

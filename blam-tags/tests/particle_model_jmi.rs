@@ -139,6 +139,56 @@ fn gen3_multi_object_strip_splits_at_variant_boundaries() {
     }
 }
 
+/// The strip the GPU draws holds the same triangles as the per-object
+/// decode: each variant's run of strip vertices, de-stripped, gives that
+/// object's triangles corner for corner. Reach's seven-object
+/// `glass_fragments` and Halo 4's one-object rifle casing.
+#[test]
+fn gen3_gpu_strip_matches_the_object_meshes() {
+    let cases = [
+        ("haloreach", "fx/particles/models/debris/glass_fragments/glass_fragments.particle_model", 7, None),
+        (
+            "halo4",
+            "fx/reach/particles/models/weapons/bullet_casings/sniper_rifle/sniper_rifle.particle_model",
+            1,
+            Some(78),
+        ),
+    ];
+    for (kit, rel, objects, max_size) in cases {
+        let Some(tags) = kit_tags(kit) else { continue };
+        let path = tags.join(rel);
+        if !path.is_file() {
+            continue;
+        }
+        let tag = read(&path, &format!("{kit}_mcc"));
+        let strip = blam_tags::particle_model_strip(&tag).expect("strip");
+        let meshes = blam_tags::particle_model_meshes(&tag, &stem(&path)).expect("meshes");
+        assert_eq!(strip.variants.len(), objects, "{rel}");
+        assert_eq!(meshes.len(), objects, "{rel}");
+        if let Some(size) = max_size {
+            assert_eq!(strip.max_size, size, "{rel}");
+        }
+        let longest = strip.variants.iter().map(|(first, last)| last - first + 1).max().unwrap();
+        assert!(strip.max_size >= longest, "{rel}: every variant fits the draw");
+        let corner = |v: &blam_tags::ParticleVertex| [v.position.x, v.position.y, v.position.z];
+        for (&(first, last), mesh) in strip.variants.iter().zip(&meshes) {
+            let run: Vec<u32> = (first as u32..=last as u32).collect();
+            // Numbered by strip position, the joins' repeated vertices are
+            // no longer repeated indices; drop them by corner instead.
+            let from_strip: Vec<[f32; 3]> = blam_tags::geometry::strip_to_list_u32(&run)
+                .into_iter()
+                .map(|(a, b, c)| [a, b, c].map(|at| corner(&strip.vertices[at as usize])))
+                .filter(|[a, b, c]| a != b && b != c && a != c)
+                .flatten()
+                .collect();
+            let from_mesh: Vec<[f32; 3]> =
+                mesh.indices.iter().map(|&at| corner(&mesh.vertices[at as usize])).collect();
+            assert!(!from_mesh.is_empty(), "{rel}: `{}` decoded empty", mesh.name);
+            assert_eq!(from_strip, from_mesh, "{rel}: `{}`", mesh.name);
+        }
+    }
+}
+
 /// The gen3 shape that declares `index buffer type = DEFAULT` (the
 /// majority) must still decode as a strip.
 #[test]

@@ -190,29 +190,31 @@ pub fn is_particle_model_group(group_tag: u32) -> bool {
 // Gen3 — pmdf (Halo 3 / Reach / Halo 4)
 //================================================================================
 
+/// `m_gpu_data/m_variants[index]`'s `runtime m_count[k]`: each element is a
+/// real_vector4d surfaced as a 4-wide array of `runtime gpu_real`.
+fn variant_component(root: &TagStruct<'_>, index: usize, k: usize) -> Option<f32> {
+    let variants = root.field_path("m_gpu_data/m_variants").and_then(|f| f.as_block())?;
+    let arr = variants.element(index)?.field("runtime m_count")?.as_array()?;
+    let e = arr.element(k)?;
+    match e.fields().next().and_then(|f| f.value()) {
+        Some(crate::TagFieldData::Real(r)) => Some(r),
+        _ => None,
+    }
+}
+
 /// Inclusive `(first, last)` index range per object, read from
-/// `m_gpu_data/m_variants[1..]`. Returns `None` when the block is
-/// absent or degenerate so the caller can fall back to one object
-/// spanning the whole buffer.
+/// `m_gpu_data/m_variants[1..]` (element 0 is the header). Returns `None`
+/// when the block is absent or degenerate so the caller can fall back to
+/// one object spanning the whole buffer.
 fn read_variant_ranges(root: &TagStruct<'_>) -> Option<Vec<(usize, usize)>> {
     let variants = root.field_path("m_gpu_data/m_variants").and_then(|f| f.as_block())?;
     if variants.len() < 2 {
         return None;
     }
-    // Each element is a real_vector4d surfaced as a 4-wide array of
-    // `runtime gpu_real`. Element 0 is the header; 1.. are the ranges.
-    let component = |index: usize, k: usize| -> Option<f32> {
-        let arr = variants.element(index)?.field("runtime m_count")?.as_array()?;
-        let e = arr.element(k)?;
-        match e.fields().next().and_then(|f| f.value()) {
-            Some(crate::TagFieldData::Real(r)) => Some(r),
-            _ => None,
-        }
-    };
     let mut ranges = Vec::with_capacity(variants.len() - 1);
     for i in 1..variants.len() {
-        let first = component(i, 0)?;
-        let last = component(i, 1)?;
+        let first = variant_component(root, i, 0)?;
+        let last = variant_component(root, i, 1)?;
         if first < 0.0 || last < first {
             return None;
         }
@@ -221,11 +223,11 @@ fn read_variant_ranges(root: &TagStruct<'_>) -> Option<Vec<(usize, usize)>> {
     Some(ranges)
 }
 
-fn read_gen3(tag: &TagFile, stem: &str) -> Result<Vec<ParticleObjectMesh>, JmsError> {
-    let root = tag.root();
+/// The gen3 vertex buffer, decompressed, and the strip's indices into it.
+fn read_gen3_buffers(root: &TagStruct<'_>) -> Result<(Vec<ParticleVertex>, Vec<u32>), JmsError> {
     // Decompressed by `meshes[0]`'s vertex type where it has one, as every
     // other reader of these vertices does.
-    let mut bounds = read_compression_bounds(&root);
+    let mut bounds = read_compression_bounds(root);
     if let Some(mesh) = root
         .field_path("render geometry/meshes")
         .and_then(|f| f.as_block())
@@ -244,11 +246,79 @@ fn read_gen3(tag: &TagFile, stem: &str) -> Result<Vec<ParticleObjectMesh>, JmsEr
         .field("raw vertices")
         .and_then(|f| f.as_block())
         .ok_or(JmsError::MissingField("per mesh temporary[0]/raw vertices"))?;
+    let vertices = (0..raw_v.len())
+        .filter_map(|k| raw_v.element(k))
+        .map(|v| read_gen3_vertex(&v, &bounds))
+        .collect();
 
     // 16-bit or 32-bit indices, widened to u32 — JmsTriangle indexes with
     // u32 already.
     let indices = crate::geometry::read_mesh_indices(&pmt)
         .ok_or(JmsError::MissingField("per mesh temporary[0]/raw indices"))?;
+    Ok((vertices, indices))
+}
+
+/// A gen3 particle model's vertex buffer as the GPU reads it, which a
+/// variant's `(first, last)` range indexes directly (Halo 4's
+/// `default_particle_model_vs` fetches `mesh_vertices` with no index
+/// buffer). Its meshes are flagged `mesh is unindexed`, and Halo 4's buffer
+/// builder (MCC `halo4_tag_test` 0x1404E0C00) then writes one vertex per
+/// index, `raw vertices[raw indices[i]]`; without the flag it writes the raw
+/// vertices as they are.
+#[derive(Debug, Clone)]
+pub struct ParticleModelStrip {
+    /// In tag space, decompressed, UVs unflipped.
+    pub vertices: Vec<ParticleVertex>,
+    /// Inclusive `(first, last)` per variant, into [`Self::vertices`].
+    pub variants: Vec<(usize, usize)>,
+    /// `m_variants[0].y`, the longest variant: what the draw takes as each
+    /// particle's vertex count.
+    pub max_size: usize,
+}
+
+/// `mesh flags` bit 4, `mesh is unindexed (do not modify)`.
+const MESH_IS_UNINDEXED: i128 = 0x10;
+
+/// Decode a gen3 `pmdf` into its strip, for a renderer that draws it as
+/// the game's GPU does. Halo 2's `PRTM` has no such buffer.
+pub fn particle_model_strip(tag: &TagFile) -> Result<ParticleModelStrip, JmsError> {
+    if &tag.header.group_tag.to_be_bytes() != b"pmdf" {
+        return Err(JmsError::Unsupported("not a gen3 particle_model".to_owned()));
+    }
+    let root = tag.root();
+    let (raw, indices) = read_gen3_buffers(&root)?;
+    let unindexed = root
+        .field_path("render geometry/meshes")
+        .and_then(|f| f.as_block())
+        .and_then(|b| b.element(0))
+        .and_then(|mesh| mesh.read_int_any("mesh flags"))
+        .is_some_and(|flags| flags & MESH_IS_UNINDEXED != 0);
+    let vertices: Vec<ParticleVertex> = if unindexed {
+        indices
+            .iter()
+            .map(|&index| raw.get(index as usize).copied())
+            .collect::<Option<_>>()
+            .ok_or(JmsError::Unsupported("an index past the vertices".to_owned()))?
+    } else {
+        raw
+    };
+    let whole = vec![(0, vertices.len().saturating_sub(1))];
+    let variants: Vec<(usize, usize)> = read_variant_ranges(&root)
+        .unwrap_or(whole)
+        .into_iter()
+        .filter(|&(first, _)| first < vertices.len())
+        .map(|(first, last)| (first, last.min(vertices.len() - 1)))
+        .collect();
+    let longest = variants.iter().map(|&(first, last)| last - first + 1).max().unwrap_or(0);
+    let max_size = variant_component(&root, 0, 1)
+        .filter(|size| *size >= 1.0)
+        .map_or(longest, |size| size as usize);
+    Ok(ParticleModelStrip { vertices, variants, max_size })
+}
+
+fn read_gen3(tag: &TagFile, stem: &str) -> Result<Vec<ParticleObjectMesh>, JmsError> {
+    let root = tag.root();
+    let (vertices, indices) = read_gen3_buffers(&root)?;
 
     // No variants (or a malformed block) → treat the whole buffer as a
     // single object rather than dropping the geometry on the floor.
@@ -266,9 +336,7 @@ fn read_gen3(tag: &TagFile, stem: &str) -> Result<Vec<ParticleObjectMesh>, JmsEr
         // Gen3 is always a strip — the `index buffer type` enum reads
         // DEFAULT on most tags and cannot be trusted (see module docs).
         let tris = strip_to_list_u32(&indices[first..end]);
-        out.push(compact(name, false, &tris, |vi| {
-            raw_v.element(vi as usize).map(|v| read_gen3_vertex(&v, &bounds))
-        }));
+        out.push(compact(name, false, &tris, |vi| vertices.get(vi as usize).copied()));
     }
     Ok(out)
 }
