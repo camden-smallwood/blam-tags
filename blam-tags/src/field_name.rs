@@ -27,6 +27,10 @@
 //! contain the path separator `/` — matching Foundation, which relies on this
 //! instead of per-segment escaping).
 //!
+//! Literal bracket annotations such as `[Y]`, `[seconds]`, and `[4]` survive
+//! in the presentation name. Address cleaning retains its delimiter rules so
+//! existing paths stay compatible; display labels need not be valid paths.
+//!
 //! ## Why this matters
 //!
 //! Field paths (`crate::field_path`) address fields by their *clean* name. If a
@@ -63,7 +67,9 @@ pub struct FieldNameInfo<'a> {
     /// The bare addressable name: markup-free, `{alias}` dropped, `/`→`\`.
     /// This is what paths and lookups use.
     pub clean_name: Cow<'a, str>,
-    /// `&`-introduced display-name override, if any (else use `clean_name`).
+    /// Presentation name: an `&` override, or the authored label when it
+    /// contains literal brackets that cannot be included in a field address.
+    /// Otherwise absent, and [`Self::display`] uses `clean_name`.
     pub display_name: Option<&'a str>,
     /// `#`-introduced description / tooltip text.
     pub description: Option<&'a str>,
@@ -137,12 +143,14 @@ pub fn parse_field_name(raw: &str) -> FieldNameInfo<'_> {
     // Foundation's raw `EndsWith("^")`, which misses `name^#help`.
     let is_block_label = head.ends_with('^');
 
-    let range = range_hint(head);
+    let (label_end, literal_brackets) = presentation_name_end(head);
+    let range = range_hint(head, label_end);
 
     FieldNameInfo {
         clean_name: clean_name_cow(raw),
         // `&display` runs from `&` up to the `:units` marker (or end of head).
-        display_name: between(head, '&', &[':']),
+        display_name: between(head, '&', &[':'])
+            .or_else(|| literal_brackets.then(|| head[..label_end].trim_end())),
         // `:units` runs from `:` to the end of head, with the range excised.
         units: units_slot(head, range),
         range,
@@ -207,21 +215,124 @@ fn clean_name_cow(raw: &str) -> Cow<'_, str> {
     }
 }
 
-/// The `[…]` range hint including its brackets, if the name carries a
-/// well-formed one. Uses the first `[` and its matching-position `]`.
-/// The `[…]` range hint in `raw`, brackets and all. A `[` never closed runs to
-/// the end: it is still a range, written without its `]`, not units.
-fn range_hint(raw: &str) -> Option<&str> {
-    let open = raw.find('[')?;
-    match raw[open..].find(']') {
-        Some(close) => Some(&raw[open..=open + close]),
-        None => non_empty(raw[open..].trim_end()),
+/// The authored label can contain literal brackets, while address cleaning
+/// keeps its existing delimiter rules. This leaves paths and byte-level name
+/// matching compatible with tags and clients that already use them.
+fn presentation_name_end(raw: &str) -> (usize, bool) {
+    let mut offset = 0;
+    let mut literal_brackets = false;
+    while offset < raw.len() {
+        let byte = raw.as_bytes()[offset];
+        if byte == b'[' {
+            let tail = &raw[offset + 1..];
+            let Some(close) = tail.find(']') else { break; };
+            let content = &tail[..close];
+            if bracket_is_numeric_range(content)
+                || content.bytes().any(|byte| is_name_marker(byte) && byte != b'[') {
+                break;
+            }
+            literal_brackets = true;
+            offset += close + 2;
+        } else if is_name_marker(byte) {
+            break;
+        } else {
+            offset += 1;
+        }
     }
+    (offset, literal_brackets)
+}
+
+fn bracket_is_numeric_range(content: &str) -> bool {
+    let starts_bound = |value: &str| {
+        let value = value.trim_start().trim_start_matches(['+', '-']);
+        value.as_bytes().first().is_some_and(u8::is_ascii_digit)
+            || value.strip_prefix('.').is_some_and(|rest|
+                rest.as_bytes().first().is_some_and(u8::is_ascii_digit))
+            || value.starts_with("inf")
+    };
+    for (index, _) in content.char_indices().skip(1) {
+        if content[..index].trim().parse::<f64>().is_err() { continue; }
+        let rest = content[index..].trim_start();
+        if rest.starts_with([',', '=']) { return true; }
+        if let Some(upper) = rest.strip_prefix("to ").or_else(|| rest.strip_prefix('-')) {
+            return starts_bound(upper);
+        }
+        if let Some(upper) = rest.strip_prefix("..") {
+            return starts_bound(upper.trim_start_matches('.')) || upper.starts_with(')');
+        }
+    }
+    false
+}
+
+/// Skip literal name annotations and aliases. Numeric ranges in the name,
+/// and legacy bracket hints in the units slot, retain their markup behavior.
+/// An unclosed hint runs to the end, as it does in the original definitions.
+fn range_hint(raw: &str, mut offset: usize) -> Option<&str> {
+    let mut in_units = false;
+    while offset < raw.len() {
+        match raw.as_bytes()[offset] {
+            b'{' => { offset += raw[offset..].find('}')? + 1; }
+            b':' => { in_units = true; offset += 1; }
+            b'[' => {
+                let tail = &raw[offset + 1..];
+                let Some(close) = tail.find(']') else { return non_empty(raw[offset..].trim_end()); };
+                if in_units || bracket_is_numeric_range(&tail[..close]) {
+                    return Some(&raw[offset..=offset + close + 1]);
+                }
+                offset += close + 2;
+            }
+            _ => offset += 1,
+        }
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn literal_brackets_are_display_labels_not_ranges() {
+        for raw in ["[Y] unit flags", "[N] unit flags", "[custom] state flags",
+            "fade in time [seconds]", "pixel shader code[UNUSED]", "Default Label [4]",
+            "texture coordinate u[16-bit]", "normal[11.11.10-bit]", "bumpenv mat[0][1]",
+            "日本語 [表示]"] {
+            let info = parse_field_name(raw);
+            assert_eq!(info.display(), raw);
+            assert_eq!(info.range, None, "literal annotation is not a range: {raw}");
+            // Presentation must not change existing field path addresses.
+            assert_eq!(info.clean_name, raw[..raw.find('[').unwrap()].trim_end());
+        }
+        let info = parse_field_name("[custom] weight*![0,1]#help");
+        assert_eq!(info.display(), "[custom] weight");
+        assert_eq!(info.range, Some("[0,1]"));
+        assert!(info.read_only && info.hidden);
+        assert_eq!(info.description, Some("help"));
+        let info = parse_field_name("[custom] weight:[0,1]seconds#help");
+        assert_eq!(info.display(), "[custom] weight");
+        assert_eq!(info.units, Some("seconds"));
+        assert_eq!(info.range, Some("[0,1]"));
+        assert_eq!(parse_field_name("[custom] weight&Custom weight").display(), "Custom weight");
+    }
+
+    #[test]
+    fn numeric_brackets_keep_their_range_semantics() {
+        for range in ["[0,1]", "[0-1]", "[0..1]", "[-1...1]", "[0.0 to 1.0]",
+            "[0,+inf]", "[0, n]", "[0, ping max view angle]", "[-90,90]"] {
+            for prefix in ["weight ", "[custom] weight "] {
+                let raw = format!("{prefix}{range}");
+                let info = parse_field_name(&raw);
+                assert_eq!(info.display(), prefix.trim_end());
+                assert_eq!(info.range, Some(range));
+            }
+        }
+        // Preserve the older definitions' units-slot annotations too.
+        assert_eq!(parse_field_name("radius:[wu]").range, Some("[wu]"));
+        assert_eq!(parse_field_name("weight:[0.1]").range, Some("[0.1]"));
+        let info = parse_field_name("bc4 [a.k.a. DXT5A]{old bc4 [old alias]}");
+        assert_eq!(info.display(), "bc4 [a.k.a. DXT5A]");
+        assert_eq!(info.range, None, "brackets in aliases are not ranges");
+    }
 
     fn clean(raw: &str) -> String {
         clean_field_name(raw).into_owned()

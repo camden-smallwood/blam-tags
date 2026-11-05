@@ -716,8 +716,8 @@ impl<'a> TagField<'a> {
         crate::field_name::clean_field_name(self.name())
     }
 
-    /// The name to show a user: the `&`-introduced display override if the raw
-    /// name carries one, otherwise the clean name.
+    /// The name to show a user: an `&` override or the authored label with
+    /// literal bracket annotations, falling back to the clean name.
     pub fn display_name(&self) -> std::borrow::Cow<'a, str> {
         let info = crate::field_name::parse_field_name(self.name());
         match info.display_name {
@@ -2272,14 +2272,8 @@ impl<'a> TagField<'a> {
     /// [`TagFlagMut::name`].
     fn flag_from_bit(&self, bit: u32) -> &'a str {
         let field = &self.layout.fields[self.field_index];
-        let Some(string_list) = self.layout.string_lists.get(field.definition as usize) else {
-            return "";
-        };
-        if bit >= string_list.count {
-            return "";
-        }
-        let offset_index = (string_list.first + bit) as usize;
-        let Some(&string_offset) = self.layout.string_offsets.get(offset_index) else {
+        let Some(&string_offset) = crate::fields::checked_string_list_offsets(self.layout, field)
+            .and_then(|offsets| offsets.get(bit as usize)) else {
             return "";
         };
         self.layout.get_string(string_offset).unwrap_or("")

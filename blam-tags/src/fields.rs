@@ -834,16 +834,19 @@ pub(crate) fn encode_null_padded_string(s: &str, dest: &mut [u8]) {
 // Enum / flags name resolution.
 //================================================================================
 
+/// Validate the declared list before indexing or iterating it. Malformed
+/// layouts can overflow `first + count`, or claim billions of missing names.
+pub(crate) fn checked_string_list_offsets<'a>(layout: &'a TagLayout, field: &TagFieldLayout) -> Option<&'a [u32]> {
+    let list = layout.string_lists.get(field.definition as usize)?;
+    layout.string_offsets.get(list.first as usize..)?.get(..list.count as usize)
+}
+
 /// Resolve an enum value to its variant name via the layout's
 /// `string_lists[field.definition]`. Returns `None` if `value` is out
 /// of range or the string list / offset is missing.
 fn resolve_enum_name(layout: &TagLayout, field: &TagFieldLayout, value: i64) -> Option<String> {
-    let string_list = layout.string_lists.get(field.definition as usize)?;
-    if value < 0 || (value as u32) >= string_list.count {
-        return None;
-    }
-    let offset_index = (string_list.first + value as u32) as usize;
-    let string_offset = *layout.string_offsets.get(offset_index)?;
+    let offsets = checked_string_list_offsets(layout, field)?;
+    let string_offset = *offsets.get(usize::try_from(value).ok()?)?;
     layout.get_string(string_offset).map(str::to_string)
 }
 
@@ -853,15 +856,9 @@ fn resolve_enum_name(layout: &TagLayout, field: &TagFieldLayout, value: i64) -> 
 /// name exists. Used by the `flag` CLI command to map a user-supplied
 /// flag name to the bit it should set/clear.
 pub(crate) fn find_flag_bit(layout: &TagLayout, field: &TagFieldLayout, name: &str) -> Option<u32> {
-    let string_list = layout.string_lists.get(field.definition as usize)?;
-    for bit in 0..string_list.count {
-        let offset_index = (string_list.first + bit) as usize;
-        let Some(&string_offset) = layout.string_offsets.get(offset_index) else { continue };
-        if layout.get_string(string_offset) == Some(name) {
-            return Some(bit);
-        }
-    }
-    None
+    let offsets = checked_string_list_offsets(layout, field)?;
+    let bit = offsets.iter().position(|&offset| layout.get_string(offset) == Some(name))?;
+    u32::try_from(bit).ok()
 }
 
 /// Render a 4-byte group tag (stored as a BE-packed `u32` with
@@ -914,20 +911,11 @@ pub(crate) fn field_option_names<'a>(
             | TagFieldType::WordFlags
             | TagFieldType::ByteFlags,
     );
-    let string_list = names_a_string_list
-        .then(|| layout.string_lists.get(field.definition as usize))
-        .flatten();
-    let range = match string_list {
-        Some(sl) => sl.first..sl.first + sl.count,
-        None => 0..0,
-    };
-    range.map(move |i| {
-        layout
-            .string_offsets
-            .get(i as usize)
-            .and_then(|&off| layout.get_string(off))
-            .unwrap_or("")
-    })
+    let offsets = names_a_string_list
+        .then(|| checked_string_list_offsets(layout, field))
+        .flatten()
+        .unwrap_or_default();
+    offsets.iter().map(|&offset| layout.get_string(offset).unwrap_or(""))
 }
 
 /// Resolve the names of the set bits of a flags value. Unset bits and
@@ -940,18 +928,14 @@ fn resolve_flag_names(
     total_bits: u32,
 ) -> Vec<(u32, String)> {
     let mut names = Vec::new();
-    let Some(string_list) = layout.string_lists.get(field.definition as usize) else {
+    let Some(offsets) = checked_string_list_offsets(layout, field) else {
         return names;
     };
     for bit in 0..total_bits {
         if (value & (1u64 << bit)) == 0 {
             continue;
         }
-        if bit >= string_list.count {
-            continue;
-        }
-        let offset_index = (string_list.first + bit) as usize;
-        let Some(&string_offset) = layout.string_offsets.get(offset_index) else { continue };
+        let Some(&string_offset) = offsets.get(bit as usize) else { continue };
         let Some(name) = layout.get_string(string_offset) else { continue };
         names.push((bit, name.to_string()));
     }
@@ -1445,6 +1429,31 @@ pub(crate) fn serialize_field(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enum_and_flag_names_refuse_invalid_string_lists() {
+        let mut layout = TagLayout::from_json("../definitions/halo4_mcc/device_control.json").unwrap();
+        layout.string_data = b"first\0second\0".to_vec();
+        layout.string_offsets = vec![0, 6];
+        let field = TagFieldLayout {
+            name_offset: 0, type_index: 0, definition: 0,
+            field_type: TagFieldType::LongFlags, offset: 0,
+        };
+        for (first, count) in [(u32::MAX, 2), (1, u32::MAX), (1, 2), (3, 1)] {
+            layout.string_lists = vec![crate::layout::TagStringList { offset: 0, first, count }];
+            assert!(resolve_flag_names(&layout, &field, 2, 32).is_empty());
+            assert_eq!(resolve_enum_name(&layout, &field, 1), None);
+            assert_eq!(find_flag_bit(&layout, &field, "second"), None);
+            assert_eq!(field_option_names(&layout, &field).count(), 0);
+        }
+        layout.string_lists = vec![crate::layout::TagStringList { offset: 0, first: 0, count: 2 }];
+        assert_eq!(resolve_flag_names(&layout, &field, 2, 32), vec![(1, "second".to_owned())]);
+        assert_eq!(resolve_enum_name(&layout, &field, 1).as_deref(), Some("second"));
+        assert_eq!(resolve_enum_name(&layout, &field, -1), None);
+        assert_eq!(resolve_enum_name(&layout, &field, (1i64 << 32) + 1), None);
+        assert_eq!(find_flag_bit(&layout, &field, "second"), Some(1));
+        assert_eq!(field_option_names(&layout, &field).collect::<Vec<_>>(), ["first", "second"]);
+    }
 
     /// `with_int` keeps the variant and cuts the value to its width; `int_any`
     /// reads it back; `integer` takes only integers and block indices.
