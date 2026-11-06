@@ -850,15 +850,16 @@ fn resolve_enum_name(layout: &TagLayout, field: &TagFieldLayout, value: i64) -> 
     layout.get_string(string_offset).map(str::to_string)
 }
 
-/// Reverse of the name-resolution step: the bit of a flags field whose
-/// option is `name` (case-sensitive). The stored name matches first, so
+/// Reverse of the name-resolution step: the index of the option named
+/// `name` (case-sensitive) in an enum's or flags field's list, which for
+/// flags is its bit. The stored name matches first, so
 /// raw names keep working. Otherwise `name` matches an option's display
 /// name ([`crate::field_name::option_display_name`]: markup such as
 /// `#help` or a trailing `!` left out) or its `{alias}`, which is how one
 /// game's name for an option reaches another's (ODST's
 /// `first person{first person only}`), unless two options match. `None` if
 /// the field has no string list or no option matches.
-pub(crate) fn find_flag_bit(layout: &TagLayout, field: &TagFieldLayout, name: &str) -> Option<u32> {
+pub(crate) fn find_option_index(layout: &TagLayout, field: &TagFieldLayout, name: &str) -> Option<u32> {
     let offsets = checked_string_list_offsets(layout, field)?;
     let names = || offsets.iter().map(|&offset| layout.get_string(offset).unwrap_or(""));
     let bit = names().position(|raw| raw == name).or_else(|| {
@@ -1455,7 +1456,7 @@ mod tests {
             layout.string_lists = vec![crate::layout::TagStringList { offset: 0, first, count }];
             assert!(resolve_flag_names(&layout, &field, 2, 32).is_empty());
             assert_eq!(resolve_enum_name(&layout, &field, 1), None);
-            assert_eq!(find_flag_bit(&layout, &field, "second"), None);
+            assert_eq!(find_option_index(&layout, &field, "second"), None);
             assert_eq!(field_option_names(&layout, &field).count(), 0);
         }
         layout.string_lists = vec![crate::layout::TagStringList { offset: 0, first: 0, count: 2 }];
@@ -1463,7 +1464,7 @@ mod tests {
         assert_eq!(resolve_enum_name(&layout, &field, 1).as_deref(), Some("second"));
         assert_eq!(resolve_enum_name(&layout, &field, -1), None);
         assert_eq!(resolve_enum_name(&layout, &field, (1i64 << 32) + 1), None);
-        assert_eq!(find_flag_bit(&layout, &field, "second"), Some(1));
+        assert_eq!(find_option_index(&layout, &field, "second"), Some(1));
         assert_eq!(field_option_names(&layout, &field).collect::<Vec<_>>(), ["first", "second"]);
     }
 
@@ -1497,7 +1498,7 @@ mod tests {
             name_offset: 0, type_index: 0, definition: 0,
             field_type: TagFieldType::LongFlags, offset: 0,
         };
-        let bit = |name: &str| find_flag_bit(&layout, &field, name);
+        let bit = |name: &str| find_option_index(&layout, &field, name);
         assert_eq!(bit("plain"), Some(0));
         assert_eq!(bit("with help"), Some(1), "shown name, help left out");
         assert_eq!(bit("with help#what it does"), Some(1), "stored name still works");

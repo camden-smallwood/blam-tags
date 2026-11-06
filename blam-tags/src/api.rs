@@ -45,7 +45,7 @@
 use crate::data::{TagBlockData, TagResourceChunk, TagStructData, TagSubChunkContent};
 use crate::io::Endian;
 use crate::fields::{
-    field_option_names, find_flag_bit, TagFieldData, TagFieldType,
+    field_option_names, find_option_index, TagFieldData, TagFieldType,
 };
 use crate::file::TagFile;
 use crate::layout::TagLayout;
@@ -957,10 +957,28 @@ impl<'a> TagField<'a> {
         }
     }
 
+    /// Whether an enum field holds the option named `option`, matched as
+    /// [`TagField::flag`] matches a flag: the stored name, else the one
+    /// option whose display name or `{alias}` is `option`. False for a field
+    /// that is not an enum, and for a name no option has or several share.
+    pub fn enum_is(&self, option: &str) -> bool {
+        let field = &self.layout.fields[self.field_index];
+        let Some(index) = find_option_index(self.layout, field, option) else {
+            return false;
+        };
+        let current = match self.value() {
+            Some(TagFieldData::CharEnum { value, .. }) => i64::from(value),
+            Some(TagFieldData::ShortEnum { value, .. }) => i64::from(value),
+            Some(TagFieldData::LongEnum { value, .. }) => i64::from(value),
+            _ => return false,
+        };
+        current == i64::from(index)
+    }
+
     /// Look up a single flag by name on a flags-typed field.
     pub fn flag(&self, name: &str) -> Option<TagFlag<'a>> {
         let field = &self.layout.fields[self.field_index];
-        let bit = find_flag_bit(self.layout, field, name)?;
+        let bit = find_option_index(self.layout, field, name)?;
         Some(TagFlag { field: *self, bit })
     }
 
@@ -1677,7 +1695,7 @@ impl<'a> TagFieldMut<'a> {
     /// Look up a single flag by name and return a mutable handle.
     pub fn flag_mut(&mut self, name: &str) -> Option<TagFlagMut<'_>> {
         let field = &self.layout.fields[self.field_index];
-        let bit = find_flag_bit(self.layout, field, name)?;
+        let bit = find_option_index(self.layout, field, name)?;
         Some(TagFlagMut {
             field: TagFieldMut {
                 layout: self.layout,
@@ -2611,6 +2629,22 @@ mod set_type_tests {
             .expect("render depth bias")
             .set(TagFieldData::Data(vec![1, 2, 3]));
         assert!(matches!(result, Err(TagSetError::TypeMismatch { .. })), "{result:?}");
+    }
+
+    /// `enum_is` answers for the option the field holds and no other, and
+    /// for nothing on a name the list lacks or a field that is not an enum.
+    #[test]
+    fn an_enum_is_the_option_it_holds() {
+        let halo3 = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../definitions/halo3_mcc");
+        let mut flare = TagFile::new(halo3.join("lens_flare.json")).unwrap();
+        let direction = "occlusion offset direction";
+        let mut root = flare.root_mut();
+        root.field_path_mut(direction).unwrap().set(TagFieldData::ShortEnum { value: 1, name: None }).unwrap();
+        let field = flare.root().field(direction).unwrap();
+        assert!(field.enum_is("marker forward"));
+        assert!(!field.enum_is("toward viewer"));
+        assert!(!field.enum_is("missing"));
+        assert!(!flare.root().field("flags").unwrap().enum_is("marker forward"), "flags are not an enum");
     }
 
     /// A field is a function when its definition says so, not when its bytes
