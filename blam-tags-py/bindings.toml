@@ -163,6 +163,10 @@ reason = "not bound yet (parity gap; see parity.toml)"
 strategy = "skip"
 reason = "not bound yet (parity gap; see parity.toml)"
 
+[module.material]
+strategy = "skip"
+reason = "not bound yet (parity gap; see parity.toml)"
+
 [module.render_model]
 strategy = "skip"
 reason = "not bound yet (parity gap; see parity.toml)"
