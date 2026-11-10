@@ -208,16 +208,9 @@ impl<'a> Bitmap<'a> {
             return Err(BitmapError::NotABitmapTag);
         }
 
-        // Sprite-sheet atlas layout. Prefer the processed `sequences[]`
-        // (the runtime atlas tool.exe bakes with the normalized sprite
-        // rects); fall back to `manual sequences[]` (the authored input).
-        let sequences = root
-            .field_path("sequences")
-            .and_then(|f| f.as_block())
-            .filter(|b| !b.is_empty())
-            .or_else(|| {
-                root.field_path("manual sequences").and_then(|f| f.as_block())
-            });
+        // The processed `sequences[]` only: `manual_sequences[]` is authoring
+        // input of another kind (see [`BitmapDefinition::manual_sequences`]).
+        let sequences = root.field("sequences").and_then(|f| f.as_block());
 
         let p8_palette = if matches!(crate::game::Game::of(tag), crate::game::Game::Halo1) {
             P8Palette::Halo1
@@ -234,40 +227,10 @@ impl<'a> Bitmap<'a> {
         })
     }
 
-    /// Decode the sprite-sheet `sequences[]` block: each sequence is a
-    /// run of frames (sprites), each sprite a normalized sub-rect of the
-    /// atlas image. Empty for plain (non-sprite) bitmaps. Used by
-    /// particle sprite-sheet animation to bake per-frame UVs.
+    /// The processed `sequences[]` block, as [`BitmapDefinition::sequences`]
+    /// reads it. Empty for plain (non-sprite) bitmaps.
     pub fn sequences(&self) -> Vec<BitmapSequence> {
-        let Some(block) = &self.sequences else { return Vec::new() };
-        let mut out = Vec::with_capacity(block.len());
-        for i in 0..block.len() {
-            let Some(seq) = block.element(i) else { continue };
-            let first_bitmap_index = seq.read_int_any("first bitmap index").unwrap_or(0) as i16;
-            let bitmap_count = seq.read_int_any("bitmap count").unwrap_or(0) as i16;
-            let sprites = seq
-                .field("sprites")
-                .and_then(|f| f.as_block())
-                .map(|sb| {
-                    let mut sprites = Vec::with_capacity(sb.len());
-                    for j in 0..sb.len() {
-                        let Some(sp) = sb.element(j) else { continue };
-                        let reg = sp.read_point2d("registration point");
-                        sprites.push(BitmapSprite {
-                            bitmap_index: sp.read_int_any("bitmap index").unwrap_or(0) as i16,
-                            left: sp.read_real("left").unwrap_or(0.0),
-                            right: sp.read_real("right").unwrap_or(1.0),
-                            top: sp.read_real("top").unwrap_or(0.0),
-                            bottom: sp.read_real("bottom").unwrap_or(1.0),
-                            registration_point: [reg.x, reg.y],
-                        });
-                    }
-                    sprites
-                })
-                .unwrap_or_default();
-            out.push(BitmapSequence { first_bitmap_index, bitmap_count, sprites });
-        }
-        out
+        read_sequence_block(self.sequences.as_ref())
     }
 
     /// Number of images in the tag's `bitmaps[]` block.
@@ -311,21 +274,71 @@ impl<'a> Bitmap<'a> {
     }
 }
 
-/// One `sequences[]` entry — a run of sprite frames. For multi-image
-/// (non-atlas) sprite bitmaps the frames are whole images
-/// (`first_bitmap_index .. + bitmap_count`); for atlas bitmaps the
-/// `sprites` carry the sub-rects.
-#[derive(Debug, Clone)]
+/// One `sequences[]` (or `manual_sequences[]`) element: a run of frames.
+///
+/// A sequence either lists `sprites`, each a rectangle on one image, or
+/// leaves them out and names a run of whole images, `first_bitmap_index ..
+/// first_bitmap_index + bitmap_count`. Tool writes `bitmap_count` on a sprite
+/// sequence as `last page - first page`, so it is often 0 there: count the
+/// sprites instead ([`Self::frame_count`]).
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct BitmapSequence {
+    /// Free text no game reads. Tool names an imported sequence `import #N`;
+    /// [`Self::display_name`] leaves those out.
+    pub name: String,
+    /// `NONE` (-1) for an empty sequence.
     pub first_bitmap_index: i16,
     pub bitmap_count: i16,
     pub sprites: Vec<BitmapSprite>,
 }
 
-/// One sprite — a normalized sub-rect of an atlas image plus a
-/// registration (pivot) point. `left/right/top/bottom` are in `[0,1]`
-/// UV space.
-#[derive(Debug, Clone)]
+impl BitmapSequence {
+    /// The name, unless it is empty or the `import #N` tool gives an
+    /// imported sequence.
+    pub fn display_name(&self) -> Option<&str> {
+        let name = self.name.trim();
+        let imported = name
+            .strip_prefix("import #")
+            .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()));
+        (!name.is_empty() && !imported).then_some(name)
+    }
+
+    /// How many frames the sequence steps through: its sprites, or its run
+    /// of images where it has no sprites.
+    pub fn frame_count(&self) -> usize {
+        if self.sprites.is_empty() { self.bitmap_count.max(0) as usize } else { self.sprites.len() }
+    }
+
+    /// The image a frame of this sequence shows, as
+    /// `bitmap_group_get_bitmap_index_from_sequence` (Ares
+    /// `bitmaps/bitmap_group.cpp`) picks it: from the run of images when it
+    /// has one, else the sprite's own image, else the frame itself. The game
+    /// reads `sprites[frame]` unwrapped; here a frame past the end wraps, as
+    /// its bounds lookup beside it does.
+    pub fn frame_bitmap(&self, frame: usize) -> usize {
+        let index = if self.bitmap_count > 0 {
+            i64::from(self.first_bitmap_index) + (frame % self.bitmap_count as usize) as i64
+        } else if !self.sprites.is_empty() {
+            i64::from(self.sprites[frame % self.sprites.len()].bitmap_index)
+        } else {
+            -1
+        };
+        if index == -1 { frame } else { index.max(0) as usize }
+    }
+}
+
+/// One sprite: a rectangle on one image and the point it hangs from.
+///
+/// `left`, `right`, `top` and `bottom` are fractions of the image's stored
+/// width and height, y down. Tool includes the group's sprite spacing on
+/// every side, so a rect can overhang the image by that much; the game's
+/// HUD and antennas take `sprite spacing` pixels back off each side.
+///
+/// In processed `sequences[]` the registration point is an offset from the
+/// rect's top-left corner, in the same units (every game's `build_sprite`
+/// adds it to `left`, `top`). A `manual_sequences[]` sprite is a window in
+/// repeat space instead: its rect may lie outside `[0, 1]` and be mirrored.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct BitmapSprite {
     pub bitmap_index: i16,
     pub left: f32,
@@ -334,6 +347,62 @@ pub struct BitmapSprite {
     pub bottom: f32,
     pub registration_point: [f32; 2],
 }
+
+impl BitmapSprite {
+    /// `[left, right, top, bottom]`.
+    pub fn rect(&self) -> [f32; 4] { [self.left, self.right, self.top, self.bottom] }
+
+    /// The registration point on the image: the rect's top-left plus the
+    /// stored offset. For processed sequences only.
+    pub fn registration_uv(&self) -> [f32; 2] {
+        [self.left + self.registration_point[0], self.top + self.registration_point[1]]
+    }
+
+    /// The rect in pixels of an image `width` by `height`, as
+    /// `[left, right, top, bottom]`. Not rounded: MCC interface sheets with
+    /// non-power-of-two pages have fractional edges.
+    pub fn pixel_rect(&self, width: u32, height: u32) -> [f32; 4] {
+        let (w, h) = (width as f32, height as f32);
+        [self.left * w, self.right * w, self.top * h, self.bottom * h]
+    }
+}
+
+/// Read a `sequences[]`-shaped block. A sprite's missing edge reads as 0.
+fn read_sequence_block(block: Option<&TagBlock<'_>>) -> Vec<BitmapSequence> {
+    let Some(block) = block else { return Vec::new() };
+    (0..block.len())
+        .filter_map(|i| block.element(i))
+        .map(|seq| BitmapSequence {
+            name: seq.read_string("name").unwrap_or_default(),
+            first_bitmap_index: seq.read_int_any("first bitmap index").unwrap_or(0) as i16,
+            bitmap_count: seq.read_int_any("bitmap count").unwrap_or(0) as i16,
+            sprites: seq
+                .field("sprites")
+                .and_then(|f| f.as_block())
+                .map(|sprites| {
+                    (0..sprites.len())
+                        .filter_map(|j| sprites.element(j))
+                        .map(|sp| {
+                            let reg = sp.read_point2d("registration point");
+                            BitmapSprite {
+                                bitmap_index: sp.read_int_any("bitmap index").unwrap_or(0) as i16,
+                                left: sp.read_real("left").unwrap_or(0.0),
+                                right: sp.read_real("right").unwrap_or(0.0),
+                                top: sp.read_real("top").unwrap_or(0.0),
+                                bottom: sp.read_real("bottom").unwrap_or(0.0),
+                                registration_point: [reg.x, reg.y],
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// How many frames a GPU particle's frame list holds at most (H3, Reach and
+/// Halo 4 `postprocess_frame_animation`).
+pub const GPU_PARTICLE_MOST_FRAMES: usize = 15;
 
 // ===========================================================================
 // Strongly-typed bitmap-group walker (Ares `bitmap_group_v2` / `bitmap_data`).
@@ -353,6 +422,8 @@ pub struct BitmapDefinition {
     /// e.g. [`BitmapUsage::WarpMap`] = EMBM distortion). Engine stores it raw.
     pub usage: Enum<BitmapUsage, i32>,
     pub flags: Flags<BitmapGroupFlags, u16>,
+    /// `sprite spacing` as stored. Tool resolves 0 and negatives at import;
+    /// the game reads the stored value (H3 `chud_draw.cpp`, `antenna.cpp`).
     pub sprite_spacing: i16,
     /// `bump_height` — apparent bump height, in texture repeats.
     pub bump_height: f32,
@@ -364,7 +435,13 @@ pub struct BitmapDefinition {
     pub force_format: Enum<BitmapForceFormat, i16>,
     /// `usage_override` block — per-usage import overrides (authoring tooling).
     pub usage_overrides: Vec<BitmapUsageOverride>,
+    /// `sequences[]`: what tool built, and what the game reads.
     pub sequences: Vec<BitmapSequence>,
+    /// `manual_sequences[]` (H3 on): authored windows that tool neither reads
+    /// nor rebuilds. The game reads them only for decals (a random one, else
+    /// `sequences`) and the GPU particle frame list
+    /// ([`Self::gpu_frame_sequence`]).
+    pub manual_sequences: Vec<BitmapSequence>,
     /// `bitmaps` block — the per-image metadata (pixels via [`Bitmap`]).
     pub images: Vec<BitmapImageDef>,
 }
@@ -431,44 +508,22 @@ impl BitmapDefinition {
             mipmap_limit: root.read_int_any("max mipmap level").unwrap_or(0) as i8,
             force_format: root.try_read_enum("force bitmap format").unwrap_or_default(),
             usage_overrides: read_usage_overrides(&root),
-            sequences: read_sequences(&root),
+            sequences: read_sequence_block(root.field("sequences").and_then(|f| f.as_block()).as_ref()),
+            manual_sequences: read_sequence_block(
+                root.field("manual_sequences").and_then(|f| f.as_block()).as_ref(),
+            ),
             images: read_image_defs(&root),
         }
     }
-}
 
-fn read_sequences(root: &TagStruct<'_>) -> Vec<BitmapSequence> {
-    let Some(block) = root.field("sequences").and_then(|f| f.as_block()) else { return Vec::new() };
-    let mut out = Vec::with_capacity(block.len());
-    for i in 0..block.len() {
-        let Some(seq) = block.element(i) else { continue };
-        let sprites = seq
-            .field("sprites")
-            .and_then(|f| f.as_block())
-            .map(|sb| {
-                (0..sb.len())
-                    .filter_map(|j| sb.element(j))
-                    .map(|sp| {
-                        let reg = sp.read_point2d("registration point");
-                        BitmapSprite {
-                            bitmap_index: sp.read_int_any("bitmap index").unwrap_or(0) as i16,
-                            left: sp.read_real("left").unwrap_or(0.0),
-                            right: sp.read_real("right").unwrap_or(1.0),
-                            top: sp.read_real("top").unwrap_or(0.0),
-                            bottom: sp.read_real("bottom").unwrap_or(1.0),
-                            registration_point: [reg.x, reg.y],
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        out.push(BitmapSequence {
-            first_bitmap_index: seq.read_int_any("first bitmap index").unwrap_or(0) as i16,
-            bitmap_count: seq.read_int_any("bitmap count").unwrap_or(0) as i16,
-            sprites,
-        });
+    /// The sequence a GPU particle takes its frame list from: the manual
+    /// sequences when there are any, else the processed ones, at
+    /// `(first_sequence_index + 1) % count`. Take at most
+    /// [`GPU_PARTICLE_MOST_FRAMES`] of its sprites.
+    pub fn gpu_frame_sequence(&self, first_sequence_index: usize) -> Option<&BitmapSequence> {
+        let listed = if self.manual_sequences.is_empty() { &self.sequences } else { &self.manual_sequences };
+        listed.get((first_sequence_index + 1) % listed.len().max(1))
     }
-    out
 }
 
 fn read_image_defs(root: &TagStruct<'_>) -> Vec<BitmapImageDef> {
