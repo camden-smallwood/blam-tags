@@ -33,7 +33,7 @@ use flate2::read::ZlibDecoder;
 
 use crate::api::{TagBlock, TagStruct};
 use crate::file::TagFile;
-use crate::typed_enums::{Enum, Flags, SchemaEnum};
+use crate::typed_enums::{Enum, Flags, SchemaEnum, TagInt};
 use xbox360::{EndianSwap, SurfaceDef, TextureType, level_data};
 
 pub mod dds;
@@ -499,14 +499,14 @@ impl BitmapDefinition {
     pub fn from_tag(tag: &TagFile) -> Self {
         let root = tag.root();
         Self {
-            usage: root.try_read_enum("Usage").unwrap_or_default(),
-            flags: root.try_read_flags("Flags").unwrap_or_default(),
+            usage: enum_by_name(&root, "Usage"),
+            flags: flags_by_name(&root, "Flags"),
             sprite_spacing: root.read_int_any("sprite spacing").unwrap_or(0) as i16,
             bump_height: root.read_real("bump map height").unwrap_or(0.0),
             detail_fade_factor: root.read_real("fade factor").unwrap_or(0.0),
-            curve_override: root.try_read_enum("curve mode").unwrap_or_default(),
+            curve_override: enum_by_name(&root, "curve mode"),
             mipmap_limit: root.read_int_any("max mipmap level").unwrap_or(0) as i8,
-            force_format: root.try_read_enum("force bitmap format").unwrap_or_default(),
+            force_format: enum_by_name(&root, "force bitmap format"),
             usage_overrides: read_usage_overrides(&root),
             sequences: read_sequence_block(root.field("sequences").and_then(|f| f.as_block()).as_ref()),
             manual_sequences: read_sequence_block(
@@ -526,6 +526,30 @@ impl BitmapDefinition {
     }
 }
 
+/// An enum field by its option name; the default where the field is absent
+/// or names an option `T` does not list. Later games add options the typed
+/// enums lack (Reach's and Halo 4's usages, a `Random` swizzle), and
+/// `try_read_enum` panics on those: 2,817 of the six kits' 49,392 bitmaps.
+fn enum_by_name<T: SchemaEnum + Default, U: TagInt>(holder: &TagStruct<'_>, name: &str) -> Enum<T, U> {
+    holder
+        .read_enum_name(name)
+        .and_then(|option| T::from_schema_name(&option))
+        .map(Enum::from_variant)
+        .unwrap_or_default()
+}
+
+/// A flags field's set bits by their names, leaving out any `T` does not
+/// list, for the reason [`enum_by_name`] gives.
+fn flags_by_name<T: SchemaEnum, U: TagInt>(holder: &TagStruct<'_>, name: &str) -> Flags<T, U> {
+    let set: Vec<T> = holder
+        .read_flag_names(name)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|(_, option)| T::from_schema_name(option))
+        .collect();
+    Flags::from_slice(&set)
+}
+
 fn read_image_defs(root: &TagStruct<'_>) -> Vec<BitmapImageDef> {
     let Some(block) = root.field("bitmaps").and_then(|f| f.as_block()) else { return Vec::new() };
     let mut out = Vec::with_capacity(block.len());
@@ -535,16 +559,16 @@ fn read_image_defs(root: &TagStruct<'_>) -> Vec<BitmapImageDef> {
             width: e.read_int_any("width").unwrap_or(0).max(0) as u16,
             height: e.read_int_any("height").unwrap_or(0).max(0) as u16,
             depth: e.read_int_any("depth").unwrap_or(1).max(0) as u8,
-            more_flags: e.try_read_flags("more flags").unwrap_or_default(),
-            bitmap_type: e.try_read_enum("type").unwrap_or_default(),
+            more_flags: flags_by_name(&e, "more flags"),
+            bitmap_type: enum_by_name(&e, "type"),
             format: e.read_enum_name("format").and_then(|n| BitmapFormat::from_schema_name(&n)),
-            flags: e.try_read_flags("flags").unwrap_or_default(),
+            flags: flags_by_name(&e, "flags"),
             registration_point: match e.field("registration point").and_then(|f| f.value()) {
                 Some(crate::fields::TagFieldData::Point2d(p)) => p,
                 _ => crate::math::Point2d::default(),
             },
             mipmap_count_excluding_highest: e.read_int_any("mipmap count").unwrap_or(0) as i8,
-            curve: e.try_read_enum("curve").unwrap_or_default(),
+            curve: enum_by_name(&e, "curve"),
             interleaved_interop_index: e.read_int_any("interleaved interop").unwrap_or(-1) as i8,
             interleaved_texture_index: e.read_int_any("interleaved texture index").unwrap_or(0) as i8,
             pixels_offset: e.read_int_any("pixels offset").unwrap_or(0) as i32,
@@ -563,21 +587,21 @@ fn read_usage_overrides(root: &TagStruct<'_>) -> Vec<BitmapUsageOverride> {
         let Some(e) = block.element(i) else { continue };
         out.push(BitmapUsageOverride {
             source_gamma: e.read_real("source gamma").unwrap_or(0.0),
-            bitmap_curve: e.try_read_enum("bitmap curve").unwrap_or_default(),
-            flags: e.try_read_flags("flags").unwrap_or_default(),
-            slicer: e.try_read_enum("slicer").unwrap_or_default(),
-            dicer_flags: e.try_read_flags("dicer flags").unwrap_or_default(),
-            packer: e.try_read_enum("packer").unwrap_or_default(),
-            bitmap_type: e.try_read_enum("type").unwrap_or_default(),
+            bitmap_curve: enum_by_name(&e, "bitmap curve"),
+            flags: flags_by_name(&e, "flags"),
+            slicer: enum_by_name(&e, "slicer"),
+            dicer_flags: flags_by_name(&e, "dicer flags"),
+            packer: enum_by_name(&e, "packer"),
+            bitmap_type: enum_by_name(&e, "type"),
             mipmap_limit: e.read_int_any("mipmap limit").unwrap_or(0) as i16,
-            downsample_filter: e.try_read_enum("downsample filter").unwrap_or_default(),
-            downsample_flags: e.try_read_flags("downsample flags").unwrap_or_default(),
+            downsample_filter: enum_by_name(&e, "downsample filter"),
+            downsample_flags: flags_by_name(&e, "downsample flags"),
             sprite_background_color: e.read_rgb("sprite background color"),
-            swizzle_red: e.try_read_enum("swizzle red").unwrap_or_default(),
-            swizzle_green: e.try_read_enum("swizzle green").unwrap_or_default(),
-            swizzle_blue: e.try_read_enum("swizzle blue").unwrap_or_default(),
-            swizzle_alpha: e.try_read_enum("swizzle alpha").unwrap_or_default(),
-            bitmap_format: e.try_read_enum("bitmap format").unwrap_or_default(),
+            swizzle_red: enum_by_name(&e, "swizzle red"),
+            swizzle_green: enum_by_name(&e, "swizzle green"),
+            swizzle_blue: enum_by_name(&e, "swizzle blue"),
+            swizzle_alpha: enum_by_name(&e, "swizzle alpha"),
+            bitmap_format: enum_by_name(&e, "bitmap format"),
         });
     }
     out
@@ -662,7 +686,7 @@ fn surface_def(elem: TagStruct<'_>) -> Result<SurfaceDef, BitmapError> {
     };
 
     let more_flags: Flags<BitmapMoreFlags, u8> =
-        elem.try_read_flags("more flags").unwrap_or_default();
+        flags_by_name(&elem, "more flags");
 
     Ok(SurfaceDef {
         width: elem.read_int_any("width").unwrap_or(0).max(0) as u32,

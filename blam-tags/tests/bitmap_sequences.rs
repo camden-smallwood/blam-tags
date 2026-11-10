@@ -173,3 +173,40 @@ fn halo_3_manual_sequences_stay_apart() {
     assert_eq!(definition.gpu_frame_sequence(0), Some(small));
     assert!(Bitmap::new(&tag).unwrap().sequences().is_empty());
 }
+
+/// Every bitmap in every kit that is set up reads into a definition without
+/// panicking: its typed enums resolve every option the kits store, and its
+/// sprites and sequences read. The preview reads every bitmap through this.
+#[test]
+#[ignore = "reads every bitmap in each kit; run with --ignored"]
+fn every_kit_bitmap_reads_its_definition() {
+    let kits = [
+        ("BLAM_TEST_HCEEK", Some("haloce_mcc")),
+        ("BLAM_TEST_H2EK", Some("halo2_mcc")),
+        ("BLAM_TEST_H3EK", None),
+        ("BLAM_TEST_ODSTEK", None),
+        ("BLAM_TEST_HREK", None),
+        ("BLAM_TEST_H4EK", None),
+    ];
+    let mut failures = Vec::new();
+    let mut read = 0usize;
+    for (env, classic) in kits {
+        let Some(kit) = common::kit(env) else { continue };
+        let layout = classic
+            .map(|game| TagLayout::from_json(common::definitions(game).join("bitmap.json")).unwrap());
+        for path in common::walk(&kit.tags(), "bitmap") {
+            let bytes = std::fs::read(&path).unwrap();
+            let tag = match &layout {
+                Some(layout) => read_classic_tag_file(&bytes, layout.clone()).ok(),
+                None => TagFile::read_from_bytes(&bytes).ok(),
+            };
+            let Some(tag) = tag else { continue };
+            read += 1;
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| BitmapDefinition::from_tag(&tag))).is_err() {
+                failures.push(path.display().to_string());
+            }
+        }
+    }
+    eprintln!("read {read} bitmaps");
+    assert!(failures.is_empty(), "{} of {read} panicked, e.g. {:?}", failures.len(), &failures[..failures.len().min(5)]);
+}
