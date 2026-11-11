@@ -42,7 +42,7 @@ use crate::api::TagStruct;
 use crate::fields::TagFieldData;
 use crate::file::TagFile;
 use crate::geometry::{
-    index_start, mesh_is_triangle_strip, read_compression_bounds, read_mesh_indices,
+    h2_part_triangles, index_start, mesh_is_triangle_strip, read_compression_bounds, read_mesh_indices,
     strip_to_list, strip_to_list_u32, walk_surface_ring, write_floats, CompressionBounds, SCALE,
 };
 use crate::math::{RealPoint3d, RealQuaternion, RealVector3d};
@@ -903,9 +903,8 @@ impl JmsFile {
                     Some(b) => b, None => continue,
                 };
 
-                // H2 strip indices are u16 with a `0xFFFF` restart
-                // sentinel between subparts (use the u16 strip decoder,
-                // NOT the u32 one whose sentinel is `0xFFFFFFFF`).
+                // H2 indices are u16; each part reads its range as a strip
+                // (`0xFFFF` restarts) or a list, per `h2_part_triangles`.
                 let strip_idx: Vec<u16> = (0..strip.len())
                     .filter_map(|k| strip.element(k))
                     .map(|e| e.read_int_any("index").unwrap_or(0) as u16)
@@ -924,11 +923,7 @@ impl JmsFile {
                     let cell_label = format!("{perm_name} {region_name}");
                     let jms_mat = material_slot(&mut materials, shader_name, &cell_label);
 
-                    let start = part.read_int_any("strip start index").unwrap_or(0).max(0) as usize;
-                    let len = part.read_int_any("strip length").unwrap_or(0).max(0) as usize;
-                    if start >= strip_idx.len() { continue; }
-                    let end = (start + len).min(strip_idx.len());
-                    for (a, b, c) in strip_to_list(&strip_idx[start..end]) {
+                    for (a, b, c) in h2_part_triangles(&part, &strip_idx) {
                         let base = vertices.len() as u32;
                         for vi in [a, b, c] {
                             let Some(v) = raw_v.element(vi as usize) else { continue };

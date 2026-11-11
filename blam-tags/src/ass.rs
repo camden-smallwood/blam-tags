@@ -1619,12 +1619,13 @@ fn build_h2_section_object(section: &TagStruct<'_>, materials_count: usize) -> A
         (Some(v), Some(s), Some(p)) => (v, s, p),
         _ => return empty_mesh(),
     };
-    // Unlike the H2 render_model (triangle strips with a 0xFFFF
-    // restart), H2 sbsp cluster/IGD geometry is stored as triangle
-    // LISTS — the `strip indices` block carries no 0xFFFF restarts and
-    // every part's `strip length` is a multiple of 3. (Same as H3 sbsp,
-    // whose meshes are also lists despite the "strip" field name.) So
-    // read each part's range as consecutive index triples.
+    // Unlike the H2 render_model (strips unless a part sets `override
+    // triangle list`, see `geometry::h2_part_triangles`), H2 sbsp
+    // cluster/IGD geometry is always stored as triangle LISTS — the
+    // `strip indices` block carries no 0xFFFF restarts and every part's
+    // `strip length` is a multiple of 3; halo2_mcc never draws structure
+    // as strips. (Same as H3 sbsp, whose meshes are also lists despite the
+    // "strip" field name.) So read each part's range as index triples.
     let strip_idx: Vec<u32> = (0..strip.len())
         .filter_map(|k| strip.element(k))
         .map(|e| e.read_int_any("index").unwrap_or(0) as u32)

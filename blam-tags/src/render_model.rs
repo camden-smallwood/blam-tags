@@ -29,7 +29,8 @@ use crate::fields::TagFieldData;
 use crate::file::TagFile;
 use crate::game::Game;
 use crate::geometry::{
-    read_compression_bounds, read_mesh_indices, read_mesh_strip_indices, strip_to_list, strip_to_list_u32, CompressionBounds,
+    h2_part_triangles, read_compression_bounds, read_mesh_indices, read_mesh_strip_indices, strip_to_list,
+    strip_to_list_u32, CompressionBounds,
 };
 use crate::math::{
     RealOrientation, RealPlane3d, RealPoint2d, RealPoint3d, RealQuaternion, RealVector3d,
@@ -1768,7 +1769,8 @@ fn read_h2_section(section: &TagStruct<'_>) -> RenderMesh {
                 vertices.push(vertex);
             }
         }
-        // H2 strip indices are u16 with a 0xFFFF restart sentinel between subparts.
+        // H2 indices are u16; each part reads its range as a strip (0xFFFF
+        // restarts) or a list, per `h2_part_triangles`.
         let strip: Vec<u16> = sd
             .field("strip indices")
             .and_then(|f| f.as_block())
@@ -1785,16 +1787,9 @@ fn read_h2_section(section: &TagStruct<'_>) -> RenderMesh {
                 let material_index = part.read_int_any("material").unwrap_or(0).max(0) as u16;
                 let part_type =
                     GeometryPartType::from_raw(part.read_int_any("type").unwrap_or(0) as i8);
-                let start = part.read_int_any("strip start index").unwrap_or(0).max(0) as usize;
-                let len = part.read_int_any("strip length").unwrap_or(0).max(0) as usize;
                 let index_start = indices.len() as u32;
-                if start < strip.len() {
-                    let end = (start + len).min(strip.len());
-                    for (a, b, c) in strip_to_list(&strip[start..end]) {
-                        indices.push(a as u32);
-                        indices.push(b as u32);
-                        indices.push(c as u32);
-                    }
+                for (a, b, c) in h2_part_triangles(&part, &strip) {
+                    indices.extend([a as u32, b as u32, c as u32]);
                 }
                 parts.push(RenderMeshPart {
                     material_index,
@@ -3669,6 +3664,52 @@ mod tests {
                 let total: f32 = v.node_weights.iter().sum();
                 assert!((total - 1.0).abs() < 1e-4, "weights sum to 1, got {total}");
             }
+        }
+    }
+
+    /// Every part of the scarab sets `override triangle list`: its indices
+    /// are a list, so each decoded section holds exactly the section's
+    /// `total triangle count`. Read as strips the same indices give ~2.7x
+    /// that, the shards the preview drew.
+    #[test]
+    fn halo2_override_triangle_list_parts_decode_as_lists() {
+        let Some(tags) = kit_tags("BLAM_TEST_H2EK") else {
+            eprintln!("skipping halo2_override_triangle_list_parts_decode_as_lists: set BLAM_TEST_H2EK");
+            return;
+        };
+        let tag = read_kit_tag(
+            &tags,
+            "halo2_mcc",
+            "scenarios/objects/covenant/military/scarab/scarab.render_model",
+            "render_model",
+        );
+        let meshes = RenderModel::derive_render_meshes(&tag).expect("derive meshes");
+        let sections = tag.root().field("sections").and_then(|f| f.as_block()).unwrap();
+        assert_eq!(meshes.len(), sections.len());
+        for (si, mesh) in meshes.iter().enumerate() {
+            let section = sections.element(si).unwrap();
+            let expected = section
+                .field("section info").and_then(|f| f.as_struct()).unwrap()
+                .read_int_any("total triangle count").unwrap() as usize;
+            let raw = section
+                .field("section data").and_then(|f| f.as_block()).and_then(|b| b.element(0)).unwrap()
+                .field("section").and_then(|f| f.as_struct()).unwrap();
+            let parts = raw.field("parts").and_then(|f| f.as_block()).unwrap();
+            let strip = raw.field("strip indices").and_then(|f| f.as_block()).unwrap();
+            let indices: Vec<u16> = (0..strip.len())
+                .map(|k| strip.element(k).unwrap().read_int_any("index").unwrap() as u16)
+                .collect();
+            let mut as_strips = 0;
+            for pi in 0..parts.len() {
+                let part = parts.element(pi).unwrap();
+                let flag = part.field("flags").and_then(|f| f.flag("override triangle list")).unwrap();
+                assert!(flag.is_set(), "section {si} part {pi} sets `override triangle list`");
+                let start = part.read_int_any("strip start index").unwrap() as usize;
+                let len = part.read_int_any("strip length").unwrap() as usize;
+                as_strips += strip_to_list(&indices[start..start + len]).len();
+            }
+            assert_eq!(mesh.indices.len() / 3, expected, "section {si} decodes its total triangle count");
+            assert_ne!(as_strips, expected, "section {si}: strip decoding would also have matched");
         }
     }
 

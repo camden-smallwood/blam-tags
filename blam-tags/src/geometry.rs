@@ -233,6 +233,34 @@ pub fn strip_to_list_u32(strip: &[u32]) -> Vec<(u32, u32, u32)> {
     out
 }
 
+/// The triangles one Halo 2 geometry part draws from its section's `strip
+/// indices`: the part's `strip start index`/`strip length` range, read as a
+/// triangle list when the part sets `override triangle list` and as a
+/// restart-aware strip ([`strip_to_list`]) otherwise.
+///
+/// This is the choice halo2_mcc's object renderer makes per part
+/// (`rasterizer_visible_section_render`: list when the flag is set, strip
+/// when not). Flagged parts (the scarab, the Zanzibar wheel, the Delta Temple
+/// gondolas) hold `3 * total triangle count` indices; decoded as a strip they
+/// grow ~2.7x the triangles, most of them bridging unrelated vertices.
+/// Structure geometry always draws as a list and does not come through here.
+pub(crate) fn h2_part_triangles(part: &TagStruct<'_>, indices: &[u16]) -> Vec<(u16, u16, u16)> {
+    let start = part.read_int_any("strip start index").unwrap_or(0).max(0) as usize;
+    let len = part.read_int_any("strip length").unwrap_or(0).max(0) as usize;
+    let Some(range) = indices.get(start..(start + len).min(indices.len())) else {
+        return Vec::new();
+    };
+    let is_list = part
+        .field("flags")
+        .and_then(|f| f.flag("override triangle list"))
+        .is_some_and(|flag| flag.is_set());
+    if is_list {
+        range.chunks_exact(3).map(|t| (t[0], t[1], t[2])).collect()
+    } else {
+        strip_to_list(range)
+    }
+}
+
 /// A tag reference's name: the last segment of its `\\`-separated path.
 /// `None` when that is empty — a null reference, or a path ending in a
 /// separator.
