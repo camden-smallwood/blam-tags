@@ -2773,6 +2773,18 @@ pub fn extract_render_geometry_meshes(
     })
 }
 
+/// Decode a model's render geometry held under another field than `render
+/// geometry`: `imposter_model`'s is `geometry`. As
+/// [`RenderModel::derive_render_meshes`] does for a `render_model`, every
+/// mesh takes the geometry's first `compression info` entry.
+pub fn extract_render_geometry_meshes_at(
+    root: &TagStruct<'_>,
+    geometry_path: &str,
+) -> Result<Vec<RenderMesh>, RenderModelError> {
+    let bounds = crate::geometry::read_compression_bounds_at_path(root, geometry_path, 0);
+    read_meshes_at_path(root, geometry_path, |_| bounds, IndexFormatPolicy::PerMeshSchema)
+}
+
 /// As [`extract_render_geometry_meshes`] but the caller picks the
 /// compression bounds per mesh.
 pub fn extract_render_geometry_meshes_with_bounds<F>(
@@ -3812,6 +3824,38 @@ mod tests {
                 assert_eq!(v.node_weights, [1.0, 0.0, 0.0, 0.0]);
             }
         }
+    }
+
+    /// An imposter keeps its render geometry under `geometry`, not `render
+    /// geometry`, which only the path-taking extractor reads.
+    #[test]
+    fn reach_imposter_geometry_reads_at_its_own_path() {
+        let Some(tags) = kit_tags("BLAM_TEST_HREK") else {
+            eprintln!("skipping reach_imposter_geometry_reads_at_its_own_path: set BLAM_TEST_HREK");
+            return;
+        };
+        let path = tags.join("objects/vehicles/covenant/banshee/banshee.imposter_model");
+        let tag = TagFile::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let root = tag.root();
+        assert!(extract_render_geometry_meshes(&root).is_err(), "no `render geometry` here");
+        let meshes = extract_render_geometry_meshes_at(&root, "geometry").expect("derive meshes");
+        assert!(!meshes.is_empty());
+        let triangles: usize = meshes.iter().map(|mesh| mesh.indices.len() / 3).sum();
+        assert!(triangles > 0, "the banshee imposter draws nothing");
+        // Every mesh decompressed into the banshee's bounds (about 2.4 by
+        // 2.6 by 1.2 units), not left in the unit cube.
+        let bounds = crate::geometry::read_compression_bounds_at_path(&root, "geometry", 0);
+        assert!(bounds.pos_compressed);
+        for (mi, mesh) in meshes.iter().enumerate() {
+            let min_x = mesh.vertices.iter().map(|v| v.position.x).fold(f32::MAX, f32::min);
+            assert!(min_x >= bounds.px_min - 0.01, "mesh {mi} outside the bounds: {min_x}");
+        }
+        let min_x = meshes
+            .iter()
+            .flat_map(|mesh| &mesh.vertices)
+            .map(|v| v.position.x)
+            .fold(f32::MAX, f32::min);
+        assert!(min_x < -1.0, "positions still compressed: {min_x}");
     }
 
     /// A mesh past 16 bits of vertices keeps its indices in `raw indices32`
