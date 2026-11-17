@@ -161,7 +161,19 @@ pub fn read_compression_bounds(root: &TagStruct<'_>) -> CompressionBounds {
 /// instanced geometry has its own bounds. Falls back to identity if
 /// the index is out of range.
 pub fn read_compression_bounds_at(root: &TagStruct<'_>, index: usize) -> CompressionBounds {
-    let Some(ci_block) = root.field_path("render geometry/compression info").and_then(|f| f.as_block())
+    read_compression_bounds_at_path(root, "render geometry", index)
+}
+
+/// As [`read_compression_bounds_at`], for render geometry held under
+/// another field (`imposter_model`'s is `geometry`).
+pub fn read_compression_bounds_at_path(
+    root: &TagStruct<'_>,
+    geometry_path: &str,
+    index: usize,
+) -> CompressionBounds {
+    let Some(ci_block) = root
+        .field_path(&format!("{geometry_path}/compression info"))
+        .and_then(|f| f.as_block())
         else { return CompressionBounds::identity(); };
     if index >= ci_block.len() { return CompressionBounds::identity(); }
     let ci = ci_block.element(index).unwrap();
