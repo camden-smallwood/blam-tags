@@ -6507,22 +6507,17 @@ fn convert_enum(
     let Some(TagOptions::Enum { names, .. }) = target.as_ref().options() else {
         return;
     };
-    let Some((index, mapped_by_catalog)) = names.iter().enumerate().find_map(|(index, name)| {
-        if option_names_match(name, &source_name) {
-            Some((index, false))
-        } else if context.mapping_catalog.option_names_match(
+    let found = enum_option_index(&names, &source_name, |name| {
+        context.mapping_catalog.option_names_match(
             context.group_name,
             path,
             context.source_game,
             context.target_game,
             &source_name,
             name,
-        ) {
-            Some((index, true))
-        } else {
-            None
-        }
-    }) else {
+        )
+    });
+    let Some((index, mapped_by_catalog)) = found else {
         record_unsupported(
             context,
             path.to_owned(),
@@ -6549,6 +6544,33 @@ fn convert_enum(
         _ => return,
     };
     set_converted(&mut target, value, path, false, context);
+}
+
+/// The target enum option a source option goes to, and whether the catalog
+/// said so: the exact name first, then the loose match, then the catalog.
+/// The loose match drops dashes, so on its own a model region's sort order
+/// `1` took the first of `-1` and `1`, which is `-1`.
+fn enum_option_index(
+    names: &[&str],
+    source_name: &str,
+    catalog_matches: impl Fn(&str) -> bool,
+) -> Option<(usize, bool)> {
+    let exact = exact_option_name(source_name);
+    names
+        .iter()
+        .position(|name| exact_option_name(name) == exact)
+        .map(|index| (index, false))
+        .or_else(|| {
+            names.iter().enumerate().find_map(|(index, name)| {
+                if option_names_match(name, source_name) {
+                    Some((index, false))
+                } else if catalog_matches(name) {
+                    Some((index, true))
+                } else {
+                    None
+                }
+            })
+        })
 }
 
 fn convert_flags(
@@ -7508,6 +7530,31 @@ mod tests {
                 .iter()
                 .all(|route| !route.iter().any(|game| game == CAMPAIGN_EVOLVED_GAME))
         );
+    }
+
+    /// An enum option goes to its own name before one that reads the same
+    /// without its dashes: a model region's sort order `1` used to become
+    /// `-1` between Reach, Halo 4 and H2A, which put it in front.
+    #[test]
+    fn an_enum_option_goes_to_its_own_name_before_its_negative() {
+        let definitions = locate_definitions_root();
+        let model: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(definitions.join("haloreach_mcc/model.json")).unwrap())
+                .unwrap();
+        let names: Vec<&str> = model["enums_flags"]["region_sort_enum"]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap())
+            .collect();
+        let index = |source: &str| enum_option_index(&names, source, |_| false).map(|(index, _)| names[index]);
+        assert_eq!(index("1"), Some("1"));
+        assert_eq!(index("-1"), Some("-1"));
+        assert_eq!(index("4"), Some("4"));
+        assert_eq!(index("5 (farthest)"), Some("5 (farthest)"));
+        // The loose match and the catalog still apply when nothing is exact.
+        assert_eq!(index("no_sorting"), Some("no sorting"));
+        assert_eq!(enum_option_index(&names, "somewhere", |name| name == "0 (same as model)"), Some((6, true)));
     }
 
     /// The set bits of a style's `Behaviors1` to `Behaviors7`, by name.
