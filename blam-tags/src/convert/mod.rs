@@ -4625,8 +4625,13 @@ fn convert_struct(
     let plan = match_plan(source, target.as_ref(), source_guid, target_guid, same_guid, context);
     let lifted = lift_unmatched_source_structs(source, &mut target, &plan, path, context);
     reparented_fields.extend(lifted.consumed);
+    let families = flag_families(source, target.as_ref(), &plan);
+    let in_family: HashSet<usize> = families
+        .iter()
+        .flat_map(|family| family.iter().map(|member| member.source))
+        .collect();
 
-    for (source_field, planned) in source.fields().zip(plan.fields.iter()) {
+    for (index, (source_field, planned)) in source.fields().zip(plan.fields.iter()).enumerate() {
         let key = &planned.key;
         let field_path = join_path(
             path,
@@ -4648,6 +4653,10 @@ fn convert_struct(
         if root {
             context.root_matches += 1;
         }
+        // Converted with the rest of its numbered family, below.
+        if in_family.contains(&index) {
+            continue;
+        }
         let Some(target_field) = target.field_at_mut(matched.ordinal) else {
             continue;
         };
@@ -4658,6 +4667,9 @@ fn convert_struct(
             same_guid || structurally_identical,
             context,
         );
+    }
+    for family in &families {
+        convert_flag_family(source, &mut target, family, path, context);
     }
 
     context.report.defaulted_target += plan.defaulted.saturating_sub(lifted.filled);
@@ -6564,22 +6576,32 @@ fn convert_flags(
     };
     let mut raw = 0u64;
     for (_, source_name) in names.1 {
-        let Some((option, mapped_by_catalog)) = target_options.iter().find_map(|option| {
-            if option_names_match(&option.name, &source_name) {
-                Some((option, false))
-            } else if context.mapping_catalog.option_names_match(
-                context.group_name,
-                path,
-                context.source_game,
-                context.target_game,
-                &source_name,
-                &option.name,
-            ) {
-                Some((option, true))
-            } else {
-                None
-            }
-        }) else {
+        // An exact name first, so a heading bit can't take a real one's
+        // place (see `exact_option_name`).
+        let exact = exact_option_name(&source_name);
+        let found = target_options
+            .iter()
+            .find(|option| exact_option_name(option.name) == exact)
+            .map(|option| (option, false))
+            .or_else(|| {
+                target_options.iter().find_map(|option| {
+                    if option_names_match(&option.name, &source_name) {
+                        Some((option, false))
+                    } else if context.mapping_catalog.option_names_match(
+                        context.group_name,
+                        path,
+                        context.source_game,
+                        context.target_game,
+                        &source_name,
+                        &option.name,
+                    ) {
+                        Some((option, true))
+                    } else {
+                        None
+                    }
+                })
+            });
+        let Some((option, mapped_by_catalog)) = found else {
             record_unsupported(
                 context,
                 path.to_owned(),
@@ -6592,7 +6614,15 @@ fn convert_flags(
         }
         raw |= 1u64 << option.bit;
     }
-    let value = match target.as_ref().field_type() {
+    let Some(value) = flags_value(target.as_ref().field_type(), raw) else {
+        return;
+    };
+    set_converted(&mut target, value, path, false, context);
+}
+
+/// A flags field's value with exactly the `raw` bits set.
+fn flags_value(field_type: TagFieldType, raw: u64) -> Option<TagFieldData> {
+    Some(match field_type {
         TagFieldType::ByteFlags => TagFieldData::ByteFlags {
             value: raw as u8,
             names: Vec::new(),
@@ -6605,9 +6635,181 @@ fn convert_flags(
             value: raw as u32 as i32,
             names: Vec::new(),
         },
-        _ => return,
-    };
-    set_converted(&mut target, value, path, false, context);
+        _ => return None,
+    })
+}
+
+/// An option name as written, without its markup or comment, for the exact
+/// match tried before [`option_names_match`]. The loose match drops dashes and
+/// underscores, so a heading bit such as `------ENGAGE------` and the real
+/// `engage` bit read the same to it, and whichever came first won: a style's
+/// `engage`, `search`, `retreat`, `alert` and `idle` landed on their headings.
+fn exact_option_name(name: &str) -> String {
+    name.split('#')
+        .next()
+        .unwrap_or(name)
+        .chars()
+        .filter(|character| !matches!(character, '*' | '!' | '^'))
+        .collect::<String>()
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// One source field of a numbered flags family and the target field it was
+/// paired with.
+struct FlagFamilyMember {
+    source: usize,
+    target: usize,
+    key: String,
+}
+
+/// A field name's stem when it ends in a number: `behaviors` for `Behaviors7`.
+fn numbered_stem(key: &str) -> Option<&str> {
+    let stem = key.trim_end_matches(|character: char| character.is_ascii_digit());
+    let stem = stem.trim_end();
+    (stem.len() < key.len() && !stem.is_empty()).then_some(stem)
+}
+
+/// The struct's numbered flags fields that hold one list between them, such
+/// as a style's `Behaviors1` to `Behaviors7`: two or more flags fields with
+/// the same stem, each paired with a target flags field of that stem. A game
+/// that adds a bit to such a list pushes the rest along, some into the next
+/// field, so a bit is looked for across the whole family, not only in the
+/// field with its own number.
+fn flag_families(source: TagStruct<'_>, target: TagStruct<'_>, plan: &MatchPlan) -> Vec<Vec<FlagFamilyMember>> {
+    let target_fields: Vec<(String, TagFieldType)> = target
+        .fields()
+        .map(|field| (clean_field_key(field.name()), field.field_type()))
+        .collect();
+    let mut families: Vec<(String, Vec<FlagFamilyMember>)> = Vec::new();
+    for (index, (field, planned)) in source.fields().zip(plan.fields.iter()).enumerate() {
+        let Some(matched) = planned.target else { continue };
+        let Some((target_key, target_type)) = target_fields.get(matched.ordinal) else {
+            continue;
+        };
+        if !is_flags_type(field.field_type()) || !is_flags_type(*target_type) {
+            continue;
+        }
+        let (Some(stem), Some(target_stem)) = (numbered_stem(&planned.key), numbered_stem(target_key)) else {
+            continue;
+        };
+        if stem != target_stem {
+            continue;
+        }
+        let member = FlagFamilyMember {
+            source: index,
+            target: matched.ordinal,
+            key: planned.key.clone(),
+        };
+        match families.iter_mut().find(|(known, _)| known == stem) {
+            Some((_, members)) => members.push(member),
+            None => families.push((stem.to_owned(), vec![member])),
+        }
+    }
+    families
+        .into_iter()
+        .map(|(_, members)| members)
+        .filter(|members| members.len() > 1)
+        .collect()
+}
+
+/// Convert a numbered flags family together. Each set source bit goes to the
+/// target bit of the same name: its own field's first, then any field of the
+/// family, matching exactly before loosely, so a bit the target keeps in the
+/// next field along still comes across.
+fn convert_flag_family(
+    source: TagStruct<'_>,
+    target: &mut TagStructMut<'_>,
+    family: &[FlagFamilyMember],
+    path: &str,
+    context: &mut ConversionContext<'_>,
+) {
+    // Every target bit of the family: its field, bit and name.
+    let mut options: Vec<(usize, u32, String)> = Vec::new();
+    let mut raw: Vec<(usize, u64, String)> = Vec::new();
+    for member in family {
+        let Some(field) = target.as_ref().fields().nth(member.target) else {
+            continue;
+        };
+        if let Some(TagOptions::Flags(found)) = field.options() {
+            options.extend(found.iter().map(|option| (member.target, option.bit, option.name.to_owned())));
+        }
+        if !raw.iter().any(|(target, _, _)| *target == member.target) {
+            raw.push((member.target, 0, join_path(path, &member.key)));
+        }
+    }
+    for member in family {
+        let Some(field) = source.fields().nth(member.source) else {
+            continue;
+        };
+        let field_path = join_path(path, &member.key);
+        let (value, names) = match field.value() {
+            Some(TagFieldData::ByteFlags { value, names }) => (value as u64, names),
+            Some(TagFieldData::WordFlags { value, names }) => (value as u64, names),
+            Some(TagFieldData::LongFlags { value, names }) => (value as u32 as u64, names),
+            _ => continue,
+        };
+        if value != 0 && names.is_empty() {
+            record_unsupported(context, field_path, "Set source flag bits have no names".to_owned());
+            continue;
+        }
+        for (_, source_name) in names {
+            let exact = exact_option_name(&source_name);
+            let own = |target: usize| target == member.target;
+            let found = options
+                .iter()
+                .find(|(target, _, name)| own(*target) && exact_option_name(name) == exact)
+                .or_else(|| options.iter().find(|(_, _, name)| exact_option_name(name) == exact))
+                .or_else(|| {
+                    options
+                        .iter()
+                        .find(|(target, _, name)| own(*target) && option_names_match(name, &source_name))
+                })
+                .or_else(|| options.iter().find(|(_, _, name)| option_names_match(name, &source_name)))
+                .map(|found| (found, false))
+                .or_else(|| {
+                    // A rename the catalog knows, within the bit's own field
+                    // as a lone flags field would look.
+                    options
+                        .iter()
+                        .find(|(target, _, name)| {
+                            own(*target)
+                                && context.mapping_catalog.option_names_match(
+                                    context.group_name,
+                                    &field_path,
+                                    context.source_game,
+                                    context.target_game,
+                                    &source_name,
+                                    name,
+                                )
+                        })
+                        .map(|found| (found, true))
+                });
+            let Some(((target, bit, _), mapped_by_catalog)) = found else {
+                record_unsupported(
+                    context,
+                    field_path.clone(),
+                    format!("Target flags have no {source_name:?} bit"),
+                );
+                continue;
+            };
+            if mapped_by_catalog {
+                context.report.mapped_aliases += 1;
+            }
+            if let Some(slot) = raw.iter_mut().find(|(known, _, _)| known == target) {
+                slot.1 |= 1u64 << bit;
+            }
+        }
+    }
+    for (ordinal, bits, field_path) in raw {
+        let Some(mut field) = target.field_at_mut(ordinal) else {
+            continue;
+        };
+        let Some(value) = flags_value(field.as_ref().field_type(), bits) else {
+            continue;
+        };
+        set_converted(&mut field, value, &field_path, false, context);
+    }
 }
 
 fn option_names_match(left: &str, right: &str) -> bool {
@@ -7306,6 +7508,135 @@ mod tests {
                 .iter()
                 .all(|route| !route.iter().any(|game| game == CAMPAIGN_EVOLVED_GAME))
         );
+    }
+
+    /// The set bits of a style's `Behaviors1` to `Behaviors7`, by name.
+    fn style_behaviors(tag: &TagFile) -> Vec<String> {
+        (1..=7)
+            .filter_map(|index| tag.root().field(&format!("Behaviors{index}")))
+            .flat_map(|field| match field.value() {
+                Some(TagFieldData::LongFlags { names, .. }) => {
+                    names.into_iter().map(|(_, name)| name).collect()
+                }
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    /// Set a style's behaviours by name, in whichever numbered field holds each.
+    fn set_style_behaviors(tag: &mut TagFile, wanted: &[&str]) {
+        for index in 1..=7 {
+            let name = format!("Behaviors{index}");
+            let bits = match tag.root().field(&name).and_then(|field| field.options()) {
+                Some(TagOptions::Flags(options)) => options
+                    .iter()
+                    .filter(|option| wanted.contains(&option.name))
+                    .fold(0u32, |bits, option| bits | (1 << option.bit)),
+                _ => continue,
+            };
+            tag.root_mut()
+                .field_mut(&name)
+                .unwrap()
+                .set(TagFieldData::LongFlags { value: bits as i32, names: Vec::new() })
+                .unwrap();
+        }
+    }
+
+    /// A heading bit reads the same as the bit it heads once dashes and case
+    /// are gone, so the exact name is tried first: ODST's `engage` used to land
+    /// on Halo 3's `------ENGAGE------`, leaving the AI unable to engage.
+    #[test]
+    fn a_flag_bit_goes_to_its_own_name_before_a_heading_that_reads_the_same() {
+        assert!(option_names_match("------ENGAGE------", "engage"), "the loose match can't tell them apart");
+        assert_ne!(exact_option_name("------ENGAGE------"), exact_option_name("engage"));
+        assert_eq!(exact_option_name(" Engage*# comment"), exact_option_name("engage"));
+        assert_eq!(numbered_stem("behaviors7"), Some("behaviors"));
+        assert_eq!(numbered_stem("behaviors"), None);
+        assert_eq!(numbered_stem("7"), None);
+
+        let definitions = locate_definitions_root();
+        let mut source = TagFile::new(definitions.join("halo3odst_mcc/style.json")).unwrap();
+        let wanted = ["engage", "search", "retreat", "alert", "idle", "------ENGAGE------"];
+        set_style_behaviors(&mut source, &wanted[..5]);
+        let draft = analyze_conversion_with_templates(&source, "halo3odst_mcc", "halo3_mcc", &definitions, None)
+            .unwrap();
+        let landed = style_behaviors(&draft.tag);
+        for name in &wanted[..5] {
+            assert!(landed.iter().any(|landed| landed == name), "{name} didn't come across: {landed:?}");
+        }
+        assert!(
+            !landed.iter().any(|landed| landed.starts_with('-')),
+            "no heading was set in the source, so none is in the target: {landed:?}"
+        );
+    }
+
+    /// ODST adds behaviours part way through a style's numbered lists, so the
+    /// rest move along, some into the next field: `go_to` and `activity` are in
+    /// ODST's `Behaviors7` but Halo 3's `Behaviors6`. The numbered fields are
+    /// one list, so they still find their bits, and only the ODST-only ones
+    /// are left behind.
+    #[test]
+    fn a_flag_bit_that_moved_to_the_next_numbered_field_still_comes_across() {
+        let definitions = locate_definitions_root();
+        let mut source = TagFile::new(definitions.join("halo3odst_mcc/style.json")).unwrap();
+        set_style_behaviors(&mut source, &["go_to", "activity", "cure_isolation", "engineer_control"]);
+        let draft = analyze_conversion_with_templates(&source, "halo3odst_mcc", "halo3_mcc", &definitions, None)
+            .unwrap();
+        let landed = style_behaviors(&draft.tag);
+        assert_eq!(landed, ["go_to", "activity", "cure_isolation"]);
+        let lost: Vec<&str> = draft
+            .report
+            .issues
+            .iter()
+            .filter(|issue| issue.kind == ConversionIssueKind::Unsupported)
+            .map(|issue| issue.message.as_str())
+            .collect();
+        assert_eq!(lost, ["Target flags have no \"engineer_control\" bit"], "only the ODST-only one");
+    }
+
+    /// The Engineer's real style into Halo 3, against H3EK's own style layout:
+    /// every behaviour Halo 3 has comes across under its own name, and only
+    /// ODST's additions are left behind.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn the_engineers_style_keeps_its_behaviours_in_halo_3() {
+        let (Some(odst), Some(h3)) = (
+            kit_tags("BLAM_TEST_ODSTEK", "H3ODSTEK"),
+            kit_tags("BLAM_TEST_H3EK", "H3EK"),
+        ) else {
+            eprintln!("skipping: needs H3ODSTEK and H3EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let group_tag = u32::from_be_bytes(*b"styl");
+        let path = odst.join("objects/characters/engineer/ai/engineer_freeform.style");
+        let source = read_tag_for_conversion(&path, Some("halo3odst_mcc"), Some(&definitions), group_tag).unwrap();
+        let groups = GameTagIndex::load(&definitions, "halo3_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(&h3, &groups);
+        let draft = analyze_conversion_with_templates(
+            &source,
+            "halo3odst_mcc",
+            "halo3_mcc",
+            &definitions,
+            Some(&templates),
+        )
+        .unwrap();
+        let had = style_behaviors(&source);
+        let landed = style_behaviors(&draft.tag);
+        let odst_only = [
+            "fight_positioning",
+            "kungfu_cover",
+            "inspect",
+            "------ENGINEER------",
+            "engineer_control",
+            "engineer_control@free",
+            "boost_allies",
+        ];
+        for name in had.iter().filter(|name| !odst_only.contains(&name.as_str())) {
+            assert!(landed.contains(name), "{name} didn't come across: {landed:?}");
+        }
+        assert_eq!(landed.len(), had.iter().filter(|name| !odst_only.contains(&name.as_str())).count());
     }
 
     /// A bitmap Halo 2 cannot hand to Reach directly arrives by way of Halo 3.
