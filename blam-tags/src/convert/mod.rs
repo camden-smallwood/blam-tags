@@ -4628,7 +4628,7 @@ fn convert_struct(
     let families = flag_families(source, target.as_ref(), &plan);
     let in_family: HashSet<usize> = families
         .iter()
-        .flat_map(|family| family.iter().map(|member| member.source))
+        .flat_map(|family| family.sources.iter().map(|member| member.source))
         .collect();
 
     for (index, (source_field, planned)) in source.fields().zip(plan.fields.iter()).enumerate() {
@@ -4642,7 +4642,9 @@ fn convert_struct(
             },
         );
         let Some(matched) = planned.target else {
-            if !reparented_fields.contains(key) {
+            // An unpaired member of a numbered family still finds its bits
+            // in the family's other fields, below.
+            if !reparented_fields.contains(key) && !in_family.contains(&index) {
                 record_unmatched_field_values(source_field, &field_path, context);
             }
             continue;
@@ -6677,11 +6679,20 @@ fn exact_option_name(name: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// One source field of a numbered flags family and the target field it was
-/// paired with.
-struct FlagFamilyMember {
+/// A numbered flags list split across fields, such as a style's
+/// `Behaviors1` to `Behaviors7`, on both sides of a conversion.
+struct FlagFamily {
+    sources: Vec<FlagFamilySource>,
+    /// Every target flags field of the stem: its ordinal and key.
+    targets: Vec<(usize, String)>,
+}
+
+/// One source field of a numbered flags family.
+struct FlagFamilySource {
     source: usize,
-    target: usize,
+    /// The target field the plan paired it with, if any, whose bits it tries
+    /// first.
+    own: Option<usize>,
     key: String,
 }
 
@@ -6693,74 +6704,102 @@ fn numbered_stem(key: &str) -> Option<&str> {
 }
 
 /// The struct's numbered flags fields that hold one list between them, such
-/// as a style's `Behaviors1` to `Behaviors7`: two or more flags fields with
-/// the same stem, each paired with a target flags field of that stem. A game
-/// that adds a bit to such a list pushes the rest along, some into the next
-/// field, so a bit is looked for across the whole family, not only in the
-/// field with its own number.
-fn flag_families(source: TagStruct<'_>, target: TagStruct<'_>, plan: &MatchPlan) -> Vec<Vec<FlagFamilyMember>> {
-    let target_fields: Vec<(String, TagFieldType)> = target
-        .fields()
-        .map(|field| (clean_field_key(field.name()), field.field_type()))
-        .collect();
-    let mut families: Vec<(String, Vec<FlagFamilyMember>)> = Vec::new();
+/// as a style's `Behaviors1` to `Behaviors7`: flags fields sharing a stem,
+/// with three or more between the source and the target. A game that adds a
+/// bit to such a list pushes the rest along, some into the next field, so a
+/// bit is looked for across the whole family, not only in the field with its
+/// own number.
+///
+/// Each side holds every flags field of the stem, paired or not. A shipped
+/// tag can carry an older layout with fewer fields than the target (ODST's
+/// styles on disk stop at `Behaviors6`, Halo 3's go to `Behaviors7`), and the
+/// target's extra field still takes the bits that belong in it. Pairing only
+/// says which target field a source field tries first.
+fn flag_families(source: TagStruct<'_>, target: TagStruct<'_>, plan: &MatchPlan) -> Vec<FlagFamily> {
+    let mut families: Vec<(String, FlagFamily)> = Vec::new();
+    let family = |families: &mut Vec<(String, FlagFamily)>, stem: &str| -> usize {
+        match families.iter().position(|(known, _)| known == stem) {
+            Some(found) => found,
+            None => {
+                families.push((
+                    stem.to_owned(),
+                    FlagFamily {
+                        sources: Vec::new(),
+                        targets: Vec::new(),
+                    },
+                ));
+                families.len() - 1
+            }
+        }
+    };
+    // Target fields the plan pairs with a source field outside the family
+    // are that field's to write.
+    let mut paired_elsewhere: HashSet<usize> = HashSet::new();
     for (index, (field, planned)) in source.fields().zip(plan.fields.iter()).enumerate() {
-        let Some(matched) = planned.target else { continue };
-        let Some((target_key, target_type)) = target_fields.get(matched.ordinal) else {
+        let Some(stem) = numbered_stem(&planned.key).filter(|_| is_flags_type(field.field_type())) else {
+            if let Some(matched) = planned.target {
+                paired_elsewhere.insert(matched.ordinal);
+            }
             continue;
         };
-        if !is_flags_type(field.field_type()) || !is_flags_type(*target_type) {
-            continue;
-        }
-        let (Some(stem), Some(target_stem)) = (numbered_stem(&planned.key), numbered_stem(target_key)) else {
-            continue;
-        };
-        if stem != target_stem {
-            continue;
-        }
-        let member = FlagFamilyMember {
+        let at = family(&mut families, stem);
+        families[at].1.sources.push(FlagFamilySource {
             source: index,
-            target: matched.ordinal,
+            own: planned.target.map(|matched| matched.ordinal),
             key: planned.key.clone(),
-        };
-        match families.iter_mut().find(|(known, _)| known == stem) {
-            Some((_, members)) => members.push(member),
-            None => families.push((stem.to_owned(), vec![member])),
+        });
+    }
+    for (ordinal, field) in target.fields().enumerate() {
+        if !is_flags_type(field.field_type()) || paired_elsewhere.contains(&ordinal) {
+            continue;
+        }
+        let key = clean_field_key(field.name());
+        let Some(stem) = numbered_stem(&key) else { continue };
+        if let Some(at) = families.iter().position(|(known, _)| known == stem) {
+            families[at].1.targets.push((ordinal, key));
         }
     }
     families
         .into_iter()
-        .map(|(_, members)| members)
-        .filter(|members| members.len() > 1)
+        .map(|(_, family)| family)
+        .filter(|family| {
+            // A source field paired outside the stem's target fields keeps
+            // its own conversion.
+            let ours = |own: &Option<usize>| own.is_none_or(|own| family.targets.iter().any(|(target, _)| *target == own));
+            !family.sources.is_empty()
+                && !family.targets.is_empty()
+                && family.sources.iter().all(|member| ours(&member.own))
+                && family.sources.len() + family.targets.len() > 2
+        })
         .collect()
 }
 
 /// Convert a numbered flags family together. Each set source bit goes to the
-/// target bit of the same name: its own field's first, then any field of the
-/// family, matching exactly before loosely, so a bit the target keeps in the
-/// next field along still comes across.
+/// target bit of the same name, looked for in this order: an exact name in
+/// its own field, an exact name in any field of the family, then a loose name
+/// or a rename the catalog knows in its own field (as a lone flags field
+/// would look), then a loose name in any field. So a bit the target keeps in
+/// the next field along still comes across.
 fn convert_flag_family(
     source: TagStruct<'_>,
     target: &mut TagStructMut<'_>,
-    family: &[FlagFamilyMember],
+    family: &FlagFamily,
     path: &str,
     context: &mut ConversionContext<'_>,
 ) {
     // Every target bit of the family: its field, bit and name.
     let mut options: Vec<(usize, u32, String)> = Vec::new();
     let mut raw: Vec<(usize, u64, String)> = Vec::new();
-    for member in family {
-        let Some(field) = target.as_ref().fields().nth(member.target) else {
+    for (ordinal, key) in &family.targets {
+        let Some(field) = target.as_ref().fields().nth(*ordinal) else {
             continue;
         };
         if let Some(TagOptions::Flags(found)) = field.options() {
-            options.extend(found.iter().map(|option| (member.target, option.bit, option.name.to_owned())));
+            options.extend(found.iter().map(|option| (*ordinal, option.bit, option.name.to_owned())));
         }
-        if !raw.iter().any(|(target, _, _)| *target == member.target) {
-            raw.push((member.target, 0, join_path(path, &member.key)));
-        }
+        raw.push((*ordinal, 0, join_path(path, key)));
     }
-    for member in family {
+    for member in &family.sources {
         let Some(field) = source.fields().nth(member.source) else {
             continue;
         };
@@ -6777,35 +6816,36 @@ fn convert_flag_family(
         }
         for (_, source_name) in names {
             let exact = exact_option_name(&source_name);
-            let own = |target: usize| target == member.target;
+            let own = |target: usize| member.own == Some(target);
             let found = options
                 .iter()
                 .find(|(target, _, name)| own(*target) && exact_option_name(name) == exact)
                 .or_else(|| options.iter().find(|(_, _, name)| exact_option_name(name) == exact))
-                .or_else(|| {
-                    options
-                        .iter()
-                        .find(|(target, _, name)| own(*target) && option_names_match(name, &source_name))
-                })
-                .or_else(|| options.iter().find(|(_, _, name)| option_names_match(name, &source_name)))
                 .map(|found| (found, false))
                 .or_else(|| {
-                    // A rename the catalog knows, within the bit's own field
-                    // as a lone flags field would look.
+                    options.iter().filter(|(target, _, _)| own(*target)).find_map(|found| {
+                        let (_, _, name) = found;
+                        if option_names_match(name, &source_name) {
+                            Some((found, false))
+                        } else if context.mapping_catalog.option_names_match(
+                            context.group_name,
+                            &field_path,
+                            context.source_game,
+                            context.target_game,
+                            &source_name,
+                            name,
+                        ) {
+                            Some((found, true))
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .or_else(|| {
                     options
                         .iter()
-                        .find(|(target, _, name)| {
-                            own(*target)
-                                && context.mapping_catalog.option_names_match(
-                                    context.group_name,
-                                    &field_path,
-                                    context.source_game,
-                                    context.target_game,
-                                    &source_name,
-                                    name,
-                                )
-                        })
-                        .map(|found| (found, true))
+                        .find(|(_, _, name)| option_names_match(name, &source_name))
+                        .map(|found| (found, false))
                 });
             let Some(((target, bit, _), mapped_by_catalog)) = found else {
                 record_unsupported(
@@ -6824,6 +6864,11 @@ fn convert_flag_family(
         }
     }
     for (ordinal, bits, field_path) in raw {
+        // A target field no source field was paired with, and that took no
+        // bits, stays at its default.
+        if bits == 0 && !family.sources.iter().any(|member| member.own == Some(ordinal)) {
+            continue;
+        }
         let Some(mut field) = target.field_at_mut(ordinal) else {
             continue;
         };
@@ -7684,6 +7729,107 @@ mod tests {
             assert!(landed.contains(name), "{name} didn't come across: {landed:?}");
         }
         assert_eq!(landed.len(), had.iter().filter(|name| !odst_only.contains(&name.as_str())).count());
+    }
+
+    /// ODST's style tags on disk carry an older layout than the definitions,
+    /// with `Behaviors1` to `Behaviors6` only. Halo 3's `Behaviors7` has no
+    /// source field to pair with, but it is part of the family, so the
+    /// crewman's `cure_isolation` still lands in it.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn a_six_field_style_fills_halo_3s_seventh_behaviors_field() {
+        let (Some(odst), Some(h3)) = (
+            kit_tags("BLAM_TEST_ODSTEK", "H3ODSTEK"),
+            kit_tags("BLAM_TEST_H3EK", "H3EK"),
+        ) else {
+            eprintln!("skipping: needs H3ODSTEK and H3EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let path = odst.join("objects/characters/marine/ai/crewman.style");
+        let (source, draft) = convert_kit_style(&path, &h3, &definitions);
+        assert!(source.root().field("Behaviors7").is_none(), "the crewman's style on disk stops at Behaviors6");
+        assert!(style_behaviors(&source).iter().any(|name| name == "cure_isolation"));
+        let seventh: Vec<String> = match draft.tag.root().field("Behaviors7").and_then(|field| field.value()) {
+            Some(TagFieldData::LongFlags { names, .. }) => names.into_iter().map(|(_, name)| name).collect(),
+            other => panic!("Halo 3's style has a Behaviors7 long flags field: {other:?}"),
+        };
+        assert!(seventh.iter().any(|name| name == "cure_isolation"), "Behaviors7 holds {seventh:?}");
+    }
+
+    /// Every ODST style in the kit into Halo 3: each behaviour Halo 3 has
+    /// lands under its own name, and nothing else is set.
+    ///
+    /// Self-skips without the kits.
+    #[test]
+    fn every_odst_style_keeps_the_behaviours_halo_3_has() {
+        let (Some(odst), Some(h3)) = (
+            kit_tags("BLAM_TEST_ODSTEK", "H3ODSTEK"),
+            kit_tags("BLAM_TEST_H3EK", "H3EK"),
+        ) else {
+            eprintln!("skipping: needs H3ODSTEK and H3EK");
+            return;
+        };
+        let definitions = locate_definitions_root();
+        let mut styles = Vec::new();
+        let mut folders = vec![odst.clone()];
+        while let Some(folder) = folders.pop() {
+            for entry in std::fs::read_dir(&folder).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    folders.push(path);
+                } else if path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("style"))
+                    && !is_generated_output(&path)
+                {
+                    styles.push(path);
+                }
+            }
+        }
+        styles.sort();
+        assert!(!styles.is_empty(), "the ODST kit has style tags");
+        let mut wrong = Vec::new();
+        for path in &styles {
+            let (source, draft) = convert_kit_style(path, &h3, &definitions);
+            let offered: Vec<String> = (1..=7)
+                .filter_map(|index| draft.tag.root().field(&format!("Behaviors{index}")))
+                .flat_map(|field| match field.options() {
+                    Some(TagOptions::Flags(options)) => {
+                        options.iter().map(|option| option.name.to_owned()).collect()
+                    }
+                    _ => Vec::new(),
+                })
+                .collect();
+            let mut expected: Vec<String> =
+                style_behaviors(&source).into_iter().filter(|name| offered.contains(name)).collect();
+            let mut landed = style_behaviors(&draft.tag);
+            expected.sort();
+            landed.sort();
+            if expected != landed {
+                let missing: Vec<&String> = expected.iter().filter(|name| !landed.contains(name)).collect();
+                let extra: Vec<&String> = landed.iter().filter(|name| !expected.contains(name)).collect();
+                wrong.push(format!("{}: missing {missing:?}, extra {extra:?}", path.display()));
+            }
+        }
+        assert!(wrong.is_empty(), "{} of {} styles:\n{}", wrong.len(), styles.len(), wrong.join("\n"));
+    }
+
+    /// Read a kit's ODST style and convert it to Halo 3 against H3EK's own
+    /// style layout.
+    fn convert_kit_style(path: &Path, h3: &Path, definitions: &Path) -> (TagFile, TagConversionDraft) {
+        let group_tag = u32::from_be_bytes(*b"styl");
+        let source = read_tag_for_conversion(path, Some("halo3odst_mcc"), Some(definitions), group_tag).unwrap();
+        let groups = GameTagIndex::load(definitions, "halo3_mcc").unwrap();
+        let templates = NativeTemplateIndex::build(h3, &groups);
+        let draft = analyze_conversion_with_templates(
+            &source,
+            "halo3odst_mcc",
+            "halo3_mcc",
+            definitions,
+            Some(&templates),
+        )
+        .unwrap();
+        (source, draft)
     }
 
     /// A bitmap Halo 2 cannot hand to Reach directly arrives by way of Halo 3.
