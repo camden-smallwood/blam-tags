@@ -280,6 +280,17 @@ impl<'a> Cursor<'a> {
         self.pos = end;
         Ok(slice)
     }
+
+    /// Whether the next `len + 1` bytes are a tag path: `len` printable
+    /// characters, then a NUL.
+    fn holds_path(&self, len: usize) -> bool {
+        self.data
+            .get(self.pos..)
+            .and_then(|rest| rest.get(..=len))
+            .is_some_and(|bytes| {
+                bytes[len] == 0 && bytes[..len].iter().all(|byte| (0x20..0x7f).contains(byte))
+            })
+    }
 }
 
 fn rd_u32(raw: &[u8], off: usize, endian: Endian) -> u32 {
@@ -1005,7 +1016,13 @@ fn decode_struct_trailing(
                 // trailing. Prepend the inline group bytes so the payload
                 // matches the MCC convention; the encoder strips them back.
                 let mut payload = raw[*off..*off + 4].to_vec();
-                if group != -1 && len != 0 {
+                // Guerilla keeps a path whose type was cleared to NONE: a
+                // Halo 2 reference can hold group -1 and a path, and the path
+                // is on disk. Skipping it read the rest of the tag from the
+                // wrong place. With group -1 the path is read only when one
+                // is really there (printable, then its NUL), so a CE null
+                // with a stale length still reads as before.
+                if len != 0 && (group != -1 || cur.holds_path(len)) {
                     payload.extend_from_slice(cur.take(len + 1, "tag_reference path")?);
                 }
                 entries.push(TagSubChunkEntry {
@@ -1675,6 +1692,45 @@ mod tests {
             colors.iter().map(|color| color.read_string("name").unwrap_or_default()).collect();
         assert_eq!(names, ["red", "green"]);
         assert_eq!(read.write_to_bytes().unwrap(), written);
+    }
+
+    /// A Halo 2 reference whose type was cleared to NONE keeps its path on
+    /// disk, as Guerilla saves it (the H2CE kit's flamethrower has four in
+    /// its attachments). The path is read, so what follows it is too, and
+    /// the tag writes back byte for byte.
+    #[test]
+    fn a_halo_2_reference_with_no_type_but_a_path_reads_its_path() {
+        let layout = crate::TagLayout::from_json("../definitions/halo2_mcc/particle_physics.json")
+            .expect("H2 particle_physics layout");
+        let path = b"effects\\fire";
+        let mut bytes = vec![0u8; 64];
+        bytes[36..40].copy_from_slice(b"vomp"); // `pmov`, stored reversed
+        bytes[60..64].copy_from_slice(b"!MLB");
+        bytes.extend_from_slice(b"dfbt");
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&32u32.to_le_bytes());
+        // `template`: group NONE, a path length, then `flags` = 5 and an
+        // empty `movements` block.
+        bytes.extend_from_slice(&[0xFF; 4]);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&[0xFF; 4]);
+        bytes.extend_from_slice(&5u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 12]);
+        bytes.extend_from_slice(path);
+        bytes.push(0);
+
+        let tag = super::read_classic_tag_file(&bytes, layout).expect("read");
+        let template = tag.root().field("template").and_then(|field| field.value());
+        let Some(crate::TagFieldData::TagReference(reference)) = template else {
+            panic!("not a reference: {template:?}");
+        };
+        let (_, name) = reference.group_tag_and_name.expect("the path is kept");
+        assert_eq!(name, "effects\\fire");
+        assert_eq!(tag.root().read_int_any("flags"), Some(5));
+        // The body byte for byte; the header gains its checksum.
+        assert_eq!(tag.write_to_bytes().unwrap()[64..], bytes[64..]);
     }
 
     /// Only the forms tools write today can be created.
